@@ -30478,6 +30478,1556 @@ void destroyHostWindow(Renderer* R);
         gpuPhaseEnd(kGpuPhaseWater);
     }
 
+    // TIER 2: linearize + GTAO compute. Whole kGpuPhasePostDepth bracket, and the seven nested
+    // brackets inside it (Linearize, AODown, AOSearch, AOBlur, AOUp, ShadowMask).
+    //
+    // Returns aoBlockRan — the single genuine cross-pass output in this part of the frame. Everything
+    // else the survey flagged as crossing here turned out to be a name re-declared inside the region.
+    template <class PhBegin, class PhEnd>
+    bool passLinearizeAndGtao(const float* rzViewProj, PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        gpuPhaseBegin(kGpuPhasePostDepth);
+        // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
+        // First compute work in the host. Sits between the depth-complete prepass and the colour
+        // pass: resolve pDepth (sample 0, MSAA-robust) -> single-sample pLinearDepth, then GTAO
+        // -> pAO (bent normal + visibility). Tier 2 feeds ONLY the F12 debug views; the colour
+        // pass reads pAO unconditionally is Tier 3. pLinearDepth/pAO live in UNORDERED_ACCESS at
+        // frame start (created state on frame 0; returned to SHADER_RESOURCE at the end of each
+        // frame, so they're flipped back to UAV here on every frame after the first).
+        // Tier 2 master toggle: runs the linearize dispatch + the pDepth/pLinearDepth/pAO(/pAOBlur)
+        // state ping-pong each frame. Kept ON: the linearize output (pLinearDepth) is sampled by the
+        // ALWAYS-ON water pass (gSceneLinDepth) and the colour pass samples pAOBlur (gAO), so the
+        // resource-state transitions here are load-bearing beyond AO — fully gating this off would
+        // leave those in UNORDERED_ACCESS while sampled (the old "clean Tier-1 degradation" comment
+        // predates water-takeover + the bilateral blur). The EXPENSIVE AO horizon-search + blur
+        // dispatches are gated separately by aoDispatchRuns below.
+        static const bool g_aoComputeEnable = true;
+        // Baseline-thinning (2026-07-02): skip the two costly AO dispatches (horizon search + blur,
+        // ~0.8ms) unless something actually READS the result. Derived rather than a knob of its own,
+        // because the two states a knob allows are both wrong: dispatch-off with a consumer on hands
+        // the colour frag a STALE pAOBlur (never written this frame) and reads as black AO;
+        // dispatch-on with no consumer is 0.8ms of GPU for nothing. Consumption is the whole answer,
+        // so the baseline (all three off) still costs exactly zero and cannot be mis-set.
+        const bool aoDispatchRuns = g_aoEnable || g_bentNormalEnable
+                                      || g_debugMode == 3u || g_debugMode == 4u;
+        // Which of the four AO modes runs. Falls back to GTAO if the picked pipeline is missing (a
+        // half-deployed shader tree after F8), so switching modes live can never drop the UAV write.
+        Pipeline* aoPipeline = (g_aoMode < (uint32_t)kAOModeCount) ? g_live.pAOPipeline[g_aoMode] : nullptr;
+        if (!aoPipeline) { aoPipeline = g_live.pAOPipeline[kAOModeGTAO]; }
+        static bool s_aoDispatchLogged = false;
+        if (!s_aoDispatchLogged) {
+            std::printf("[forge] AO dispatch GATE: enable=%d aoPipe=%p linPipe=%p linSet=%p gBatchSet=%p pAO=%p pLinDepth=%p firstFrame=%d\n",
+                        (int)g_aoComputeEnable, (void*)aoPipeline, (void*)g_live.pLinearizePipeline,
+                        (void*)g_live.pLinearizeSet, (void*)g_live.pGtaoBatchSet,
+                        (void*)g_live.pAO, (void*)g_live.pLinearDepth, (int)g_live.firstFrame);
+            s_aoDispatchLogged = true;
+        }
+        // Named once, because THREE later blocks depend on the states this one leaves behind
+        // (pLinearDepth in SHADER_RESOURCE above all) and each used to re-spell the condition by
+        // hand. A hand-mirrored gate that drifts is a silent state-mismatch, not a compile error.
+        const bool aoBlockRan = g_aoComputeEnable && g_live.pLinearizePipeline && aoPipeline;
+        // Half-res AO: the AO pass and the blur run at half, bracketed by a depth downsample and an
+        // adaptive Lanczos upscale. Only armed when the AO dispatches themselves are — with them
+        // gated off there is nothing to downsample FOR, and pAOBlur must be left exactly as the
+        // full-res path leaves it (stale but state-valid) rather than half-written.
+        const bool aoHalf = g_aoHalfRes && g_live.aoHalfReady && aoDispatchRuns;
+        // Latched the first time the half chain actually runs — see the barrier block below for why
+        // g_live.firstFrame cannot stand in for it.
+        static bool s_aoHalfPrimed = false;
+        if (aoBlockRan) {
+            // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
+            // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
+            // may need MW-scale tuning — change here). eye is read back from the frame cbuffer
+            // (floats 36..38 = gFrameData.eyePos), which holds the latest value across null-lighting frames.
+            float invVP[16];
+            if (!invert4x4(rzViewProj, invVP)) {
+                for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }  // identity guard
+            }
+            // AO knobs are now dev-overlay sliders (g_ao*); the per-frame upload reads them live.
+            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* ap = (float*)g_live.pAOParamsCbv->pCpuMappedAddress;
+            // Both the AO pass and the blur run at HALF when the toggle is on, so the one
+            // screenParams lane serves both — that is why it can live in the shared struct.
+            const uint32_t aoW = aoHalf ? ((g_live.width  + 1u) / 2u) : g_live.width;
+            const uint32_t aoH = aoHalf ? ((g_live.height + 1u) / 2u) : g_live.height;
+            std::memcpy(ap, invVP, 16 * sizeof(float));
+            ap[16] = (float)aoW;  ap[17] = (float)aoH;
+            ap[18] = 1.0f / (float)aoW; ap[19] = 1.0f / (float)aoH;
+            ap[20] = g_aoRadius; ap[21] = g_aoFalloff; ap[22] = g_aoIntensity; ap[23] = g_aoThickness;
+            // ap[27] and ap[30..31] are the AO pass's sample-budget lanes (eyePos.w / sliceParams.zw
+            // in gtao.srt.h). ap[28..29] are the BLUR's, in the same float4 — one buffer, two struct
+            // views; the two .srt.h files must stay byte-identical or this line corrupts the blur.
+            ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = (float)g_aoSlices;
+            // The blur's spatial sigma is in PIXELS, and at half res those pixels are twice as big —
+            // so shipping the slider value unscaled silently DOUBLED the blur's screen-space width
+            // the moment half res went on, which at a contact-scale AO radius is enough to wash the
+            // crease valley flat and leave the crease reading brighter than its surroundings. Halve
+            // it so the toggle stays a look-neutral A/B ("a softer version of the same signal, not a
+            // differently-shaped one"). The RANGE sigma below needs no such fix — it is in world
+            // units, which do not care about the resolution. Neither does the AO pass's own
+            // aoStepPixels, whose 96px ceiling and 1px floor are genuinely not compensable; that one
+            // is documented as an accepted difference beside g_aoHalfRes.
+            ap[28] = aoHalf ? (g_aoBlurPx * 0.5f) : g_aoBlurPx;
+            ap[29] = g_aoBlurDepth; ap[30] = (float)g_aoSteps; ap[31] = g_aoBitThick;
+            // ap[32..35] = AOParams::aoParams2 / BlurParams::blurParams2 — one float4 read by BOTH
+            // passes through their two struct views, same lockstep rule as sliceParams.xy. x is the
+            // AO pass's bent strength, y the blur's plane sigma, z the blur's FAR range sigma; w
+            // stays zeroed rather than left stale, since an unwritten lane here is an unspecified
+            // value there.
+            // ap[35] packs the dither SOURCE and its PHASE into one lane, because it is one
+            // question (aocommon.h.fsl's aoDither decodes it): <= -1.5 = the complementary 2x2 quad
+            // carrying its phase as -(w + 2), in (-1.5, 0) = the legacy 4x4 tile, >= 0 = the STBN
+            // mask at that time slice. Mode 1 pins slice 0 (spatial-only), 2 advances, 3 is the quad
+            // frozen, 4 the quad turning. The counter is frame-driven, not time-driven, so a
+            // frame-rate change alters how fast it walks in SECONDS but never makes it skip a step —
+            // a dropped frame must not put a hole in the sequence.
+            //
+            // ⚠ THE QUAD'S PHASE IS QUANTISED TO QUARTERS AND MUST STAY THAT WAY. A continuous phase
+            // would rotate the quad onto a DIFFERENT set of directions each frame — still complete,
+            // still zero-variance in the mean, but a different answer every frame, which is crawl
+            // reintroduced through the one door this pattern closes. On quarters the set is
+            // invariant and only the assignment of members to pixels rotates.
+            static uint32_t s_ditherFrame = 0;
+            ++s_ditherFrame;
+            const uint32_t ditherStride = (g_aoDitherStride < 1u) ? 1u : g_aoDitherStride;
+            float ditherSel = -1.0f;
+            if (g_aoDither == 1u) {
+                ditherSel = 0.0f;
+            } else if (g_aoDither == 2u) {
+                ditherSel = (float)((s_ditherFrame / ditherStride) & 15u);
+            } else if (g_aoDither == 3u) {
+                ditherSel = -2.0f;
+            } else if (g_aoDither >= 4u) {
+                ditherSel = -2.0f - 0.25f * (float)((s_ditherFrame / ditherStride) & 3u);
+            }
+            // Upload failed → the tile, not a black read. Only the two STBN rungs sample gStbn, so
+            // this must not reach the quad: it needs no texture at all, and sending it to the legacy
+            // 4x4 diagonal would be a downgrade triggered by an unrelated failure.
+            if (!g_live.pStbn && ditherSel >= 0.0f) { ditherSel = -1.0f; }
+            ap[32] = g_aoBentStr; ap[33] = g_aoPlaneSig; ap[34] = g_aoBlurDepthFar; ap[35] = ditherSel;
+
+            const uint32_t gx = (g_live.width + 7u) / 8u;
+            const uint32_t gy = (g_live.height + 7u) / 8u;
+            // Half-res dispatch extent. The textures are allocated at half of alloc*, and the live
+            // rect never exceeds the alloc rect, so this can never overrun them.
+            const uint32_t gxH = (aoW + 7u) / 8u;
+            const uint32_t gyH = (aoH + 7u) / 8u;
+            if (aoHalf) {
+                // The half-res chain's own cbuffer: full AND half dims, which is exactly why it is
+                // not in the shared AOParams/BlurParams layout.
+                float* up = (float*)g_live.pAOUpCbv->pCpuMappedAddress;
+                std::memcpy(up, invVP, 16 * sizeof(float));
+                up[16] = (float)g_live.width;  up[17] = (float)g_live.height;
+                up[18] = 1.0f / (float)g_live.width; up[19] = 1.0f / (float)g_live.height;
+                up[20] = (float)aoW; up[21] = (float)aoH;
+                up[22] = 1.0f / (float)aoW; up[23] = 1.0f / (float)aoH;
+                // ⚠ .z WAS DOCUMENTED "spare" AND IS NOW THE PROFILE LANE -- keep aohalfres.srt.h's
+                // comment in step, since the struct's comment is the only description of it.
+                up[24] = g_aoUpSigma; up[25] = g_aoPlaneSig;
+                up[26] = (float)g_aoUpProf; up[27] = 0.0f;
+            }
+
+            // End the prepass render pass, then pDepth DEPTH_WRITE -> SHADER_RESOURCE (first depth
+            // -> SRV transition in the host) and flip pLinearDepth back to UAV (skip on frame 0).
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pDepth;
+                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                TextureBarrier tb[4] = {};
+                uint32_t nt = 0;
+                if (!g_live.firstFrame) {
+                    tb[nt].pTexture = g_live.pLinearDepth;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                // The three half-res targets ride their own "primed" latch rather than firstFrame:
+                // they are created UNORDERED_ACCESS and only reach SHADER_RESOURCE at the end of a
+                // frame that actually ran the half chain, which may be any frame (or never). Using
+                // firstFrame here would issue an SR->UAV from a state they were never in.
+                if (aoHalf && s_aoHalfPrimed) {
+                    tb[nt].pTexture = g_live.pLinearDepthHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                    tb[nt].pTexture = g_live.pAOHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                    tb[nt].pTexture = g_live.pAOBlurHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+            }
+
+            // (1) Linearize/resolve dispatch.
+            gpuPhaseBegin(kGpuPhaseLinearize);
+            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "LINEARIZE (writes pLinearDepth)");
+            cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
+            cmdDispatch(g_live.pCmd, gx, gy, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            gpuPhaseEnd(kGpuPhaseLinearize);
+
+            // pLinearDepth UAV -> SRV (GTAO reads it); pAO SRV -> UAV (skip on frame 0).
+            {
+                TextureBarrier tb[2] = {};
+                uint32_t nt = 0;
+                tb[nt].pTexture = g_live.pLinearDepth;
+                tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                ++nt;
+                if (!g_live.firstFrame) {
+                    tb[nt].pTexture = g_live.pAO;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 0, nullptr);
+            }
+
+            // (1b) Half-res only: pLinearDepth (full) -> pLinearDepthHalf, MAX of each 2x2.
+            if (aoHalf) {
+                gpuPhaseBegin(kGpuPhaseAODown);
+                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.5f, 0.9f, "AO DEPTH DOWNSAMPLE (pLinearDepth -> half)");
+                cmdBindPipeline(g_live.pCmd, g_live.pAODownPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAODownSet);
+                cmdDispatch(g_live.pCmd, gxH, gyH, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseAODown);
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pLinearDepthHalf;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+
+            // (2) AO dispatch — pAOPipeline[g_aoMode] over the ONE shared PerDraw set (cbuffer +
+            // depth SRV + AO UAV; identical bindings for all four modes). Gated: with nothing
+            // consuming AO this is skipped and pAO is left stale but state-valid. Half-res swaps
+            // the SET, not the shader: same pipeline, same root index, half-res textures. The full
+            // pAO's UAV/SRV ping-pong above and below is unconditional either way, so its state
+            // machine never depends on the toggle — it is simply left unwritten on a half frame.
+            if (aoDispatchRuns) {
+                gpuPhaseBegin(kGpuPhaseAOSearch);
+                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "AO (linear depth -> pAO: bent normal + visibility)");
+                cmdBindPipeline(g_live.pCmd, aoPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pGtaoBatchSetHalf : g_live.pGtaoBatchSet);
+                cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseAOSearch);
+                static uint32_t s_aoDispatchedMode = 0xFFFFFFFFu;
+                static bool     s_aoDispatchedHalf = false;
+                static uint32_t s_aoDispatchedBlur = 0xFFFFFFFFu;
+                if (s_aoDispatchedMode != g_aoMode || s_aoDispatchedHalf != aoHalf
+                    || s_aoDispatchedBlur != g_aoBlurMode) {
+                    // LOG, not printf. `half=` is the one number that separates "AO is expensive"
+                    // from "AO is running at 4x the pixels it was configured for", and it was only
+                    // ever written to a stdout nobody captures — which is why a 2.43 ms AO could
+                    // not be told apart from a 0.67 ms one without a rebuild. Both REQUESTED and
+                    // EFFECTIVE are printed: the toggle can be on while the chain is unbuilt.
+                    // The BLUR variant belongs on this line too. It is a separate binary with a
+                    // different tap count and a different range weight, so "which blur ran" is as
+                    // load-bearing for reading a timing as "which AO ran" — and an env knob set in
+                    // a minimized harness has no other witness.
+                    LOG::logline(">> [forge][ao] dispatch mode=%u (%s) halfRequested=%d halfReady=%d"
+                                 " halfEFFECTIVE=%d grid=%ux%u aoTarget=%ux%u blur=%u (%s)",
+                                 g_aoMode, kAOShaderFiles[g_aoMode < (uint32_t)kAOModeCount ? g_aoMode : 0u],
+                                 (int)g_aoHalfRes, (int)g_live.aoHalfReady,
+                                 (int)aoHalf, aoHalf ? gxH : gx, aoHalf ? gyH : gy, aoW, aoH,
+                                 g_aoBlurMode,
+                                 kAOBlurShaderFiles[g_aoBlurMode < (uint32_t)kAOBlurModeCount ? g_aoBlurMode : 0u]);
+                    s_aoDispatchedMode = g_aoMode;
+                    s_aoDispatchedHalf = aoHalf;
+                    s_aoDispatchedBlur = g_aoBlurMode;
+                }
+                g_live.aoLastHalf = aoHalf;
+            }
+
+            // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
+            // pDepth SRV -> DEPTH_WRITE (colour LOADs it). pLinearDepth STAYS SRV — the blur reads it.
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pDepth;
+                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                TextureBarrier tb[3] = {};
+                uint32_t nt = 0;
+                tb[nt].pTexture = g_live.pAO;
+                tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                ++nt;
+                if (aoHalf) {
+                    tb[nt].pTexture = g_live.pAOHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    ++nt;
+                }
+                if (!g_live.firstFrame) {
+                    tb[nt].pTexture = g_live.pAOBlur;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+            }
+
+            // (3) Bilateral AO blur: pAO + pLinearDepth (both SRV) -> pAOBlur (UAV). PerFrame set
+            // (root distinct from gtao/linearize). Depth-aware, so it denoises without silhouette
+            // bleed. The colour frags sample pAOBlur as gAO. Half-res again swaps only the SET —
+            // and the DEPTH in that set is the half one too, or the range weight would reconstruct
+            // from a depth that does not correspond to the AO texel it is weighting.
+            {
+                // Gated with the GTAO dispatch: baseline skips the blur (pAOBlur stays stale but is
+                // still transitioned UAV -> SRV below, so the colour pass samples it in a valid state).
+                if (aoDispatchRuns) {
+                    gpuPhaseBegin(kGpuPhaseAOBlur);
+                    cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
+                    // Out-of-range falls back to the 2D reference rather than binding null.
+                    const uint32_t bmode = (g_aoBlurMode < (uint32_t)kAOBlurModeCount) ? g_aoBlurMode : 0u;
+                    cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline[bmode]);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pAOBlurSetHalf : g_live.pAOBlurSet);
+                    cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
+                    cmdEndDebugMarker(g_live.pCmd);
+                    gpuPhaseEnd(kGpuPhaseAOBlur);
+                }
+                // (4) Half-res only: pAOBlurHalf UAV -> SRV, then the depth+normal-adaptive
+                // Lanczos-2 upscale writes the FULL pAOBlur — so everything downstream, colour
+                // frags included, sees exactly the resource it always did.
+                if (aoHalf) {
+                    TextureBarrier hb = {};
+                    hb.pTexture = g_live.pAOBlurHalf;
+                    hb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    hb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &hb, 0, nullptr);
+
+                    gpuPhaseBegin(kGpuPhaseAOUp);
+                    cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.3f, "AO LANCZOS UPSCALE (half -> pAOBlur)");
+                    cmdBindPipeline(g_live.pCmd, g_live.pAOUpPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOUpSet);
+                    cmdDispatch(g_live.pCmd, gx, gy, 1);
+                    cmdEndDebugMarker(g_live.pCmd);
+                    gpuPhaseEnd(kGpuPhaseAOUp);
+                    // All three half targets now rest in SHADER_RESOURCE, which is what the primed
+                    // latch promises the next half frame's SR->UAV flip.
+                    s_aoHalfPrimed = true;
+                }
+                // pAOBlur UAV -> SRV for the colour pass.
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pAOBlur;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+        }
+
+        // P1: screen-space shadow-mask dispatch. Needs pLinearDepth in SHADER_RESOURCE, which the
+        // AO block above guarantees (linearize always runs; only the GTAO dispatches are gated) —
+        // hence aoBlockRan rather than a hand-copied gate. Runs whenever shadowReady, even with
+        // ZERO active slots: the comp then writes an all-lit mask, keeping the UAV/SRV ping-pong
+        // and the colour frag's mode-10 read state-valid. Own nested timer (kGpuPhaseShadowMask):
+        // per-pixel cost scales with ACTIVE slots (PCF loads, x2 for dynBits slots).
+        if (g_live.shadowReady && aoBlockRan) {
+            gpuPhaseBegin(kGpuPhaseShadowMask);
+            if (!g_live.firstFrame) {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pShadowMask;
+                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.2f, "SHADOW MASK (atlas -> per-pixel visibility)");
+            cmdBindPipeline(g_live.pCmd, g_live.pShadowMaskPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowMaskSet);
+            cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pShadowMask;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            gpuPhaseEnd(kGpuPhaseShadowMask);
+        }
+
+        gpuPhaseEnd(kGpuPhasePostDepth);
+
+        // ⚠ THE ONE LINE THAT IS NOT PART OF THE MOVE. aoBlockRan is declared inside this region
+        // and read ~1,300 lines later, in the colour->water seam, to decide whether pLinearDepth
+        // was actually left in a state worth re-linearizing. Returning it keeps the declaration
+        // above untouched — `const bool aoBlockRan = ...` is still exactly where it was, still
+        // const — which an out-parameter could not have done: that would have forced a bare
+        // assignment and dropped the const for the same result.
+        return aoBlockRan;
+    }
+
+    // P1: point-light shadow faces (atlas tile re-render). Whole kGpuPhaseShadow bracket plus the
+    // three nested ones inside it (ShadowStatic, ShadowDyn, ShadowSun). No outputs.
+    template <class PhBegin, class PhEnd>
+    void passPointLightShadowFaces(const float* lighting, const float* waterParams, unsigned waterEnabled,
+                                   const float* rzViewProj, uint32_t vStride, uint32_t iStride,
+                                   PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        // Direct draws — ≤ kShadowMaxCasters low-poly casters x 6 faces; the exec-indirect args
+        // buffer is camera-shaped + single-buffered, so indirect here would fight the main pass
+        // (revisit only if profiled). Both atlases rest SHADER_RESOURCE and flip to DEPTH_WRITE
+        // only on re-render frames; each tile is cleared by the viewport triangle (z = 0), NEVER
+        // by a load action (that would wipe every cached tile).
+        // C4b composite: TWO passes — the STATIC atlas (cached tiles, statics only, re-rendered
+        // on must/stale) and the DYNAMIC atlas (movers: skinned + MM, re-rendered every frame for
+        // slots with a mover in reach). shadowmask.comp max()es the two per texel.
+        gpuPhaseBegin(kGpuPhaseShadow);
+        gpuPhaseBegin(kGpuPhaseShadowStatic);
+        if (g_live.shadowReady && !g_shadowRenders.empty()) {
+            cmdBindRenderTargets(g_live.pCmd, nullptr);   // end the prepass pass before the barrier
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pShadowAtlas;
+                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            }
+            BindRenderTargetsDesc sbind = {};
+            sbind.mRenderTargetCount = 0;
+            sbind.mDepthStencil = { g_live.pShadowAtlas, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &sbind);
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.1f, "SHADOW FACES (static)");
+
+            // One job per dirty slot scheduled this frame (≤ kMaxShadowLights). Job b uses its
+            // slot's atlas block, its PREFIX-SUM-PACKED caster region (C4b: regionBase sized by the
+            // actual gather; firstInstance offsets into pShadowInstanceBuf / pShadowWorldsBuf), and
+            // face CBV base b*6.
+            for (uint32_t b = 0; b < (uint32_t)g_shadowRenders.size(); ++b) {
+                const ShadowRender& R = g_shadowRenders[b];
+                const uint32_t regionBase = R.regionBase;
+                uint32_t bx, by, bs;
+                shadowSlotBlock(R.slot, bx, by, bs);
+                for (uint32_t f = 0; f < 6; ++f) {
+                    const uint32_t tx = bx + (f % 3) * bs;
+                    const uint32_t ty = by + (f / 3) * bs;
+                    cmdSetViewport(g_live.pCmd, (float)tx, (float)ty, (float)bs, (float)bs, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, tx, ty, bs, bs);
+
+                    // Per-tile clear triangle (CMP_ALWAYS + write, z = 0 = reverse-Z far).
+                    cmdBindPipeline(g_live.pCmd, g_live.pShadowClearPipeline);
+                    cmdDraw(g_live.pCmd, 3, 0);
+
+                    // This job's casters (twoSided,mirror,slot)-sorted; draw local i reads matrix
+                    // regionBase+i of the SHADOW world window via firstInstance. Face CBV
+                    // R.slot*6+f (per-slot, shared with the dyn pass) carries this job's face
+                    // light-centred viewProj. Rebind keyed on the CHOSEN pso (covers both the
+                    // mirror flip AND the fixture-cage two-sided override).
+                    Pipeline* boundPso = nullptr;
+                    for (uint32_t k = R.casterBegin; k < R.casterEnd; ++k) {
+                        const ShadowCaster& scst = g_shadowCasters[k];
+                        HostMesh& hm = g_meshes[scst.slot];
+                        const uint32_t firstInst = regionBase + (k - R.casterBegin);
+                        // A fixture cage enclosing its own light forces CULL_NONE regardless of the
+                        // live g_shadowCasterCull mode (which front/back-culls half the cage away).
+                        Pipeline* casterPso;
+                        if (scst.twoSided) {
+                            casterPso = g_live.pShadowPipelineNone;
+                        } else {
+                            // Live caster-cull pick (g_shadowCasterCull). CULL_NONE ignores winding
+                            // (one PSO); BACK/FRONT keep the mirror-winding pair.
+                            switch (g_shadowCasterCull) {
+                            case 1:  casterPso = g_live.pShadowPipelineNone; break;
+                            case 2:  casterPso = scst.mirror ? g_live.pShadowPipelineFrontMirror
+                                                             : g_live.pShadowPipelineFront; break;
+                            default: casterPso = scst.mirror ? g_live.pShadowPipelineMirror
+                                                             : g_live.pShadowPipeline; break;
+                            }
+                        }
+                        if (casterPso != boundPso) {
+                            cmdBindPipeline(g_live.pCmd, casterPso);
+                            cmdBindDescriptorSet(g_live.pCmd, R.slot * 6 + f, g_live.pShadowFaceSet);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
+                            boundPso = casterPso;
+                        }
+                        if (hm.inArena) {
+                            Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
+                            uint32_t strides[2] = { vStride, iStride };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount,
+                                                    (uint32_t)(hm.ibOff / sizeof(uint16_t)), 1,
+                                                    (uint32_t)(hm.vbOff / sizeof(IPC::GeomVertexWire)), firstInst);
+                        } else {
+                            Buffer*  vbs[2]     = { hm.vb, g_live.pShadowInstanceBuf };
+                            uint32_t strides[2] = { vStride, iStride };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, firstInst);
+                        }
+                    }
+
+                }
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pShadowAtlas;
+                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            }
+        }
+
+        gpuPhaseEnd(kGpuPhaseShadowStatic);
+        gpuPhaseBegin(kGpuPhaseShadowDyn);
+        // --- C4b DYNAMIC atlas: movers only (skinned + MM), re-rendered EVERY frame for each
+        // slot with a mover in reach. Skinned/MM Z-prepasses already filled the bone/MM windows
+        // (they run before this); draws bind the per-slot face CBVs (s*6+f, written by the
+        // scheduler) and cost zero pool matrices. The mask samples this atlas only for slots in
+        // dynBits, so a stale tile (mover left) is inert. ---
+        if (g_live.shadowReady && !g_shadowRendersDyn.empty()) {
+            cmdBindRenderTargets(g_live.pCmd, nullptr);   // end whatever pass is open
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pShadowAtlasDyn;
+                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            }
+            BindRenderTargetsDesc dbind = {};
+            dbind.mRenderTargetCount = 0;
+            dbind.mDepthStencil = { g_live.pShadowAtlasDyn, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &dbind);
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.5f, 0.1f, "SHADOW FACES (dynamic movers)");
+
+            // Record-cost shape of this pass (2026-07-10 rec-split instrumentation): the leak
+            // that spiked host record to 2.6ms was slots × 6 faces × (full caster-list sphere
+            // sweep + bind/draw per in-reach caster per face). Two cuts, output-identical:
+            //   1. HOIST the sphere test out of the face loop — it's face-independent (the
+            //      scheduler ran the identical test for dynHit) — into per-slot hit lists.
+            //   2. Per-face 90°-pyramid cull: bit f of a hit's face mask is set iff the caster
+            //      sphere touches face f's frustum (light-relative centre c, conservative
+            //      half-space test c[axis] + r*sqrt2 >= max of the other two |axes|). A mover
+            //      is geometrically visible in at most 3 faces, usually 1-2 — so its draws are
+            //      recorded 1-2 times instead of 6.
+            // Face order matches buildShadowFaceVP/shadowmask.comp: +X -X +Y -Y +Z -Z.
+            auto dynFaceMask = [](float dx, float dy, float dz, float rad) -> uint32_t {
+                const float rs = rad * 1.41421356f;
+                const float ax = fabsf(dx), ay = fabsf(dy), az = fabsf(dz);
+                uint32_t m = 0;
+                if ( dx + rs >= fmaxf(ay, az)) { m |= 1u << 0; }
+                if (-dx + rs >= fmaxf(ay, az)) { m |= 1u << 1; }
+                if ( dy + rs >= fmaxf(ax, az)) { m |= 1u << 2; }
+                if (-dy + rs >= fmaxf(ax, az)) { m |= 1u << 3; }
+                if ( dz + rs >= fmaxf(ax, ay)) { m |= 1u << 4; }
+                if (-dz + rs >= fmaxf(ax, ay)) { m |= 1u << 5; }
+                return m;
+            };
+            struct DynHit { uint32_t idx; uint32_t faces; };
+            std::vector<DynHit> skHits, mmHits, rmHits;
+            skHits.reserve(g_skinnedCasters.size());
+            mmHits.reserve(g_mmCasters.size());
+            rmHits.reserve(g_dynMoverCasters.size());
+
+            for (const uint32_t s : g_shadowRendersDyn) {
+                const ShadowSlot& sl = g_shadowSlots[s];
+                const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
+                const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
+                const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
+                const float reach = 2.0f * sl.radius;
+                uint32_t bx, by, bs;
+                shadowSlotBlock(s, bx, by, bs);
+
+                // ONE clear triangle over the whole 3x2 face block (was 6 per-tile clears).
+                cmdSetViewport(g_live.pCmd, (float)bx, (float)by, (float)(3 * bs), (float)(2 * bs), 0.0f, 1.0f);
+                cmdSetScissor(g_live.pCmd, bx, by, 3 * bs, 2 * bs);
+                cmdBindPipeline(g_live.pCmd, g_live.pShadowClearPipeline);
+                cmdDraw(g_live.pCmd, 3, 0);
+
+                // Per-slot in-reach gather (once, not per face) + face masks. faceUnion skips
+                // whole faces no hit can touch (viewport/scissor/binds never recorded).
+                skHits.clear(); mmHits.clear(); rmHits.clear();
+                uint32_t faceUnion = 0;
+                if (g_shadowSkinnedCasters) {
+                    for (uint32_t i = 0; i < (uint32_t)g_skinnedCasters.size(); ++i) {
+                        const SkinnedCaster& sc = g_skinnedCasters[i];
+                        const float dx = sc.cRel[0] - lrx, dy = sc.cRel[1] - lry, dz = sc.cRel[2] - lrz;
+                        const float rr = reach + sc.rad;
+                        if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
+                        const uint32_t fm = dynFaceMask(dx, dy, dz, sc.rad);
+                        if (fm) { skHits.push_back({ i, fm }); faceUnion |= fm; }
+                    }
+                }
+                if (g_shadowMMCasters) {
+                    for (uint32_t i = 0; i < (uint32_t)g_mmCasters.size(); ++i) {
+                        const MMCaster& mc = g_mmCasters[i];
+                        const float dx = mc.cRel[0] - lrx, dy = mc.cRel[1] - lry, dz = mc.cRel[2] - lrz;
+                        const float rr = reach + mc.rad;
+                        if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
+                        const uint32_t fm = dynFaceMask(dx, dy, dz, mc.rad);
+                        if (fm) { mmHits.push_back({ i, fm }); faceUnion |= fm; }
+                    }
+                }
+                if (g_shadowRigidMovers) {
+                    for (uint32_t i = 0; i < (uint32_t)g_dynMoverCasters.size(); ++i) {
+                        const DynMoverCaster& dm = g_dynMoverCasters[i];
+                        const float dx = dm.cRel[0] - lrx, dy = dm.cRel[1] - lry, dz = dm.cRel[2] - lrz;
+                        const float rr = reach + dm.rad;
+                        if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
+                        const uint32_t fm = dynFaceMask(dx, dy, dz, dm.rad);
+                        if (fm) { rmHits.push_back({ i, fm }); faceUnion |= fm; }
+                    }
+                }
+
+                for (uint32_t f = 0; f < 6; ++f) {
+                    if ((faceUnion & (1u << f)) == 0u) { continue; }
+                    const uint32_t tx = bx + (f % 3) * bs;
+                    const uint32_t ty = by + (f / 3) * bs;
+                    cmdSetViewport(g_live.pCmd, (float)tx, (float)ty, (float)bs, (float)bs, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, tx, ty, bs, bs);
+
+                    // C4a skinned casters for THIS slot/face (this-frame poses, firstInstance=index).
+                    {
+                        Pipeline* skBound = nullptr;   // tracks the PSO, not just mirror: a BLENDED
+                                                       // caster switches frag as well as winding
+                        uint32_t skWindow = UINT32_MAX;
+                        for (const DynHit& h : skHits) {
+                            if ((h.faces & (1u << f)) == 0u) { continue; }
+                            const SkinnedCaster& sc = g_skinnedCasters[h.idx];
+                            Pipeline* skPso;
+                            if (sc.alphaCast && g_live.pSkinnedAlphaShadowPipeline) {
+                                // Opacity-thresholded caster (alphashadowdepth.frag), CULL_NONE: the
+                                // cull knob's back/front variants exist to fight opaque shadow acne,
+                                // which a thresholded translucent caster does not produce.
+                                skPso = g_live.pSkinnedAlphaShadowPipeline;
+                            } else {
+                                switch (g_shadowCasterCull) {
+                                case 1:  skPso = g_live.pSkinnedShadowPipelineNone; break;
+                                case 2:  skPso = sc.mirror ? g_live.pSkinnedShadowPipelineFrontMirror
+                                                           : g_live.pSkinnedShadowPipelineFront; break;
+                                default: skPso = sc.mirror ? g_live.pSkinnedShadowPipelineMirror
+                                                           : g_live.pSkinnedShadowPipeline; break;
+                                }
+                            }
+                            if (skPso != skBound) {
+                                cmdBindPipeline(g_live.pCmd, skPso);
+                                cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                skBound = skPso;
+                                skWindow = UINT32_MAX;
+                            }
+                            if (sc.window != skWindow) {
+                                cmdBindDescriptorSet(g_live.pCmd, sc.window, g_live.pPerBatchSetSkin);
+                                skWindow = sc.window;
+                            }
+                            HostMesh& sm = g_meshes[sc.slot];
+                            Buffer*  svbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                            uint32_t sstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
+                        }
+                    }
+
+                    // Multimap casters (heads/glow) for THIS slot/face (resident MM windows,
+                    // firstInstance=index).
+                    {
+                        int mmMirror = -1;
+                        for (const DynHit& h : mmHits) {
+                            if ((h.faces & (1u << f)) == 0u) { continue; }
+                            const MMCaster& mc = g_mmCasters[h.idx];
+                            if ((int)mc.mirror != mmMirror) {
+                                Pipeline* mmPso;
+                                switch (g_shadowCasterCull) {
+                                case 1:  mmPso = g_live.pMultiMapShadowPipelineNone; break;
+                                case 2:  mmPso = mc.mirror ? g_live.pMultiMapShadowPipelineFrontMirror
+                                                           : g_live.pMultiMapShadowPipelineFront; break;
+                                default: mmPso = mc.mirror ? g_live.pMultiMapShadowPipelineMirror
+                                                           : g_live.pMultiMapShadowPipeline; break;
+                                }
+                                cmdBindPipeline(g_live.pCmd, mmPso);
+                                cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                                mmMirror = (int)mc.mirror;
+                            }
+                            HostMesh& mm = g_meshes[mc.slot];
+                            Buffer*  mvbs[2]     = { mm.vb, g_live.pInstanceBufMM };
+                            uint32_t mstrides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, mvbs, mstrides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, mc.index);
+                        }
+                    }
+
+                    // C4d LIVE rigid casters (hands, held weapons/shields, activators, doors)
+                    // for THIS slot/face — this-frame lastWorld packed at the pool TAIL
+                    // (matIdx), one matrix per caster shared by every slot. Same static-caster
+                    // PSOs (cutout via instance texAlpha), firstInstance = matIdx.
+                    {
+                        int rmMirror = -1;
+                        for (const DynHit& h : rmHits) {
+                            if ((h.faces & (1u << f)) == 0u) { continue; }
+                            const DynMoverCaster& dm = g_dynMoverCasters[h.idx];
+                            if ((int)dm.mirror != rmMirror) {
+                                Pipeline* rmPso;
+                                switch (g_shadowCasterCull) {
+                                case 1:  rmPso = g_live.pShadowPipelineNone; break;
+                                case 2:  rmPso = dm.mirror ? g_live.pShadowPipelineFrontMirror
+                                                           : g_live.pShadowPipelineFront; break;
+                                default: rmPso = dm.mirror ? g_live.pShadowPipelineMirror
+                                                           : g_live.pShadowPipeline; break;
+                                }
+                                cmdBindPipeline(g_live.pCmd, rmPso);
+                                cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
+                                rmMirror = (int)dm.mirror;
+                            }
+                            HostMesh& hm = g_meshes[dm.slot];
+                            if (hm.inArena) {
+                                Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
+                                uint32_t strides[2] = { vStride, iStride };
+                                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                                cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                                cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount,
+                                                        (uint32_t)(hm.ibOff / sizeof(uint16_t)), 1,
+                                                        (uint32_t)(hm.vbOff / sizeof(IPC::GeomVertexWire)), dm.matIdx);
+                            } else {
+                                Buffer*  vbs[2]     = { hm.vb, g_live.pShadowInstanceBuf };
+                                uint32_t strides[2] = { vStride, iStride };
+                                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                                cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
+                                cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, dm.matIdx);
+                            }
+                        }
+                    }
+                }
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pShadowAtlasDyn;
+                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            }
+        }
+        gpuPhaseEnd(kGpuPhaseShadowDyn);
+
+        // SUN shadow: render the DL-statics MSM moments map. It MUST be here — inside the shadow
+        // phase, before reflect/colour — because from Phase B on, every colour pass SAMPLES it. The
+        // map is CAMERA-RELATIVE, so a frame-late map is offset by the camera delta and the shadows
+        // visibly slide under motion; same-frame is not an optimisation, it is correctness. The sun
+        // cull it consumes ran back in kGpuPhaseCull, and the pass is self-contained (own RT +
+        // barriers, leaves pSunMoments in SHADER_RESOURCE), so it slots in with no state coupling.
+        //
+        // Latch this frame's water plane FIRST: publishSunShadowParams writes the fog block, and both
+        // of renderSunShadow's exits go through it. The volumetric march clamps against this plane
+        // because the depth it reads is the OPAQUE prepass — water is drawn later, so over open sea
+        // the ray would otherwise run to the seabed or the far clamp through solid water.
+        // Held off entirely when the camera is submerged: the height-fog model is an AIR model.
+        g_volFogWaterZ  = waterParams ? waterParams[0] : 0.0f;
+        g_volFogWaterOn = (waterEnabled != 0) && waterParams && !(waterParams[7] > 0.5f);
+        // ...and the UNIFIED WATER FOG's own latch, off the SAME params in the SAME place — the two
+        // features must never disagree about where the surface is, and deriving one plane twice is
+        // how that starts. They differ in exactly one respect, which is why they cannot share a
+        // lane: the volumetric clamp above goes OFF when the camera submerges (its model is air),
+        // and this one is at its most load-bearing precisely then.
+        // (The ini behind it is read in ForgeRender::init, not here — see loadWaterIniOnce.)
+        //
+        // ⚠ waterTrueLevel, NOT the raw waterParams[0], and the difference is load-bearing rather
+        // than cosmetic. The client's `underwater` bit is MWBridge::IsUnderwater, which trips at
+        // `WaterLevel() - 1` — so a fog plane at the raw level disagrees with the flag over a
+        // one-unit band around the waterline, i.e. exactly where the model's continuity argument
+        // lives, and the shader's flag-vs-plane guards would fire there instead of never. It is also
+        // what MGE, scene-walk and scene-walk-v2 all mean by "the water plane" (see waterTrueLevel).
+        // Deliberately NOT waterMeshZ: that one snaps +-5 with the camera to keep the drawn mesh off
+        // the near plane, so a fog plane following it would jump 10 units at the crossing.
+        g_waterFogZ     = waterParams ? waterTrueLevel(waterParams[0]) : 0.0f;
+        g_waterFogOn    = (waterEnabled != 0) && waterParams != nullptr;
+        g_waterFogUnder = waterParams && waterParams[7] > 0.5f;
+        // MW's GameHour, off the water block's last (previously reserved) lane — see the client's
+        // waterParams fill. It rides there rather than on a lighting lane because the ONLY consumer
+        // is the water fog's time-of-day density, and because the water block is already gated on
+        // the cell having water, which is exactly when that density matters.
+        if (waterParams) { g_waterFogHour = waterParams[11]; }
+        // W23: MW's windFactor, for the caustic slice bias. Cached here with the other water lanes
+        // rather than read at the publish, which runs in a different function.
+        if (waterParams) { g_causticWindNow = waterParams[1]; }
+        // R1: MW's live precipitation counters. Zeroed with the water block rather than latched —
+        // the client already zeroes them in interiors, and a latched counter would keep raining on
+        // the next puddle the player finds indoors.
+        g_rainWetRain = waterParams ? waterParams[12] : 0.0f;
+        g_rainWetSnow = waterParams ? waterParams[13] : 0.0f;
+        // R2 actor ripples are ingested EARLIER (see ingestActorRipples, called before the wave-sim
+        // dispatch) — this block runs ~1000 lines after it, and the sim needs THIS frame's births.
+        {
+            static unsigned s_lastN = 0xFFFFFFFFu;
+            if (g_actorRippleCount != s_lastN) {
+                s_lastN = g_actorRippleCount;
+                if (g_actorRippleCount) {
+                    LOG::logline(">> [ripl] actor ripples: %u  first=(%.0f %.0f) age=%.2f scale=%.2f",
+                                 g_actorRippleCount, g_actorRipples[0], g_actorRipples[1],
+                                 g_actorRipples[2], g_actorRipples[3]);
+                } else {
+                    LOG::logline(">> [ripl] actor ripples: 0");
+                }
+            }
+        }
+        // One line per meaningful move in the derived density. The dev panel cannot show this — its
+        // label() takes a static string, so a live readout would freeze at whatever the panel was
+        // built with — and the REF knob above is exactly the kind of constant that can only be found
+        // by watching a real storm arrive. Edge-triggered, so a dry frame costs one compare.
+        {
+            static float s_lastDens = -1.0f;
+            const float dens = effectiveRainDensity();
+            if (std::fabs(dens - s_lastDens) > 0.02f) {
+                LOG::logline(">> [ripl] weather: rain %.0f snow %.0f ref %.0f -> density %.3f",
+                             g_rainWetRain, g_rainWetSnow, g_rainWeatherRef, dens);
+                s_lastDens = dens;
+            }
+        }
+        // DIAGNOSTIC, one line per surface crossing. "MW is also changing lighting underwater" is a
+        // claim the host can SETTLE rather than assume: these are MW's own authored values off the
+        // wire, before any lift or decode, so a diff between the two lines around a crossing says
+        // exactly which of them the engine switches. (OpenMW, the reference reimplementation, moves
+        // only the fog start/end/colour — nothing touches sun or ambient — so if sun/amb DO move
+        // here that is vanilla-specific and we would be inheriting a camera-dependent global where
+        // the physical answer is a per-fragment one. Costs nothing: it fires on an edge.)
+        {
+            static bool s_lastUnder = false;
+            if (g_waterFogUnder != s_lastUnder) {
+                s_lastUnder = g_waterFogUnder;
+                if (lighting) {
+                    // weather=0 says the LIGHT lanes were left alone by unblendUnderwaterTint (MW
+                    // never tinted them) while the fog lane was still undone — so if a weatherless
+                    // interior's fog range does NOT move across this crossing, the assumption that
+                    // MW's fog override is weather-independent is what to overturn, from this line.
+                    LOG::logline(">> [waterfog] crossing -> %-5s  sun(%.3f %.3f %.3f) amb(%.3f %.3f %.3f)"
+                                 " fog(%.3f %.3f %.3f) near %.0f..%.0f weather=%d",
+                                 g_waterFogUnder ? "UNDER" : "above",
+                                 lighting[4],  lighting[5],  lighting[6],
+                                 lighting[8],  lighting[9],  lighting[10],
+                                 lighting[12], lighting[13], lighting[14],
+                                 lighting[16], lighting[17], g_uwMwTinted ? 1 : 0);
+                }
+            }
+        }
+        gpuPhaseBegin(kGpuPhaseShadowSun);
+        renderSunShadow();
+        gpuPhaseEnd(kGpuPhaseShadowSun);
+
+        // --- W8d DIAGNOSTIC: every uniform the in-scatter reads, one CSV row per frame ----------
+        //
+        // "There is a value used in scattering that's affected by the one frame delay." A host-side
+        // trace can settle that WITHOUT guessing which one, because a one-frame lag between two
+        // signals is a PHASE SHIFT when the input oscillates: move back and forth, and whichever
+        // column turns around a row after the others is the late one. Everything is sampled at this
+        // single point — after the water plane latch above and after publishSunShadowParams ->
+        // publishWaterFog, i.e. once every value below is the one this frame's pixels will read.
+        //
+        // The columns are deliberately REDUNDANT in three places, because each pair is one candidate:
+        //   eye*   vs wireEye*   — gFrameData.lodEye (what the shader divides by) against lighting[24..26]
+        //                          straight off the wire. These are written from each other, so a split
+        //                          here would mean the cbuffer write is not where it looks.
+        //   waterZ vs waterZraw  — the latched plane against waterParams[0]; and under vs underWire.
+        //   dir*                 — the centre-pixel ray, rebuilt from rzViewProj by the IDENTICAL
+        //                          arithmetic waterfill.frag uses (invert, NDC 0,0,0.5, divide by w).
+        //                          This is the ORIENTATION lane: it is the only column that comes from
+        //                          the matrix rather than from the lighting/water blocks, so if the
+        //                          camera's rotation and the camera's position enter the frame at
+        //                          different times, these two groups separate here and nowhere else.
+        // eyeDepth is the derived quantity that actually scales the in-scatter (e0 = exp(-sigma*slant*
+        // dNear)), so it is worth its own column rather than being recomputed offline.
+        //
+        // Buffered fprintf, not LOGF: a per-frame LOGF is a ~3ms/frame tax in this codebase
+        // ([[project_forge_multimap_night_collapse]]) and a tax that big would distort the very
+        // timing being measured. Flushed each row so a hard exit still leaves a complete capture.
+        {
+            static FILE* s_wfTrace = nullptr;
+            static bool  s_wfTraceWas = false;
+            if (g_waterFogTrace && !s_wfTraceWas) {
+                s_wfTrace = std::fopen("waterfog_trace.csv", "w");
+                if (s_wfTrace) {
+                    std::fprintf(s_wfTrace,
+                        "frame,t_ms,eyeX,eyeY,eyeZ,wireEyeX,wireEyeY,wireEyeZ,"
+                        "waterZ,waterZraw,under,underWire,eyeDepth,"
+                        "dirX,dirY,dirZ,sunDirX,sunDirY,sunDirZ,"
+                        "sunR,sunG,sunB,ambR,ambG,ambB,fogR,fogG,fogB,"
+                        "kView,sigTr,sigTg,sigTb,sigSr,sigSg,sigSb,"
+                        "kdR,kdG,kdB,kdS,gain,volS,msIso,ivpMaxAbs,ivpRayDeg\n");
+                }
+                LOG::logline(">> [waterfog] trace ON -> waterfog_trace.csv");
+            } else if (!g_waterFogTrace && s_wfTraceWas && s_wfTrace) {
+                std::fclose(s_wfTrace);
+                s_wfTrace = nullptr;
+                LOG::logline(">> [waterfog] trace OFF");
+            }
+            s_wfTraceWas = g_waterFogTrace;
+
+            if (s_wfTrace && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress
+                          && g_live.pShadowMaskParamsCbv
+                          && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+                const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+                const float* sp = (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+
+                // The centre-pixel ray, by waterfill.frag's own arithmetic. The upload is row-major
+                // and HLSL reads it column-major, so the shader's mul(M, v) is v * M_row here — do
+                // it that way round rather than "the obvious" one, or the printed direction is the
+                // transpose of the one the pixels used.
+                float invVP[16];
+                float dir[3] = { 0.0f, 0.0f, 0.0f };
+                if (invert4x4(rzViewProj, invVP)) {
+                    const float v[4] = { 0.0f, 0.0f, 0.5f, 1.0f };
+                    float hp[4];
+                    for (int j = 0; j < 4; ++j) {
+                        hp[j] = v[0] * invVP[0 * 4 + j] + v[1] * invVP[1 * 4 + j]
+                              + v[2] * invVP[2 * 4 + j] + v[3] * invVP[3 * 4 + j];
+                    }
+                    const float iw = (std::fabs(hp[3]) > 1.0e-9f) ? (1.0f / hp[3]) : 0.0f;
+                    float p[3] = { hp[0] * iw, hp[1] * iw, hp[2] * iw };
+                    const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+                    if (len > 1.0e-6f) {
+                        dir[0] = p[0] / len; dir[1] = p[1] / len; dir[2] = p[2] / len;
+                    }
+                }
+
+                // --- THE PROBE THIS TRACE SHOULD HAVE HAD FROM THE START ------------------------
+                // The first capture logged `dir` from an inverse computed FRESHLY here, so it compared
+                // this frame's camera against itself and could only ever say "consistent". What the
+                // hole fill actually reads is the PUBLISHED gShadowParams.invViewProj (floats 0..15),
+                // and that is a different object in a different buffer written at a different point in
+                // the frame. Rebuilding water.frag's ray from the analogous lane made its shear an
+                // order of magnitude worse, which is evidence that the published inverse does not
+                // agree with the matrix that rasterised the frame.
+                //
+                // Two numbers, because one of them is interpretable and the other is not:
+                //   ivpMaxAbs — max element-wise |published - fresh|. Nonzero at all = they differ.
+                //   ivpRayDeg — the ANGLE between the centre-pixel ray each one produces, in degrees.
+                //               This is the quantity that matters: it is exactly how far the fill's
+                //               ray points away from where the pixel actually looks, and the phase
+                //               function turns a fraction of a degree near the sun into real
+                //               brightness. Expect ~0 standing still and a velocity-proportional
+                //               value while moving if the one-frame tear is real.
+                float ivpMax = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    ivpMax = std::max(ivpMax, std::fabs(sp[i] - invVP[i]));
+                }
+                float ivpDeg = 0.0f;
+                {
+                    const float v[4] = { 0.0f, 0.0f, 0.5f, 1.0f };
+                    float hp[4];
+                    for (int j = 0; j < 4; ++j) {
+                        hp[j] = v[0] * sp[0 * 4 + j] + v[1] * sp[1 * 4 + j]
+                              + v[2] * sp[2 * 4 + j] + v[3] * sp[3 * 4 + j];
+                    }
+                    const float iw = (std::fabs(hp[3]) > 1.0e-9f) ? (1.0f / hp[3]) : 0.0f;
+                    float p[3] = { hp[0] * iw, hp[1] * iw, hp[2] * iw };
+                    const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+                    if (len > 1.0e-6f && (dir[0] != 0.0f || dir[1] != 0.0f || dir[2] != 0.0f)) {
+                        const float c = (p[0] * dir[0] + p[1] * dir[1] + p[2] * dir[2]) / len;
+                        ivpDeg = std::acos(std::max(-1.0f, std::min(1.0f, c))) * 57.29577951f;
+                    }
+                }
+
+                const float waterZ  = sp[kWaterFogPlaneFloat + 0];
+                const float underSP = sp[kWaterFogPlaneFloat + 2];
+                std::fprintf(s_wfTrace,
+                    "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+                    "%.3f,%.3f,%.0f,%.0f,%.3f,"
+                    "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
+                    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                    "%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
+                    "%.8f,%.8f,%.8f,%.3f,%.4f,%.3f,%.3f,%.9f,%.6f\n",
+                    g_renderFrame, hostNowMs(),
+                    fd[56], fd[57], fd[58],
+                    lighting ? lighting[24] : 0.0f,
+                    lighting ? lighting[25] : 0.0f,
+                    lighting ? lighting[26] : 0.0f,
+                    waterZ, waterParams ? waterParams[0] : 0.0f,
+                    underSP, waterParams ? waterParams[7] : 0.0f,
+                    (waterZ - fd[58] > 0.0f) ? (waterZ - fd[58]) : 0.0f,
+                    dir[0], dir[1], dir[2], fd[16], fd[17], fd[18],
+                    fd[20], fd[21], fd[22], fd[24], fd[25], fd[26], fd[28], fd[29], fd[30],
+                    sp[kWaterFogColFloat + 3],
+                    sp[kWaterFogExtFloat + 0], sp[kWaterFogExtFloat + 1], sp[kWaterFogExtFloat + 2],
+                    sp[kWaterFogScatterFloat + 0], sp[kWaterFogScatterFloat + 1],
+                    sp[kWaterFogScatterFloat + 2],
+                    sp[kWaterFogKdFloat + 0], sp[kWaterFogKdFloat + 1], sp[kWaterFogKdFloat + 2],
+                    sp[kWaterFogKdFloat + 3],
+                    sp[kWaterFogScatterFloat + 3], sp[kWaterFogExtFloat + 3],
+                    sp[kWaterFogPhase2Float + 2],
+                    ivpMax, ivpDeg);
+                std::fflush(s_wfTrace);
+            }
+        }
+
+        if (g_live.shadowReady && g_shadowFrameActive) {
+            // Restore the full-screen viewport/scissor for the compute + colour passes below
+            // (the colour pass re-sets them at bind, but the AO block in between binds nothing).
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        }
+        gpuPhaseEnd(kGpuPhaseShadow);
+    }
+
+    // Z-PREPASS (depth-only, opaque set). Whole kGpuPhasePrepass bracket, no outputs.
+    //
+    // ⚠ THE SIGNATURE IS LONG, AND THAT IS THE FINDING RATHER THAN A PROBLEM WITH IT. Four of these
+    // parameters — groupCount, groupOff, s_dynamic, s_portal — are taken by REFERENCE because the
+    // prepass fills them and the COLOUR pass, 400 lines later, replays them. That sharing was
+    // previously invisible: two regions of one function touching the same four locals. Stating it
+    // in a signature is the point of promoting in place, and it is what has to be designed away
+    // before either pass could move to a file of its own.
+    template <class PhBegin, class PhEnd>
+    void passZPrepass(const IPC::DrawItemWire* items,
+                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
+                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
+                      uint32_t vStride, uint32_t iStride,
+                      uint32_t (&groupCount)[2][2][kMaxBatches],
+                      uint32_t (&groupOff)[2][2][kMaxBatches],
+                      std::vector<uint32_t>& s_dynamic, std::vector<uint32_t>& s_portal,
+                      PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        // Replay the SAME arena groups + dynamic-morph parts through the depth-only pipeline
+        // (opaque.vert + depthonly.frag, GEQUAL + depthWrite, NO colour target), so opaque depth
+        // is complete before the colour pass. The colour pass then LOADs this depth and tests
+        // CMP_EQUAL (true early-Z). No depth barrier: depth stays DEPTH_WRITE (skinned/multimap
+        // still write it in the colour pass) and is read as a DSV, not an SRV — coherent across
+        // the two passes. (Skinned/multimap are NOT in the prepass yet — Tier 1b; they keep
+        // their combined depth+colour draw, which still renders correctly.)
+        gpuPhaseBegin(kGpuPhasePrepass);
+        {
+            BindRenderTargetsDesc pbind = {};
+            pbind.mRenderTargetCount = 0;
+            pbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
+            cmdBindRenderTargets(g_live.pCmd, &pbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            // PSO by (mirror, at): pure-opaque groups draw PS-less (early-Z full-rate depth,
+            // no texture traffic); cutout groups keep the alpha-tested depthonly.frag.
+            Pipeline* const prePSO[2][2] = {
+                { g_live.pOpaquePrepassPipelineNoAT,       g_live.pOpaquePrepassPipeline },
+                { g_live.pOpaquePrepassPipelineNoATMirror, g_live.pOpaquePrepassPipelineMirror },
+            };
+            cmdBindPipeline(g_live.pCmd, prePSO[0][0]);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);     // gFrameData viewProj
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (alpha test)
+
+            Pipeline* preBound = prePSO[0][0];
+            for (uint32_t mir = 0; mir < 2; ++mir) {
+                for (uint32_t at = 0; at < 2; ++at) {
+                    bool anyInGroup = false;
+                    for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][at][b]) { anyInGroup = true; break; } }
+                    if (!anyInGroup) continue;
+                    if (prePSO[mir][at] != preBound) {
+                        cmdBindPipeline(g_live.pCmd, prePSO[mir][at]);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        preBound = prePSO[mir][at];
+                    }
+                    for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                        const uint32_t c = groupCount[mir][at][b];
+                        if (!c) continue;
+                        cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
+                        Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
+                        uint32_t strides[2] = { vStride, iStride };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
+                                           (uint64_t)groupOff[mir][at][b] * sizeof(IndirectDrawIndexArguments),
+                                           nullptr, 0);
+                    }
+                }
+            }
+            for (uint32_t i : s_dynamic) {
+                const uint32_t slot  = items[i].slot;
+                const uint32_t batch = i / kBatchSize;
+                const uint32_t local = i % kBatchSize;
+                const int mirror = worldMirrored(items[i].world) ? 1 : 0;
+                const int at     = (items[i].alphaRef > 0.0f) ? 1 : 0;
+                if (prePSO[mirror][at] != preBound) {
+                    cmdBindPipeline(g_live.pCmd, prePSO[mirror][at]);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    preBound = prePSO[mirror][at];
+                }
+                cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+                HostMesh& m = g_meshes[slot];
+                Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf[batch] };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
+            }
+
+            // --- BISECT: skinned Z-prepass (depth-only). Fill bone+instance buffers and draw
+            // depth-only; the skinned COLOUR loop below re-walks the blob and re-fills the SAME
+            // buffers (identical data → same SV_Position) then draws EQUAL. Double-fill is a
+            // deliberate simplification for the bisect (records come back once this is proven).
+            if (skinnedBlob && skinnedCount && skinnedBytes &&
+                g_live.pSkinnedPrepassPipeline && g_live.pSkinnedPrepassPipelineMirror) {
+                cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPrepassPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                const uint8_t* sp  = (const uint8_t*)skinnedBlob;
+                const uint8_t* sEnd = sp + skinnedBytes;
+                uint32_t boundWindow = UINT32_MAX;
+                int      boundSkinMirror = 0;
+                uint32_t preDrawn = 0;
+                uint32_t packWin = 0, packCur = 0;   // must mirror the caster/colour cursors
+                for (uint32_t k = 0; k < skinnedCount; ++k) {
+                    if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                    IPC::SkinnedDrawWire item;
+                    std::memcpy(&item, sp, sizeof(item));
+                    const uint8_t* palette = sp + sizeof(item);
+                    const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                    const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                    if (palette + paletteBytes > sEnd) { break; }
+                    sp = palette + paletteBytes;
+                    if (preDrawn >= kMaxSkinned) { continue; }
+                    const uint32_t slot = item.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
+                    uint32_t window = 0, base = 0;
+                    if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
+                    window = packWin;
+                    uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
+                    std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
+                    const bool     blended = skinIsBlended(item);
+                    const uint32_t inst    = preDrawn;
+                    ++preDrawn;   // the instance slot is CONSUMED whether or not we draw
+                    uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
+                    sinst[inst * kSkinInstU32 + 0] = base;
+                    sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
+                                                   | (blended ? kSkinBlendBit : 0u);
+                    std::memcpy(&sinst[inst * kSkinInstU32 + 2], &item.matAlpha, sizeof(float));
+                    // A transparent surface must not write the depth the opaque colour pass then
+                    // tests EQUAL against — it would depth-kill everything behind the ghost. The
+                    // pack above still ran, so the bone window and the instance slot are identical
+                    // to what every other walk expects; only the draw is gone.
+                    //
+                    // …but "transparent" is a PER-PIXEL fact, not a per-mesh one. Deferring the whole
+                    // part left a blended-but-SOLID body (Dagoth Ur: BLEND only so his death dissolve
+                    // can fade him, alpha pinned at 1.0 until then) out of the depth buffer that
+                    // PostDepth builds AO and the shadow mask from — so he sampled the AO and the
+                    // shadowing of whatever was BEHIND him and read as a thin backlit sheet. Record
+                    // the part instead and run alphadepth.frag over it below, which keeps depth only
+                    // where outA >= gFrameData.alphaParams.x: the solid body lands in the prepass and
+                    // gets real AO + shadows, a genuine ghost still writes nothing anywhere.
+                    // Additives never occlude. See tasks/forge-akulakhan-aside.md.
+                    if (blended) {
+                        if (g_alphaDepthWrite && !g_alphaDebugNoDepth
+                            && !(item.srcBlend == kD3DBLEND_SRCALPHA && item.destBlend == kD3DBLEND_ONE)) {
+                            g_skinAlphaPrepassCmds.push_back(SkinAlphaCmd{
+                                inst, window, slot,
+                                (uint8_t)(item.mirror ? 1u : 0u),
+                                0u,   // additive: filtered out by the condition above
+                                (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
+                                0u,   // nearOpaque: unused here — this list only writes depth, and
+                                      // alphadepth.frag makes that call per PIXEL. The flag matters
+                                      // only for the COLOUR list's group ordering.
+                                item.viewDepth });
+                        }
+                        continue;
+                    }
+                    const int mirror = item.mirror ? 1 : 0;
+                    if (mirror != boundSkinMirror) {
+                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPrepassPipelineMirror : g_live.pSkinnedPrepassPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        boundSkinMirror = mirror;
+                        boundWindow = UINT32_MAX;
+                    }
+                    if (window != boundWindow) {
+                        cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
+                        boundWindow = window;
+                    }
+                    HostMesh& sm = g_meshes[slot];
+                    Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                    uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, inst);
+                }
+
+                // --- blended skinned parts: NEAR-OPAQUE depth, inside the prepass ------------------
+                // Same instance buffer, same bone windows, same cull variants — only the PSO differs
+                // (alphadepth.frag discards below the opacity threshold). This must run HERE, not in
+                // the alpha stage: everything screen-space that a solid body needs to look solid —
+                // GTAO, the point-light shadow mask — is built by PostDepth from this buffer, and a
+                // depth write after that point is invisible to all of it.
+                if (!g_skinAlphaPrepassCmds.empty() && g_live.pSkinnedAlphaPrepassPipeline) {
+                    cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPrepassPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    Pipeline* curPre = g_live.pSkinnedAlphaPrepassPipeline;
+                    uint32_t  boundPreWindow = UINT32_MAX;
+                    for (const SkinAlphaCmd& c : g_skinAlphaPrepassCmds) {
+                        Pipeline* want = c.twoSided ? g_live.pSkinnedAlphaPrepassPipelineNone
+                                       : (c.mirror  ? g_live.pSkinnedAlphaPrepassPipelineMirror
+                                                    : g_live.pSkinnedAlphaPrepassPipeline);
+                        if (want != curPre) {
+                            cmdBindPipeline(g_live.pCmd, want);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                            curPre = want;
+                            boundPreWindow = UINT32_MAX;   // pipeline rebind drops the batch set
+                        }
+                        if (c.window != boundPreWindow) {
+                            cmdBindDescriptorSet(g_live.pCmd, c.window, g_live.pPerBatchSetSkin);
+                            boundPreWindow = c.window;
+                        }
+                        HostMesh& sm = g_meshes[c.slot];
+                        Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                        uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                        cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, c.idx);
+                        ++g_lastSkinAlphaPrepassDrawn;
+                    }
+                }
+            }
+
+            // --- BISECT: multi-map Z-prepass (depth-only). Same double-fill pattern as skinned:
+            // fill pMMWorldsBuf + pInstanceBufMM and draw depth-only with depthonly_mm.frag (base-
+            // stage alpha test). The multi-map COLOUR loop below re-walks the blob and re-fills the
+            // SAME buffers with identical data → bit-identical SV_Position → colour matches EQUAL.
+            // depthonly_mm.frag needs gTextures (Persistent) only; NO gLights (no shading).
+            if (multiMapBlob && multiMapCount && multiMapBytes &&
+                g_live.pMultiMapPrepassPipeline && g_live.pMultiMapPrepassPipelineMirror) {
+                cmdBindPipeline(g_live.pCmd, g_live.pMultiMapPrepassPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);   // single world window
+                const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+                const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+                const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
+                int      boundMMMirror = 0;
+                uint32_t preDrawnMM = 0;
+                for (uint32_t k = 0; k < nMM; ++k) {
+                    if (preDrawnMM >= kMaxMultiMap) { break; }   // no fallback (PD1); matches colour cap
+                    const IPC::MultiMapDrawWire& it = mmItems[k];
+                    if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }   // Route C: blended glass has no Z-prepass (no depth write)
+                    const uint32_t slot = it.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
+                    const uint32_t idx = preDrawnMM;
+
+                    uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
+                    std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+
+                    uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
+                    uint32_t* e = inst + (size_t)idx * kMMInstU32;
+                    const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
+                    float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
+                    const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
+                    const uint32_t vcs  = it.vColSource & 0x3u;
+                    // Meta: idx(0-9)|sc(10-12)|vcs(13-14)|aref(16-23)|uvAnimId(24-31). Index
+                    // widened to 10 bits for the 1024 cap; uvAnimId = NiUVController takeover
+                    // (memoized per mesh per frame, so the colour loop repack matches).
+                    const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
+                    e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
+                    e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
+                    float* fe = (float*)e;
+                    fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
+                    fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
+                    fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+                    fe[14] = it.matAlpha;   // unused by depthonly_mm.frag; lane must not be stale
+                    // [15..17] the emissive ratio. multimap.vert is SHARED by this prepass and the
+                    // colour pass, and the gain never touches SV_Position, so early-Z stays exact.
+                    fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
+
+                    const int mirror = worldMirrored(it.world) ? 1 : 0;
+                    if (mirror != boundMMMirror) {
+                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pMultiMapPrepassPipelineMirror
+                                                            : g_live.pMultiMapPrepassPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                        boundMMMirror = mirror;
+                    }
+
+                    HostMesh& mm = g_meshes[slot];
+                    Buffer*  vbs[2]     = { mm.vb, g_live.pInstanceBufMM };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
+                    ++preDrawnMM;
+                }
+            }
+
+            // --- HOST-OWNED TERRAIN, depth-only. LAST in the prepass on purpose: terrain is by far
+            // the largest surface in the frame, and by this point the near scene has already written
+            // its depth, so most terrain fragments are rejected before they are ever shaded (they
+            // aren't shaded here at all — this PSO is PS-less — but the same ordering keeps the
+            // rasteriser's early-Z doing the work).
+            //
+            // The cull + instance ring this reads were filled by dlLiveCullAndBuild, well before the
+            // record phase, so there is no second cull and no extra CPU work: this is the SAME
+            // g_terrainMain the colour pass draws, one pipeline swap apart.
+            terrainRecordDepth(g_live.pCmd);
+
+            // --- G1f HOST-OWNED GRASS, depth-only. AFTER terrain, and that ordering is the whole
+            // reason this is cheap: grass is a cutout whose every fragment costs a texture fetch,
+            // and by this point the near opaque set AND the ground it grows out of have written
+            // their depth, so a blade behind the hill is early-Z-rejected before this shader runs.
+            //
+            // It cannot early-reject its own layers — a cutout prepass is late-Z-WRITE by
+            // construction, since coverage is not known until the fetch — so what this converts is
+            // one full grass shade per overdrawn layer (a shadow tap plus the clustered point-light
+            // loop over two lists) into one texture fetch per overdrawn layer. The colour draw in
+            // the DL block then runs CMP_EQUAL and shades each pixel exactly once.
+            //
+            // Same set, same args, same vertex shader as that colour draw — one pipeline apart.
+            // The ...G brackets, not the local lambdas, so both halves of the grass trade are timed
+            // by identical machinery and `grassdep` vs `grass` is a like-for-like comparison.
+            gpuPhaseBeginG(kGpuPhaseGrassDepth);
+            grassRecordDepth(g_live.pCmd);
+            gpuPhaseEndG(kGpuPhaseGrassDepth);
+
+            // --- STENCIL "FAKE HOLE" PORTALS, prepass half (see s_portal) ------------------------
+            // Three sub-passes over the SAME list, filtered by role, so the object's own draw order
+            // is reconstructed from the role bits rather than from an author index we do not have:
+            //
+            //   gate  masks   -> the R8 gate, depth GEQUAL + write OFF. The depth test decides which
+            //                    pixels get stamped, and that IS MW's stencil gate.
+            //   hull  hulls   -> depth LEQUAL + write, discarding where the gate is 0. This is the
+            //                    erasure: the occluder's depth is replaced by the hull's, but only
+            //                    inside the opening, so a wall in front of it survives untouched.
+            //   rest  members -> the ordinary prepass PSO. The real interior draws over the hull on
+            //                    a plain GEQUAL test, because the hull put the depth out of its way.
+            //
+            // The gate sub-pass is the only thing in the whole prepass that binds a colour target,
+            // so it ends the depth-only pass and rebinds afterwards.
+            if (!s_portal.empty() && g_live.pPortalGatePipeline && g_live.pPortalHullPipeline) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.9f, "PORTALS (prepass)");
+                // One inline draw, arena or own-VB. Portal objects are pulled out of the indirect
+                // groups wholesale, so both kinds land here; the arena case just carries its
+                // first-index / first-vertex offsets into the shared buffers.
+                auto portalDraw = [&](uint32_t i) {
+                    const uint32_t slot  = items[i].slot;
+                    const uint32_t batch = i / kBatchSize;
+                    const uint32_t local = i % kBatchSize;
+                    HostMesh& m = g_meshes[slot];
+                    cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+                    Buffer*  vbs[2]     = { m.inArena ? g_live.pArenaVB : m.vb,
+                                            g_live.pInstanceBuf[batch] };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, m.inArena ? g_live.pArenaIB : m.ib,
+                                       INDEX_TYPE_UINT16, 0);
+                    const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                    const uint32_t firstVertex = m.inArena
+                        ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1,
+                                            firstVertex, local);
+                };
+                // (1) GATE. Colour target = the gate, cleared here; depth stays pDepth so the mask
+                // can test against the scene it has to see past.
+                {
+                    BindRenderTargetsDesc gbind = {};
+                    gbind.mRenderTargetCount = 1;
+                    gbind.mRenderTargets[0] = { g_live.pPortalGate, LOAD_ACTION_CLEAR };
+                    gbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                    cmdBindRenderTargets(g_live.pCmd, &gbind);
+                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width,
+                                   (float)g_live.height, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+                    Pipeline* gateBound = nullptr;
+                    for (uint32_t i : s_portal) {
+                        if (!(items[i].casterFlags & IPC::kDrawPortalMask)) continue;
+                        const uint32_t slot = items[i].slot;
+                        if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+                        Pipeline* want = worldMirrored(items[i].world)
+                            ? g_live.pPortalGatePipelineMirror : g_live.pPortalGatePipeline;
+                        if (want != gateBound) {
+                            cmdBindPipeline(g_live.pCmd, want);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                            gateBound = want;
+                        }
+                        portalDraw(i);
+                    }
+                }
+                // Gate RT -> SRV so the hull frag can read what was just stamped.
+                {
+                    cmdBindRenderTargets(g_live.pCmd, nullptr);   // end the colour pass first
+                    RenderTargetBarrier gb = {};
+                    gb.pRenderTarget = g_live.pPortalGate;
+                    gb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                    gb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &gb);
+                }
+                // (2)+(3) HULLS then MEMBERS, back on the depth-only target.
+                {
+                    BindRenderTargetsDesc pbind2 = {};
+                    pbind2.mRenderTargetCount = 0;
+                    pbind2.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                    cmdBindRenderTargets(g_live.pCmd, &pbind2);
+                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width,
+                                   (float)g_live.height, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+                    Pipeline* bound = nullptr;
+                    for (uint32_t pass = 0; pass < 2; ++pass) {
+                        const uint32_t wantBit = (pass == 0) ? IPC::kDrawPortalHull
+                                                             : IPC::kDrawPortalMember;
+                        for (uint32_t i : s_portal) {
+                            if (!(items[i].casterFlags & wantBit)) continue;
+                            const uint32_t slot = items[i].slot;
+                            if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+                            const int mirror = worldMirrored(items[i].world) ? 1 : 0;
+                            const int at     = (items[i].alphaRef > 0.0f) ? 1 : 0;
+                            Pipeline* want;
+                            if (pass == 0) {
+                                want = mirror ? g_live.pPortalHullPipelineMirror
+                                              : g_live.pPortalHullPipeline;
+                            } else {
+                                want = prePSO[mirror][at];
+                            }
+                            if (want != bound) {
+                                cmdBindPipeline(g_live.pCmd, want);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                bound = want;
+                            }
+                            portalDraw(i);
+                        }
+                    }
+                    preBound = nullptr;   // the shared prepass PSO tracker no longer knows what is bound
+                }
+                // Back to RENDER_TARGET for next frame's clear+stamp.
+                {
+                    RenderTargetBarrier gb = {};
+                    gb.pRenderTarget = g_live.pPortalGate;
+                    gb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    gb.mNewState = RESOURCE_STATE_RENDER_TARGET;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &gb);
+                }
+                cmdEndDebugMarker(g_live.pCmd);
+            }
+        }
+
+        gpuPhaseEnd(kGpuPhasePrepass);
+    }
+
+    // Hi-Z prologue: reduce mips 1..N on the dedicated cmd list and TAIL-SUBMIT it — no fence wait,
+    // so the pyramid builds under MW's frame. No gpuPhase bracket (the work is not on the main list).
+    //
+    // ⚠ 96 LINES, NOT THE 1,386 THE SURVEY PROMISED, and the gap is worth recording. The region
+    // between this banner and the next `=====` one is mostly the FRAME EPILOGUE — the camera
+    // snapshot for reprojection, then the heartbeat and diagnostic blocks — so sizing a pass by the
+    // distance to the next banner counted all of that as Hi-Z. That is also why it appeared to need
+    // seventeen inputs: they are the frame's accounting totals, which the epilogue reads and this
+    // pass does not. Measure a pass by where its WORK ends, not by where the next banner starts.
+    //
+    // ⚠ `R` HERE IS `Renderer*`, NOT THE DRAW-DISTANCE FLOAT. renderScene aliases the renderer as
+    // `Renderer* R` on its second line and a later nested block shadows the name with
+    // `const float R = Configuration.DL.DrawDist...`. An interface scan that ignores scope reports
+    // whichever declaration it saw last, which was the float — and the compiler then rejected
+    // `getFenceStatus(float, ...)` four times over. Third correction the compiler has made to that
+    // scan in this phase, and the third of a different kind: missed parameter, invented local, and
+    // now right name / wrong declaration.
+    template <class PhBegin, class PhEnd>
+    void passHiZPrologue(Renderer* R, const float* rzViewProj, bool hizMip0Filled,
+                         PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        // Frame N's mip 0 (filled in the MAIN cmd at the colour->water seam) -> full mip pyramid
+        // for frame N+1's occlusion cull. Recorded into its OWN cmd/fence and submitted WITHOUT a
+        // wait: the server signals the client off the main fence above, so the client-visible
+        // frame is not lengthened; same single queue means frame N+1's cmds (incl. the cull that
+        // samples pHiz) are GPU-ordered after this automatically (no semaphores). CPU cost of
+        // recording lands in g_lastPostMs. Gated on the mip-0 fill having been RECORDED this frame.
+        if (!(g_live.hizReady && g_hizPrologue && hizMip0Filled)) {
+            g_hizValid = false;   // no FRESH full pyramid this frame -> next frame's test passes through
+        }
+        if (g_live.hizReady && g_hizPrologue && hizMip0Filled) {
+            // Settle the PREVIOUS prologue first (no-op if never submitted). Still-incomplete
+            // here means it overran MW's whole inter-frame window — count it (expect ~never).
+            FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
+            getFenceStatus(R, g_live.pHizFence, &fs);
+            if (fs == FENCE_STATUS_INCOMPLETE) {
+                ++g_hizOverruns;
+            }
+            waitForFences(R, 1, &g_live.pHizFence);
+            // Last prologue's GPU time (its resolve is valid now the fence has signalled).
+            if (g_live.pHizQueryPool && g_live.gpuTickFreq > 0.0 && fs != FENCE_STATUS_NOTSUBMITTED) {
+                QueryData qd = {};
+                getQueryData(R, g_live.pHizQueryPool, 0, &qd);
+                if (qd.mEndTimestamp > qd.mBeginTimestamp) {
+                    g_lastHizGpuMs = ((double)(qd.mEndTimestamp - qd.mBeginTimestamp) / g_live.gpuTickFreq) * 1000.0;
+                }
+            }
+
+            resetCmdPool(R, g_live.pHizCmdPool);
+            beginCmd(g_live.pHizCmd);
+            if (g_live.pHizQueryPool) {
+                QueryDesc q = {};
+                q.mIndex = 0;
+                cmdBeginQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
+            }
+            cmdBeginDebugMarker(g_live.pHizCmd, 0.3f, 0.8f, 0.8f, "HI-Z PROLOGUE (reduce mips 1..N)");
+            // Mip 0 is already filled (main cmd, colour->water seam). Bracket pHiz SR -> UAV, then
+            // per mip a UAV barrier (current==new==UNORDERED_ACCESS lowers to a true D3D12 UAV
+            // barrier — same trick as the cull block's uavBarrier lambda) + the 2x2 MIN reduce.
+            // Set index m binds src mip m-1 / dst mip m. Back to SR at the end (cmd invariant).
+            {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pHiz;
+                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdBindPipeline(g_live.pHizCmd, g_live.pHizPipeline);
+            // Reduce over the FULL allocation (matches the alloc-covering mip-0 fill above) so the
+            // whole pyramid — including the far-cleared border — is conservatively valid at any
+            // render scale. hizMips was computed from the allocation size, so the loop bound fits.
+            uint32_t mw = g_live.allocWidth, mh = g_live.allocHeight;
+            for (uint32_t m = 1; m < g_live.hizMips; ++m) {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pHiz;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                mw = (mw > 1u) ? (mw >> 1) : 1u;
+                mh = (mh > 1u) ? (mh >> 1) : 1u;
+                cmdBindDescriptorSet(g_live.pHizCmd, m, g_live.pHizSet);
+                cmdDispatch(g_live.pHizCmd, (mw + 7u) / 8u, (mh + 7u) / 8u, 1);
+            }
+            {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pHiz;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdEndDebugMarker(g_live.pHizCmd);
+            if (g_live.pHizQueryPool) {
+                QueryDesc q = {};
+                q.mIndex = 0;
+                cmdEndQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
+                cmdResolveQuery(g_live.pHizCmd, g_live.pHizQueryPool, 0, 1);
+            }
+            endCmd(g_live.pHizCmd);
+
+            QueueSubmitDesc hizSubmit = {};
+            hizSubmit.mCmdCount = 1;
+            hizSubmit.ppCmds = &g_live.pHizCmd;
+            hizSubmit.pSignalFence = g_live.pHizFence;
+            hizSubmit.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &hizSubmit);
+            // NO fence wait — return to the client now; the GPU builds the pyramid under MW's frame.
+
+            // Snapshot the pyramid's camera for next frame's occlusion test: the RAW rzViewProj
+            // bytes this frame drew with + its absolute eye (gFrameData.lodEye, floats 56..58 —
+            // same source the water/AO blocks read). Next frame's CullParams fill reprojects
+            // instance spheres with exactly this matrix.
+            std::memcpy(g_hizVP, rzViewProj, sizeof(g_hizVP));
+            const float* hizFcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            g_hizEye[0] = hizFcbv[56]; g_hizEye[1] = hizFcbv[57]; g_hizEye[2] = hizFcbv[58];
+            g_hizValid = true;
+        }
+    }
+
     }  // namespace — promoted passes
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
@@ -34698,1397 +36248,16 @@ void destroyHostWindow(Renderer* R);
         }
 
         // ===================== Z-PREPASS (depth-only, opaque set) =====================
-        // Replay the SAME arena groups + dynamic-morph parts through the depth-only pipeline
-        // (opaque.vert + depthonly.frag, GEQUAL + depthWrite, NO colour target), so opaque depth
-        // is complete before the colour pass. The colour pass then LOADs this depth and tests
-        // CMP_EQUAL (true early-Z). No depth barrier: depth stays DEPTH_WRITE (skinned/multimap
-        // still write it in the colour pass) and is read as a DSV, not an SRV — coherent across
-        // the two passes. (Skinned/multimap are NOT in the prepass yet — Tier 1b; they keep
-        // their combined depth+colour draw, which still renders correctly.)
-        gpuPhaseBegin(kGpuPhasePrepass);
-        {
-            BindRenderTargetsDesc pbind = {};
-            pbind.mRenderTargetCount = 0;
-            pbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
-            cmdBindRenderTargets(g_live.pCmd, &pbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            // PSO by (mirror, at): pure-opaque groups draw PS-less (early-Z full-rate depth,
-            // no texture traffic); cutout groups keep the alpha-tested depthonly.frag.
-            Pipeline* const prePSO[2][2] = {
-                { g_live.pOpaquePrepassPipelineNoAT,       g_live.pOpaquePrepassPipeline },
-                { g_live.pOpaquePrepassPipelineNoATMirror, g_live.pOpaquePrepassPipelineMirror },
-            };
-            cmdBindPipeline(g_live.pCmd, prePSO[0][0]);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);     // gFrameData viewProj
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (alpha test)
-
-            Pipeline* preBound = prePSO[0][0];
-            for (uint32_t mir = 0; mir < 2; ++mir) {
-                for (uint32_t at = 0; at < 2; ++at) {
-                    bool anyInGroup = false;
-                    for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][at][b]) { anyInGroup = true; break; } }
-                    if (!anyInGroup) continue;
-                    if (prePSO[mir][at] != preBound) {
-                        cmdBindPipeline(g_live.pCmd, prePSO[mir][at]);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                        preBound = prePSO[mir][at];
-                    }
-                    for (uint32_t b = 0; b < kMaxBatches; ++b) {
-                        const uint32_t c = groupCount[mir][at][b];
-                        if (!c) continue;
-                        cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
-                        Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
-                        uint32_t strides[2] = { vStride, iStride };
-                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                        cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
-                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
-                                           (uint64_t)groupOff[mir][at][b] * sizeof(IndirectDrawIndexArguments),
-                                           nullptr, 0);
-                    }
-                }
-            }
-            for (uint32_t i : s_dynamic) {
-                const uint32_t slot  = items[i].slot;
-                const uint32_t batch = i / kBatchSize;
-                const uint32_t local = i % kBatchSize;
-                const int mirror = worldMirrored(items[i].world) ? 1 : 0;
-                const int at     = (items[i].alphaRef > 0.0f) ? 1 : 0;
-                if (prePSO[mirror][at] != preBound) {
-                    cmdBindPipeline(g_live.pCmd, prePSO[mirror][at]);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                    preBound = prePSO[mirror][at];
-                }
-                cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
-                HostMesh& m = g_meshes[slot];
-                Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf[batch] };
-                uint32_t strides[2] = { vStride, iStride };
-                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
-            }
-
-            // --- BISECT: skinned Z-prepass (depth-only). Fill bone+instance buffers and draw
-            // depth-only; the skinned COLOUR loop below re-walks the blob and re-fills the SAME
-            // buffers (identical data → same SV_Position) then draws EQUAL. Double-fill is a
-            // deliberate simplification for the bisect (records come back once this is proven).
-            if (skinnedBlob && skinnedCount && skinnedBytes &&
-                g_live.pSkinnedPrepassPipeline && g_live.pSkinnedPrepassPipelineMirror) {
-                cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPrepassPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                const uint8_t* sp  = (const uint8_t*)skinnedBlob;
-                const uint8_t* sEnd = sp + skinnedBytes;
-                uint32_t boundWindow = UINT32_MAX;
-                int      boundSkinMirror = 0;
-                uint32_t preDrawn = 0;
-                uint32_t packWin = 0, packCur = 0;   // must mirror the caster/colour cursors
-                for (uint32_t k = 0; k < skinnedCount; ++k) {
-                    if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
-                    IPC::SkinnedDrawWire item;
-                    std::memcpy(&item, sp, sizeof(item));
-                    const uint8_t* palette = sp + sizeof(item);
-                    const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
-                    const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
-                    if (palette + paletteBytes > sEnd) { break; }
-                    sp = palette + paletteBytes;
-                    if (preDrawn >= kMaxSkinned) { continue; }
-                    const uint32_t slot = item.slot;
-                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
-                    uint32_t window = 0, base = 0;
-                    if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
-                    window = packWin;
-                    uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
-                    std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
-                    const bool     blended = skinIsBlended(item);
-                    const uint32_t inst    = preDrawn;
-                    ++preDrawn;   // the instance slot is CONSUMED whether or not we draw
-                    uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
-                    sinst[inst * kSkinInstU32 + 0] = base;
-                    sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
-                                                   | (blended ? kSkinBlendBit : 0u);
-                    std::memcpy(&sinst[inst * kSkinInstU32 + 2], &item.matAlpha, sizeof(float));
-                    // A transparent surface must not write the depth the opaque colour pass then
-                    // tests EQUAL against — it would depth-kill everything behind the ghost. The
-                    // pack above still ran, so the bone window and the instance slot are identical
-                    // to what every other walk expects; only the draw is gone.
-                    //
-                    // …but "transparent" is a PER-PIXEL fact, not a per-mesh one. Deferring the whole
-                    // part left a blended-but-SOLID body (Dagoth Ur: BLEND only so his death dissolve
-                    // can fade him, alpha pinned at 1.0 until then) out of the depth buffer that
-                    // PostDepth builds AO and the shadow mask from — so he sampled the AO and the
-                    // shadowing of whatever was BEHIND him and read as a thin backlit sheet. Record
-                    // the part instead and run alphadepth.frag over it below, which keeps depth only
-                    // where outA >= gFrameData.alphaParams.x: the solid body lands in the prepass and
-                    // gets real AO + shadows, a genuine ghost still writes nothing anywhere.
-                    // Additives never occlude. See tasks/forge-akulakhan-aside.md.
-                    if (blended) {
-                        if (g_alphaDepthWrite && !g_alphaDebugNoDepth
-                            && !(item.srcBlend == kD3DBLEND_SRCALPHA && item.destBlend == kD3DBLEND_ONE)) {
-                            g_skinAlphaPrepassCmds.push_back(SkinAlphaCmd{
-                                inst, window, slot,
-                                (uint8_t)(item.mirror ? 1u : 0u),
-                                0u,   // additive: filtered out by the condition above
-                                (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
-                                0u,   // nearOpaque: unused here — this list only writes depth, and
-                                      // alphadepth.frag makes that call per PIXEL. The flag matters
-                                      // only for the COLOUR list's group ordering.
-                                item.viewDepth });
-                        }
-                        continue;
-                    }
-                    const int mirror = item.mirror ? 1 : 0;
-                    if (mirror != boundSkinMirror) {
-                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPrepassPipelineMirror : g_live.pSkinnedPrepassPipeline);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                        boundSkinMirror = mirror;
-                        boundWindow = UINT32_MAX;
-                    }
-                    if (window != boundWindow) {
-                        cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
-                        boundWindow = window;
-                    }
-                    HostMesh& sm = g_meshes[slot];
-                    Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                    uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
-                    cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, inst);
-                }
-
-                // --- blended skinned parts: NEAR-OPAQUE depth, inside the prepass ------------------
-                // Same instance buffer, same bone windows, same cull variants — only the PSO differs
-                // (alphadepth.frag discards below the opacity threshold). This must run HERE, not in
-                // the alpha stage: everything screen-space that a solid body needs to look solid —
-                // GTAO, the point-light shadow mask — is built by PostDepth from this buffer, and a
-                // depth write after that point is invisible to all of it.
-                if (!g_skinAlphaPrepassCmds.empty() && g_live.pSkinnedAlphaPrepassPipeline) {
-                    cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPrepassPipeline);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                    Pipeline* curPre = g_live.pSkinnedAlphaPrepassPipeline;
-                    uint32_t  boundPreWindow = UINT32_MAX;
-                    for (const SkinAlphaCmd& c : g_skinAlphaPrepassCmds) {
-                        Pipeline* want = c.twoSided ? g_live.pSkinnedAlphaPrepassPipelineNone
-                                       : (c.mirror  ? g_live.pSkinnedAlphaPrepassPipelineMirror
-                                                    : g_live.pSkinnedAlphaPrepassPipeline);
-                        if (want != curPre) {
-                            cmdBindPipeline(g_live.pCmd, want);
-                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                            curPre = want;
-                            boundPreWindow = UINT32_MAX;   // pipeline rebind drops the batch set
-                        }
-                        if (c.window != boundPreWindow) {
-                            cmdBindDescriptorSet(g_live.pCmd, c.window, g_live.pPerBatchSetSkin);
-                            boundPreWindow = c.window;
-                        }
-                        HostMesh& sm = g_meshes[c.slot];
-                        Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                        uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
-                        cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
-                        cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                        cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, c.idx);
-                        ++g_lastSkinAlphaPrepassDrawn;
-                    }
-                }
-            }
-
-            // --- BISECT: multi-map Z-prepass (depth-only). Same double-fill pattern as skinned:
-            // fill pMMWorldsBuf + pInstanceBufMM and draw depth-only with depthonly_mm.frag (base-
-            // stage alpha test). The multi-map COLOUR loop below re-walks the blob and re-fills the
-            // SAME buffers with identical data → bit-identical SV_Position → colour matches EQUAL.
-            // depthonly_mm.frag needs gTextures (Persistent) only; NO gLights (no shading).
-            if (multiMapBlob && multiMapCount && multiMapBytes &&
-                g_live.pMultiMapPrepassPipeline && g_live.pMultiMapPrepassPipelineMirror) {
-                cmdBindPipeline(g_live.pCmd, g_live.pMultiMapPrepassPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);   // single world window
-                const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
-                const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
-                const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
-                int      boundMMMirror = 0;
-                uint32_t preDrawnMM = 0;
-                for (uint32_t k = 0; k < nMM; ++k) {
-                    if (preDrawnMM >= kMaxMultiMap) { break; }   // no fallback (PD1); matches colour cap
-                    const IPC::MultiMapDrawWire& it = mmItems[k];
-                    if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }   // Route C: blended glass has no Z-prepass (no depth write)
-                    const uint32_t slot = it.slot;
-                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
-                    const uint32_t idx = preDrawnMM;
-
-                    uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
-                    std::memcpy(dst + (size_t)idx * 64, it.world, 64);
-
-                    uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
-                    uint32_t* e = inst + (size_t)idx * kMMInstU32;
-                    const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
-                    float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
-                    const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
-                    const uint32_t vcs  = it.vColSource & 0x3u;
-                    // Meta: idx(0-9)|sc(10-12)|vcs(13-14)|aref(16-23)|uvAnimId(24-31). Index
-                    // widened to 10 bits for the 1024 cap; uvAnimId = NiUVController takeover
-                    // (memoized per mesh per frame, so the colour loop repack matches).
-                    const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
-                    e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
-                    e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
-                    float* fe = (float*)e;
-                    fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
-                    fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
-                    fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
-                    fe[14] = it.matAlpha;   // unused by depthonly_mm.frag; lane must not be stale
-                    // [15..17] the emissive ratio. multimap.vert is SHARED by this prepass and the
-                    // colour pass, and the gain never touches SV_Position, so early-Z stays exact.
-                    fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
-
-                    const int mirror = worldMirrored(it.world) ? 1 : 0;
-                    if (mirror != boundMMMirror) {
-                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pMultiMapPrepassPipelineMirror
-                                                            : g_live.pMultiMapPrepassPipeline);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
-                        boundMMMirror = mirror;
-                    }
-
-                    HostMesh& mm = g_meshes[slot];
-                    Buffer*  vbs[2]     = { mm.vb, g_live.pInstanceBufMM };
-                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
-                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
-                    ++preDrawnMM;
-                }
-            }
-
-            // --- HOST-OWNED TERRAIN, depth-only. LAST in the prepass on purpose: terrain is by far
-            // the largest surface in the frame, and by this point the near scene has already written
-            // its depth, so most terrain fragments are rejected before they are ever shaded (they
-            // aren't shaded here at all — this PSO is PS-less — but the same ordering keeps the
-            // rasteriser's early-Z doing the work).
-            //
-            // The cull + instance ring this reads were filled by dlLiveCullAndBuild, well before the
-            // record phase, so there is no second cull and no extra CPU work: this is the SAME
-            // g_terrainMain the colour pass draws, one pipeline swap apart.
-            terrainRecordDepth(g_live.pCmd);
-
-            // --- G1f HOST-OWNED GRASS, depth-only. AFTER terrain, and that ordering is the whole
-            // reason this is cheap: grass is a cutout whose every fragment costs a texture fetch,
-            // and by this point the near opaque set AND the ground it grows out of have written
-            // their depth, so a blade behind the hill is early-Z-rejected before this shader runs.
-            //
-            // It cannot early-reject its own layers — a cutout prepass is late-Z-WRITE by
-            // construction, since coverage is not known until the fetch — so what this converts is
-            // one full grass shade per overdrawn layer (a shadow tap plus the clustered point-light
-            // loop over two lists) into one texture fetch per overdrawn layer. The colour draw in
-            // the DL block then runs CMP_EQUAL and shades each pixel exactly once.
-            //
-            // Same set, same args, same vertex shader as that colour draw — one pipeline apart.
-            // The ...G brackets, not the local lambdas, so both halves of the grass trade are timed
-            // by identical machinery and `grassdep` vs `grass` is a like-for-like comparison.
-            gpuPhaseBeginG(kGpuPhaseGrassDepth);
-            grassRecordDepth(g_live.pCmd);
-            gpuPhaseEndG(kGpuPhaseGrassDepth);
-
-            // --- STENCIL "FAKE HOLE" PORTALS, prepass half (see s_portal) ------------------------
-            // Three sub-passes over the SAME list, filtered by role, so the object's own draw order
-            // is reconstructed from the role bits rather than from an author index we do not have:
-            //
-            //   gate  masks   -> the R8 gate, depth GEQUAL + write OFF. The depth test decides which
-            //                    pixels get stamped, and that IS MW's stencil gate.
-            //   hull  hulls   -> depth LEQUAL + write, discarding where the gate is 0. This is the
-            //                    erasure: the occluder's depth is replaced by the hull's, but only
-            //                    inside the opening, so a wall in front of it survives untouched.
-            //   rest  members -> the ordinary prepass PSO. The real interior draws over the hull on
-            //                    a plain GEQUAL test, because the hull put the depth out of its way.
-            //
-            // The gate sub-pass is the only thing in the whole prepass that binds a colour target,
-            // so it ends the depth-only pass and rebinds afterwards.
-            if (!s_portal.empty() && g_live.pPortalGatePipeline && g_live.pPortalHullPipeline) {
-                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.9f, "PORTALS (prepass)");
-                // One inline draw, arena or own-VB. Portal objects are pulled out of the indirect
-                // groups wholesale, so both kinds land here; the arena case just carries its
-                // first-index / first-vertex offsets into the shared buffers.
-                auto portalDraw = [&](uint32_t i) {
-                    const uint32_t slot  = items[i].slot;
-                    const uint32_t batch = i / kBatchSize;
-                    const uint32_t local = i % kBatchSize;
-                    HostMesh& m = g_meshes[slot];
-                    cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
-                    Buffer*  vbs[2]     = { m.inArena ? g_live.pArenaVB : m.vb,
-                                            g_live.pInstanceBuf[batch] };
-                    uint32_t strides[2] = { vStride, iStride };
-                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, m.inArena ? g_live.pArenaIB : m.ib,
-                                       INDEX_TYPE_UINT16, 0);
-                    const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
-                    const uint32_t firstVertex = m.inArena
-                        ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
-                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1,
-                                            firstVertex, local);
-                };
-                // (1) GATE. Colour target = the gate, cleared here; depth stays pDepth so the mask
-                // can test against the scene it has to see past.
-                {
-                    BindRenderTargetsDesc gbind = {};
-                    gbind.mRenderTargetCount = 1;
-                    gbind.mRenderTargets[0] = { g_live.pPortalGate, LOAD_ACTION_CLEAR };
-                    gbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-                    cmdBindRenderTargets(g_live.pCmd, &gbind);
-                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width,
-                                   (float)g_live.height, 0.0f, 1.0f);
-                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-                    Pipeline* gateBound = nullptr;
-                    for (uint32_t i : s_portal) {
-                        if (!(items[i].casterFlags & IPC::kDrawPortalMask)) continue;
-                        const uint32_t slot = items[i].slot;
-                        if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
-                        Pipeline* want = worldMirrored(items[i].world)
-                            ? g_live.pPortalGatePipelineMirror : g_live.pPortalGatePipeline;
-                        if (want != gateBound) {
-                            cmdBindPipeline(g_live.pCmd, want);
-                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                            gateBound = want;
-                        }
-                        portalDraw(i);
-                    }
-                }
-                // Gate RT -> SRV so the hull frag can read what was just stamped.
-                {
-                    cmdBindRenderTargets(g_live.pCmd, nullptr);   // end the colour pass first
-                    RenderTargetBarrier gb = {};
-                    gb.pRenderTarget = g_live.pPortalGate;
-                    gb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-                    gb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &gb);
-                }
-                // (2)+(3) HULLS then MEMBERS, back on the depth-only target.
-                {
-                    BindRenderTargetsDesc pbind2 = {};
-                    pbind2.mRenderTargetCount = 0;
-                    pbind2.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-                    cmdBindRenderTargets(g_live.pCmd, &pbind2);
-                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width,
-                                   (float)g_live.height, 0.0f, 1.0f);
-                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-                    Pipeline* bound = nullptr;
-                    for (uint32_t pass = 0; pass < 2; ++pass) {
-                        const uint32_t wantBit = (pass == 0) ? IPC::kDrawPortalHull
-                                                             : IPC::kDrawPortalMember;
-                        for (uint32_t i : s_portal) {
-                            if (!(items[i].casterFlags & wantBit)) continue;
-                            const uint32_t slot = items[i].slot;
-                            if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
-                            const int mirror = worldMirrored(items[i].world) ? 1 : 0;
-                            const int at     = (items[i].alphaRef > 0.0f) ? 1 : 0;
-                            Pipeline* want;
-                            if (pass == 0) {
-                                want = mirror ? g_live.pPortalHullPipelineMirror
-                                              : g_live.pPortalHullPipeline;
-                            } else {
-                                want = prePSO[mirror][at];
-                            }
-                            if (want != bound) {
-                                cmdBindPipeline(g_live.pCmd, want);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                                bound = want;
-                            }
-                            portalDraw(i);
-                        }
-                    }
-                    preBound = nullptr;   // the shared prepass PSO tracker no longer knows what is bound
-                }
-                // Back to RENDER_TARGET for next frame's clear+stamp.
-                {
-                    RenderTargetBarrier gb = {};
-                    gb.pRenderTarget = g_live.pPortalGate;
-                    gb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    gb.mNewState = RESOURCE_STATE_RENDER_TARGET;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &gb);
-                }
-                cmdEndDebugMarker(g_live.pCmd);
-            }
-        }
-
-        gpuPhaseEnd(kGpuPhasePrepass);
+        passZPrepass(items, skinnedBlob, skinnedCount, skinnedBytes,
+                     multiMapBlob, multiMapCount, multiMapBytes,
+                     vStride, iStride, groupCount, groupOff, s_dynamic, s_portal,
+                     gpuPhaseBegin, gpuPhaseEnd);
 
         // ===================== P1: POINT-LIGHT SHADOW FACES (atlas tile re-render) ==========
-        // Direct draws — ≤ kShadowMaxCasters low-poly casters x 6 faces; the exec-indirect args
-        // buffer is camera-shaped + single-buffered, so indirect here would fight the main pass
-        // (revisit only if profiled). Both atlases rest SHADER_RESOURCE and flip to DEPTH_WRITE
-        // only on re-render frames; each tile is cleared by the viewport triangle (z = 0), NEVER
-        // by a load action (that would wipe every cached tile).
-        // C4b composite: TWO passes — the STATIC atlas (cached tiles, statics only, re-rendered
-        // on must/stale) and the DYNAMIC atlas (movers: skinned + MM, re-rendered every frame for
-        // slots with a mover in reach). shadowmask.comp max()es the two per texel.
-        gpuPhaseBegin(kGpuPhaseShadow);
-        gpuPhaseBegin(kGpuPhaseShadowStatic);
-        if (g_live.shadowReady && !g_shadowRenders.empty()) {
-            cmdBindRenderTargets(g_live.pCmd, nullptr);   // end the prepass pass before the barrier
-            {
-                RenderTargetBarrier rtb = {};
-                rtb.pRenderTarget = g_live.pShadowAtlas;
-                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
-            }
-            BindRenderTargetsDesc sbind = {};
-            sbind.mRenderTargetCount = 0;
-            sbind.mDepthStencil = { g_live.pShadowAtlas, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &sbind);
-            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.1f, "SHADOW FACES (static)");
-
-            // One job per dirty slot scheduled this frame (≤ kMaxShadowLights). Job b uses its
-            // slot's atlas block, its PREFIX-SUM-PACKED caster region (C4b: regionBase sized by the
-            // actual gather; firstInstance offsets into pShadowInstanceBuf / pShadowWorldsBuf), and
-            // face CBV base b*6.
-            for (uint32_t b = 0; b < (uint32_t)g_shadowRenders.size(); ++b) {
-                const ShadowRender& R = g_shadowRenders[b];
-                const uint32_t regionBase = R.regionBase;
-                uint32_t bx, by, bs;
-                shadowSlotBlock(R.slot, bx, by, bs);
-                for (uint32_t f = 0; f < 6; ++f) {
-                    const uint32_t tx = bx + (f % 3) * bs;
-                    const uint32_t ty = by + (f / 3) * bs;
-                    cmdSetViewport(g_live.pCmd, (float)tx, (float)ty, (float)bs, (float)bs, 0.0f, 1.0f);
-                    cmdSetScissor(g_live.pCmd, tx, ty, bs, bs);
-
-                    // Per-tile clear triangle (CMP_ALWAYS + write, z = 0 = reverse-Z far).
-                    cmdBindPipeline(g_live.pCmd, g_live.pShadowClearPipeline);
-                    cmdDraw(g_live.pCmd, 3, 0);
-
-                    // This job's casters (twoSided,mirror,slot)-sorted; draw local i reads matrix
-                    // regionBase+i of the SHADOW world window via firstInstance. Face CBV
-                    // R.slot*6+f (per-slot, shared with the dyn pass) carries this job's face
-                    // light-centred viewProj. Rebind keyed on the CHOSEN pso (covers both the
-                    // mirror flip AND the fixture-cage two-sided override).
-                    Pipeline* boundPso = nullptr;
-                    for (uint32_t k = R.casterBegin; k < R.casterEnd; ++k) {
-                        const ShadowCaster& scst = g_shadowCasters[k];
-                        HostMesh& hm = g_meshes[scst.slot];
-                        const uint32_t firstInst = regionBase + (k - R.casterBegin);
-                        // A fixture cage enclosing its own light forces CULL_NONE regardless of the
-                        // live g_shadowCasterCull mode (which front/back-culls half the cage away).
-                        Pipeline* casterPso;
-                        if (scst.twoSided) {
-                            casterPso = g_live.pShadowPipelineNone;
-                        } else {
-                            // Live caster-cull pick (g_shadowCasterCull). CULL_NONE ignores winding
-                            // (one PSO); BACK/FRONT keep the mirror-winding pair.
-                            switch (g_shadowCasterCull) {
-                            case 1:  casterPso = g_live.pShadowPipelineNone; break;
-                            case 2:  casterPso = scst.mirror ? g_live.pShadowPipelineFrontMirror
-                                                             : g_live.pShadowPipelineFront; break;
-                            default: casterPso = scst.mirror ? g_live.pShadowPipelineMirror
-                                                             : g_live.pShadowPipeline; break;
-                            }
-                        }
-                        if (casterPso != boundPso) {
-                            cmdBindPipeline(g_live.pCmd, casterPso);
-                            cmdBindDescriptorSet(g_live.pCmd, R.slot * 6 + f, g_live.pShadowFaceSet);
-                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
-                            boundPso = casterPso;
-                        }
-                        if (hm.inArena) {
-                            Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
-                            uint32_t strides[2] = { vStride, iStride };
-                            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                            cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
-                            cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount,
-                                                    (uint32_t)(hm.ibOff / sizeof(uint16_t)), 1,
-                                                    (uint32_t)(hm.vbOff / sizeof(IPC::GeomVertexWire)), firstInst);
-                        } else {
-                            Buffer*  vbs[2]     = { hm.vb, g_live.pShadowInstanceBuf };
-                            uint32_t strides[2] = { vStride, iStride };
-                            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                            cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
-                            cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, firstInst);
-                        }
-                    }
-
-                }
-            }
-            cmdEndDebugMarker(g_live.pCmd);
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            {
-                RenderTargetBarrier rtb = {};
-                rtb.pRenderTarget = g_live.pShadowAtlas;
-                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
-                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
-            }
-        }
-
-        gpuPhaseEnd(kGpuPhaseShadowStatic);
-        gpuPhaseBegin(kGpuPhaseShadowDyn);
-        // --- C4b DYNAMIC atlas: movers only (skinned + MM), re-rendered EVERY frame for each
-        // slot with a mover in reach. Skinned/MM Z-prepasses already filled the bone/MM windows
-        // (they run before this); draws bind the per-slot face CBVs (s*6+f, written by the
-        // scheduler) and cost zero pool matrices. The mask samples this atlas only for slots in
-        // dynBits, so a stale tile (mover left) is inert. ---
-        if (g_live.shadowReady && !g_shadowRendersDyn.empty()) {
-            cmdBindRenderTargets(g_live.pCmd, nullptr);   // end whatever pass is open
-            {
-                RenderTargetBarrier rtb = {};
-                rtb.pRenderTarget = g_live.pShadowAtlasDyn;
-                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
-            }
-            BindRenderTargetsDesc dbind = {};
-            dbind.mRenderTargetCount = 0;
-            dbind.mDepthStencil = { g_live.pShadowAtlasDyn, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &dbind);
-            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.5f, 0.1f, "SHADOW FACES (dynamic movers)");
-
-            // Record-cost shape of this pass (2026-07-10 rec-split instrumentation): the leak
-            // that spiked host record to 2.6ms was slots × 6 faces × (full caster-list sphere
-            // sweep + bind/draw per in-reach caster per face). Two cuts, output-identical:
-            //   1. HOIST the sphere test out of the face loop — it's face-independent (the
-            //      scheduler ran the identical test for dynHit) — into per-slot hit lists.
-            //   2. Per-face 90°-pyramid cull: bit f of a hit's face mask is set iff the caster
-            //      sphere touches face f's frustum (light-relative centre c, conservative
-            //      half-space test c[axis] + r*sqrt2 >= max of the other two |axes|). A mover
-            //      is geometrically visible in at most 3 faces, usually 1-2 — so its draws are
-            //      recorded 1-2 times instead of 6.
-            // Face order matches buildShadowFaceVP/shadowmask.comp: +X -X +Y -Y +Z -Z.
-            auto dynFaceMask = [](float dx, float dy, float dz, float rad) -> uint32_t {
-                const float rs = rad * 1.41421356f;
-                const float ax = fabsf(dx), ay = fabsf(dy), az = fabsf(dz);
-                uint32_t m = 0;
-                if ( dx + rs >= fmaxf(ay, az)) { m |= 1u << 0; }
-                if (-dx + rs >= fmaxf(ay, az)) { m |= 1u << 1; }
-                if ( dy + rs >= fmaxf(ax, az)) { m |= 1u << 2; }
-                if (-dy + rs >= fmaxf(ax, az)) { m |= 1u << 3; }
-                if ( dz + rs >= fmaxf(ax, ay)) { m |= 1u << 4; }
-                if (-dz + rs >= fmaxf(ax, ay)) { m |= 1u << 5; }
-                return m;
-            };
-            struct DynHit { uint32_t idx; uint32_t faces; };
-            std::vector<DynHit> skHits, mmHits, rmHits;
-            skHits.reserve(g_skinnedCasters.size());
-            mmHits.reserve(g_mmCasters.size());
-            rmHits.reserve(g_dynMoverCasters.size());
-
-            for (const uint32_t s : g_shadowRendersDyn) {
-                const ShadowSlot& sl = g_shadowSlots[s];
-                const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
-                const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
-                const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
-                const float reach = 2.0f * sl.radius;
-                uint32_t bx, by, bs;
-                shadowSlotBlock(s, bx, by, bs);
-
-                // ONE clear triangle over the whole 3x2 face block (was 6 per-tile clears).
-                cmdSetViewport(g_live.pCmd, (float)bx, (float)by, (float)(3 * bs), (float)(2 * bs), 0.0f, 1.0f);
-                cmdSetScissor(g_live.pCmd, bx, by, 3 * bs, 2 * bs);
-                cmdBindPipeline(g_live.pCmd, g_live.pShadowClearPipeline);
-                cmdDraw(g_live.pCmd, 3, 0);
-
-                // Per-slot in-reach gather (once, not per face) + face masks. faceUnion skips
-                // whole faces no hit can touch (viewport/scissor/binds never recorded).
-                skHits.clear(); mmHits.clear(); rmHits.clear();
-                uint32_t faceUnion = 0;
-                if (g_shadowSkinnedCasters) {
-                    for (uint32_t i = 0; i < (uint32_t)g_skinnedCasters.size(); ++i) {
-                        const SkinnedCaster& sc = g_skinnedCasters[i];
-                        const float dx = sc.cRel[0] - lrx, dy = sc.cRel[1] - lry, dz = sc.cRel[2] - lrz;
-                        const float rr = reach + sc.rad;
-                        if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
-                        const uint32_t fm = dynFaceMask(dx, dy, dz, sc.rad);
-                        if (fm) { skHits.push_back({ i, fm }); faceUnion |= fm; }
-                    }
-                }
-                if (g_shadowMMCasters) {
-                    for (uint32_t i = 0; i < (uint32_t)g_mmCasters.size(); ++i) {
-                        const MMCaster& mc = g_mmCasters[i];
-                        const float dx = mc.cRel[0] - lrx, dy = mc.cRel[1] - lry, dz = mc.cRel[2] - lrz;
-                        const float rr = reach + mc.rad;
-                        if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
-                        const uint32_t fm = dynFaceMask(dx, dy, dz, mc.rad);
-                        if (fm) { mmHits.push_back({ i, fm }); faceUnion |= fm; }
-                    }
-                }
-                if (g_shadowRigidMovers) {
-                    for (uint32_t i = 0; i < (uint32_t)g_dynMoverCasters.size(); ++i) {
-                        const DynMoverCaster& dm = g_dynMoverCasters[i];
-                        const float dx = dm.cRel[0] - lrx, dy = dm.cRel[1] - lry, dz = dm.cRel[2] - lrz;
-                        const float rr = reach + dm.rad;
-                        if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
-                        const uint32_t fm = dynFaceMask(dx, dy, dz, dm.rad);
-                        if (fm) { rmHits.push_back({ i, fm }); faceUnion |= fm; }
-                    }
-                }
-
-                for (uint32_t f = 0; f < 6; ++f) {
-                    if ((faceUnion & (1u << f)) == 0u) { continue; }
-                    const uint32_t tx = bx + (f % 3) * bs;
-                    const uint32_t ty = by + (f / 3) * bs;
-                    cmdSetViewport(g_live.pCmd, (float)tx, (float)ty, (float)bs, (float)bs, 0.0f, 1.0f);
-                    cmdSetScissor(g_live.pCmd, tx, ty, bs, bs);
-
-                    // C4a skinned casters for THIS slot/face (this-frame poses, firstInstance=index).
-                    {
-                        Pipeline* skBound = nullptr;   // tracks the PSO, not just mirror: a BLENDED
-                                                       // caster switches frag as well as winding
-                        uint32_t skWindow = UINT32_MAX;
-                        for (const DynHit& h : skHits) {
-                            if ((h.faces & (1u << f)) == 0u) { continue; }
-                            const SkinnedCaster& sc = g_skinnedCasters[h.idx];
-                            Pipeline* skPso;
-                            if (sc.alphaCast && g_live.pSkinnedAlphaShadowPipeline) {
-                                // Opacity-thresholded caster (alphashadowdepth.frag), CULL_NONE: the
-                                // cull knob's back/front variants exist to fight opaque shadow acne,
-                                // which a thresholded translucent caster does not produce.
-                                skPso = g_live.pSkinnedAlphaShadowPipeline;
-                            } else {
-                                switch (g_shadowCasterCull) {
-                                case 1:  skPso = g_live.pSkinnedShadowPipelineNone; break;
-                                case 2:  skPso = sc.mirror ? g_live.pSkinnedShadowPipelineFrontMirror
-                                                           : g_live.pSkinnedShadowPipelineFront; break;
-                                default: skPso = sc.mirror ? g_live.pSkinnedShadowPipelineMirror
-                                                           : g_live.pSkinnedShadowPipeline; break;
-                                }
-                            }
-                            if (skPso != skBound) {
-                                cmdBindPipeline(g_live.pCmd, skPso);
-                                cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                                skBound = skPso;
-                                skWindow = UINT32_MAX;
-                            }
-                            if (sc.window != skWindow) {
-                                cmdBindDescriptorSet(g_live.pCmd, sc.window, g_live.pPerBatchSetSkin);
-                                skWindow = sc.window;
-                            }
-                            HostMesh& sm = g_meshes[sc.slot];
-                            Buffer*  svbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                            uint32_t sstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
-                            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
-                            cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                            cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
-                        }
-                    }
-
-                    // Multimap casters (heads/glow) for THIS slot/face (resident MM windows,
-                    // firstInstance=index).
-                    {
-                        int mmMirror = -1;
-                        for (const DynHit& h : mmHits) {
-                            if ((h.faces & (1u << f)) == 0u) { continue; }
-                            const MMCaster& mc = g_mmCasters[h.idx];
-                            if ((int)mc.mirror != mmMirror) {
-                                Pipeline* mmPso;
-                                switch (g_shadowCasterCull) {
-                                case 1:  mmPso = g_live.pMultiMapShadowPipelineNone; break;
-                                case 2:  mmPso = mc.mirror ? g_live.pMultiMapShadowPipelineFrontMirror
-                                                           : g_live.pMultiMapShadowPipelineFront; break;
-                                default: mmPso = mc.mirror ? g_live.pMultiMapShadowPipelineMirror
-                                                           : g_live.pMultiMapShadowPipeline; break;
-                                }
-                                cmdBindPipeline(g_live.pCmd, mmPso);
-                                cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
-                                mmMirror = (int)mc.mirror;
-                            }
-                            HostMesh& mm = g_meshes[mc.slot];
-                            Buffer*  mvbs[2]     = { mm.vb, g_live.pInstanceBufMM };
-                            uint32_t mstrides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
-                            cmdBindVertexBuffer(g_live.pCmd, 2, mvbs, mstrides, nullptr);
-                            cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
-                            cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, mc.index);
-                        }
-                    }
-
-                    // C4d LIVE rigid casters (hands, held weapons/shields, activators, doors)
-                    // for THIS slot/face — this-frame lastWorld packed at the pool TAIL
-                    // (matIdx), one matrix per caster shared by every slot. Same static-caster
-                    // PSOs (cutout via instance texAlpha), firstInstance = matIdx.
-                    {
-                        int rmMirror = -1;
-                        for (const DynHit& h : rmHits) {
-                            if ((h.faces & (1u << f)) == 0u) { continue; }
-                            const DynMoverCaster& dm = g_dynMoverCasters[h.idx];
-                            if ((int)dm.mirror != rmMirror) {
-                                Pipeline* rmPso;
-                                switch (g_shadowCasterCull) {
-                                case 1:  rmPso = g_live.pShadowPipelineNone; break;
-                                case 2:  rmPso = dm.mirror ? g_live.pShadowPipelineFrontMirror
-                                                           : g_live.pShadowPipelineFront; break;
-                                default: rmPso = dm.mirror ? g_live.pShadowPipelineMirror
-                                                           : g_live.pShadowPipeline; break;
-                                }
-                                cmdBindPipeline(g_live.pCmd, rmPso);
-                                cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
-                                rmMirror = (int)dm.mirror;
-                            }
-                            HostMesh& hm = g_meshes[dm.slot];
-                            if (hm.inArena) {
-                                Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
-                                uint32_t strides[2] = { vStride, iStride };
-                                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                                cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
-                                cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount,
-                                                        (uint32_t)(hm.ibOff / sizeof(uint16_t)), 1,
-                                                        (uint32_t)(hm.vbOff / sizeof(IPC::GeomVertexWire)), dm.matIdx);
-                            } else {
-                                Buffer*  vbs[2]     = { hm.vb, g_live.pShadowInstanceBuf };
-                                uint32_t strides[2] = { vStride, iStride };
-                                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                                cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
-                                cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, dm.matIdx);
-                            }
-                        }
-                    }
-                }
-            }
-            cmdEndDebugMarker(g_live.pCmd);
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            {
-                RenderTargetBarrier rtb = {};
-                rtb.pRenderTarget = g_live.pShadowAtlasDyn;
-                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
-                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
-            }
-        }
-        gpuPhaseEnd(kGpuPhaseShadowDyn);
-
-        // SUN shadow: render the DL-statics MSM moments map. It MUST be here — inside the shadow
-        // phase, before reflect/colour — because from Phase B on, every colour pass SAMPLES it. The
-        // map is CAMERA-RELATIVE, so a frame-late map is offset by the camera delta and the shadows
-        // visibly slide under motion; same-frame is not an optimisation, it is correctness. The sun
-        // cull it consumes ran back in kGpuPhaseCull, and the pass is self-contained (own RT +
-        // barriers, leaves pSunMoments in SHADER_RESOURCE), so it slots in with no state coupling.
-        //
-        // Latch this frame's water plane FIRST: publishSunShadowParams writes the fog block, and both
-        // of renderSunShadow's exits go through it. The volumetric march clamps against this plane
-        // because the depth it reads is the OPAQUE prepass — water is drawn later, so over open sea
-        // the ray would otherwise run to the seabed or the far clamp through solid water.
-        // Held off entirely when the camera is submerged: the height-fog model is an AIR model.
-        g_volFogWaterZ  = waterParams ? waterParams[0] : 0.0f;
-        g_volFogWaterOn = (waterEnabled != 0) && waterParams && !(waterParams[7] > 0.5f);
-        // ...and the UNIFIED WATER FOG's own latch, off the SAME params in the SAME place — the two
-        // features must never disagree about where the surface is, and deriving one plane twice is
-        // how that starts. They differ in exactly one respect, which is why they cannot share a
-        // lane: the volumetric clamp above goes OFF when the camera submerges (its model is air),
-        // and this one is at its most load-bearing precisely then.
-        // (The ini behind it is read in ForgeRender::init, not here — see loadWaterIniOnce.)
-        //
-        // ⚠ waterTrueLevel, NOT the raw waterParams[0], and the difference is load-bearing rather
-        // than cosmetic. The client's `underwater` bit is MWBridge::IsUnderwater, which trips at
-        // `WaterLevel() - 1` — so a fog plane at the raw level disagrees with the flag over a
-        // one-unit band around the waterline, i.e. exactly where the model's continuity argument
-        // lives, and the shader's flag-vs-plane guards would fire there instead of never. It is also
-        // what MGE, scene-walk and scene-walk-v2 all mean by "the water plane" (see waterTrueLevel).
-        // Deliberately NOT waterMeshZ: that one snaps +-5 with the camera to keep the drawn mesh off
-        // the near plane, so a fog plane following it would jump 10 units at the crossing.
-        g_waterFogZ     = waterParams ? waterTrueLevel(waterParams[0]) : 0.0f;
-        g_waterFogOn    = (waterEnabled != 0) && waterParams != nullptr;
-        g_waterFogUnder = waterParams && waterParams[7] > 0.5f;
-        // MW's GameHour, off the water block's last (previously reserved) lane — see the client's
-        // waterParams fill. It rides there rather than on a lighting lane because the ONLY consumer
-        // is the water fog's time-of-day density, and because the water block is already gated on
-        // the cell having water, which is exactly when that density matters.
-        if (waterParams) { g_waterFogHour = waterParams[11]; }
-        // W23: MW's windFactor, for the caustic slice bias. Cached here with the other water lanes
-        // rather than read at the publish, which runs in a different function.
-        if (waterParams) { g_causticWindNow = waterParams[1]; }
-        // R1: MW's live precipitation counters. Zeroed with the water block rather than latched —
-        // the client already zeroes them in interiors, and a latched counter would keep raining on
-        // the next puddle the player finds indoors.
-        g_rainWetRain = waterParams ? waterParams[12] : 0.0f;
-        g_rainWetSnow = waterParams ? waterParams[13] : 0.0f;
-        // R2 actor ripples are ingested EARLIER (see ingestActorRipples, called before the wave-sim
-        // dispatch) — this block runs ~1000 lines after it, and the sim needs THIS frame's births.
-        {
-            static unsigned s_lastN = 0xFFFFFFFFu;
-            if (g_actorRippleCount != s_lastN) {
-                s_lastN = g_actorRippleCount;
-                if (g_actorRippleCount) {
-                    LOG::logline(">> [ripl] actor ripples: %u  first=(%.0f %.0f) age=%.2f scale=%.2f",
-                                 g_actorRippleCount, g_actorRipples[0], g_actorRipples[1],
-                                 g_actorRipples[2], g_actorRipples[3]);
-                } else {
-                    LOG::logline(">> [ripl] actor ripples: 0");
-                }
-            }
-        }
-        // One line per meaningful move in the derived density. The dev panel cannot show this — its
-        // label() takes a static string, so a live readout would freeze at whatever the panel was
-        // built with — and the REF knob above is exactly the kind of constant that can only be found
-        // by watching a real storm arrive. Edge-triggered, so a dry frame costs one compare.
-        {
-            static float s_lastDens = -1.0f;
-            const float dens = effectiveRainDensity();
-            if (std::fabs(dens - s_lastDens) > 0.02f) {
-                LOG::logline(">> [ripl] weather: rain %.0f snow %.0f ref %.0f -> density %.3f",
-                             g_rainWetRain, g_rainWetSnow, g_rainWeatherRef, dens);
-                s_lastDens = dens;
-            }
-        }
-        // DIAGNOSTIC, one line per surface crossing. "MW is also changing lighting underwater" is a
-        // claim the host can SETTLE rather than assume: these are MW's own authored values off the
-        // wire, before any lift or decode, so a diff between the two lines around a crossing says
-        // exactly which of them the engine switches. (OpenMW, the reference reimplementation, moves
-        // only the fog start/end/colour — nothing touches sun or ambient — so if sun/amb DO move
-        // here that is vanilla-specific and we would be inheriting a camera-dependent global where
-        // the physical answer is a per-fragment one. Costs nothing: it fires on an edge.)
-        {
-            static bool s_lastUnder = false;
-            if (g_waterFogUnder != s_lastUnder) {
-                s_lastUnder = g_waterFogUnder;
-                if (lighting) {
-                    // weather=0 says the LIGHT lanes were left alone by unblendUnderwaterTint (MW
-                    // never tinted them) while the fog lane was still undone — so if a weatherless
-                    // interior's fog range does NOT move across this crossing, the assumption that
-                    // MW's fog override is weather-independent is what to overturn, from this line.
-                    LOG::logline(">> [waterfog] crossing -> %-5s  sun(%.3f %.3f %.3f) amb(%.3f %.3f %.3f)"
-                                 " fog(%.3f %.3f %.3f) near %.0f..%.0f weather=%d",
-                                 g_waterFogUnder ? "UNDER" : "above",
-                                 lighting[4],  lighting[5],  lighting[6],
-                                 lighting[8],  lighting[9],  lighting[10],
-                                 lighting[12], lighting[13], lighting[14],
-                                 lighting[16], lighting[17], g_uwMwTinted ? 1 : 0);
-                }
-            }
-        }
-        gpuPhaseBegin(kGpuPhaseShadowSun);
-        renderSunShadow();
-        gpuPhaseEnd(kGpuPhaseShadowSun);
-
-        // --- W8d DIAGNOSTIC: every uniform the in-scatter reads, one CSV row per frame ----------
-        //
-        // "There is a value used in scattering that's affected by the one frame delay." A host-side
-        // trace can settle that WITHOUT guessing which one, because a one-frame lag between two
-        // signals is a PHASE SHIFT when the input oscillates: move back and forth, and whichever
-        // column turns around a row after the others is the late one. Everything is sampled at this
-        // single point — after the water plane latch above and after publishSunShadowParams ->
-        // publishWaterFog, i.e. once every value below is the one this frame's pixels will read.
-        //
-        // The columns are deliberately REDUNDANT in three places, because each pair is one candidate:
-        //   eye*   vs wireEye*   — gFrameData.lodEye (what the shader divides by) against lighting[24..26]
-        //                          straight off the wire. These are written from each other, so a split
-        //                          here would mean the cbuffer write is not where it looks.
-        //   waterZ vs waterZraw  — the latched plane against waterParams[0]; and under vs underWire.
-        //   dir*                 — the centre-pixel ray, rebuilt from rzViewProj by the IDENTICAL
-        //                          arithmetic waterfill.frag uses (invert, NDC 0,0,0.5, divide by w).
-        //                          This is the ORIENTATION lane: it is the only column that comes from
-        //                          the matrix rather than from the lighting/water blocks, so if the
-        //                          camera's rotation and the camera's position enter the frame at
-        //                          different times, these two groups separate here and nowhere else.
-        // eyeDepth is the derived quantity that actually scales the in-scatter (e0 = exp(-sigma*slant*
-        // dNear)), so it is worth its own column rather than being recomputed offline.
-        //
-        // Buffered fprintf, not LOGF: a per-frame LOGF is a ~3ms/frame tax in this codebase
-        // ([[project_forge_multimap_night_collapse]]) and a tax that big would distort the very
-        // timing being measured. Flushed each row so a hard exit still leaves a complete capture.
-        {
-            static FILE* s_wfTrace = nullptr;
-            static bool  s_wfTraceWas = false;
-            if (g_waterFogTrace && !s_wfTraceWas) {
-                s_wfTrace = std::fopen("waterfog_trace.csv", "w");
-                if (s_wfTrace) {
-                    std::fprintf(s_wfTrace,
-                        "frame,t_ms,eyeX,eyeY,eyeZ,wireEyeX,wireEyeY,wireEyeZ,"
-                        "waterZ,waterZraw,under,underWire,eyeDepth,"
-                        "dirX,dirY,dirZ,sunDirX,sunDirY,sunDirZ,"
-                        "sunR,sunG,sunB,ambR,ambG,ambB,fogR,fogG,fogB,"
-                        "kView,sigTr,sigTg,sigTb,sigSr,sigSg,sigSb,"
-                        "kdR,kdG,kdB,kdS,gain,volS,msIso,ivpMaxAbs,ivpRayDeg\n");
-                }
-                LOG::logline(">> [waterfog] trace ON -> waterfog_trace.csv");
-            } else if (!g_waterFogTrace && s_wfTraceWas && s_wfTrace) {
-                std::fclose(s_wfTrace);
-                s_wfTrace = nullptr;
-                LOG::logline(">> [waterfog] trace OFF");
-            }
-            s_wfTraceWas = g_waterFogTrace;
-
-            if (s_wfTrace && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress
-                          && g_live.pShadowMaskParamsCbv
-                          && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-                const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-                const float* sp = (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
-
-                // The centre-pixel ray, by waterfill.frag's own arithmetic. The upload is row-major
-                // and HLSL reads it column-major, so the shader's mul(M, v) is v * M_row here — do
-                // it that way round rather than "the obvious" one, or the printed direction is the
-                // transpose of the one the pixels used.
-                float invVP[16];
-                float dir[3] = { 0.0f, 0.0f, 0.0f };
-                if (invert4x4(rzViewProj, invVP)) {
-                    const float v[4] = { 0.0f, 0.0f, 0.5f, 1.0f };
-                    float hp[4];
-                    for (int j = 0; j < 4; ++j) {
-                        hp[j] = v[0] * invVP[0 * 4 + j] + v[1] * invVP[1 * 4 + j]
-                              + v[2] * invVP[2 * 4 + j] + v[3] * invVP[3 * 4 + j];
-                    }
-                    const float iw = (std::fabs(hp[3]) > 1.0e-9f) ? (1.0f / hp[3]) : 0.0f;
-                    float p[3] = { hp[0] * iw, hp[1] * iw, hp[2] * iw };
-                    const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
-                    if (len > 1.0e-6f) {
-                        dir[0] = p[0] / len; dir[1] = p[1] / len; dir[2] = p[2] / len;
-                    }
-                }
-
-                // --- THE PROBE THIS TRACE SHOULD HAVE HAD FROM THE START ------------------------
-                // The first capture logged `dir` from an inverse computed FRESHLY here, so it compared
-                // this frame's camera against itself and could only ever say "consistent". What the
-                // hole fill actually reads is the PUBLISHED gShadowParams.invViewProj (floats 0..15),
-                // and that is a different object in a different buffer written at a different point in
-                // the frame. Rebuilding water.frag's ray from the analogous lane made its shear an
-                // order of magnitude worse, which is evidence that the published inverse does not
-                // agree with the matrix that rasterised the frame.
-                //
-                // Two numbers, because one of them is interpretable and the other is not:
-                //   ivpMaxAbs — max element-wise |published - fresh|. Nonzero at all = they differ.
-                //   ivpRayDeg — the ANGLE between the centre-pixel ray each one produces, in degrees.
-                //               This is the quantity that matters: it is exactly how far the fill's
-                //               ray points away from where the pixel actually looks, and the phase
-                //               function turns a fraction of a degree near the sun into real
-                //               brightness. Expect ~0 standing still and a velocity-proportional
-                //               value while moving if the one-frame tear is real.
-                float ivpMax = 0.0f;
-                for (int i = 0; i < 16; ++i) {
-                    ivpMax = std::max(ivpMax, std::fabs(sp[i] - invVP[i]));
-                }
-                float ivpDeg = 0.0f;
-                {
-                    const float v[4] = { 0.0f, 0.0f, 0.5f, 1.0f };
-                    float hp[4];
-                    for (int j = 0; j < 4; ++j) {
-                        hp[j] = v[0] * sp[0 * 4 + j] + v[1] * sp[1 * 4 + j]
-                              + v[2] * sp[2 * 4 + j] + v[3] * sp[3 * 4 + j];
-                    }
-                    const float iw = (std::fabs(hp[3]) > 1.0e-9f) ? (1.0f / hp[3]) : 0.0f;
-                    float p[3] = { hp[0] * iw, hp[1] * iw, hp[2] * iw };
-                    const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
-                    if (len > 1.0e-6f && (dir[0] != 0.0f || dir[1] != 0.0f || dir[2] != 0.0f)) {
-                        const float c = (p[0] * dir[0] + p[1] * dir[1] + p[2] * dir[2]) / len;
-                        ivpDeg = std::acos(std::max(-1.0f, std::min(1.0f, c))) * 57.29577951f;
-                    }
-                }
-
-                const float waterZ  = sp[kWaterFogPlaneFloat + 0];
-                const float underSP = sp[kWaterFogPlaneFloat + 2];
-                std::fprintf(s_wfTrace,
-                    "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                    "%.3f,%.3f,%.0f,%.0f,%.3f,"
-                    "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
-                    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                    "%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
-                    "%.8f,%.8f,%.8f,%.3f,%.4f,%.3f,%.3f,%.9f,%.6f\n",
-                    g_renderFrame, hostNowMs(),
-                    fd[56], fd[57], fd[58],
-                    lighting ? lighting[24] : 0.0f,
-                    lighting ? lighting[25] : 0.0f,
-                    lighting ? lighting[26] : 0.0f,
-                    waterZ, waterParams ? waterParams[0] : 0.0f,
-                    underSP, waterParams ? waterParams[7] : 0.0f,
-                    (waterZ - fd[58] > 0.0f) ? (waterZ - fd[58]) : 0.0f,
-                    dir[0], dir[1], dir[2], fd[16], fd[17], fd[18],
-                    fd[20], fd[21], fd[22], fd[24], fd[25], fd[26], fd[28], fd[29], fd[30],
-                    sp[kWaterFogColFloat + 3],
-                    sp[kWaterFogExtFloat + 0], sp[kWaterFogExtFloat + 1], sp[kWaterFogExtFloat + 2],
-                    sp[kWaterFogScatterFloat + 0], sp[kWaterFogScatterFloat + 1],
-                    sp[kWaterFogScatterFloat + 2],
-                    sp[kWaterFogKdFloat + 0], sp[kWaterFogKdFloat + 1], sp[kWaterFogKdFloat + 2],
-                    sp[kWaterFogKdFloat + 3],
-                    sp[kWaterFogScatterFloat + 3], sp[kWaterFogExtFloat + 3],
-                    sp[kWaterFogPhase2Float + 2],
-                    ivpMax, ivpDeg);
-                std::fflush(s_wfTrace);
-            }
-        }
-
-        if (g_live.shadowReady && g_shadowFrameActive) {
-            // Restore the full-screen viewport/scissor for the compute + colour passes below
-            // (the colour pass re-sets them at bind, but the AO block in between binds nothing).
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-        }
-        gpuPhaseEnd(kGpuPhaseShadow);
-        gpuPhaseBegin(kGpuPhasePostDepth);
+        passPointLightShadowFaces(lighting, waterParams, waterEnabled, rzViewProj, vStride, iStride,
+                                  gpuPhaseBegin, gpuPhaseEnd);
         // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
-        // First compute work in the host. Sits between the depth-complete prepass and the colour
-        // pass: resolve pDepth (sample 0, MSAA-robust) -> single-sample pLinearDepth, then GTAO
-        // -> pAO (bent normal + visibility). Tier 2 feeds ONLY the F12 debug views; the colour
-        // pass reads pAO unconditionally is Tier 3. pLinearDepth/pAO live in UNORDERED_ACCESS at
-        // frame start (created state on frame 0; returned to SHADER_RESOURCE at the end of each
-        // frame, so they're flipped back to UAV here on every frame after the first).
-        // Tier 2 master toggle: runs the linearize dispatch + the pDepth/pLinearDepth/pAO(/pAOBlur)
-        // state ping-pong each frame. Kept ON: the linearize output (pLinearDepth) is sampled by the
-        // ALWAYS-ON water pass (gSceneLinDepth) and the colour pass samples pAOBlur (gAO), so the
-        // resource-state transitions here are load-bearing beyond AO — fully gating this off would
-        // leave those in UNORDERED_ACCESS while sampled (the old "clean Tier-1 degradation" comment
-        // predates water-takeover + the bilateral blur). The EXPENSIVE AO horizon-search + blur
-        // dispatches are gated separately by aoDispatchRuns below.
-        static const bool g_aoComputeEnable = true;
-        // Baseline-thinning (2026-07-02): skip the two costly AO dispatches (horizon search + blur,
-        // ~0.8ms) unless something actually READS the result. Derived rather than a knob of its own,
-        // because the two states a knob allows are both wrong: dispatch-off with a consumer on hands
-        // the colour frag a STALE pAOBlur (never written this frame) and reads as black AO;
-        // dispatch-on with no consumer is 0.8ms of GPU for nothing. Consumption is the whole answer,
-        // so the baseline (all three off) still costs exactly zero and cannot be mis-set.
-        const bool aoDispatchRuns = g_aoEnable || g_bentNormalEnable
-                                      || g_debugMode == 3u || g_debugMode == 4u;
-        // Which of the four AO modes runs. Falls back to GTAO if the picked pipeline is missing (a
-        // half-deployed shader tree after F8), so switching modes live can never drop the UAV write.
-        Pipeline* aoPipeline = (g_aoMode < (uint32_t)kAOModeCount) ? g_live.pAOPipeline[g_aoMode] : nullptr;
-        if (!aoPipeline) { aoPipeline = g_live.pAOPipeline[kAOModeGTAO]; }
-        static bool s_aoDispatchLogged = false;
-        if (!s_aoDispatchLogged) {
-            std::printf("[forge] AO dispatch GATE: enable=%d aoPipe=%p linPipe=%p linSet=%p gBatchSet=%p pAO=%p pLinDepth=%p firstFrame=%d\n",
-                        (int)g_aoComputeEnable, (void*)aoPipeline, (void*)g_live.pLinearizePipeline,
-                        (void*)g_live.pLinearizeSet, (void*)g_live.pGtaoBatchSet,
-                        (void*)g_live.pAO, (void*)g_live.pLinearDepth, (int)g_live.firstFrame);
-            s_aoDispatchLogged = true;
-        }
-        // Named once, because THREE later blocks depend on the states this one leaves behind
-        // (pLinearDepth in SHADER_RESOURCE above all) and each used to re-spell the condition by
-        // hand. A hand-mirrored gate that drifts is a silent state-mismatch, not a compile error.
-        const bool aoBlockRan = g_aoComputeEnable && g_live.pLinearizePipeline && aoPipeline;
-        // Half-res AO: the AO pass and the blur run at half, bracketed by a depth downsample and an
-        // adaptive Lanczos upscale. Only armed when the AO dispatches themselves are — with them
-        // gated off there is nothing to downsample FOR, and pAOBlur must be left exactly as the
-        // full-res path leaves it (stale but state-valid) rather than half-written.
-        const bool aoHalf = g_aoHalfRes && g_live.aoHalfReady && aoDispatchRuns;
-        // Latched the first time the half chain actually runs — see the barrier block below for why
-        // g_live.firstFrame cannot stand in for it.
-        static bool s_aoHalfPrimed = false;
-        if (aoBlockRan) {
-            // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
-            // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
-            // may need MW-scale tuning — change here). eye is read back from the frame cbuffer
-            // (floats 36..38 = gFrameData.eyePos), which holds the latest value across null-lighting frames.
-            float invVP[16];
-            if (!invert4x4(rzViewProj, invVP)) {
-                for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }  // identity guard
-            }
-            // AO knobs are now dev-overlay sliders (g_ao*); the per-frame upload reads them live.
-            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-            float* ap = (float*)g_live.pAOParamsCbv->pCpuMappedAddress;
-            // Both the AO pass and the blur run at HALF when the toggle is on, so the one
-            // screenParams lane serves both — that is why it can live in the shared struct.
-            const uint32_t aoW = aoHalf ? ((g_live.width  + 1u) / 2u) : g_live.width;
-            const uint32_t aoH = aoHalf ? ((g_live.height + 1u) / 2u) : g_live.height;
-            std::memcpy(ap, invVP, 16 * sizeof(float));
-            ap[16] = (float)aoW;  ap[17] = (float)aoH;
-            ap[18] = 1.0f / (float)aoW; ap[19] = 1.0f / (float)aoH;
-            ap[20] = g_aoRadius; ap[21] = g_aoFalloff; ap[22] = g_aoIntensity; ap[23] = g_aoThickness;
-            // ap[27] and ap[30..31] are the AO pass's sample-budget lanes (eyePos.w / sliceParams.zw
-            // in gtao.srt.h). ap[28..29] are the BLUR's, in the same float4 — one buffer, two struct
-            // views; the two .srt.h files must stay byte-identical or this line corrupts the blur.
-            ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = (float)g_aoSlices;
-            // The blur's spatial sigma is in PIXELS, and at half res those pixels are twice as big —
-            // so shipping the slider value unscaled silently DOUBLED the blur's screen-space width
-            // the moment half res went on, which at a contact-scale AO radius is enough to wash the
-            // crease valley flat and leave the crease reading brighter than its surroundings. Halve
-            // it so the toggle stays a look-neutral A/B ("a softer version of the same signal, not a
-            // differently-shaped one"). The RANGE sigma below needs no such fix — it is in world
-            // units, which do not care about the resolution. Neither does the AO pass's own
-            // aoStepPixels, whose 96px ceiling and 1px floor are genuinely not compensable; that one
-            // is documented as an accepted difference beside g_aoHalfRes.
-            ap[28] = aoHalf ? (g_aoBlurPx * 0.5f) : g_aoBlurPx;
-            ap[29] = g_aoBlurDepth; ap[30] = (float)g_aoSteps; ap[31] = g_aoBitThick;
-            // ap[32..35] = AOParams::aoParams2 / BlurParams::blurParams2 — one float4 read by BOTH
-            // passes through their two struct views, same lockstep rule as sliceParams.xy. x is the
-            // AO pass's bent strength, y the blur's plane sigma, z the blur's FAR range sigma; w
-            // stays zeroed rather than left stale, since an unwritten lane here is an unspecified
-            // value there.
-            // ap[35] packs the dither SOURCE and its PHASE into one lane, because it is one
-            // question (aocommon.h.fsl's aoDither decodes it): <= -1.5 = the complementary 2x2 quad
-            // carrying its phase as -(w + 2), in (-1.5, 0) = the legacy 4x4 tile, >= 0 = the STBN
-            // mask at that time slice. Mode 1 pins slice 0 (spatial-only), 2 advances, 3 is the quad
-            // frozen, 4 the quad turning. The counter is frame-driven, not time-driven, so a
-            // frame-rate change alters how fast it walks in SECONDS but never makes it skip a step —
-            // a dropped frame must not put a hole in the sequence.
-            //
-            // ⚠ THE QUAD'S PHASE IS QUANTISED TO QUARTERS AND MUST STAY THAT WAY. A continuous phase
-            // would rotate the quad onto a DIFFERENT set of directions each frame — still complete,
-            // still zero-variance in the mean, but a different answer every frame, which is crawl
-            // reintroduced through the one door this pattern closes. On quarters the set is
-            // invariant and only the assignment of members to pixels rotates.
-            static uint32_t s_ditherFrame = 0;
-            ++s_ditherFrame;
-            const uint32_t ditherStride = (g_aoDitherStride < 1u) ? 1u : g_aoDitherStride;
-            float ditherSel = -1.0f;
-            if (g_aoDither == 1u) {
-                ditherSel = 0.0f;
-            } else if (g_aoDither == 2u) {
-                ditherSel = (float)((s_ditherFrame / ditherStride) & 15u);
-            } else if (g_aoDither == 3u) {
-                ditherSel = -2.0f;
-            } else if (g_aoDither >= 4u) {
-                ditherSel = -2.0f - 0.25f * (float)((s_ditherFrame / ditherStride) & 3u);
-            }
-            // Upload failed → the tile, not a black read. Only the two STBN rungs sample gStbn, so
-            // this must not reach the quad: it needs no texture at all, and sending it to the legacy
-            // 4x4 diagonal would be a downgrade triggered by an unrelated failure.
-            if (!g_live.pStbn && ditherSel >= 0.0f) { ditherSel = -1.0f; }
-            ap[32] = g_aoBentStr; ap[33] = g_aoPlaneSig; ap[34] = g_aoBlurDepthFar; ap[35] = ditherSel;
-
-            const uint32_t gx = (g_live.width + 7u) / 8u;
-            const uint32_t gy = (g_live.height + 7u) / 8u;
-            // Half-res dispatch extent. The textures are allocated at half of alloc*, and the live
-            // rect never exceeds the alloc rect, so this can never overrun them.
-            const uint32_t gxH = (aoW + 7u) / 8u;
-            const uint32_t gyH = (aoH + 7u) / 8u;
-            if (aoHalf) {
-                // The half-res chain's own cbuffer: full AND half dims, which is exactly why it is
-                // not in the shared AOParams/BlurParams layout.
-                float* up = (float*)g_live.pAOUpCbv->pCpuMappedAddress;
-                std::memcpy(up, invVP, 16 * sizeof(float));
-                up[16] = (float)g_live.width;  up[17] = (float)g_live.height;
-                up[18] = 1.0f / (float)g_live.width; up[19] = 1.0f / (float)g_live.height;
-                up[20] = (float)aoW; up[21] = (float)aoH;
-                up[22] = 1.0f / (float)aoW; up[23] = 1.0f / (float)aoH;
-                // ⚠ .z WAS DOCUMENTED "spare" AND IS NOW THE PROFILE LANE -- keep aohalfres.srt.h's
-                // comment in step, since the struct's comment is the only description of it.
-                up[24] = g_aoUpSigma; up[25] = g_aoPlaneSig;
-                up[26] = (float)g_aoUpProf; up[27] = 0.0f;
-            }
-
-            // End the prepass render pass, then pDepth DEPTH_WRITE -> SHADER_RESOURCE (first depth
-            // -> SRV transition in the host) and flip pLinearDepth back to UAV (skip on frame 0).
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            {
-                RenderTargetBarrier rtb = {};
-                rtb.pRenderTarget = g_live.pDepth;
-                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
-                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                TextureBarrier tb[4] = {};
-                uint32_t nt = 0;
-                if (!g_live.firstFrame) {
-                    tb[nt].pTexture = g_live.pLinearDepth;
-                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    ++nt;
-                }
-                // The three half-res targets ride their own "primed" latch rather than firstFrame:
-                // they are created UNORDERED_ACCESS and only reach SHADER_RESOURCE at the end of a
-                // frame that actually ran the half chain, which may be any frame (or never). Using
-                // firstFrame here would issue an SR->UAV from a state they were never in.
-                if (aoHalf && s_aoHalfPrimed) {
-                    tb[nt].pTexture = g_live.pLinearDepthHalf;
-                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    ++nt;
-                    tb[nt].pTexture = g_live.pAOHalf;
-                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    ++nt;
-                    tb[nt].pTexture = g_live.pAOBlurHalf;
-                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    ++nt;
-                }
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
-            }
-
-            // (1) Linearize/resolve dispatch.
-            gpuPhaseBegin(kGpuPhaseLinearize);
-            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "LINEARIZE (writes pLinearDepth)");
-            cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
-            cmdDispatch(g_live.pCmd, gx, gy, 1);
-            cmdEndDebugMarker(g_live.pCmd);
-            gpuPhaseEnd(kGpuPhaseLinearize);
-
-            // pLinearDepth UAV -> SRV (GTAO reads it); pAO SRV -> UAV (skip on frame 0).
-            {
-                TextureBarrier tb[2] = {};
-                uint32_t nt = 0;
-                tb[nt].pTexture = g_live.pLinearDepth;
-                tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                ++nt;
-                if (!g_live.firstFrame) {
-                    tb[nt].pTexture = g_live.pAO;
-                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    ++nt;
-                }
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 0, nullptr);
-            }
-
-            // (1b) Half-res only: pLinearDepth (full) -> pLinearDepthHalf, MAX of each 2x2.
-            if (aoHalf) {
-                gpuPhaseBegin(kGpuPhaseAODown);
-                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.5f, 0.9f, "AO DEPTH DOWNSAMPLE (pLinearDepth -> half)");
-                cmdBindPipeline(g_live.pCmd, g_live.pAODownPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAODownSet);
-                cmdDispatch(g_live.pCmd, gxH, gyH, 1);
-                cmdEndDebugMarker(g_live.pCmd);
-                gpuPhaseEnd(kGpuPhaseAODown);
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pLinearDepthHalf;
-                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
-            }
-
-            // (2) AO dispatch — pAOPipeline[g_aoMode] over the ONE shared PerDraw set (cbuffer +
-            // depth SRV + AO UAV; identical bindings for all four modes). Gated: with nothing
-            // consuming AO this is skipped and pAO is left stale but state-valid. Half-res swaps
-            // the SET, not the shader: same pipeline, same root index, half-res textures. The full
-            // pAO's UAV/SRV ping-pong above and below is unconditional either way, so its state
-            // machine never depends on the toggle — it is simply left unwritten on a half frame.
-            if (aoDispatchRuns) {
-                gpuPhaseBegin(kGpuPhaseAOSearch);
-                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "AO (linear depth -> pAO: bent normal + visibility)");
-                cmdBindPipeline(g_live.pCmd, aoPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pGtaoBatchSetHalf : g_live.pGtaoBatchSet);
-                cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
-                cmdEndDebugMarker(g_live.pCmd);
-                gpuPhaseEnd(kGpuPhaseAOSearch);
-                static uint32_t s_aoDispatchedMode = 0xFFFFFFFFu;
-                static bool     s_aoDispatchedHalf = false;
-                static uint32_t s_aoDispatchedBlur = 0xFFFFFFFFu;
-                if (s_aoDispatchedMode != g_aoMode || s_aoDispatchedHalf != aoHalf
-                    || s_aoDispatchedBlur != g_aoBlurMode) {
-                    // LOG, not printf. `half=` is the one number that separates "AO is expensive"
-                    // from "AO is running at 4x the pixels it was configured for", and it was only
-                    // ever written to a stdout nobody captures — which is why a 2.43 ms AO could
-                    // not be told apart from a 0.67 ms one without a rebuild. Both REQUESTED and
-                    // EFFECTIVE are printed: the toggle can be on while the chain is unbuilt.
-                    // The BLUR variant belongs on this line too. It is a separate binary with a
-                    // different tap count and a different range weight, so "which blur ran" is as
-                    // load-bearing for reading a timing as "which AO ran" — and an env knob set in
-                    // a minimized harness has no other witness.
-                    LOG::logline(">> [forge][ao] dispatch mode=%u (%s) halfRequested=%d halfReady=%d"
-                                 " halfEFFECTIVE=%d grid=%ux%u aoTarget=%ux%u blur=%u (%s)",
-                                 g_aoMode, kAOShaderFiles[g_aoMode < (uint32_t)kAOModeCount ? g_aoMode : 0u],
-                                 (int)g_aoHalfRes, (int)g_live.aoHalfReady,
-                                 (int)aoHalf, aoHalf ? gxH : gx, aoHalf ? gyH : gy, aoW, aoH,
-                                 g_aoBlurMode,
-                                 kAOBlurShaderFiles[g_aoBlurMode < (uint32_t)kAOBlurModeCount ? g_aoBlurMode : 0u]);
-                    s_aoDispatchedMode = g_aoMode;
-                    s_aoDispatchedHalf = aoHalf;
-                    s_aoDispatchedBlur = g_aoBlurMode;
-                }
-                g_live.aoLastHalf = aoHalf;
-            }
-
-            // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
-            // pDepth SRV -> DEPTH_WRITE (colour LOADs it). pLinearDepth STAYS SRV — the blur reads it.
-            {
-                RenderTargetBarrier rtb = {};
-                rtb.pRenderTarget = g_live.pDepth;
-                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
-                TextureBarrier tb[3] = {};
-                uint32_t nt = 0;
-                tb[nt].pTexture = g_live.pAO;
-                tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                ++nt;
-                if (aoHalf) {
-                    tb[nt].pTexture = g_live.pAOHalf;
-                    tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    ++nt;
-                }
-                if (!g_live.firstFrame) {
-                    tb[nt].pTexture = g_live.pAOBlur;
-                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    ++nt;
-                }
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
-            }
-
-            // (3) Bilateral AO blur: pAO + pLinearDepth (both SRV) -> pAOBlur (UAV). PerFrame set
-            // (root distinct from gtao/linearize). Depth-aware, so it denoises without silhouette
-            // bleed. The colour frags sample pAOBlur as gAO. Half-res again swaps only the SET —
-            // and the DEPTH in that set is the half one too, or the range weight would reconstruct
-            // from a depth that does not correspond to the AO texel it is weighting.
-            {
-                // Gated with the GTAO dispatch: baseline skips the blur (pAOBlur stays stale but is
-                // still transitioned UAV -> SRV below, so the colour pass samples it in a valid state).
-                if (aoDispatchRuns) {
-                    gpuPhaseBegin(kGpuPhaseAOBlur);
-                    cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
-                    // Out-of-range falls back to the 2D reference rather than binding null.
-                    const uint32_t bmode = (g_aoBlurMode < (uint32_t)kAOBlurModeCount) ? g_aoBlurMode : 0u;
-                    cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline[bmode]);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pAOBlurSetHalf : g_live.pAOBlurSet);
-                    cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
-                    cmdEndDebugMarker(g_live.pCmd);
-                    gpuPhaseEnd(kGpuPhaseAOBlur);
-                }
-                // (4) Half-res only: pAOBlurHalf UAV -> SRV, then the depth+normal-adaptive
-                // Lanczos-2 upscale writes the FULL pAOBlur — so everything downstream, colour
-                // frags included, sees exactly the resource it always did.
-                if (aoHalf) {
-                    TextureBarrier hb = {};
-                    hb.pTexture = g_live.pAOBlurHalf;
-                    hb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    hb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &hb, 0, nullptr);
-
-                    gpuPhaseBegin(kGpuPhaseAOUp);
-                    cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.3f, "AO LANCZOS UPSCALE (half -> pAOBlur)");
-                    cmdBindPipeline(g_live.pCmd, g_live.pAOUpPipeline);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOUpSet);
-                    cmdDispatch(g_live.pCmd, gx, gy, 1);
-                    cmdEndDebugMarker(g_live.pCmd);
-                    gpuPhaseEnd(kGpuPhaseAOUp);
-                    // All three half targets now rest in SHADER_RESOURCE, which is what the primed
-                    // latch promises the next half frame's SR->UAV flip.
-                    s_aoHalfPrimed = true;
-                }
-                // pAOBlur UAV -> SRV for the colour pass.
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pAOBlur;
-                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
-            }
-        }
-
-        // P1: screen-space shadow-mask dispatch. Needs pLinearDepth in SHADER_RESOURCE, which the
-        // AO block above guarantees (linearize always runs; only the GTAO dispatches are gated) —
-        // hence aoBlockRan rather than a hand-copied gate. Runs whenever shadowReady, even with
-        // ZERO active slots: the comp then writes an all-lit mask, keeping the UAV/SRV ping-pong
-        // and the colour frag's mode-10 read state-valid. Own nested timer (kGpuPhaseShadowMask):
-        // per-pixel cost scales with ACTIVE slots (PCF loads, x2 for dynBits slots).
-        if (g_live.shadowReady && aoBlockRan) {
-            gpuPhaseBegin(kGpuPhaseShadowMask);
-            if (!g_live.firstFrame) {
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pShadowMask;
-                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
-            }
-            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.2f, "SHADOW MASK (atlas -> per-pixel visibility)");
-            cmdBindPipeline(g_live.pCmd, g_live.pShadowMaskPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowMaskSet);
-            cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
-            cmdEndDebugMarker(g_live.pCmd);
-            {
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pShadowMask;
-                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
-            }
-            gpuPhaseEnd(kGpuPhaseShadowMask);
-        }
-
-        gpuPhaseEnd(kGpuPhasePostDepth);
+        const bool aoBlockRan = passLinearizeAndGtao(rzViewProj, gpuPhaseBegin, gpuPhaseEnd);
 
         // ===================== O1: intra-frame split-submit =====================
         // Everything recorded so far (cull → froxel → prepass → shadow → postdepth) goes to the
@@ -41712,101 +41881,7 @@ void destroyHostWindow(Renderer* R);
         const double tSubmit1 = hostNowMs();   // Tier 1: end of submit == start of the "post" phase
 
         // ===================== Hi-Z prologue: reduce mips 1..N (tail submit) =====================
-        // Frame N's mip 0 (filled in the MAIN cmd at the colour->water seam) -> full mip pyramid
-        // for frame N+1's occlusion cull. Recorded into its OWN cmd/fence and submitted WITHOUT a
-        // wait: the server signals the client off the main fence above, so the client-visible
-        // frame is not lengthened; same single queue means frame N+1's cmds (incl. the cull that
-        // samples pHiz) are GPU-ordered after this automatically (no semaphores). CPU cost of
-        // recording lands in g_lastPostMs. Gated on the mip-0 fill having been RECORDED this frame.
-        if (!(g_live.hizReady && g_hizPrologue && hizMip0Filled)) {
-            g_hizValid = false;   // no FRESH full pyramid this frame -> next frame's test passes through
-        }
-        if (g_live.hizReady && g_hizPrologue && hizMip0Filled) {
-            // Settle the PREVIOUS prologue first (no-op if never submitted). Still-incomplete
-            // here means it overran MW's whole inter-frame window — count it (expect ~never).
-            FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
-            getFenceStatus(R, g_live.pHizFence, &fs);
-            if (fs == FENCE_STATUS_INCOMPLETE) {
-                ++g_hizOverruns;
-            }
-            waitForFences(R, 1, &g_live.pHizFence);
-            // Last prologue's GPU time (its resolve is valid now the fence has signalled).
-            if (g_live.pHizQueryPool && g_live.gpuTickFreq > 0.0 && fs != FENCE_STATUS_NOTSUBMITTED) {
-                QueryData qd = {};
-                getQueryData(R, g_live.pHizQueryPool, 0, &qd);
-                if (qd.mEndTimestamp > qd.mBeginTimestamp) {
-                    g_lastHizGpuMs = ((double)(qd.mEndTimestamp - qd.mBeginTimestamp) / g_live.gpuTickFreq) * 1000.0;
-                }
-            }
-
-            resetCmdPool(R, g_live.pHizCmdPool);
-            beginCmd(g_live.pHizCmd);
-            if (g_live.pHizQueryPool) {
-                QueryDesc q = {};
-                q.mIndex = 0;
-                cmdBeginQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
-            }
-            cmdBeginDebugMarker(g_live.pHizCmd, 0.3f, 0.8f, 0.8f, "HI-Z PROLOGUE (reduce mips 1..N)");
-            // Mip 0 is already filled (main cmd, colour->water seam). Bracket pHiz SR -> UAV, then
-            // per mip a UAV barrier (current==new==UNORDERED_ACCESS lowers to a true D3D12 UAV
-            // barrier — same trick as the cull block's uavBarrier lambda) + the 2x2 MIN reduce.
-            // Set index m binds src mip m-1 / dst mip m. Back to SR at the end (cmd invariant).
-            {
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pHiz;
-                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
-            }
-            cmdBindPipeline(g_live.pHizCmd, g_live.pHizPipeline);
-            // Reduce over the FULL allocation (matches the alloc-covering mip-0 fill above) so the
-            // whole pyramid — including the far-cleared border — is conservatively valid at any
-            // render scale. hizMips was computed from the allocation size, so the loop bound fits.
-            uint32_t mw = g_live.allocWidth, mh = g_live.allocHeight;
-            for (uint32_t m = 1; m < g_live.hizMips; ++m) {
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pHiz;
-                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
-                mw = (mw > 1u) ? (mw >> 1) : 1u;
-                mh = (mh > 1u) ? (mh >> 1) : 1u;
-                cmdBindDescriptorSet(g_live.pHizCmd, m, g_live.pHizSet);
-                cmdDispatch(g_live.pHizCmd, (mw + 7u) / 8u, (mh + 7u) / 8u, 1);
-            }
-            {
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pHiz;
-                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
-            }
-            cmdEndDebugMarker(g_live.pHizCmd);
-            if (g_live.pHizQueryPool) {
-                QueryDesc q = {};
-                q.mIndex = 0;
-                cmdEndQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
-                cmdResolveQuery(g_live.pHizCmd, g_live.pHizQueryPool, 0, 1);
-            }
-            endCmd(g_live.pHizCmd);
-
-            QueueSubmitDesc hizSubmit = {};
-            hizSubmit.mCmdCount = 1;
-            hizSubmit.ppCmds = &g_live.pHizCmd;
-            hizSubmit.pSignalFence = g_live.pHizFence;
-            hizSubmit.mSubmitDone = true;
-            queueSubmit(g_live.pQueue, &hizSubmit);
-            // NO fence wait — return to the client now; the GPU builds the pyramid under MW's frame.
-
-            // Snapshot the pyramid's camera for next frame's occlusion test: the RAW rzViewProj
-            // bytes this frame drew with + its absolute eye (gFrameData.lodEye, floats 56..58 —
-            // same source the water/AO blocks read). Next frame's CullParams fill reprojects
-            // instance spheres with exactly this matrix.
-            std::memcpy(g_hizVP, rzViewProj, sizeof(g_hizVP));
-            const float* hizFcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-            g_hizEye[0] = hizFcbv[56]; g_hizEye[1] = hizFcbv[57]; g_hizEye[2] = hizFcbv[58];
-            g_hizValid = true;
-        }
+        passHiZPrologue(R, rzViewProj, hizMip0Filled, gpuPhaseBegin, gpuPhaseEnd);
 
         // --- M1: SNAPSHOT THIS FRAME'S CAMERA FOR NEXT FRAME'S REPROJECTION -----------------------
         // ⚠ UNCONDITIONAL, and deliberately NOT tucked inside the Hi-Z block above even though that
