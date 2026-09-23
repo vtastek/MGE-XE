@@ -32028,6 +32028,1679 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
+    // THE FRAME EPILOGUE: everything renderScene does after the last command is recorded.
+    //
+    // The camera snapshot for next frame's reprojection, then the heartbeat, the frame-accounting
+    // line, the bursty-phase detector, the cost model and the APL accumulators. 1,650 lines, and
+    // NOT ONE of them records a command, binds a pipeline or touches a render target — this block
+    // only reads what the frame produced and writes it to globals and the log.
+    //
+    // ⚠ IT CONTAINS NO gpuPhase BRACKET. kGpuPhaseFrame closes before the Hi-Z prologue, above the
+    // call to this function, so unlike every other promoted pass this one needs no timer parameters
+    // at all. That is also why it is the safest 1,650 lines in the function to move.
+    //
+    // ⚠ TEN PARAMETERS, AND DELIBERATELY NOT A `FrameStats` STRUCT. A struct is the tidier signature
+    // and it is the wrong change to make HERE: it would rename roughly a hundred references inside
+    // the body, which destroys the verbatim property that makes this move checkable at all (see
+    // verify_move.py). Isolate first, with the compiler verifying every name; tidy second, as a
+    // small visible change to a function that is already on its own. The same rule the plan states
+    // for behaviour — do not interleave a refactor with a cleanup — applies to cosmetics.
+    void frameEpilogue(uint32_t drawn, uint32_t skinnedDrawn, uint32_t multiMapDrawn,
+                       uint32_t skyDrawn, uint32_t alphaDrawn,
+                       double tEntry, double tSubmit1,
+                       const float* rzViewProj, const float* fpRzSaved, bool fpRzValid) {
+        // --- M1: SNAPSHOT THIS FRAME'S CAMERA FOR NEXT FRAME'S REPROJECTION -----------------------
+        // ⚠ UNCONDITIONAL, and deliberately NOT tucked inside the Hi-Z block above even though that
+        // block snapshots the very same matrix two lines earlier. The Hi-Z snapshot is gated on the
+        // pyramid having been built; if the motion vectors borrowed it they would silently reproject
+        // into a matrix from an arbitrary older frame the moment the pyramid was skipped, and the
+        // symptom — a field that is right most of the time — is the worst kind to debug.
+        //
+        // ⚠ RENDERED FRAMES, NOT PRODUCED ONES, which is why it is here rather than anywhere the
+        // client's frame counter is touched. Park mode and frame-ahead both re-render a parked
+        // payload at a new camera; "previous frame" has to mean the previous RASTER, or the
+        // reprojection targets an image that was never drawn. Same rule the jitter sequence follows.
+        //
+        // The matrix is stored exactly as rendered — its own half-pixel offset AND its own jitter —
+        // because the image it will be used to address was rasterised with both.
+        std::memcpy(g_prevViewProj, rzViewProj, sizeof(g_prevViewProj));
+        g_prevBakeEye[0] = (double)g_eyeAbsShadow[0];
+        g_prevBakeEye[1] = (double)g_eyeAbsShadow[1];
+        g_prevBakeEye[2] = (double)g_eyeAbsShadow[2];
+        g_prevViewProjValid = true;
+        // MB-1d: ...and the ARM camera, which is a SEPARATE matrix and a SEPARATE question. The FP
+        // pass renders with its own FOV/near/far, so reprojecting an arm vertex through the world
+        // matrix above would give it the world's parallax and none of its own.
+        //
+        // ⚠ CONDITIONAL, unlike the world snapshot, and STAMPED rather than flagged. The FP pass is
+        // simply absent in third person, in a menu, or with nothing in hand — so "there was an arm
+        // camera last frame" is not answerable by a bool that only ever goes true. Recording the
+        // frame number lets the consumer demand exactly g_renderFrame - 1, which is what makes
+        // g_prevBakeEye (stamped unconditionally, one line up, this frame) the matching origin. A
+        // stale arm camera paired with a fresh bake eye is the origin bug wearing a different hat.
+        if (fpRzValid) {
+            std::memcpy(g_fpPrevViewProj, fpRzSaved, sizeof(g_fpPrevViewProj));
+            g_fpPrevViewProjFrame = g_renderFrame;
+        }
+
+        g_live.firstFrame = false;
+        g_lastDrawn = drawn;
+        g_lastSkinnedDrawn = skinnedDrawn;
+        g_lastMultiMapDrawn = multiMapDrawn;
+        g_lastSkyDrawn = skyDrawn;
+        g_lastAlphaDrawn = alphaDrawn;
+
+        // Host-side heartbeat to mgeHost64.log (LOG::logline; LOGF goes to uncaptured stdout).
+        // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
+        // meshHigh = total slots ever populated (monotonic leak check). Lets us correlate the
+        // client's [hb] frame cost with what the Forge renderer is actually drawing.
+        // Post-fence + whole-frame totals (host-internal; the server also wall-times renderScene for
+        // the client's hostMs — these let us see WHERE that wall goes: setup+cull+record+gpu+post).
+        // Tier 1: "post" used to start where the fence wait ended; the wait is gone, so it starts at
+        // the submit. The host split now reads setup + cull + gpuWait(top-of-frame) + record + post,
+        // and gpuWait is the residual the overlap failed to hide rather than the GPU's frame time.
+        g_lastPostMs  = hostNowMs() - tSubmit1;
+        g_lastTotalMs = hostNowMs() - tEntry;
+        if ((g_renderFrame % 300u) == 0u) {
+            // MW's live lighting, as the host actually received it. The standalone viewer has no MW, so
+            // it synthesizes sun/ambient — these are the values to copy into its defaults so it lights
+            // the world the way the game does (else the viewer's contrast is its own invention).
+            {
+                const float* lf = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+                // S3a — THE RATIO, on the line that already carries the two colours it is made of,
+                // and made of exactly those lanes rather than of a second copy. These are POST-GAIN:
+                // the CAL gains were folded in at the decode site, so this is what the frame renders
+                // with and not what MW sent.
+                //
+                //   ratio   — sun:ambient as rendered. 4.70 in the logged daytime exterior.
+                //   target  — calSunAmbTarget(), DERIVED live off the ext-day pair and the armed
+                //             curve, at ndl = 1. knob is what the solve actually aims at; the two
+                //             disagreeing means the curve moved and the knob wants re-authoring.
+                //   at-ndl  — the ndl at which today's ratio is ALREADY correct. This is the free
+                //             parameter made VISIBLE instead of chosen: 0.38 says the frame is
+                //             mildly off for flat ground and badly off for a sun-facing surface.
+                //   solve   — what the button would do. Printed, never applied.
+                const CalRatio cr = calRatioMeasure(lf + 20, lf + 24);
+                char ratioTxt[24], ndlTxt[24], solveTxt[64];
+                if (cr.ratio >= 0.0) { std::snprintf(ratioTxt, sizeof(ratioTxt), "%.2f", cr.ratio); }
+                else                 { std::snprintf(ratioTxt, sizeof(ratioTxt), "n/a"); }
+                if (cr.atNdl >= 0.0) { std::snprintf(ndlTxt, sizeof(ndlTxt), "%.2f", cr.atNdl); }
+                else                 { std::snprintf(ndlTxt, sizeof(ndlTxt), "n/a"); }
+                if (cr.gSun > 0.0)   { std::snprintf(solveTxt, sizeof(solveTxt),
+                                                     "sun x%.2f amb x%.2f (sum held)", cr.gSun, cr.gAmb); }
+                else                 { std::snprintf(solveTxt, sizeof(solveTxt), "n/a"); }
+                // ⚠ `target=` STILL DOUBLES AS AN ASSERT, BUT ON A DIFFERENT QUESTION SINCE P2.
+                // While P1's anchor lived, it asserted that scaling the sky had not disturbed the
+                // sun:ambient calibration. Now it says which END OF THE BLEND the frame is on:
+                // calSunAmbTarget() states what MW's AUTHORED pair should be calibrated to (1.79 at
+                // the restored 80/128 rows), and the PHYSICAL pair's ratio is the atmosphere's —
+                // measured 6.06 at the reference configuration. So `ratio=` sitting far above
+                // `target=` at full blend is EXPECTED and is the tell that the physics is armed;
+                // `ratio=` landing on `target=` means the blend is at 0. The physical numbers
+                // themselves are on the [sky] line below, which is where P2 reports.
+                LOG::logline(">> [forge-hb][light] sunDir=(%.4f,%.4f,%.4f) sunCol=(%.4f,%.4f,%.4f) ambCol=(%.4f,%.4f,%.4f)"
+                             " eyeAbs=(%.0f,%.0f,%.0f)"
+                             " | ratio=%s target=%.2f(ndl=1) knob=%.2f | at-ndl=%s | solve: %s",
+                             lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
+                             lf[56], lf[57], lf[58],   // lodEye = ABSOLUTE world eye (viewer start pos)
+                             ratioTxt, calSunAmbTarget(), (double)g_calRatioTarget, ndlTxt, solveTxt);
+                // ─── P2 — THE PHYSICAL SKY, AND EVERY NUMBER HERE IS A FALSIFICATION TEST ────────
+                // Nothing on this line is tuned to; all of it is REPORTED, which is the only way the
+                // §0 measurements stay tests rather than targets:
+                //
+                //   q      — L_zenith / (E_total/pi), the albedo-free scale-invariant invariant §0
+                //            is built on. Real clear skies: 0.122 median, p25..p75 0.093..0.148. MW's
+                //            authored sky read 0.265, and the RETIRED closed form computed 0.100 at
+                //            the reference — outside the band on the other side. The medium should
+                //            land INSIDE it without being told to, which S2b's gate is what checks.
+                //            ⚠ A MOVED ZENITH IS THE FIX, NOT A REGRESSION. Landing inside the band
+                //            from 0.100 necessarily shifts the drawn zenith by ~15%; what may not
+                //            move is the LIGHT (ambScene, sunScene and their ratio), which are
+                //            integrals over the whole sphere that a zenith/horizon redistribution
+                //            barely touches. Anyone reading a moved zenith as a continuity failure
+                //            will "fix" the one number this phase exists to correct.
+                //   sun%   — E_sun_horizontal / E_total. Real clear skies ~0.80 (p25..p75 0.73..0.84).
+                //            ⚠⚠ THIS IS A PREDICTION EVERYWHERE SINCE S2, INCLUDING AT THE REFERENCE.
+                //            The retired model SOLVED its beam scale so 0.80 held there by
+                //            construction — the number was an identity restating an anchor. The
+                //            medium's beam is E_TOA x transmittance with no free scale, so it can
+                //            now miss at the reference too, and it should still FALL toward dusk.
+                //   sky/sun lx — the sky's horizontal illuminance and the sun's DIRECT-NORMAL
+                //            illuminance. The sun peaks near 109 klx with the sun overhead, against a
+                //            textbook sea-level maximum of ~110. A number far outside that says the
+                //            beam anchor or the transmittance is wrong, not the sky.
+                //   amb/sun — the physical pair in SCENE units, i.e. exactly what was blended into
+                //            gFrameData at the decode site, and their ratio, which is the honest
+                //            version of the `ratio=` above.
+                //   ramp   — the night ramp. It fades the SKY to black and hands the LIGHTING back
+                //            to MW at once, so a value between 0 and 1 is dawn/dusk, not a fault.
+                if (g_skyPhys.active) {
+                    const double ambL = (double)SceneCal::luma709(g_skyPhys.ambScene);
+                    const double sunL = (double)SceneCal::luma709(g_skyPhys.sunScene);
+                    //   elev / light — MW'S TWO SUNS, side by side. `elev` is the DISC, which is what
+                    //            the model is cooked at and what actually SETS; `light` is the
+                    //            sgSunlight direction that drives every lighting term, sits ~29
+                    //            degrees away from the disc, and BOUNCES back above the horizon at
+                    //            night instead of setting. Expect them to differ all day and to
+                    //            diverge completely after dusk, when `elev` goes negative and
+                    //            `light` does not. ⚠ Step MW's hour across dusk and watch `elev`
+                    //            reach 0: MW flips the disc when its own sunVis byte hits zero, so
+                    //            if that happens AT the horizon the crossing is continuous, and if
+                    //            MW holds sunVis up past it, `elev` STEPS in one frame and the sky
+                    //            snaps. That is the one thing about this port MGE's source cannot
+                    //            settle, so it is on the line instead of in a comment.
+                    //   elev is the UNCLAMPED disc elevation and goes NEGATIVE at dusk. There is no
+                    //            `cook=` companion any more and that absence IS a result: the closed
+                    //            form had to be clamped at 0 because it was undefined below the
+                    //            horizon, so the two numbers parted company at dusk. A medium takes
+                    //            a negative elevation as an ordinary configuration and computes
+                    //            twilight, so there is only one elevation left to print.
+                    //   ⚠ nits — S2's new row, and it is per CHANNEL for a reason. q and sun% are
+                    //            scale-free BY CONSTRUCTION: they would read exactly the same if the
+                    //            whole sky were ten times too bright, or the right brightness and
+                    //            the wrong colour. A zenith in cd/m2 is checkable against published
+                    //            sky measurements, and the phase's success criterion is chromatic.
+                    //   ⚠ fogTarget — the row this session added, and it is a COMPARISON, not a
+                    //            reading. `below` is the medium 10 deg under the horizon: what the
+                    //            WATER, the reflection hole fill and every downhill vista melt into
+                    //            now that skyhw.frag is opaque there. `land` is fogColNear, what
+                    //            everything ABOVE the horizon melts into below applyFog's 0.85
+                    //            saturation knee, i.e. almost the whole visible world. They are the
+                    //            same quantity for two surfaces standing side by side, so a large
+                    //            gap between them IS the "fog discrepancy" defect, on one line.
+                    //   ⚠ ev — Sunny 16, riding along free. A textbook clear noon is EV 15, nothing
+                    //            is tuned to it and nothing reads it. It is on the line because a
+                    //            number nobody targeted is the only kind that can falsify anything.
+                    //   stars / sun disc — P2b's two element lanes, each printed next to the thing
+                    //            it has to be judged against: the star radiance against the DRAWN
+                    //            zenith it must hide under by day, and the sun's L against the solid
+                    //            angle MW's sprite actually covers (which is NOT the sun's 6.8e-5 sr
+                    //            — the ratio is a finding about MW's art).
+                    // `aim` is the elevation change aimSunLightAtDisc actually applied to the LIGHT
+                    // this frame and `w` its handover weight, printed beside the two suns they are
+                    // computed from. At w=1 the light IS the disc, so `light + aim` should equal
+                    // `elev`; at w=0 the light is MW's bounce untouched, which is what night wants.
+                    LOG::logline(">> [forge-hb][sky] MEDIUM mie=%.2fx (cal x%.2f) alb=%.2f elev=%.2fdeg (light=%.2fdeg"
+                                 " aim=%+.2fdeg w=%.2f)"
+                                 " ramp=%.2f blend=%.2f nightAmb=%.2f alt=%.0fm"
+                                 " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80,"
+                                 " a PREDICTION since S2)"
+                                 " | sky=%.0flx sunNormal=%.0flx ev100=%.2f (clear noon: 15)"
+                                 " | nits zenith=(%.0f,%.0f,%.0f) horizon=(%.0f,%.0f,%.0f) cd/m2"
+                                 " | fogTarget below=(%.0f,%.0f,%.0f) land=(%.0f,%.0f,%.0f) cd/m2"
+                                 " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2"
+                                 " | mwRef amb=%.3f sun=%.3f nl=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " refDiv=(sun x%.2f amb x%.2f)"
+                                 " | zenith=%.5f stars=%.5f (%.1f%% of zenith)"
+                                 " cloud=%.5f (%.1fx zenith, albedo %.2f / q)"
+                                 " | sunDisc %s omega=%.3e sr (%.2fdeg, %.0fx solar) L=%.1f p=%.2f",
+                                 (double)g_skyPhys.turbidity, (double)g_atmosMieMul,
+                                 (double)g_skyPhys.albedo,
+                                 (double)g_skyPhys.elevDisc,
+                                 (double)g_skyPhys.elevLight,
+                                 (double)g_sunAimAppliedDeg, (double)g_sunAimWeight,
+                                 (double)g_skyPhys.nightRamp, (double)g_skyPhysBlend,
+                                 (double)nightAmbScaleNow(),
+                                 (double)(g_skyPhys.cameraRadiusM - Atmosphere::kGroundRadiusM),
+                                 g_skyPhys.qZenith, g_skyPhys.sunShare,
+                                 g_skyPhys.EskyLux, g_skyPhys.EsunLux, g_skyPhys.ev100,
+                                 (double)g_skyPhys.zenithNative[0] * 683.0,
+                                 (double)g_skyPhys.zenithNative[1] * 683.0,
+                                 (double)g_skyPhys.zenithNative[2] * 683.0,
+                                 (double)g_skyPhys.horizonNative[0] * 683.0,
+                                 (double)g_skyPhys.horizonNative[1] * 683.0,
+                                 (double)g_skyPhys.horizonNative[2] * 683.0,
+                                 (double)g_skyPhys.belowNative[0] * 683.0,
+                                 (double)g_skyPhys.belowNative[1] * 683.0,
+                                 (double)g_skyPhys.belowNative[2] * 683.0,
+                                 (double)g_fogNearScene[0] * SceneCal::kSceneUnitCd,
+                                 (double)g_fogNearScene[1] * SceneCal::kSceneUnitCd,
+                                 (double)g_fogNearScene[2] * SceneCal::kSceneUnitCd,
+                                 ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
+                                 SceneCal::kSceneUnitCd,
+                                 (double)g_mwAmbCodeRef, (double)g_mwSunCodeRef,
+                                 (double)(g_skyPhys.active
+                                     ? std::max(0.0f, std::sin(g_skyPhys.elevLight
+                                                               * (float)(SceneCal::kPi / 180.0)))
+                                     : kCalDayElevSin),
+                                 (double)mwRefLevel(), (double)(mwRefLevel() / calMwDayRef()),
+                                 (double)(g_calDayCentre * mwRefLevel() / calMwDayRef()),
+                                 // EVERYTHING DIVIDED OUT OF THE SETPOINT'S REFERENCE, as the ratio
+                                 // the wire lets us recover: MW's delivered light over the reference
+                                 // the servo aims by. TWO things now live in it — MGEgui's per-weather
+                                 // look table (Cloudy sun x1.60) and the per-weather DAY-ROW
+                                 // normalisation the client applies (renderprocess.cpp, sunColRef) —
+                                 // so it is no longer the ini dial alone and is named for what it is.
+                                 // Clear reads x1.00/x1.00 because both factors are the identity there.
+                                 // It stays on the line so the next person to read "cloudy is washed
+                                 // out" sees the divisor beside the setpoint rather than hunting an ini.
+                                 (g_mwSunCodeRef > 1.0e-6f) ? (double)(g_mwSunCode / g_mwSunCodeRef) : 0.0,
+                                 (g_mwAmbCodeRef > 1.0e-6f) ? (double)(g_mwAmbCode / g_mwAmbCodeRef) : 0.0,
+                                 g_skyPhys.zenithScene,
+                                 (double)g_skyPhys.starScene,
+                                 (g_skyPhys.zenithScene > 1.0e-9)
+                                     ? 100.0 * (double)g_skyPhys.starScene / g_skyPhys.zenithScene : 0.0,
+                                 (double)g_skyPhys.cloudScene, g_skyPhys.cloudOverZenith,
+                                 (double)g_skyCloudAlbedo,
+                                 g_skyPhys.sunDiscFound ? "ok" : "ABSENT",
+                                 (double)g_skyPhys.sunDiscOmega, (double)g_skyPhys.sunDiscHalfDeg,
+                                 (double)(g_skyPhys.sunDiscOmega / 6.80e-05f),
+                                 (double)SceneCal::luma709(g_skyPhys.sunDiscL),
+                                 (double)g_sunDiscExpand);
+                } else {
+                    // ⚠ THE MW REFERENCE HAS TO BE PRINTED HERE TOO, AND UNTIL NOW IT WAS NOT. The
+                    // exterior branch above reports `mwRef amb=.. sun=.. -> setpoint ..`, which is
+                    // the whole state of the setpoint rule; this branch reported nothing, so an
+                    // interior's authored light was latched every frame and never once shown. That
+                    // is exactly why "this interior looks nuclear" had no number attached to it for
+                    // as long as it did: the input to the rule was invisible from the outside, and a
+                    // calibration whose input you cannot read is not falsifiable.
+                    // Printed whatever g_calFollowMwInterior is set to, so the A/B has both arms.
+                    const float iref = mwRefLevelInterior();
+                    const float irat = iref / calMwDayRef();
+                    // B1: BOTH ARMS, ALWAYS. The floor-referred reference and the lamp-inclusive one
+                    // print side by side whatever `calInteriorLit` is set to, for the reason the
+                    // paragraph above gives about the exterior branch — a calibration whose input you
+                    // cannot read is not falsifiable, and this one has TWO inputs now. `pt` is the
+                    // lamps' own contribution in MW code space (mwRefLevelInteriorLit); `setpoint`
+                    // is what each arm would ask the servo for, AFTER g_calInteriorFloor — which is
+                    // the number to watch, because on both complaint saves the floor is what is
+                    // actually in force and the MW-referred value never reaches it.
+                    const float ilit = mwRefLevelInteriorLit();
+                    const float ilrat = ilit / calMwDayRef();
+                    LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting"
+                                 " | mwRef amb=%.3f sun=%.3f pt=%.3f n=%u"
+                                 " | FLOOR m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " | LIT m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " | armed=%s followMwInterior=%d",
+                                 g_skyHw ? "interior / no sun" : "master toggle",
+                                 (double)g_mwAmbCode, (double)g_mwSunCode, (double)g_mwPtCode,
+                                 g_lastLightCount,
+                                 (double)iref, (double)irat,
+                                 (double)std::max(g_calInteriorFloor, g_calDayCentre * irat),
+                                 (double)ilit, (double)ilrat,
+                                 (double)std::max(g_calInteriorFloor, g_calDayCentre * ilrat),
+                                 g_calInteriorLit ? "LIT" : "floor",
+                                 g_calFollowMwInterior ? 1 : 0);
+                }
+                // The medium MW's weather currently describes. Sits with the [sky] line because
+                // since S2 the two ARE the same object: the row below is what the LUTs above were
+                // built from, so a sky that looks wrong and a weather row that reads wrong are one
+                // diagnosis rather than two.
+                logAtmosphereRow("hb");
+            }
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
+                         "| refl sky=%u near=%u skin=%u mm=%u "
+                         "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
+                         g_renderFrame, drawn, skinnedDrawn, g_lastSkinAlphaDrawn, g_lastSkinAlphaPrepassDrawn,
+                         multiMapDrawn, skyDrawn, alphaDrawn,
+                         g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
+                         g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn, g_lastReflMMDrawn,
+                         g_recAccum / 300.0, g_gpuAccum / 300.0);
+            // H2 pool occupancy (external audit PR #2). The arenas grow by doubling to a HARD cap
+            // and then drop parts — i.e. objects go missing — so "how close are we" must be a
+            // standing number, not something reconstructed after a bug report. skipped= is SESSION
+            // CUMULATIVE and any non-zero value is a defect. frag= is free-region count: a high
+            // count against plenty of free bytes means the first-fit allocator is fragmenting and
+            // a grow can be refused while the arena looks empty.
+            {
+                // WHITE-TEXTURE TRIAGE. Slots a draw actually REFERENCED this window that are still
+                // the host's default white — geometry drawn untextured while nothing in either log
+                // complains. Slot 0 is the legitimate textureless case and is excluded; any other
+                // slot here means the client resolved a name to it and the DDS never became a
+                // texture (upload dropped, parse failed, or the batch never arrived). Reads the
+                // bitset packTexAlpha already maintains, so it costs one pass per 300 frames, and
+                // it must run BEFORE the clearing loop below. Pairs with the client's [tex-census]
+                // line, which is what maps the slot back to a texture NAME.
+                if (g_live.pDefaultWhite) {
+                    char list[220]; int n = 0; unsigned whites = 0;
+                    for (unsigned s = 1; s < (unsigned)MAX_TEXTURES; ++s) {
+                        if (!(g_texSeenBits[s >> 5] & (1u << (s & 31u)))) { continue; }
+                        if (g_live.pTextures[s] != g_live.pDefaultWhite) { continue; }
+                        ++whites;
+                        if (n < 200) {
+                            n += snprintf(list + n, sizeof(list) - (size_t)n, "%s%u", n ? "," : "", s);
+                        }
+                    }
+                    if (whites) {
+                        LOG::logline("!! [forge] %u referenced slot(s) still DEFAULT WHITE: %s",
+                                     whites, list);
+                    }
+                }
+                // NEAR-TEXTURE LEDGER + ITS ALARMS (tasks/forge-memory-shape.md). Read HERE, before the
+                // clearing loop below, because "sampled this window" is g_texSeenBits itself — every
+                // draw path, off-screen shadow casters included, marks it through packTexAlpha.
+                {
+                    constexpr uint32_t kHighRes = 4u << 20;   // 2048^2 BC3 with mips is 5.3 MB
+                    uint32_t nRes = 0, nResHi = 0, nHot = 0, nHotHi = 0;
+                    uint64_t bRes = 0, bHot = 0, bData = 0;
+                    for (unsigned s = 1; s < (unsigned)MAX_TEXTURES; ++s) {
+                        const uint32_t b = g_texSlotBytes[s];
+                        if (!b) { continue; }
+                        const bool hi  = b >= kHighRes;
+                        const bool hot = (g_texSeenBits[s >> 5] & (1u << (s & 31u))) != 0u;
+                        ++nRes; bRes += b; if (hi) { ++nResHi; }
+                        if (g_texIsData[s]) { bData += b; }
+                        if (hot) { ++nHot; bHot += b; if (hi) { ++nHotHi; } }
+                    }
+                    const double kMB = 1024.0 * 1024.0;
+                    LOG::logline(">> [forge-hb] mem near-tex: resident %u tex %.0f MB (high-res %u, _paramh %.0f MB)"
+                                 " | sampled this window %u tex %.0f MB (high-res %u) | unsampled %.0f MB"
+                                 " | flip arrays %.0f MB | evicted by client %llu this session",
+                                 nRes, (double)bRes / kMB, nResHi, (double)bData / kMB,
+                                 nHot, (double)bHot / kMB, nHotHi, (double)(bRes - bHot) / kMB,
+                                 (double)g_flipArrayBytes / kMB, (unsigned long long)g_texReleased);
+                    if (bRes != g_texResidentBytes) {
+                        LOG::logline("!! [mem] near-texture ledger DRIFT: running total %.0f MB, re-sum %.0f MB"
+                                     " — a writer of pTextures[] is not keeping g_texSlotBytes",
+                                     (double)g_texResidentBytes / kMB, (double)bRes / kMB);
+                    }
+                    if (nResHi > g_memHighResMax) {
+                        LOG::logline("!! [mem] near textures: %u HIGH-RES resident (envelope %u) — %u of them"
+                                     " unsampled this window; %.0f MB held that nothing is drawing",
+                                     nResHi, g_memHighResMax, nResHi - nHotHi, (double)(bRes - bHot) / kMB);
+                    }
+                    if (nHotHi > g_memHighResMax) {
+                        LOG::logline("!! [mem] near textures: %u high-res SAMPLED in one window (envelope %u) —"
+                                     " the working set itself is over, not just the residency",
+                                     nHotHi, g_memHighResMax);
+                    }
+                    if (bRes > (uint64_t)g_memNearTexMB << 20) {
+                        LOG::logline("!! [mem] near textures: %.0f MB resident (envelope %u MB, loose until"
+                                     " texel density is normalised)", (double)bRes / kMB, g_memNearTexMB);
+                    }
+                }
+                // Unique slots referenced since the LAST heartbeat, i.e. the working set over a
+                // 300-frame window — the number that is actually comparable to client residency
+                // (a per-frame count would undercount a set the player pans across). Cleared here,
+                // so each heartbeat reports its own window.
+                g_lastUniqueTex = 0;
+                for (unsigned w = 0; w < (unsigned)((MAX_TEXTURES + 31) / 32); ++w) {
+                    g_lastUniqueTex += (unsigned)__popcnt(g_texSeenBits[w]);
+                    g_texSeenBits[w] = 0;
+                }
+                const uint64_t vbUsed = g_arenaVB.total - g_arenaVB.freeBytes;
+                const uint64_t ibUsed = g_arenaIB.total - g_arenaIB.freeBytes;
+                LOG::logline(">> [forge-hb] pools: arenaVB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu)"
+                             " arenaIB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu) grows=%llu"
+                             " | meshBuf=%llu/%llu MB (peak %llu, refused %llu)"
+                             " | skipped=%llu parts (%llu KB VB / %llu KB IB) | uniqueTex/300f=%u",
+                             (unsigned long long)(vbUsed >> 20), (unsigned long long)(g_arenaVB.total >> 20),
+                             g_arenaVB.total ? 100.0 * (double)vbUsed / (double)g_arenaVB.total : 0.0,
+                             (unsigned long long)(kArenaVBMaxBytes >> 20), g_arenaVB.regions.size(),
+                             (unsigned long long)(ibUsed >> 20), (unsigned long long)(g_arenaIB.total >> 20),
+                             g_arenaIB.total ? 100.0 * (double)ibUsed / (double)g_arenaIB.total : 0.0,
+                             (unsigned long long)(kArenaIBMaxBytes >> 20), g_arenaIB.regions.size(),
+                             (unsigned long long)g_arenaGrowCount,
+                             // meshBuf= — what the NON-arena parts (skinned, multimap, morph rings,
+                             // i.e. every actor) hold in D3D12 buffers, against the hard cap that
+                             // keeps a refused allocation from AVing the host (kMeshBufMaxBytes).
+                             // `refused` is the number that matters: any non-zero means parts are
+                             // being dropped to stay alive, and the cap or the churn wants looking
+                             // at. In normal play this sits in single-digit MB.
+                             (unsigned long long)(g_meshBufBytes >> 20),
+                             (unsigned long long)(kMeshBufMaxBytes >> 20),
+                             (unsigned long long)(g_meshBufPeak >> 20),
+                             (unsigned long long)g_meshBufRefusals,
+                             (unsigned long long)g_skippedPartsTotal,
+                             (unsigned long long)(g_skippedVBTotal >> 10),
+                             (unsigned long long)(g_skippedIBTotal >> 10),
+                             g_lastUniqueTex);
+                // VRAM budget + EcoQoS, the two regime probes (see forgeVramAdapter above).
+                // Read `local` against its BUDGET, not against the card total: the budget is what
+                // the driver is currently willing to give US, it moves when another app takes
+                // memory, and crossing it — not filling the card — is what starts paging.
+                // `OVER` is therefore the whole point of the line; the percentage is context.
+                // nonlocal = system memory the GPU reaches over PCIe, which is where evicted
+                // resources LAND, so a rising nonlocal usage is the paging itself, in progress.
+                {
+                    // One mark per heartbeat, so the FIRST one closes the accounting: everything
+                    // between the end of buildOpaquePath and a live frame (terrain upload, distant
+                    // land, the bindless texture array, per-frame ring buffers) lands in this one
+                    // delta. If that residual is the biggest number in the list, the phase marks
+                    // above are in the wrong place and the next ones go here.
+                    static bool s_firstHb = true;
+                    if (s_firstHb) { vramMark(g_live.pRenderer, "FIRST FRAME (residual)"); s_firstHb = false; }
+                    const int eco = forgeEcoQoSState();
+                    if (IDXGIAdapter3* ad = forgeVramAdapter(g_live.pRenderer)) {
+                        DXGI_QUERY_VIDEO_MEMORY_INFO loc = {}, non = {};
+                        const bool okL = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,     &loc));
+                        const bool okN = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non));
+                        if (okL || okN) {
+                            char ecobuf[32];
+                            if (eco == 1)      { std::snprintf(ecobuf, sizeof(ecobuf), "THROTTLED"); }
+                            else if (eco == 0) { std::snprintf(ecobuf, sizeof(ecobuf), "off"); }
+                            else if (eco == -1){ std::snprintf(ecobuf, sizeof(ecobuf), "?(noexport)"); }
+                            else               { std::snprintf(ecobuf, sizeof(ecobuf), "?(err=%d)", -eco); }
+                            // streamTex/streamGeo are SUMS of per-call bracketed deltas, so they
+                            // are directly comparable to `local` and to each other. What they will
+                            // NOT do is add up to `local` — the difference is init (render targets,
+                            // LUTs, atlases) plus driver overhead, and that gap is the point: if
+                            // streamTex keeps climbing while residency sits at 872/872, a recycled
+                            // slot is not returning its texture's memory.
+                            LOG::logline(">> [forge-hb] vram-stream: textures=%+.0f MB geometry=%+.0f MB"
+                                         " (summed per-call, bracketed)",
+                                         (double)g_vramTexBytes / (1024.0 * 1024.0),
+                                         (double)g_vramGeoBytes / (1024.0 * 1024.0));
+                            // The lifetime ledger. Read LIVE (created - destroyed) per bucket:
+                            //   static live climbing        -> unique geometry accumulating
+                            //   DYN live climbing           -> particles/movers are NOT being
+                            //       released; "unique per upload" must still be BOUNDED
+                            //   all live flat, vram-stream high -> our lifetimes are right and the
+                            //       allocator is retaining freed heaps (a pooling fix, not a leak)
+                            {
+                                const double kMB = 1024.0 * 1024.0;
+                                auto liveMB = [&](const GeoLedger& g) {
+                                    return ((double)g.createdBytes - (double)g.destroyedBytes) / kMB;
+                                };
+                                LOG::logline(">> [forge-hb] geo-ledger: static live=%.0f MB (%llu/%llu) |"
+                                             " dyn live=%.0f MB (%llu/%llu) | arena live=%.0f MB (%llu/%llu)"
+                                             " | meshBuf gauge=%llu MB",
+                                             liveMB(g_geoStatic),
+                                             (unsigned long long)g_geoStatic.creates,
+                                             (unsigned long long)g_geoStatic.destroys,
+                                             liveMB(g_geoDyn),
+                                             (unsigned long long)g_geoDyn.creates,
+                                             (unsigned long long)g_geoDyn.destroys,
+                                             liveMB(g_geoArena),
+                                             (unsigned long long)g_geoArena.creates,
+                                             (unsigned long long)g_geoArena.destroys,
+                                             (unsigned long long)(g_meshBufBytes >> 20));
+                            }
+                            LOG::logline(">> [forge-hb] vram: local=%llu/%llu MB (%.0f%%%s)"
+                                         " nonlocal=%llu/%llu MB (%.0f%%%s) | resv=%llu MB"
+                                         " | ecoqos=%s prio=0x%lx",
+                                         (unsigned long long)(loc.CurrentUsage >> 20),
+                                         (unsigned long long)(loc.Budget >> 20),
+                                         loc.Budget ? 100.0 * (double)loc.CurrentUsage / (double)loc.Budget : 0.0,
+                                         (loc.Budget && loc.CurrentUsage > loc.Budget) ? " OVER" : "",
+                                         (unsigned long long)(non.CurrentUsage >> 20),
+                                         (unsigned long long)(non.Budget >> 20),
+                                         non.Budget ? 100.0 * (double)non.CurrentUsage / (double)non.Budget : 0.0,
+                                         (non.Budget && non.CurrentUsage > non.Budget) ? " OVER" : "",
+                                         (unsigned long long)(loc.CurrentReservation >> 20),
+                                         ecobuf,
+                                         (unsigned long)GetPriorityClass(GetCurrentProcess()));
+                            // BUDGET + UNATTRIBUTED-GROWTH ALARMS (tasks/forge-memory-shape.md).
+                            if (okL) {
+                                const uint64_t useMB = loc.CurrentUsage >> 20, budMB = loc.Budget >> 20;
+                                const double   pct   = loc.Budget ? 100.0 * (double)loc.CurrentUsage
+                                                                  / (double)loc.Budget : 0.0;
+                                // A budget DROP is an event, and it was THE event: at the collapse our
+                                // usage sat at 5318 MB on both sides while the budget went 5116 -> 4893.
+                                // 64 MB of hysteresis, because the budget jitters by tens of MB.
+                                static uint64_t s_prevBudMB = 0;
+                                if (s_prevBudMB != 0 && budMB + 64u < s_prevBudMB) {
+                                    LOG::logline("!! [mem] DXGI budget DROPPED %llu -> %llu MB with our usage at %llu MB"
+                                                 " (now %.0f%%) — another process took VRAM; over budget the"
+                                                 " driver pages, and which of our resources it pages is its choice",
+                                                 (unsigned long long)s_prevBudMB, (unsigned long long)budMB,
+                                                 (unsigned long long)useMB, pct);
+                                }
+                                s_prevBudMB = budMB;
+                                if (pct >= (double)g_memBudgetWarnPct) {
+                                    LOG::logline("!! [mem] VRAM at %.0f%% of the DXGI budget (%llu/%llu MB)%s",
+                                                 pct, (unsigned long long)useMB, (unsigned long long)budMB,
+                                                 pct > 100.0 ? " — OVER: the driver is paging; expect one pass to"
+                                                               " collapse (sun shadow did, 1.3 -> 46 ms)"
+                                                             : " — headroom is below the alarm line");
+                                }
+                                // Everything NOT in a streamed ledger: render targets, terrain, DL,
+                                // atlases, LUTs — and allocator slack from freed resources, which is real
+                                // VRAM too. It should settle once the first exterior is resident and then
+                                // hold. Baseline = the max over the first three heartbeats after terrain
+                                // is ready, so DL and terrain landing a heartbeat apart cannot trip it.
+                                const uint64_t streamedB = g_texResidentBytes + g_flipArrayBytes
+                                                         + g_arenaVB.total + g_arenaIB.total + g_meshBufBytes;
+                                const int64_t  otherMB   = (int64_t)useMB - (int64_t)(streamedB >> 20);
+                                static int     s_settle  = 0;
+                                static int64_t s_otherBase = 0;
+                                if (g_terrainReady && s_settle < 3) {
+                                    s_otherBase = (s_settle == 0) ? otherMB : std::max(s_otherBase, otherMB);
+                                    ++s_settle;
+                                }
+                                LOG::logline(">> [forge-hb] mem other: %lld MB = local %llu - streamed %llu"
+                                             " (near tex %llu + flip %llu + arenas %llu + meshBuf %llu)"
+                                             " | baseline %s%lld MB",
+                                             (long long)otherMB, (unsigned long long)useMB,
+                                             (unsigned long long)(streamedB >> 20),
+                                             (unsigned long long)(g_texResidentBytes >> 20),
+                                             (unsigned long long)(g_flipArrayBytes >> 20),
+                                             (unsigned long long)((g_arenaVB.total + g_arenaIB.total) >> 20),
+                                             (unsigned long long)(g_meshBufBytes >> 20),
+                                             s_settle < 3 ? "(settling) " : "", (long long)s_otherBase);
+                                if (s_settle >= 3 && otherMB > s_otherBase + (int64_t)g_memOtherDriftMB) {
+                                    LOG::logline("!! [mem] unattributed VRAM GREW %lld MB past its baseline (%lld -> %lld MB,"
+                                                 " envelope +%u) — not textures, not flip books, not geometry"
+                                                 " arenas: something unmetered is accumulating",
+                                                 (long long)(otherMB - s_otherBase), (long long)s_otherBase,
+                                                 (long long)otherMB, g_memOtherDriftMB);
+                                }
+                            }
+                        }
+                    } else {
+                        LOG::logline(">> [forge-hb] vram: (adapter probe unavailable)"
+                                     " | ecoqos=%s prio=0x%lx",
+                                     eco < 0 ? "?" : (eco ? "THROTTLED" : "off"),
+                                     (unsigned long)GetPriorityClass(GetCurrentProcess()));
+                    }
+                }
+            }
+            // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
+            // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
+            // loads) + wait + record + post + other = the host's CPU frame. cull is the prime
+            // pre-record suspect.
+            //
+            // ⚠ `gpu=` IS NOT A TERM OF THAT SUM AND THE LINE NOW SAYS SO BY ITS SHAPE. It is the
+            // RESOLVED whole-frame GPU execution (kGpuPhaseFrame, one frame late) rather than this
+            // frame's submit->fence wall — deliberately, so it stays comparable across the change
+            // and cannot read ~0 just because the block moved. But it is the GPU's elapsed time, not
+            // time the host CPU spends, so listing it inline among the additive terms made the line
+            // read as a sum with `total=0.88` next to `gpu=5.38`. The CPU terms are bracketed
+            // together behind `cpu=` and the GPU sits outside them. `other` is the residual —
+            // tEntry..return minus the five bracketed spans, mostly settleFrameFence's readbacks and
+            // the submit — and it exists so the identity is CHECKABLE rather than approximately true.
+            // (The old name `total=` is now `cpu=`; nothing machine-parses it, and it was the word
+            // doing the lying.)
+            const double hbCpuNamed = g_lastSetupMs + g_lastCullMs + g_lastGpuWaitMs
+                                    + g_lastRecMs + g_lastPostMs;
+            const double hbCpuOther = (g_lastTotalMs > hbCpuNamed) ? (g_lastTotalMs - hbCpuNamed) : 0.0;
+            LOG::logline(">> [forge-hb] host split: cpu=%.2fms (setup=%.2f cull=%.2f wait=%.2f record=%.2f post=%.2f other=%.2f) | gpu=%.2f gpuOverlap=%.2f"
+                         " | cull examined=%u survivors=%u (%.3f us/1k examined) | gpuCull=%u %s hizOccl=%u",
+                         g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastGpuWaitMs, g_lastRecMs,
+                         g_lastPostMs, hbCpuOther, g_lastGpuMs, g_lastGpuOverlapMs,
+                         g_lastCullExamined, g_liveLastInst,
+                         g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
+                         g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
+                         g_lastGpuOccluded);
+            // M1 jitter, ONLY when armed (tasks/forge-upscale.md). Its own line rather than a field
+            // on the one above, so the fixed-format split stays fixed-format and so the line's mere
+            // PRESENCE says the lane is live. "Is the jitter actually moving" is otherwise
+            // unanswerable from a minimized run: a sub-pixel offset is invisible in every number the
+            // heartbeat already prints, and a jitter stuck on one phase looks exactly like a
+            // working one in the log while reconstructing nothing.
+            // M1 motion vectors, ONLY when the pass is live. Same reasoning as the jitter line
+            // below: presence says the lane ran, and "the field looks wrong" and "the dispatch never
+            // happened" are otherwise the same picture from a minimized run. `valid` is what the
+            // shader gates on — it is 0 for exactly one frame after a start or a discontinuity, and
+            // a `valid=0` that persists means the end-of-frame snapshot is not being reached.
+            // ⚠ SILENCE IS NOT A READING. When the pass is off this block used to print NOTHING, so
+            // a session spent standing still and spinning on the spot to test it produced an empty
+            // log and neither side could tell whether the vectors were fine or the lane had simply
+            // never run. That happened: a redeploy restarts the host, which resets g_debugMode to 0,
+            // and reaching mode 17 again costs seventeen F12 presses. Say it once per run instead —
+            // an instrument that is absent exactly when someone is trying to use it is the same
+            // defect as one that samples the wrong frame, wearing different clothes.
+            // ⚠ GATED ON WHETHER THE PASS **RAN**, NOT ON THE KNOB. `g_mvEnable` is only one of
+            // four things that can arm this pass — a temporal upscaler, F12 modes 17/18 and now
+            // MB-2 all force it on — so a gate naming the knob goes silent for three of them. That
+            // is not hypothetical: MB-2 arming the producer made the pass run in the default
+            // configuration while this block, keyed on the knob, printed the OFF notice instead.
+            // The line reports `ran=`, so `ran` is what it should be gated on.
+            if (!g_lastMvRan && !g_mvEnable && g_debugMode != 17u && g_debugMode != 18u) {
+                static bool s_mvOffOnce = false;
+                if (!s_mvOffOnce) {
+                    s_mvOffOnce = true;
+                    LOG::logline(">> [forge-hb] mv: OFF (ready=%d) — no vectors, no field stats. Arm it "
+                                 "with the 'Motion vectors' checkbox on the dev panel's Resolve tab, "
+                                 "or MGE_HOST_KNOBS=mvEnable=1. F12 mode 17 also forces it on, but "
+                                 "that is 17 presses from a fresh host and the NUMBERS are what "
+                                 "settle a still-vs-spin test — the picture is only the intuition.",
+                                 g_live.mvReady ? 1 : 0);
+                    LOG::flush();
+                }
+            }
+            // ─── MB-2 STATISTICS: OUTSIDE THE `mv:` BLOCK, AND THAT IS THE POINT ────────────
+            // ⚠⚠ THESE LIVED INSIDE THE MOTION-VECTOR HEARTBEAT FOR ONE BUILD, WHICH GATED THEM ON
+            // `g_mvEnable` — a knob MB-2 does not use and does not need. The moment MB-2 started
+            // arming the producer for itself, the pass ran by default and its own statistics went
+            // SILENT by default, so the run that was meant to confirm the fix printed nothing at
+            // all. Statistics belong to the PASS, never to a switch that happens to enclose it —
+            // the same correction `mvfieldstats` already made when it was gated on `objVelEnable`
+            // ([[feedback_isolation_lever_killed_its_own_subject]]), made twice in one file.
+            // ─── MB-2: WHAT THE GATHER ACTUALLY DID ─────────────────────────────────────────
+            // ⚠ `blurred%` IS THE VELOCITY FLOOR'S ACCEPTANCE TEST, and it is here rather than
+            // left to the eye for the reason MB-2 step 0 has just finished paying for: a claim
+            // that is read instead of measured survives for weeks. Parked on static geometry it
+            // must read **0.000%** — every pixel below the floor is copied verbatim, so a still
+            // frame is bit-identical to `mbEnable=0`. Anything else IS the smear, as a number.
+            //
+            // It is also the only thing that explains `mb=` on the gpu split. The gather's cost
+            // is (blurred pixels) x (their taps), so a millisecond that moved is one of those two
+            // moving, and avgTaps says which: more of the screen in motion, or the same motion
+            // gone faster. maxLen is the longest streak in delivered px — if it sits pinned at K
+            // the clamp is binding and the streaks are being cut short.
+            if (g_lastMbRan && g_live.pMbStatsReadback
+                && g_live.pMbStatsReadback->pCpuMappedAddress && g_lastMbPixels > 0u) {
+                const uint32_t* ms = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
+                float mlen = 0.0f;
+                std::memcpy(&mlen, &ms[2], sizeof(float));
+                // ⚠⚠ TWO PERCENTAGES, AND THEIR **RATIO** IS THE TILING TEST. `searched` is what the
+                // pass COSTS (pixels that ran the gather, i.e. whose tile carries motion); `changed`
+                // is what it DOES (pixels where at least one tap actually agreed). Before the
+                // velocity-agreement weights those were the same number BY CONSTRUCTION — every
+                // searched pixel was blurred — and that identity IS the rectangular-tile artifact,
+                // expressed as a number. With the weights, a mover in a still scene shows `searched`
+                // covering its tiles while `changed` collapses onto the mover itself.
+                // **searched ~= changed means the tiling is back.**
+                LOG::logline(">> [forge-hb] mb: searched=%.3f%% changed=%.3f%% of %llu px"
+                             " avgTaps=%.1f maxLen=%.2f px (K=%u x reach=%u = %u px cap,"
+                             " exposure=%.1fms @dt=%.1fms x%.2f floor=%.2fpx)"
+                             "  [both MUST be 0.000%% on a parked camera; searched ~= changed is the"
+                             " TILE artifact — the agreement weights are what separate them; maxLen"
+                             " pinned at the cap means the clamp is cutting streaks short, and since"
+                             " MB-2l the fix is mbTileReach, NOT a coarser K;"
+                             " maxLen/avgTaps is the TAP SPACING and beads mean raise mbMaxTaps]",
+                             100.0 * (double)ms[0] / (double)g_lastMbPixels,
+                             100.0 * (double)ms[3] / (double)g_lastMbPixels,
+                             (unsigned long long)g_lastMbPixels,
+                             ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
+                             (double)mlen, g_lastMbK, g_lastMbReach,
+                             g_lastMbK * g_lastMbReach,
+                             // The exposure in ms, the frame interval it is divided by, and the
+                             // resulting multiplier on the per-frame vector. ⚠ THE MULTIPLIER IS THE
+                             // NUMBER THAT ANSWERS "is it framerate independent": it must RISE as
+                             // dt falls, holding exposure fixed. A build where it sat at a constant
+                             // (0.50 for a 180 degree shutter) is the one that read "too subtle".
+                             (double)((std::max(0.0f, g_mbShutter) / 360.0f)
+                                      * (1000.0f / std::max(1.0f, g_mbShutterFps))),
+                             g_frameDtMs,
+                             (g_frameDtMs > 0.0)
+                                 ? (double)((std::max(0.0f, g_mbShutter) / 360.0f)
+                                            * (1000.0f / std::max(1.0f, g_mbShutterFps))) / g_frameDtMs
+                                 : 0.0,
+                             (double)g_mbMinPx);
+                // ⚠⚠ AND THE BUSIEST FRAME, WHICH IS THE ONE THAT EXPLAINS `mb=`. The line above
+                // is a SAMPLE and the pass's load is BURSTY — a camera is parked far more often
+                // than it is turning — so the sampled frame is usually a parked one while the
+                // millisecond on the gpu split came from a moving one. Measured: eight sampled
+                // heartbeats caught ONE moving frame (0.684%) across a window where `mb=` ranged
+                // 0.22 to 2.09 ms. Same defect as MB-2 step 0's parked lane, one level down.
+                //
+                // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
+                //
+                // MB-2m: `held=` is the frozen-FIELD count — frames where the sim clock was frozen
+                // (a menu) and the pass ran against the velocity the last advancing frame left in
+                // pMbVelocity. A long-open menu shows held climbing IN STEP with ran, which is the
+                // shape to check it by; held climbing while ran stands still would mean the old
+                // output hold had come back.
+                LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
+                             " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
+                             " | held=%u (sim frozen — menu, blurring by the HELD field)"
+                             " | arms: recon=%d bg=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
+                             " K=%u reach=%u cap=%u px dbg=%u"
+                             "  [this is the frame `mb=` is priced by — cost is (searched px) x"
+                             " (their taps); the sampled line above is usually a PARKED frame]",
+                             g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
+                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames,
+                             g_mbRecon ? 1 : 0, (int)std::min(g_mbBgMode, 2u), g_mbTwoDir ? 1 : 0,
+                             g_mbObjectOnly ? 1 : 0,
+                             (double)g_mbTileJitter, (double)g_mbSoftZ,
+                             g_lastMbK, g_lastMbReach, g_lastMbK * g_lastMbReach, g_mbDebug);
+                g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
+                g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0;
+            }
+            if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
+                LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
+                             "dBake=(%+.3f, %+.3f, %+.3f) rect=%ux%u out=%ux%u",
+                             g_lastMvRan ? 1 : 0, g_live.mvReady ? 1 : 0,
+                             g_prevViewProjValid ? 1 : 0,
+                             (double)g_eyeAbsShadow[0], (double)g_eyeAbsShadow[1], (double)g_eyeAbsShadow[2],
+                             g_lastMvDelta[0], g_lastMvDelta[1], g_lastMvDelta[2],
+                             g_live.width, g_live.height, g_live.outWidth, g_live.outHeight);
+                // ⚠ THE SAMPLE **AND** THE POPULATION. `parked=` is this frame; `parkedFrames=` is
+                // every frame since the last heartbeat. Only the second can say whether the parked
+                // short circuit is reachable at all in this engine — see the counter's declaration.
+                LOG::logline(">> [forge-hb] mv camera: parked(bit-identical)=%d worstMatrixDelta=%.9g"
+                             " parkedFrames=%u/%u since last hb"
+                             "  [parked=1 => any non-zero vector is round-off and IS an error;"
+                             " parked=0 => the camera moved and a small vector is the right answer;"
+                             " parkedFrames=0/N => the bit-identity branch never fires here]",
+                             g_mvCamParked ? 1 : 0, (double)g_mvCamDelta,
+                             g_mvParkedFrames, g_mvRanFrames);
+                g_mvParkedFrames = 0;
+                g_mvRanFrames    = 0;
+                // MB-1, THE RIGID LANE. `drawn` covers doors, activators, thrown clutter and rigid
+                // animated parts. `skipPair` should be small and nonzero (anything re-entering the
+                // frame after a cull spends one frame there); a LARGE skipPair with a small drawn
+                // means the pairing key is rejecting real movers, which is what a slot-churn or an
+                // ordering bug looks like from here. `skipKind` is skinned/multimap parts seen in
+                // items[] and reads ~0 by construction — skinned parts arrive in their own blob, so
+                // it never said anything about actors; the skinned line below is where they live.
+                // ⚠ `mm=` IS THE GLOW-MAPPED-WEAPON FIX, AS A NUMBER. Multimap parts were skipped
+                // by this lane for two builds — the symptom was an enchanted weapon staying sharp
+                // while the plain one in the other hand blurred — and "drawn went up" is not
+                // evidence they are the parts now being drawn, because a door would raise it too.
+                // mm=0 with something glowing in frame means the MM pipelines did not build and the
+                // old skip is still firing; `kind=` should fall by roughly the amount mm= rises.
+                LOG::logline(">> [forge-hb] objvel: on=%d ready=%d examined=%u drawn=%u/%u (mm=%u)"
+                             " still=%u(%s) skinnedInFrame=%u skip(static=%u pair=%u kind=%u cap=%u)"
+                             " gpu=%.3f ms",
+                             g_objVelEnable ? 1 : 0, g_live.objVelReady ? 1 : 0,
+                             g_objVelExamined, g_objVelDrawn, kObjVelBatch, g_objVelDrawnMM,
+                             g_objVelStill,
+                             (g_objVelSkipStill && !g_objVelAllItems) ? "skipped" : "DRAWN",
+                             g_objVelSkinnedInFrame,
+                             g_objVelSkipStatic, g_objVelSkipPair, g_objVelSkipKind,
+                             g_objVelSkipCap, g_lastGpuPhaseMs[kGpuPhaseObjVel]);
+                // MB-1b, THE SKINNED LANE — and `drawn/inFrame` IS the deliverable, as a number:
+                // the seven skinned draws of the Caius test scene, the NPC's torso among them, are
+                // exactly what MB-1a structurally could not reach. Anything short of parity is
+                // itemised by the skip counters rather than left to inference:
+                //   pair  — small and nonzero is healthy (one frame per part entering the scene); a
+                //           LARGE pair against a small drawn is slot churn defeating the key, which
+                //           is the failure that tears a limb rather than dimming one.
+                //   bones — the ONE 64 KB bone window filled. Nonzero means add a second window; it
+                //           is never a wrap, and `bonesUsed` says how close the frame ran.
+                //   blend — ghosts and mane cards, deliberately not drawn (see the record loop).
+                LOG::logline(">> [forge-hb] objvel skinned: on=%d ready=%d drawn=%u/%u (cap %u)"
+                             " still=%u bonesUsed=%u/%u"
+                             " skip(pair=%u bones=%u blend=%u kind=%u cap=%u)"
+                             " maxBoneDelta=%.2f u (window peak %.2f u)%s",
+                             g_objVelSkinnedLane ? 1 : 0, g_live.objVelSkinReady ? 1 : 0,
+                             g_objVelSkinDrawn, g_objVelSkinnedInFrame, kObjVelSkinned,
+                             g_objVelSkinStill, g_objVelSkinBonesUsed, kObjVelBones,
+                             g_objVelSkinSkipPair, g_objVelSkinSkipBones, g_objVelSkinSkipBlend,
+                             g_objVelSkinSkipKind, g_objVelSkinSkipCap,
+                             (double)g_objVelSkinMaxBoneDelta,
+                             (double)g_objVelSkinMaxBoneDeltaPeak,
+                             g_objVelSkinIgnoreGen ? "  [!! objVelSkinIgnoreGen=1 — GENERATION CLAUSE"
+                                                     " DISABLED, this is the TEAR arm, never ship]" : "");
+                // ⚠ THE PEAK, ATTRIBUTED. |dBake| on the peak frame is the discriminator: a large
+                // delta at |dBake| ~ 0 is real animation (nothing moved the origin, so the bones
+                // moved); the same delta at a large |dBake| means the origin restamped and the
+                // -dBake rebase did not cancel it, which is a defect in this pass and not in the
+                // actor. Reported together because either number alone is unactionable.
+                LOG::logline(">> [forge-hb] objvel skinned peak: %.2f u on slot %u (%u bones) at"
+                             " |dBake|=%.3f u  [large delta at |dBake|~0 = real animation;"
+                             " large delta WITH a large |dBake| = the rebase failed to cancel]",
+                             (double)g_objVelSkinMaxBoneDeltaPeak, g_objVelSkinPeakSlot,
+                             g_objVelSkinPeakBones, (double)g_objVelSkinPeakDBake);
+                // ⚠ MB-1d, AND `rigid=N/M` IS THE NUMBER THE LANE'S ABSENCE SHOWS UP IN. Zero with
+                // arms on screen means the walk is not reaching them — which is the reading MB-1c's
+                // `mm=0` cost a whole build to learn to ask for, and it is the ONLY reading that
+                // distinguishes "the arms have no velocity" from "the arms' velocity is wrong".
+                // `why=` names the gate when the lane did not run at all, because "rigid=0" and
+                // "never entered" are otherwise the same line and need opposite fixes.
+                if (g_objVelFPRan || g_objVelFPInFrame || g_objVelFPSkinInFrame
+                    || g_objVelFPMMInFrame || g_debugMode == 17u || g_debugMode == 18u) {
+                    static const char* kWhyFP[7] = {
+                        "ran", "lane knob OFF", "not ready", "camera MV pass did not run",
+                        "no previous ARM camera (first FP frame / arms absent last frame)",
+                        "nothing paired", "no FP pass this frame" };
+                    // `mm=N/M` is FP1e's own denominator, and it is the same reading `rigid=N/M`
+                    // is: 0 with a glow-mapped weapon in hand means the MM walk is not reaching it.
+                    LOG::logline(">> [forge-hb] objvel fp: on=%d ready=%d ran=%d why=%s |"
+                                 " rigid=%u/%u skinned=%u/%u mm=%u/%u still=%u/%u/%u bonesUsed=%u/%u |"
+                                 " skip rigid(pair=%u kind=%u cap=%u)"
+                                 " skinned(pair=%u kind=%u blend=%u bones=%u cap=%u)"
+                                 " mm(pair=%u kind=%u)"
+                                 " gpu=%.3f ms",
+                                 g_objVelFPLane ? 1 : 0, g_live.objVelFPReady ? 1 : 0,
+                                 g_objVelFPRan ? 1 : 0,
+                                 kWhyFP[g_objVelFPWhyNot < 7u ? g_objVelFPWhyNot : 0u],
+                                 g_objVelFPDrawn, g_objVelFPInFrame,
+                                 g_objVelFPSkinDrawn, g_objVelFPSkinInFrame,
+                                 g_objVelFPMMDrawn, g_objVelFPMMInFrame,
+                                 g_objVelFPStill, g_objVelFPSkinStill, g_objVelFPMMStill,
+                                 g_objVelFPBonesUsed, kObjVelBones,
+                                 g_objVelFPSkipPair, g_objVelFPSkipKind, g_objVelFPSkipCap,
+                                 g_objVelFPSkinSkipPair, g_objVelFPSkinSkipKind,
+                                 g_objVelFPSkinSkipBlend, g_objVelFPSkinSkipBones,
+                                 g_objVelFPSkinSkipCap,
+                                 g_objVelFPMMSkipPair, g_objVelFPMMSkipKind,
+                                 g_lastGpuPhaseMs[kGpuPhaseObjVelFP]);
+                    // ⚠⚠ THE ACCEPTANCE TEST, AND IT IS THIS LINE. `arm` must stay ~0 while `world`
+                    // is tens of pixels: that IS "the arms stay sharp on a camera turn while the
+                    // world streams", measured instead of looked at. An arm reading that TRACKS the
+                    // world one means the FP camera pair is not reaching the draws (a stale arm
+                    // camera, or descriptor-set instance 0 bound by mistake) and the arms are still
+                    // wearing the world's motion — the exact defect MB-1d exists to remove, and it
+                    // is indistinguishable from "working" in every other number in this log.
+                    // `world` near 0 means the camera never turned in the window and the line has
+                    // not been tested; look at samples= and the mv camera delta before reading it.
+                    LOG::logline(">> [forge-hb] objvel fp identity: arm=%.3f px turn=%.2f px"
+                                 " pose=%.2f px rel=%.2f px (ratio %.4f) on the BUSIEST of %u on-screen frames"
+                                 "  [THE ACCEPTANCE TEST: `turn` is what that pixel carried BEFORE"
+                                 " this lane (the same point held world-still through last frame's"
+                                 " arm camera); `arm` is what it carries NOW. arm << turn IS the"
+                                 " arms staying sharp on a camera turn. arm ~ turn = the FP camera"
+                                 " pair never reached the draws; turn ~0 = the camera did not turn,"
+                                 " so nothing was tested. `rel` is the vector MB-2d's object-only"
+                                 " rule WOULD put in the BLUR field here, and it tracks `pose` — the"
+                                 " arm's motion through the WORLD — where `arm`, its motion across the"
+                                 " SCREEN, is what a viewer sees. rel >> arm is the camera term the"
+                                 " rule failed to cancel, and is why the FP lane pins opts.z to 0]",
+                                 (double)g_objVelFPIdArmPx, (double)g_objVelFPIdTurnPx,
+                                 (double)g_objVelFPIdPosePx, (double)g_objVelFPIdRelPx,
+                                 (double)(g_objVelFPIdTurnPx > 1.0e-6f
+                                          ? g_objVelFPIdArmPx / g_objVelFPIdTurnPx : 0.0f),
+                                 g_objVelFPIdSamples);
+                    // ...and the AGGREGATE, which is the one to read first: a peak is one frame and
+                    // a camera cut owns it. mean small + peak large = a cut in the window (look at
+                    // peakFrame); both large = the lane really is writing the wrong vector.
+                    LOG::logline(">> [forge-hb] objvel fp identity, mean over the %u TURNING"
+                                 " frames of %u: arm=%.3f px turn=%.2f px pose=%.2f px rel=%.2f px"
+                                 " ratio=%.4f | peak was frame %u"
+                                 "  [three legs of one triangle: `pose` = the arm's own motion in a"
+                                 " FIXED camera, `turn` = a FIXED point's motion under the camera"
+                                 " change, `arm` = what this lane writes. arm/turn is only the"
+                                 " acceptance test when the arms are IDLE, which MW's never are —"
+                                 " read the CANCELLATION line below instead]",
+                                 g_objVelFPIdMoved, g_objVelFPIdSamples,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumArm / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumTurn / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumPose / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumRel  / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdSumTurn > 1.0e-6
+                                     ? g_objVelFPIdSumArm / g_objVelFPIdSumTurn : 0.0,
+                                 g_objVelFPIdPeakFrame);
+                    // ⚠⚠ AND THIS IS THE VERDICT LINE — the one that does not need idle arms.
+                    if (g_objVelFPIdMoved) {
+                        const double rc = g_objVelFPIdResCancel / g_objVelFPIdMoved;
+                        const double ra = g_objVelFPIdResAdd    / g_objVelFPIdMoved;
+                        LOG::logline(">> [forge-hb] objvel fp CAMERA CANCELLATION: %s"
+                                     " (residual vs |pose-turn| = %.1f px, vs pose+turn = %.1f px,"
+                                     " over %u frames)"
+                                     "  [the arm's screen velocity is the pose term plus the camera"
+                                     " term; MB-1d's whole claim is that the camera term is"
+                                     " SUBTRACTED. Hugging |pose-turn| = it is. Hugging pose+turn ="
+                                     " the two ADD, i.e. a stale/inverted FP camera or the WORLD"
+                                     " table bound — and that is the bug, whatever the arms were"
+                                     " doing]",
+                                     (rc < ra) ? "CANCELLING (pass)" : "COMPOUNDING (FAIL)",
+                                     rc, ra, g_objVelFPIdMoved);
+                    }
+                    // Reset AFTER printing: each line reports the worst frame of its OWN window, so
+                    // a defect that STOPS is visible rather than latched forever.
+                    g_objVelFPIdArmPx = g_objVelFPIdTurnPx = g_objVelFPIdPosePx = 0.0f;
+                    g_objVelFPIdRelPx = 0.0f;
+                    g_objVelFPIdSamples = g_objVelFPIdMoved = 0;
+                    g_objVelFPIdSumArm = g_objVelFPIdSumTurn = g_objVelFPIdSumPose = 0.0;
+                    g_objVelFPIdSumRel = 0.0;
+                    g_objVelFPIdResCancel = g_objVelFPIdResAdd = 0.0;
+                }
+                // Reset AFTER printing, so each line reports the worst frame of its own window
+                // rather than of the whole session — a session peak would latch on one bad frame
+                // and then report it forever, which hides a defect that STOPS.
+                g_objVelSkinMaxBoneDeltaPeak = 0.0f;
+                g_objVelSkinPeakSlot = g_objVelSkinPeakBones = 0;
+                g_objVelSkinPeakDBake = 0.0f;
+                // ⚠ THE CHURN SOAK, AS A RUNNING TOTAL — the line above samples ONE frame in 300
+                // and reads pair=0 on a static save whether the key is working or dead. These count
+                // every rejection since startup, so a cell load or a doorway shows up between
+                // heartbeats instead of falling through the sampling. `stale` and `count` are the
+                // two that mean CHURN WAS CAUGHT: a stale or differently-shaped palette differenced
+                // against this frame's is what tears a limb across the screen, and a session that
+                // accumulates them while the picture stays clean is this key doing its job.
+                // `first` is inert — a part being seen for the first time, one per appearance.
+                LOG::logline(">> [forge-hb] objvel skinned pair rejects (cumulative): first=%llu"
+                             " stale=%llu count=%llu range=%llu dup=%llu"
+                             "  [first is inert (one per appearance); stale/count are CHURN CAUGHT;"
+                             " dup must stay 0 — a slot packed twice in one frame is the miss the"
+                             " other clauses cannot see]",
+                             (unsigned long long)g_objVelSkinPairFirstTot,
+                             (unsigned long long)g_objVelSkinPairStaleTot,
+                             (unsigned long long)g_objVelSkinPairCountTot,
+                             (unsigned long long)g_objVelSkinPairRangeTot,
+                             (unsigned long long)g_objVelSkinPairDupTot);
+                // ⚠ THE DEPTH TEST, MEASURED RATHER THAN ASSUMED. frags = fragments that survived
+                // and wrote. Run again with objVelDepthTest=0: if the count does not change, the
+                // test is inert and occluded movers are painting over what is in front of them.
+                if (g_live.pObjVelFragsReadback && g_live.pObjVelFragsReadback->pCpuMappedAddress) {
+                    const uint32_t fr = *(const uint32_t*)g_live.pObjVelFragsReadback->pCpuMappedAddress;
+                    static const char* const kDepthModeName[4] = { "OFF", "GEQUAL", "NEVER", "ALWAYS" };
+                    LOG::logline(">> [forge-hb] objvel frags: depthMode=%s survived=%u px  "
+                                 "[NEVER must give 0 — anything else means the DepthStateDesc never "
+                                 "reached the PSO, which no comparison-function A/B could show]",
+                                 kDepthModeName[g_objVelDepthMode & 3u], fr);
+                }
+                // ⚠ THE LINE THAT DESCRIBES THE FINISHED FIELD. `mv field:` above measures the
+                // CAMERA pass alone (its statistics are computed inside that shader, before the
+                // overwrite); this measures the finished texture that F12 mode 17 draws. Toggling
+                // objVelEnable moves only this line.
+                //
+                // ⚠⚠ `nonzero%` IS STRICTER THAN THE PICTURE AND IS KEPT THAT WAY. It counted the
+                // pixels mvview.frag did NOT paint grey back when that branch was `m == 0.0f`
+                // exactly; the view now uses `m < 0.01f` (the exact branch was unreachable — MW's
+                // camera matrix is not bit-stable standing still) and `still(<0.01px)` beside it is
+                // the counter that matches mode 17. This one did not follow, because a counter that
+                // tracks the view can only ever confirm the view. It is THE acceptance test for the
+                // parked-camera lane: on a frame `mv camera:` calls `parked(bit-identical)=1` it
+                // must read **0.000%**, and for three weeks it did not, because the host cleared
+                // opts.y after computing it (fixed in MB-2 step 0). It is also the only readout that
+                // can see the ~1e-3 px residue MB-2's gather would smear a still frame with.
+                if (g_live.pMvFsReadback && g_live.pMvFsReadback->pCpuMappedAddress) {
+                    const uint32_t* fs = (const uint32_t*)g_live.pMvFsReadback->pCpuMappedAddress;
+                    const uint32_t tot = fs[3];
+                    if (tot > 0u) {
+                        float fmx = 0.0f, fmn = 0.0f;
+                        std::memcpy(&fmx, &fs[0], sizeof(float));
+                        std::memcpy(&fmn, &fs[1], sizeof(float));
+                        char fmnTxt[32];
+                        if (fs[1] == 0xFFFFFFFFu) { std::snprintf(fmnTxt, sizeof(fmnTxt), "n/a"); }
+                        else { std::snprintf(fmnTxt, sizeof(fmnTxt), "%.6f", (double)fmn); }
+                        // ⚠ `wasParked` COMES OUT OF THE SAME BUFFER, not from g_mvCamParked. The
+                        // readback lags by a frame or more (no fence, pAplReadback's arrangement),
+                        // so the flag beside it would describe a different frame — and the test
+                        // this line exists to settle is a conjunction over ONE frame.
+                        LOG::logline(">> [forge-hb] mv final: nonzero=%.3f%% max=%.6f px min=%s px "
+                                     "still(<0.01px)=%.1f%% of %u px wasParked=%u  [nonzero%% is the"
+                                     " fraction not EXACTLY zero — stricter than mode 17's 0.01 px"
+                                     " grey branch on purpose; wasParked=1 with nonzero%% > 0 means"
+                                     " opts.y never reached the dispatch]",
+                                     100.0 * (double)fs[5] / (double)tot, (double)fmx, fmnTxt,
+                                     100.0 * (double)fs[2] / (double)tot, tot, fs[6]);
+                    }
+                }
+                // ⚠⚠ THE ACCEPTANCE TEST FOR THE PARKED LANE, AND IT IS A SEPARATE LINE BECAUSE THE
+                // LINE ABOVE CANNOT ANSWER IT. That one describes whichever frame the readback
+                // happened to hold, and in six sampled heartbeats it held a parked frame zero times
+                // out of a population that was up to 24% parked. This is the latch: the most recent
+                // measurement that CARRIED wasParked=1, with the count that proves one was seen.
+                //
+                // **nonzero MUST BE 0.000%.** Anything else means opts.y is not reaching the
+                // dispatch — the exact defect MB-2 step 0 fixed, which lived through three weeks of
+                // a heartbeat cheerfully reporting `parked(bit-identical)=1` while the GPU read 0.
+                // `n=0` is not a pass: it means no parked frame has been measured yet.
+                if (g_mvParkedSamples > 0u) {
+                    LOG::logline(">> [forge-hb] mv parked latch: nonzero=%.3f%% max=%.6f px over %u"
+                                 " parked measurements  [MUST be 0.000%% — a parked camera's true"
+                                 " vector is identically zero, so anything else is opts.y not"
+                                 " reaching the shader]",
+                                 g_mvParkedNonzeroPct, (double)g_mvParkedMaxPx, g_mvParkedSamples);
+                } else {
+                    LOG::logline(">> [forge-hb] mv parked latch: NO PARKED FRAME MEASURED YET"
+                                 " (parkedFrames above says how often the condition fires; 0/N there"
+                                 " means the bit-identity branch is unreachable in this scene)");
+                }
+                // ⚠ REPORTED TWICE, AND THE SECOND NUMBER IS THE USABLE ONE. The reference point
+                // (screen centre, device depth 0.5) lands only ~8 units out under reverse-Z, which
+                // makes it a very SENSITIVE canary and a very misleading absolute: the origin error
+                // is Delta-eye/distance, so a reading taken a few units from the camera is two
+                // orders of magnitude larger than the same error on real geometry. `@1000u` divides
+                // that dependence out — error x distance is the invariant — and is the figure to
+                // compare between frames, between speeds and against "does this matter".
+                // ⚠ THE PEAK IS THE HEADLINE, the instantaneous value is the footnote — see
+                // g_mvDeltaMaxLen for why an arbitrary-frame sample reports zero exactly when there
+                // is something to measure. `@1000u` divides out the reference point's distance
+                // (~8 u under reverse-Z, a sensitive canary and a misleading absolute) because the
+                // origin error is Delta-eye/distance; that is the figure to compare between speeds.
+                //
+                // ⚠ A `peak dBake` OF EXACTLY 0.000 OVER A WHOLE WINDOW IS NOT PROOF THE CAMERA WAS
+                // STILL. bakeEye arrives as float32 ABSOLUTE world coordinates and Morrowind's map
+                // reaches six figures — at x=120000 the ULP is ~0.008 u, so two consecutive frames
+                // of slow motion can round to the same float and difference to a hard zero. Below
+                // roughly 0.05 u/frame this lane is quantisation, not signal. It does not matter for
+                // the vectors (the resulting error is ~1e-4 px at 1000 u) but it is why the reading
+                // is sometimes an exact zero rather than a small number.
+                // ─── AND WHAT THE FIELD ITSELF SAYS (gMvStats, one frame late) ────────────────
+                // ⚠ min |mv| IS THE ONE TO READ. A uniform DC offset — the bakeEye signature — lifts
+                // the WHOLE field, so the quietest pixel in the frame stops being quiet, and min is
+                // exactly the offset's size. max only reports how fast the camera was going, and by
+                // eye a lifted field and a moving field are the same picture. That indistinguishable
+                // -by-eye property is why this readback exists at all.
+                //
+                // HOW TO READ IT: stand still. `still%` should go to ~100 and `min` to ~0. Under
+                // PURE ROTATION there is legitimately no still pixel, so min is large and still% is
+                // 0 — that is correct, not a fault. Translating, min is the smallest true motion in
+                // frame (distant geometry), which is small but not zero.
+                if (g_live.pMvStatsReadback && g_live.pMvStatsReadback->pCpuMappedAddress) {
+                    const uint32_t* st = (const uint32_t*)g_live.pMvStatsReadback->pCpuMappedAddress;
+                    const uint32_t total = st[3];
+                    if (total > 0u) {
+                        float mx = 0.0f, mn = 0.0f;
+                        std::memcpy(&mx, &st[0], sizeof(float));
+                        std::memcpy(&mn, &st[1], sizeof(float));
+                        // min stays at the 0xFFFFFFFF sentinel if the reduction never ran; that bit
+                        // pattern is a NaN, so it is spelled out rather than printed as a float.
+                        char mnTxt[32];
+                        if (st[1] == 0xFFFFFFFFu) { std::snprintf(mnTxt, sizeof(mnTxt), "n/a"); }
+                        else                      { std::snprintf(mnTxt, sizeof(mnTxt), "%.4f", (double)mn); }
+                        LOG::logline(">> [forge-hb] mv field: max=%.3f px min=%s px still(<0.01px)=%.1f%% "
+                                     "reactive=%.1f%% of %u px | STILL CAMERA => still%%~100 and "
+                                     "min~0; PURE ROTATION has no still pixel (min large, "
+                                     "still%%=0) and that is correct; a min that will not go to 0 "
+                                     "when you stop IS the DC offset.",
+                                     (double)mx, mnTxt,
+                                     100.0 * (double)st[2] / (double)total,
+                                     100.0 * (double)st[4] / (double)total, total);
+                        // ⚠ A MASK THAT COVERS THE SCREEN IS NOT A MASK, IT IS THE UPSCALER SWITCHED
+                        // OFF — and that failure mode reads as "slightly soft", never as an error.
+                        // Standing still it should be ~0; walking, single-digit percent (moving
+                        // things plus the disocclusion rim). Persistently high means the thresholds
+                        // are catching the reprojection's own round-off rather than real motion.
+                        if (st[3] > 0u && (100.0 * (double)st[4] / (double)total) > 40.0) {
+                            LOG::logline("!! [mv] reactive mask covers %.1f%% of the frame — that is "
+                                         "not a mask, it is the upscaler turned off. Raise "
+                                         "mvReactiveT0 (now %.3f) until a still camera reads ~0%%.",
+                                         100.0 * (double)st[4] / (double)total,
+                                         (double)g_mvReactiveT0);
+                        }
+                    }
+                }
+                LOG::logline(">> [forge-hb] mv origin-fold: PEAK %.3f px (= %.4f px @1000u) at "
+                             "|dBake| %.4f u over the window | this frame %.3f px (ref dist %.0f u). "
+                             "A peak of 0.000 with |dBake| > 0.05 = the fold is not reaching the matrix.",
+                             (double)g_mvFoldMaxPx, (double)g_mvFoldMaxAt1k, g_mvDeltaMaxLen,
+                             (double)g_lastMvOriginFixPx, (double)g_lastMvRefDist);
+                g_mvDeltaMaxLen = 0.0; g_mvFoldMaxPx = 0.0f; g_mvFoldMaxAt1k = 0.0f;
+            }
+            // ⚠ THE **EFFECTIVE** AMPLITUDE, not the knob. Gating on the raw global would print a
+            // jitter line every heartbeat of every session now that the slider ships at 1.0, while
+            // the offset actually applied was zero — a row that describes a frame that never
+            // happened, on the one instrument an unattended run has. `gated` names the state.
+            // ⚠ THE GATED CASE IS SAID **ONCE**, NOT EVERY HEARTBEAT — measured 2026-09-02, a
+            // single passthrough session emitted 114 identical all-zero rows. That inverts the
+            // line's whole reason to exist ("its PRESENCE says the lane is live") and buries the
+            // rows that carry information, on the one instrument an unattended run has. But it is
+            // still worth saying once: a knob that is set and doing nothing is the inert-control
+            // complaint the panel label also answers, and silence would leave "I dragged the jitter
+            // slider and nothing happened" undiagnosable.
+            if (jitterAmp() <= 0.0f && g_jitterAmp > 0.0f) {
+                if (!g_jitterGateReported) {
+                    g_jitterGateReported = true;
+                    LOG::logline(">> [forge-hb] jitter: knob is %.2f px but GATED OFF — no temporal "
+                                 "backend is armed, so the applied offset is exactly 0. Arm one with "
+                                 "MGE_HOST_KNOBS=upscaleBackend=ngx, or jitterForce=1 to run the "
+                                 "step-1 isolation test without an upscaler. Said once per session.",
+                                 (double)g_jitterAmp);
+                }
+            } else if (jitterAmp() > 0.0f) {
+                g_jitterGateReported = false;   // re-arm, so a later gating is reported again
+                LOG::logline(">> [forge-hb] jitter: amp=%.2fpx%s phases=%u idx=%u -> (%+.3f, %+.3f) px "
+                             "[NDC %+.5f, %+.5f on a %ux%u rect]",
+                             (double)jitterAmp(),
+                             g_jitterForce ? " (FORCED, no temporal backend)" : "",
+                             jitterPhases(), g_jitterIndex,
+                             (double)g_jitterPx[0], (double)g_jitterPx[1],
+                             (double)(2.0f * g_jitterPx[0] / (float)g_live.width),
+                             (double)(-2.0f * g_jitterPx[1] / (float)g_live.height),
+                             g_live.width, g_live.height);
+            }
+            // CPU record split: WHERE inside record (tRec0..tRec1) the CPU ms are spent recording
+            // commands. Same phase brackets as the gpu split; "other" = record − Frame bracket
+            // (pre-phase barriers, query resolve, endCmd). shadow further split static vs dyn —
+            // the dyn pass re-records 6 face passes per dyn-flagged slot EVERY frame.
+            LOG::logline(">> [forge-hb] rec split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) postdepth=%.2f reflect=%.2f color=%.2f (sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f) water=%.2f glow=%.2f alpha=%.2f resolve=%.2f other=%.2f ms",
+                         g_lastCpuPhaseMs[kGpuPhaseCull], g_lastCpuPhaseMs[kGpuPhasePrepass],
+                         g_lastCpuPhaseMs[kGpuPhaseShadow],
+                         g_lastCpuPhaseMs[kGpuPhaseShadowStatic], g_lastCpuPhaseMs[kGpuPhaseShadowDyn],
+                         g_lastCpuPhaseMs[kGpuPhasePostDepth], g_lastCpuPhaseMs[kGpuPhaseReflect],
+                         g_lastCpuPhaseMs[kGpuPhaseColor],
+                         g_lastCpuPhaseMs[kGpuPhaseColorSky], g_lastCpuPhaseMs[kGpuPhaseColorNear],
+                         g_lastCpuPhaseMs[kGpuPhaseColorSkin], g_lastCpuPhaseMs[kGpuPhaseColorMM],
+                         g_lastCpuPhaseMs[kGpuPhaseColorDL],
+                         g_lastCpuPhaseMs[kGpuPhaseWater], g_lastCpuPhaseMs[kGpuPhaseColorGlow],
+                         g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
+                         g_lastCpuPhaseMs[kGpuPhaseResolve],
+                         g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
+            // The upscale term's bracket: WHICH BACKEND and the INPUT rect it actually read from,
+            // or "off" when no pass ran. Two states that look identical in the timing alone — the
+            // feature absent, and the passthrough at scale 1.0 taking its identity fast path — read
+            // differently here.
+            //
+            // ⚠ THE BACKEND NAME IS ON IT SINCE 4d, and it is not decoration for the same reason it
+            // is on the `[rect]` line: at DLAA the rects are equal, so "ngx-dlss 1680x1050" and
+            // "passthrough 1:1" are the two readings that tell a DLSS session from a Catmull-Rom
+            // one, and nothing else on this line can. A backend that silently declined at startup
+            // otherwise produces a heartbeat indistinguishable from a working one.
+            char upscaleRectText[96];
+            // ⚠ A NON-RUN IS NO LONGER CALLED "1:1", and that wording was a wart worth removing:
+            // for the PASSTHROUGH 1:1 correctly means the identity fast path, but a temporal backend
+            // has no such path — so `ngx-dlss 1:1` read as "running at native" when it actually
+            // meant "did not run at all". The three states are now named as themselves.
+            if (g_lastUpscaleRan) {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s %s %ux%u",
+                              g_upscaleName ? g_upscaleName : "?",
+                              kUpscaleModeNames[g_upscaleMode < (uint32_t)kUpscaleModeCount
+                                                ? g_upscaleMode : 0u],
+                              g_live.width, g_live.height);
+            } else if (!g_upscaleName) {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "no backend");
+            } else if (!upscaleActive()) {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s OFF", g_upscaleName);
+            } else {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s REFUSED",
+                              g_upscaleName);
+            }
+            // The motion-blur term's bracket: the tile GRID and the K it actually ran at, or "off"
+            // when no dispatch happened. Two states that are identical in the timing alone — the knob
+            // off, and the pass failing to build — read differently here, which is the same argument
+            // the upscale bracket beside it is made of.
+            char mbText[80];
+            if (g_lastMbRan) {
+                std::snprintf(mbText, sizeof(mbText), "K%u %ux%u tiles",
+                              g_lastMbK, g_lastMbTilesX, g_lastMbTilesY);
+            } else if (!g_live.mbReady) {
+                // ⚠ NAME THE GATE. "NOT BUILT" is true and useless. Above 1x the blur needs a
+                // single-sample source and takes it from the resolve's compute pre-filter, so when
+                // THAT did not build the blur cannot exist either — for a reason that has nothing to
+                // do with the motion-blur knobs the reader just checked. Unnamed, this is how
+                // "motion blur is broken" gets reported from play against a build where it was never
+                // built: a wasted bisect that a word prevents.
+                if (g_live.sampleCount != 1) {
+                    std::snprintf(mbText, sizeof(mbText),
+                                  "NOT BUILT — MSAA %ux and no resolve pre-filter",
+                                  g_live.sampleCount);
+                } else {
+                    std::snprintf(mbText, sizeof(mbText), "NOT BUILT");
+                }
+            } else if (!g_mbEnable) {
+                std::snprintf(mbText, sizeof(mbText), "off");
+            } else if (g_live.sampleCount != 1 && !g_lastRfRan) {
+                // Built, enabled, and starved: above 1x its only source is the pre-filter's output,
+                // and that pass is a live knob (resolveCompute) with a diameter limit behind it.
+                std::snprintf(mbText, sizeof(mbText),
+                              "ON but the resolve pre-filter did not run — no 1x source at MSAA %ux",
+                              g_live.sampleCount);
+            } else {
+                // ⚠ THE STATE THAT SHIPPED BROKEN FOR ONE BUILD AND HAD NO NAME. `mbEnable` on,
+                // everything built, and no field to consume — which is what "there is no motion blur
+                // by default" looked like from inside the log: `mb=0.28(K20 128x80 tiles)`, a pass
+                // that ran, dispatched, cost time, and blurred nothing because pMotionVectors had
+                // never been written. It now says so, so this failure is a LOG LINE rather than a
+                // report from play.
+                std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
+            }
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
+                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
+                         " | nearTris=%.2fM atDraws=%u"
+                         " | atmos=%.2f (LUT chain, every frame)"
+                         // The histogram is RUNG-indexed AND FAMILY-indexed since 4b: `patch` counts
+                         // 512-unit sub-cell instances (8..128 u) and reads 0 unless the
+                         // displacement disc is live, `cell` counts whole-cell instances (128 u and
+                         // coarser). Both are spelled out in the line because a silent widening is
+                         // exactly the kind of change that makes an old log and a new one look
+                         // comparable when they are not — and because the whole point of 4b is that
+                         // the triangles moved from one family to the other.
+                         " | terrain=%u/%u cells (nearCut=%u) %.2fM tris"
+                         " (patch 8u:%u 16u:%u 32u:%u 64u:%u 128u:%u"
+                         " | cell 128u:%u/%u/%u/%u/%u/%u)%s",
+                         g_lastGpuPhaseMs[kGpuPhaseCull],
+                         g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
+                         g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
+                         g_lastGpuPhaseMs[kGpuPhaseShadowSun],
+                         g_lastGpuPhaseMs[kGpuPhasePostDepth],
+                         g_lastGpuPhaseMs[kGpuPhaseLinearize],
+                         g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                         g_lastGpuPhaseMs[kGpuPhaseAODown],  g_lastGpuPhaseMs[kGpuPhaseAOSearch],
+                         g_lastGpuPhaseMs[kGpuPhaseAOBlur],  g_lastGpuPhaseMs[kGpuPhaseAOUp],
+                         g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                         g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
+                         g_lastGpuPhaseMs[kGpuPhaseWater],
+                         // caustic=<ms> — W23/W24. The whole pure-compute block: static scatter +
+                         // whichever dynamic scatters were armed + both resolves. 0.00 means the
+                         // block did not run at all (caustics off, or strength 0), which is the
+                         // distinction worth logging; the DYNAMIC half is proportional to the
+                         // DISTURBED AREA, so this number is expected to move with swimmers and rain
+                         // and to sit at its static floor on calm water.
+                         g_lastGpuPhaseMs[kGpuPhaseCaustic],
+                         // grasscrush=<ms>(<discs>) — G7. Three dispatches over a 512² field: two
+                         // full-grid passes whose cost is fixed, and a scatter whose cost is
+                         // proportional to the DISC COUNT in brackets beside it. A 0.00 with a
+                         // non-zero count would be a timing problem; a 0.00 with (0) is the block
+                         // not running at all — interior, knob off, or nobody near the player.
+                         g_lastGpuPhaseMs[kGpuPhaseGrassCrush], g_grassCrushLastCount,
+                         // mv=<ms> — M1 camera-only motion vectors, one 8x8 dispatch over the render
+                         // rect at the colour->water seam. 0.00 means the pass did not run (off, and
+                         // it ships off because nothing consumes the vectors yet) — `[forge-hb] mv:`
+                         // beside it says which. This is the baseline the DLSS win gets measured
+                         // against, and it also carries the extra depth re-linearize the pass forces
+                         // when water and volumetric fog are both off, which lands in `lin` above.
+                         g_lastGpuPhaseMs[kGpuPhaseMotionVec],
+                         // upscale=<ms>(<in>x<in>) — M1 step 4b. ⚠ IT IS HALF OF A TWO-PART CLAIM
+                         // and neither half means anything alone. `upscale=` appearing says the pass
+                         // ran; `gpu=` DROPPING at the same time is what proves the input rect really
+                         // shrank rather than the viewport merely being clamped — a quarter-res scene
+                         // raster has to show up in `color`, `postdepth` and `reflect` too. A
+                         // 0.00 with a rect that is not the output rect would be a timing problem; a
+                         // 0.00 at in == out is the IDENTITY FAST PATH, which records nothing on
+                         // purpose and is the correct reading of the shipped default.
+                         g_lastGpuPhaseMs[kGpuPhaseUpscale],
+                         upscaleRectText,
+                         // mb=<ms>(K<k> <gx>x<gy> tiles) — MB-2, all three passes in one bracket.
+                         // ⚠ THE DILATION IS ~2% OF THIS NUMBER BY CONSTRUCTION (1.0 taps/px for the
+                         // tile max, 9/K^2 for the neighbour pass), so a `mb=` that moves is the
+                         // GATHER moving, and the gather's cost is proportional to how much of the
+                         // screen is moving fast enough to clear the velocity floor. Standing still
+                         // it should approach the floor's early-out cost; the budget context is that
+                         // the whole MB-1 producer costs 0.030 ms.
+                         g_lastGpuPhaseMs[kGpuPhaseMotionBlur], mbText,
+                         // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
+                         // (checkbox off, not scene-referred, or the pyramid failed to build), which is
+                         // the distinction worth logging: a 0.00 with L7 would be a timing problem,
+                         // with L0 it is a gate.
+                         g_lastGpuPhaseMs[kGpuPhaseBloom], g_lastBloomLevels,
+                         // rfilter=<ms> — the resolve's separable LDS pre-filter, which used to be
+                         // INSIDE `resolve=` and moved above the motion blur so the blur could read
+                         // its output. ⚠ Add the two when comparing against anything measured before
+                         // 2026-09-05. A 0.00 with a non-zero `resolve=` is the frag tap loop doing
+                         // the work instead — resolveCompute off, diameter past 5.002, or 1x.
+                         g_lastGpuPhaseMs[kGpuPhaseResolveFilter],
+                         g_lastGpuPhaseMs[kGpuPhaseResolve],
+                         g_lastHizGpuMs, g_hizOverruns,
+                         (unsigned)g_shadowCasters.size(),
+                         g_lastShadowActive, g_lastShadowDyn,
+                         (double)g_lastNearTris / 1e6, g_lastNearATDraws,
+                         // atmos=<ms> — S2. The whole four-dispatch LUT chain: transmittance,
+                         // multiscatter, sky-view and the SH measurement, rebuilt EVERY frame. It is
+                         // on the line from the FIRST build rather than from the first complaint,
+                         // because a pass whose cost first appears three sub-steps later has no
+                         // baseline to be compared against. Budget: <= 0.25 ms. A 0.00 means the
+                         // chain did not run at all — interior, master toggle off, or a build
+                         // failure — which is the distinction worth logging.
+                         g_lastGpuPhaseMs[kGpuPhaseAtmos],
+                         g_lastTerrainCells, g_lastTerrainInRange, g_lastTerrainNearCut,
+                         (double)g_lastTerrainTris / 1e6,
+                         g_lastTerrainLodHist[kTerrainFamPatch][0], g_lastTerrainLodHist[kTerrainFamPatch][1],
+                         g_lastTerrainLodHist[kTerrainFamPatch][2], g_lastTerrainLodHist[kTerrainFamPatch][3],
+                         g_lastTerrainLodHist[kTerrainFamPatch][4],
+                         g_lastTerrainLodHist[kTerrainFamCell][4], g_lastTerrainLodHist[kTerrainFamCell][5],
+                         g_lastTerrainLodHist[kTerrainFamCell][6], g_lastTerrainLodHist[kTerrainFamCell][7],
+                         g_lastTerrainLodHist[kTerrainFamCell][8], g_lastTerrainLodHist[kTerrainFamCell][9],
+                         g_terrainEyeCellMissing ? "  (no LAND record within 1 cell of the eye)" : "");
+            // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
+            // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
+            // ⚠ `grass=` IS INSIDE `dl=`, and `grassdep=` is inside `prepass=` on the line above —
+            // drawGrass is recorded in the DL block and its Z-prepass half in the prepass block. Do
+            // not add them to anything. They are printed because grass had NO bracket of its own
+            // until G1f and was therefore invisible: `dl=4.48` for 0.23M triangles was read as a
+            // draw-call problem for a whole session, when DL + statics is 1.00 and the rest was
+            // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
+            // prepass paid for itself is `grassdep + grass` now against `grass` alone at
+            // grassPrepass=0.
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
+                         " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
+                         g_lastGpuPhaseMs[kGpuPhaseColorSky],
+                         g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
+                         g_live.froxelNearActive ? "on" : "off", g_live.froxelNearLightCount,
+                         g_lastGpuPhaseMs[kGpuPhaseColorNear],
+                         g_lastGpuPhaseMs[kGpuPhaseColorSkin], g_lastGpuPhaseMs[kGpuPhaseColorMM],
+                         g_lastGpuPhaseMs[kGpuPhaseColorDL],
+                         g_lastGpuPhaseMs[kGpuPhaseGrassColor],
+                         g_lastGpuPhaseMs[kGpuPhaseGrassDepth],
+                         // WHICH PIPELINE THE COLOUR DRAW ACTUALLY USED, not which one it was asked
+                         // for. "EQ" is the only proof the pair is live: a build where the depth PSO
+                         // failed non-fatally still logs grassPrepass=1 and still draws grass, just
+                         // with none of the win, and the ms alone cannot tell those apart.
+                         g_grassPrepassRecorded ? "EQ" : (g_grassPrepass ? "GEQUAL(prepass unavailable)"
+                                                                        : "GEQUAL(off)"),
+                         g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
+                         g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
+                         // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
+                         // interior / DL not resident / knob off), which is the distinction worth
+                         // logging: a 0.00 with "on" would be a timing problem, with "off" it is a gate.
+                         g_lastGpuPhaseMs[kGpuPhaseVolFog],
+                         (g_volFog && g_live.pVolFogPipeline && g_live.sunShadowReady) ? "on" : "off",
+                         (unsigned)g_volFogSteps,
+                         // waterclamp off + fog on over open sea = the horizon band is over-marching.
+                         g_volFogWaterOn ? "on" : "off",
+                         g_lastGpuPhaseMs[kGpuPhaseReflGeo],
+                         g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
+            // ===== DOES THE FRAME ADD UP? THE LINE THAT MAKES THAT CHECKABLE ====================
+            // `gpu split:` and `gpu color sub:` above print 30-odd phases and there is no way to
+            // tell from them whether the phases COVER the frame — so for a long time they did not,
+            // and nobody could see it. Three dispatches ran in no bracket at all, and two more
+            // (ColorFP and ObjVel) were bracketed but printed nowhere, so the only way to notice was
+            // to add up two log lines by hand and compare against `gpu=` on a third.
+            //
+            // The sum is driven off a TABLE, not off the format string, because the failure being
+            // fixed is precisely a phase that exists and is not in the sum. Add a top-level phase to
+            // the enum and it must be added here too, or UNBRACKETED grows and says so.
+            // ⚠ TOP-LEVEL ONLY. Every nested phase (Linearize/ShadowMask/AO* inside PostDepth,
+            // ColorSky/Near/Skin/MM/DL inside Color, ShadowStatic/Dyn/Sun inside Shadow, ReflGeo
+            // inside Reflect, ObjVelFP inside ColorFP) is DELIBERATELY ABSENT: counting one twice
+            // would drive the residual negative and make a real gap look closed.
+            {
+                static const uint32_t kTopLevel[] = {
+                    kGpuPhaseAtmos,      kGpuPhaseCull,       kGpuPhaseCaustic,
+                    kGpuPhaseGrassCrush, kGpuPhaseFroxelNear, kGpuPhasePrepass,
+                    kGpuPhaseShadow,     kGpuPhasePostDepth,  kGpuPhaseReflect,
+                    kGpuPhaseColor,      kGpuPhaseHizMip0,    kGpuPhaseReLinear,
+                    kGpuPhaseMotionVec,  kGpuPhaseObjVel,     kGpuPhaseWater,
+                    kGpuPhaseColorGlow,  kGpuPhaseColorAlpha, kGpuPhaseVolFog,
+                    kGpuPhaseColorFP,    kGpuPhaseApl,        kGpuPhaseUpscale,
+                    kGpuPhaseResolveFilter, kGpuPhaseMotionBlur, kGpuPhaseBloom,
+                    kGpuPhaseResolve,
+                };
+                double bracketed = 0.0;
+                for (uint32_t i = 0; i < (uint32_t)(sizeof(kTopLevel) / sizeof(kTopLevel[0])); ++i) {
+                    bracketed += g_lastGpuPhaseMs[kTopLevel[i]];
+                }
+                const double frameMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
+                const double resid   = frameMs - bracketed;
+                LOG::logline(">> [forge-hb] gpu residual: frame=%.2f bracketed=%.2f UNBRACKETED=%.2f (%.0f%%)"
+                             " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f"
+                             " | measured but never printed: fp=%.2f(objvelFP=%.2f) objvel=%.2f",
+                             frameMs, bracketed, resid,
+                             (frameMs > 0.01) ? (100.0 * resid / frameMs) : 0.0,
+                             g_lastGpuPhaseMs[kGpuPhaseHizMip0],
+                             g_lastGpuPhaseMs[kGpuPhaseReLinear],
+                             g_lastGpuPhaseMs[kGpuPhaseApl],
+                             g_lastGpuPhaseMs[kGpuPhaseColorFP],
+                             g_lastGpuPhaseMs[kGpuPhaseObjVelFP],
+                             g_lastGpuPhaseMs[kGpuPhaseObjVel]);
+            }
+
+            // ===== WHICH PHASE IS BURSTY, OR IS IT NONE OF THEM? ================================
+            // Drains the stall latch: min/max per phase over the WHOLE window, not the one frame
+            // the lines above happen to print. Read the SPREAD column, not the max:
+            //   several phases each ~+1.7 ms  => one wandering stall external to all of them;
+            //                                    optimising any of those passes is chasing a ghost
+            //   one phase far above the rest  => that pass is genuinely bursty and is the subject
+            // `over` is how often the frame ran >10% above the window's cheapest frame, i.e. how
+            // much of the time the excursion is actually costing anything.
+            if (g_stallWinN > 1) {
+                struct Spread { const char* name; double lo, hi, d; };
+                static const struct { uint32_t id; const char* name; } kNamed[] = {
+                    { kGpuPhaseAtmos, "atmos" },   { kGpuPhaseCull, "cull" },
+                    { kGpuPhaseCaustic, "caustic" },{ kGpuPhaseFroxelNear, "froxel" },
+                    { kGpuPhasePrepass, "prepass" },{ kGpuPhaseShadow, "shadow" },
+                    { kGpuPhasePostDepth, "postdepth" }, { kGpuPhaseReflect, "reflect" },
+                    { kGpuPhaseColor, "color" },   { kGpuPhaseHizMip0, "hizmip0" },
+                    { kGpuPhaseReLinear, "relin" },{ kGpuPhaseMotionVec, "mv" },
+                    { kGpuPhaseObjVel, "objvel" }, { kGpuPhaseWater, "water" },
+                    { kGpuPhaseColorAlpha, "alpha" }, { kGpuPhaseVolFog, "volfog" },
+                    { kGpuPhaseColorFP, "fp" },    { kGpuPhaseApl, "apl" },
+                    { kGpuPhaseResolveFilter, "rfilter" }, { kGpuPhaseMotionBlur, "mb" },
+                    { kGpuPhaseBloom, "bloom" },   { kGpuPhaseResolve, "resolve" },
+                };
+                const uint32_t nNamed = (uint32_t)(sizeof(kNamed) / sizeof(kNamed[0]));
+                Spread sp[sizeof(kNamed) / sizeof(kNamed[0])];
+                for (uint32_t i = 0; i < nNamed; ++i) {
+                    sp[i].name = kNamed[i].name;
+                    sp[i].lo   = g_stallWinMin[kNamed[i].id];
+                    sp[i].hi   = g_stallWinMax[kNamed[i].id];
+                    sp[i].d    = sp[i].hi - sp[i].lo;
+                }
+                // Insertion sort by spread, descending. 22 entries once per 300 frames.
+                for (uint32_t i = 1; i < nNamed; ++i) {
+                    Spread k = sp[i];
+                    int32_t j = (int32_t)i - 1;
+                    while (j >= 0 && sp[j].d < k.d) { sp[j + 1] = sp[j]; --j; }
+                    sp[j + 1] = k;
+                }
+                char buf[512];
+                int off = 0;
+                for (uint32_t i = 0; i < 6 && i < nNamed; ++i) {
+                    const int w = std::snprintf(buf + off, sizeof(buf) - (size_t)off,
+                                                "%s %.2f->%.2f(+%.2f) ",
+                                                sp[i].name, sp[i].lo, sp[i].hi, sp[i].d);
+                    if (w <= 0 || (size_t)(off + w) >= sizeof(buf)) { break; }
+                    off += w;
+                }
+                const double mean = g_stallWinSum / (double)g_stallWinN;
+                LOG::logline(">> [forge-hb] gpu stall latch: frames=%u frame min=%.2f MEAN=%.2f max=%.2f"
+                             " | excursion: mean-min=%.2f (%.0f%% of mean) max-min=%.2f"
+                             " | over(+10%%)=%u (%.0f%%) | worst spreads: %s",
+                             g_stallWinN,
+                             g_stallWinMin[kGpuPhaseFrame], mean, g_stallWinMax[kGpuPhaseFrame],
+                             mean - g_stallWinMin[kGpuPhaseFrame],
+                             (mean > 0.01) ? (100.0 * (mean - g_stallWinMin[kGpuPhaseFrame]) / mean) : 0.0,
+                             g_stallWinMax[kGpuPhaseFrame] - g_stallWinMin[kGpuPhaseFrame],
+                             g_stallWinOver,
+                             (g_stallWinN > 0) ? (100.0 * (double)g_stallWinOver / (double)g_stallWinN) : 0.0,
+                             buf);
+                // ===== THE COST MODEL, WITH THE STALL TAKEN OUT =================================
+                // Every number in `gpu split:` above is one sampled frame, and roughly half the
+                // frames carry part of a ~2.1 ms excursion that belongs to no pass. So the split's
+                // `mask=0.80` and `ao=1.33` are costs PLUS whatever stall that frame caught, and
+                // they are what a whole session of tuning would have been aimed at. These are the
+                // per-phase MINIMA over the window -- the cheapest frame each pass ever ran in,
+                // which is the closest thing to its true cost the GPU will report. Nested phases
+                // included, because "postdepth floors at 1.72" does not say whether that is AO or
+                // the mask.
+                LOG::logline(">> [forge-hb] gpu floors (ONE frame, the window's cheapest): frame=%.2f | prepass=%.2f"
+                             " shadow=%.2f(sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f"
+                             " blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f(geo=%.2f) color=%.2f cull=%.2f"
+                             " caustic=%.2f atmos=%.2f mv=%.2f mb=%.2f bloom=%.2f rfilter=%.2f resolve=%.2f",
+                             g_stallBest[kGpuPhaseFrame],
+                             g_stallBest[kGpuPhasePrepass],
+                             g_stallBest[kGpuPhaseShadow], g_stallBest[kGpuPhaseShadowSun],
+                             g_stallBest[kGpuPhasePostDepth],
+                             g_stallBest[kGpuPhaseLinearize],
+                             g_stallBest[kGpuPhaseAODown] + g_stallBest[kGpuPhaseAOSearch]
+                                 + g_stallBest[kGpuPhaseAOBlur] + g_stallBest[kGpuPhaseAOUp],
+                             g_stallBest[kGpuPhaseAODown],  g_stallBest[kGpuPhaseAOSearch],
+                             g_stallBest[kGpuPhaseAOBlur],  g_stallBest[kGpuPhaseAOUp],
+                             g_stallBest[kGpuPhaseShadowMask],
+                             g_stallBest[kGpuPhaseReflect], g_stallBest[kGpuPhaseReflGeo],
+                             g_stallBest[kGpuPhaseColor],   g_stallBest[kGpuPhaseCull],
+                             g_stallBest[kGpuPhaseCaustic], g_stallBest[kGpuPhaseAtmos],
+                             g_stallBest[kGpuPhaseMotionVec], g_stallBest[kGpuPhaseMotionBlur],
+                             g_stallBest[kGpuPhaseBloom],
+                             g_stallBest[kGpuPhaseResolveFilter], g_stallBest[kGpuPhaseResolve]);
+                g_stallWinN     = 0;   // next window starts clean
+                g_stallWinOver  = 0;
+                g_stallWinSum   = 0.0;
+                g_stallBestValid = false;
+            }
+
+            // The atmosphere LUT cache, reported as a RATE rather than a boolean. `builds` is the
+            // number that matters: it is how many times in the window the 0.71 ms chain actually
+            // ran, and it should sit at a handful. A builds count that tracks the frame count means
+            // something in the packed block is moving every frame -- the weather row blending as
+            // the player walks is the candidate -- and the cache has degraded to a memcmp, which is
+            // the honest failure and is visible here rather than as a mysteriously unchanged atmos=.
+            if (g_atmosSkips + g_atmosBuilds > 0) {
+                const uint32_t tot = g_atmosSkips + g_atmosBuilds;
+                LOG::logline(">> [forge-hb] atmos cache: builds=%u skips=%u (%.0f%% skipped)"
+                             " | quantum: sun %.3f deg alt %.1f m | cache=%s",
+                             g_atmosBuilds, g_atmosSkips,
+                             100.0 * (double)g_atmosSkips / (double)tot,
+                             (double)g_atmosCacheDeg, (double)g_atmosCacheAltM,
+                             g_atmosCache ? "on" : "OFF (control arm)");
+                g_atmosSkips  = 0;
+                g_atmosBuilds = 0;
+            }
+            // Skinned-loop CPU RECORD probe: rec-split skin= is prep(palette+instance memcpy, IPC-blob
+            // reads → faults) + rec(bindVB/IB+draw). Only rec is removable by a skinned mega-VB.
+            // SETUP split: localizes the 1400-line setup bucket. gather= is the O(dirty x meshHigh)
+            // caster scan; iters/kept shows how much of that scan is WASTED (kept << iters ⇒ the
+            // scan is the wrong data structure, not just slow).
+            // casters= the index size: the sweeps' real iteration domain. It should stay ~flat while
+            // meshHigh churns upward — if casters tracks meshHigh, the index is leaking.
+            LOG::logline(">> [forge-hb] setup split: casterRefresh=%.2f shadowMgr=%.2f (gather=%.2f,"
+                         " slots=%u iters=%llu kept=%u) drawMemcpy=%.2f other=%.2f ms"
+                         " | meshHigh=%u casters=%u",
+                         g_lastSetupCasterRefreshMs, g_lastSetupShadowMgrMs, g_lastSetupGatherMs,
+                         g_lastSetupGatherSlots, (unsigned long long)g_lastSetupGatherIters,
+                         g_lastSetupGatherKept, g_lastSetupDrawMemcpyMs,
+                         g_lastSetupMs - g_lastSetupCasterRefreshMs - g_lastSetupShadowMgrMs
+                             - g_lastSetupDrawMemcpyMs,
+                         g_meshHigh, (unsigned)g_casterSlots.size());
+            // shadowMgr sub-buckets — where its ~1.5-2.3ms ACTUALLY lives (the gather is ~0.2ms of it).
+            {
+                char blk[256]; int off = 0;
+                for (uint32_t b = 0; b < kSetupBlkCount && off < (int)sizeof(blk) - 1; ++b) {
+                    off += std::snprintf(blk + off, sizeof(blk) - off, "%s%s=%.2f",
+                                         b ? " " : "", kSetupBlkName[b], g_lastSetupBlkMs[b]);
+                }
+                LOG::logline(">> [forge-hb] shadowMgr blk: %s ms", blk);
+            }
+            // max vs mean is the tell: max~=mean = uniform (contention/cache, NOT this loop's fault);
+            // one big max = a single stall to hunt at that slot.
+            LOG::logline(">> [forge-hb] skin rec probe: prep=%.2f rec=%.2f ms (n=%u parts, mean=%.1fus,"
+                         " max=%.1fus @slot%u, pipeSwitches=%u)",
+                         g_lastSkinPrepMs, g_lastSkinRecMs, g_lastSkinnedDrawn,
+                         g_lastSkinnedDrawn ? ((g_lastSkinPrepMs + g_lastSkinRecMs) * 1000.0 / g_lastSkinnedDrawn) : 0.0,
+                         g_lastSkinMaxPartMs * 1000.0, g_lastSkinMaxSlot, g_lastSkinPipeSwitches);
+            // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
+            // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
+            // Tier 1: `wall` is no longer submit->fence around OUR OWN frame — it is the residual
+            // block at the TOP of this frame waiting for the PREVIOUS one. exec is the real GPU
+            // execution (resolved timestamps, one frame late). So the reading inverts: a SMALL
+            // residual with a large exec means the overlap is working; residual ~= exec means the
+            // host is right back to serial. overruns = frames that were still executing when we
+            // came back for them, which is the saturated-GPU signal, not a fault.
+            const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
+            LOG::logline(">> [forge-hb] gpu frame: exec=%.2f residualWait=%.2f hidden=%.2f ms"
+                         " (overruns=%u) (%s)",
+                         frameExec, g_lastGpuWaitMs, frameExec - g_lastGpuWaitMs, g_frameOverruns,
+                         (g_lastGpuWaitMs < 0.5 * frameExec) ? "OVERLAPPED (host ran under the GPU)"
+                                                             : "still serial (host waits the GPU)");
+            // APL instrument (tasks/forge-postprocess.md step 2). Three numbers, deliberately:
+            //   apl  = luma of the mean colour — the literal average picture level.
+            //   geo  = exp(mean log luma) — the geometric mean, the exposure metric, and later the
+            //          input to the ported Eye Adaptation. It moves differently from apl when the
+            //          distribution changes shape rather than its level, which is precisely what a
+            //          gamma->linear migration does, so reporting only one of the two would hide it.
+            //   cast = mean RGB divided by apl — the colour cast with overall level DIVIDED OUT.
+            //          This is the "hues" half: it stays put under an exposure change and moves the
+            //          moment the migration tints anything, so the two failure modes are separable
+            //          instead of being one number that drifted.
+            if (g_aplN > 0u) {
+                const double inv = 1.0 / (double)g_aplN;
+                const double r = g_aplAccum[0] * inv;
+                const double g = g_aplAccum[1] * inv;
+                const double b = g_aplAccum[2] * inv;
+                const double apl = 0.299 * r + 0.587 * g + 0.114 * b;
+                const double geo = std::exp(g_aplAccum[3] * inv);
+                const double n   = (apl > 1.0e-6) ? (1.0 / apl) : 0.0;
+                // S3a: the same line now carries the SETPOINT this context is aimed at, and the
+                // factor still missing. Reported here rather than in the dev panel for three
+                // reasons: apl already lives on this line, the harness runs minimized with nobody
+                // at the panel, and t.label() is implicated in the 2026-08-07 null-resource crash
+                // (see the Resolve tab — it has had zero callers since).
+                // S3a: the DISTRIBUTION in display levels beside the mean, and the target as the
+                // RANGE or PAIR it actually is. `need` is computed off the frame MEAN, so it is only
+                // a gate where the target is also a frame mean — the first interior run reported
+                // 3.51x against the user's ~2.5x, and most of that was comparing a range's top end
+                // as if it were a point. What is left over is the mean-vs-region question, which is
+                // what p50/p90 are here to answer: a value someone reads off a lit surface is
+                // comparable to p90, never to the mean of a frame full of dark corners.
+                const CalTarget ct = calTarget();
+                const double meanLvl = apl * 255.0;
+                // ...in the domain the KNOBS live in, not in display levels — see calGainDomain().
+                const double gm = calGainDomain(meanLvl);
+                const double kLo = (gm > 1.0e-9) ? (calGainDomain(ct.lo) / gm) : 0.0;
+                const double kHi = (gm > 1.0e-9) ? (calGainDomain(ct.hi) / gm) : 0.0;
+                // ⚠ `exp=` IS NOT DECORATION, and the line is invalid without it. With a servo
+                // running, every level on this line was measured through an exposure that moves, so
+                // an `apl` recorded here is meaningless unless the E it was taken at is recorded
+                // beside it — the whole calibration table is built out of these lines, and a table
+                // built from readings against an unknown gain is worse than no table. `need`
+                // settling toward 1.00x while `exp` moves is exactly what "the servo is working"
+                // looks like, since `need` is the residual the servo is closing.
+                //
+                // ⚠ AND THE CURVE JOINS THE SAME TUPLE at step 3, by exactly the argument `exp=`
+                // itself is here for: an APL reading taken against an unknown curve is
+                // uninterpretable, and these lines are what the calibration table gets built out of.
+                // It reports the curve that ARMED (agxActive()), not the checkbox — a build where
+                // the scene is not linear says `legacy` truthfully.
+                // WHICH POPULATION THIS LINE DESCRIBES, on the line itself. `scene` means sky was
+                // rejected and every number here is the world only; `frame` is the old whole-image
+                // reading. sky= is the rejected fraction, and it is what makes two readings
+                // comparable — a scene mean taken at sky=0.45 and one at sky=0.05 sampled very
+                // different parts of the world even though both say `scene`.
+                const double cover = g_aplCoverAccum * inv;
+                // ⚠ RAIL CONTACT (P2), and it is NOT decoration either. The clamp was widened from
+                // five stops to twenty for the physical sky's day-night cycle, which trades the
+                // guard it used to be for the range it now needs — and a servo pinned AT its limit
+                // is indistinguishable from one that happens to want that value unless the pinning
+                // is reported. `free` is the healthy state; `MIN 4.2s` means the loop has been
+                // refused for 4.2 seconds and the answer is a CAL gain or a calTarget row, not a
+                // bigger clamp. `worst` is the longest contact this session, so a night spent on the
+                // rail is still visible in the morning.
+                char railTxt[48];
+                if (g_expRail == 0) {
+                    std::snprintf(railTxt, sizeof(railTxt), "free(worst %.1fs)", g_expRailWorstMs * 0.001);
+                } else {
+                    std::snprintf(railTxt, sizeof(railTxt), "**%s %.1fs**(worst %.1fs)",
+                                  (g_expRail < 0) ? "MIN" : "MAX",
+                                  g_expRailMs * 0.001, g_expRailWorstMs * 0.001);
+                }
+                LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
+                             " cast=(%.3f,%.3f,%.3f) n=%u [%s sky=%.0f%%]"
+                             " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
+                             " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
+                             " exp=%.3g(%s,%s,%s) rail=%s(ceil %.3g) cal=(sun %.2f amb %.2f emis %.2f)",
+                             r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
+                             g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
+                             meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
+                             g_aplPctAccum[2] * inv,
+                             ct.name, ct.lo, ct.hi, kLo, kHi,
+                             g_live.linearScene ? "linear" : "gamma",
+                             g_exposure,
+                             g_expEnable ? "servo" : "OFF",
+                             (g_expStat < 0.5f) ? "mean" : ((g_expStat < 1.5f) ? "p90" : "geo"),
+                             agxActive() ? "agx" : "legacy",
+                             railTxt, (double)g_expMaxNow,
+                             g_calSunGain, g_calAmbGain, g_calEmisGain);
+
+                // --- THE REGION SPLIT, ON ITS OWN LINE -------------------------------------
+                //
+                // Its own line and not more fields on the one above, because it answers a
+                // different question and has a different divisor: the line above is ONE
+                // population over g_aplN frames, this is TWO populations over two frame counts
+                // that need not match either it or each other.
+                //
+                // `w/l` IS THE WHOLE INSTRUMENT. Both halves were metered in the same frame,
+                // through the same exposure and the same curve, so their ratio is a property of
+                // the renderer and survives a change of weather, of time of day, or of E — which
+                // is exactly what a single-population reading cannot do. The standing target
+                // (user, 2026-08-21) is 0.50: water at half the APL of the land beside it.
+                //
+                // ⚠ THE RATIO IS OF DISPLAY LEVELS, NOT OF RADIANCE. Every number here is read
+                // off the DELIVERED image, after AgX and after the sRGB encode, and that curve is
+                // strongly compressive — so 0.50 in these units is a much larger ratio upstream,
+                // and no scene-referred coefficient can be read off this line directly. It is a
+                // TARGET to servo the physics onto, not a value to paste into a constant.
+                //
+                // p50/p90 come along because a mean over a region is still a mean: a bay with a
+                // bright specular streak and a dark body has the same mean as a uniform grey one,
+                // and only the spread tells them apart.
+                if (g_aplLandN > 0u || g_aplWaterN > 0u) {
+                    const double li = (g_aplLandN  > 0u) ? (1.0 / (double)g_aplLandN)  : 0.0;
+                    const double wi = (g_aplWaterN > 0u) ? (1.0 / (double)g_aplWaterN) : 0.0;
+                    const double lApl = (0.299 * g_aplLandAccum[0] + 0.587 * g_aplLandAccum[1]
+                                       + 0.114 * g_aplLandAccum[2]) * li;
+                    const double wApl = (0.299 * g_aplWaterAccum[0] + 0.587 * g_aplWaterAccum[1]
+                                       + 0.114 * g_aplWaterAccum[2]) * wi;
+                    const double ratio = (lApl > 1.0e-6) ? (wApl / lApl) : 0.0;
+                    // ⚠ AND THE RATIO PER CHANNEL, because a luma ratio can sit exactly on target
+                    // while the picture is wrong. MW's ground art measures 0.043/0.037/0.017 linear
+                    // — its BLUE albedo is under half its red — and a water column is blue by
+                    // construction (absorption is 4x higher in red, so omega' is blue-dominant
+                    // whatever the medium). The two can agree on luma and still differ by 2x in
+                    // blue, which is what "the bright blue is scatter" describes and what a single
+                    // w/l number structurally cannot show.
+                    double wl[3] = { 0.0, 0.0, 0.0 };
+                    for (int i = 0; i < 3; ++i) {
+                        const double lc = g_aplLandAccum[i] * li;
+                        wl[i] = (lc > 1.0e-6) ? ((g_aplWaterAccum[i] * wi) / lc) : 0.0;
+                    }
+                    LOG::logline(">> [forge-hb] apl-split: LAND lvl=%.1f p50=%.0f p90=%.0f"
+                                 " rgb=(%.4f,%.4f,%.4f) n=%u"
+                                 " | WATER lvl=%.1f p50=%.0f p90=%.0f rgb=(%.4f,%.4f,%.4f) n=%u"
+                                 " | w/l=%.3f (target 0.50) per-ch=(%.2f,%.2f,%.2f)"
+                                 " land=%.0f%% of scene%s",
+                                 lApl * 255.0, g_aplLandPct[1] * li, g_aplLandPct[2] * li,
+                                 g_aplLandAccum[0] * li, g_aplLandAccum[1] * li,
+                                 g_aplLandAccum[2] * li, g_aplLandN,
+                                 wApl * 255.0, g_aplWaterPct[1] * wi, g_aplWaterPct[2] * wi,
+                                 g_aplWaterAccum[0] * wi, g_aplWaterAccum[1] * wi,
+                                 g_aplWaterAccum[2] * wi, g_aplWaterN,
+                                 ratio, wl[0], wl[1], wl[2],
+                                 100.0 * g_aplLandFrac * inv,
+                                 g_waterNoReflect ? " [NO-REFLECT: transmitted path only]" : "");
+                }
+            }
+            dlLogHeartbeat();
+            g_recAccum = 0.0;
+            g_gpuAccum = 0.0;
+            g_aplAccum[0] = g_aplAccum[1] = g_aplAccum[2] = g_aplAccum[3] = 0.0;
+            g_aplPctAccum[0] = g_aplPctAccum[1] = g_aplPctAccum[2] = 0.0;
+            g_aplCoverAccum = 0.0;
+            g_aplN = 0;
+            for (int i = 0; i < 4; ++i) { g_aplLandAccum[i] = g_aplWaterAccum[i] = 0.0; }
+            for (int i = 0; i < 3; ++i) { g_aplLandPct[i]   = g_aplWaterPct[i]   = 0.0; }
+            g_aplLandFrac = 0.0;
+            g_aplLandN = g_aplWaterN = 0;
+        }
+    }
+
     }  // namespace — promoted passes
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
@@ -41883,1656 +43556,9 @@ void destroyHostWindow(Renderer* R);
         // ===================== Hi-Z prologue: reduce mips 1..N (tail submit) =====================
         passHiZPrologue(R, rzViewProj, hizMip0Filled, gpuPhaseBegin, gpuPhaseEnd);
 
-        // --- M1: SNAPSHOT THIS FRAME'S CAMERA FOR NEXT FRAME'S REPROJECTION -----------------------
-        // ⚠ UNCONDITIONAL, and deliberately NOT tucked inside the Hi-Z block above even though that
-        // block snapshots the very same matrix two lines earlier. The Hi-Z snapshot is gated on the
-        // pyramid having been built; if the motion vectors borrowed it they would silently reproject
-        // into a matrix from an arbitrary older frame the moment the pyramid was skipped, and the
-        // symptom — a field that is right most of the time — is the worst kind to debug.
-        //
-        // ⚠ RENDERED FRAMES, NOT PRODUCED ONES, which is why it is here rather than anywhere the
-        // client's frame counter is touched. Park mode and frame-ahead both re-render a parked
-        // payload at a new camera; "previous frame" has to mean the previous RASTER, or the
-        // reprojection targets an image that was never drawn. Same rule the jitter sequence follows.
-        //
-        // The matrix is stored exactly as rendered — its own half-pixel offset AND its own jitter —
-        // because the image it will be used to address was rasterised with both.
-        std::memcpy(g_prevViewProj, rzViewProj, sizeof(g_prevViewProj));
-        g_prevBakeEye[0] = (double)g_eyeAbsShadow[0];
-        g_prevBakeEye[1] = (double)g_eyeAbsShadow[1];
-        g_prevBakeEye[2] = (double)g_eyeAbsShadow[2];
-        g_prevViewProjValid = true;
-        // MB-1d: ...and the ARM camera, which is a SEPARATE matrix and a SEPARATE question. The FP
-        // pass renders with its own FOV/near/far, so reprojecting an arm vertex through the world
-        // matrix above would give it the world's parallax and none of its own.
-        //
-        // ⚠ CONDITIONAL, unlike the world snapshot, and STAMPED rather than flagged. The FP pass is
-        // simply absent in third person, in a menu, or with nothing in hand — so "there was an arm
-        // camera last frame" is not answerable by a bool that only ever goes true. Recording the
-        // frame number lets the consumer demand exactly g_renderFrame - 1, which is what makes
-        // g_prevBakeEye (stamped unconditionally, one line up, this frame) the matching origin. A
-        // stale arm camera paired with a fresh bake eye is the origin bug wearing a different hat.
-        if (fpRzValid) {
-            std::memcpy(g_fpPrevViewProj, fpRzSaved, sizeof(g_fpPrevViewProj));
-            g_fpPrevViewProjFrame = g_renderFrame;
-        }
-
-        g_live.firstFrame = false;
-        g_lastDrawn = drawn;
-        g_lastSkinnedDrawn = skinnedDrawn;
-        g_lastMultiMapDrawn = multiMapDrawn;
-        g_lastSkyDrawn = skyDrawn;
-        g_lastAlphaDrawn = alphaDrawn;
-
-        // Host-side heartbeat to mgeHost64.log (LOG::logline; LOGF goes to uncaptured stdout).
-        // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
-        // meshHigh = total slots ever populated (monotonic leak check). Lets us correlate the
-        // client's [hb] frame cost with what the Forge renderer is actually drawing.
-        // Post-fence + whole-frame totals (host-internal; the server also wall-times renderScene for
-        // the client's hostMs — these let us see WHERE that wall goes: setup+cull+record+gpu+post).
-        // Tier 1: "post" used to start where the fence wait ended; the wait is gone, so it starts at
-        // the submit. The host split now reads setup + cull + gpuWait(top-of-frame) + record + post,
-        // and gpuWait is the residual the overlap failed to hide rather than the GPU's frame time.
-        g_lastPostMs  = hostNowMs() - tSubmit1;
-        g_lastTotalMs = hostNowMs() - tEntry;
-        if ((g_renderFrame % 300u) == 0u) {
-            // MW's live lighting, as the host actually received it. The standalone viewer has no MW, so
-            // it synthesizes sun/ambient — these are the values to copy into its defaults so it lights
-            // the world the way the game does (else the viewer's contrast is its own invention).
-            {
-                const float* lf = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-                // S3a — THE RATIO, on the line that already carries the two colours it is made of,
-                // and made of exactly those lanes rather than of a second copy. These are POST-GAIN:
-                // the CAL gains were folded in at the decode site, so this is what the frame renders
-                // with and not what MW sent.
-                //
-                //   ratio   — sun:ambient as rendered. 4.70 in the logged daytime exterior.
-                //   target  — calSunAmbTarget(), DERIVED live off the ext-day pair and the armed
-                //             curve, at ndl = 1. knob is what the solve actually aims at; the two
-                //             disagreeing means the curve moved and the knob wants re-authoring.
-                //   at-ndl  — the ndl at which today's ratio is ALREADY correct. This is the free
-                //             parameter made VISIBLE instead of chosen: 0.38 says the frame is
-                //             mildly off for flat ground and badly off for a sun-facing surface.
-                //   solve   — what the button would do. Printed, never applied.
-                const CalRatio cr = calRatioMeasure(lf + 20, lf + 24);
-                char ratioTxt[24], ndlTxt[24], solveTxt[64];
-                if (cr.ratio >= 0.0) { std::snprintf(ratioTxt, sizeof(ratioTxt), "%.2f", cr.ratio); }
-                else                 { std::snprintf(ratioTxt, sizeof(ratioTxt), "n/a"); }
-                if (cr.atNdl >= 0.0) { std::snprintf(ndlTxt, sizeof(ndlTxt), "%.2f", cr.atNdl); }
-                else                 { std::snprintf(ndlTxt, sizeof(ndlTxt), "n/a"); }
-                if (cr.gSun > 0.0)   { std::snprintf(solveTxt, sizeof(solveTxt),
-                                                     "sun x%.2f amb x%.2f (sum held)", cr.gSun, cr.gAmb); }
-                else                 { std::snprintf(solveTxt, sizeof(solveTxt), "n/a"); }
-                // ⚠ `target=` STILL DOUBLES AS AN ASSERT, BUT ON A DIFFERENT QUESTION SINCE P2.
-                // While P1's anchor lived, it asserted that scaling the sky had not disturbed the
-                // sun:ambient calibration. Now it says which END OF THE BLEND the frame is on:
-                // calSunAmbTarget() states what MW's AUTHORED pair should be calibrated to (1.79 at
-                // the restored 80/128 rows), and the PHYSICAL pair's ratio is the atmosphere's —
-                // measured 6.06 at the reference configuration. So `ratio=` sitting far above
-                // `target=` at full blend is EXPECTED and is the tell that the physics is armed;
-                // `ratio=` landing on `target=` means the blend is at 0. The physical numbers
-                // themselves are on the [sky] line below, which is where P2 reports.
-                LOG::logline(">> [forge-hb][light] sunDir=(%.4f,%.4f,%.4f) sunCol=(%.4f,%.4f,%.4f) ambCol=(%.4f,%.4f,%.4f)"
-                             " eyeAbs=(%.0f,%.0f,%.0f)"
-                             " | ratio=%s target=%.2f(ndl=1) knob=%.2f | at-ndl=%s | solve: %s",
-                             lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
-                             lf[56], lf[57], lf[58],   // lodEye = ABSOLUTE world eye (viewer start pos)
-                             ratioTxt, calSunAmbTarget(), (double)g_calRatioTarget, ndlTxt, solveTxt);
-                // ─── P2 — THE PHYSICAL SKY, AND EVERY NUMBER HERE IS A FALSIFICATION TEST ────────
-                // Nothing on this line is tuned to; all of it is REPORTED, which is the only way the
-                // §0 measurements stay tests rather than targets:
-                //
-                //   q      — L_zenith / (E_total/pi), the albedo-free scale-invariant invariant §0
-                //            is built on. Real clear skies: 0.122 median, p25..p75 0.093..0.148. MW's
-                //            authored sky read 0.265, and the RETIRED closed form computed 0.100 at
-                //            the reference — outside the band on the other side. The medium should
-                //            land INSIDE it without being told to, which S2b's gate is what checks.
-                //            ⚠ A MOVED ZENITH IS THE FIX, NOT A REGRESSION. Landing inside the band
-                //            from 0.100 necessarily shifts the drawn zenith by ~15%; what may not
-                //            move is the LIGHT (ambScene, sunScene and their ratio), which are
-                //            integrals over the whole sphere that a zenith/horizon redistribution
-                //            barely touches. Anyone reading a moved zenith as a continuity failure
-                //            will "fix" the one number this phase exists to correct.
-                //   sun%   — E_sun_horizontal / E_total. Real clear skies ~0.80 (p25..p75 0.73..0.84).
-                //            ⚠⚠ THIS IS A PREDICTION EVERYWHERE SINCE S2, INCLUDING AT THE REFERENCE.
-                //            The retired model SOLVED its beam scale so 0.80 held there by
-                //            construction — the number was an identity restating an anchor. The
-                //            medium's beam is E_TOA x transmittance with no free scale, so it can
-                //            now miss at the reference too, and it should still FALL toward dusk.
-                //   sky/sun lx — the sky's horizontal illuminance and the sun's DIRECT-NORMAL
-                //            illuminance. The sun peaks near 109 klx with the sun overhead, against a
-                //            textbook sea-level maximum of ~110. A number far outside that says the
-                //            beam anchor or the transmittance is wrong, not the sky.
-                //   amb/sun — the physical pair in SCENE units, i.e. exactly what was blended into
-                //            gFrameData at the decode site, and their ratio, which is the honest
-                //            version of the `ratio=` above.
-                //   ramp   — the night ramp. It fades the SKY to black and hands the LIGHTING back
-                //            to MW at once, so a value between 0 and 1 is dawn/dusk, not a fault.
-                if (g_skyPhys.active) {
-                    const double ambL = (double)SceneCal::luma709(g_skyPhys.ambScene);
-                    const double sunL = (double)SceneCal::luma709(g_skyPhys.sunScene);
-                    //   elev / light — MW'S TWO SUNS, side by side. `elev` is the DISC, which is what
-                    //            the model is cooked at and what actually SETS; `light` is the
-                    //            sgSunlight direction that drives every lighting term, sits ~29
-                    //            degrees away from the disc, and BOUNCES back above the horizon at
-                    //            night instead of setting. Expect them to differ all day and to
-                    //            diverge completely after dusk, when `elev` goes negative and
-                    //            `light` does not. ⚠ Step MW's hour across dusk and watch `elev`
-                    //            reach 0: MW flips the disc when its own sunVis byte hits zero, so
-                    //            if that happens AT the horizon the crossing is continuous, and if
-                    //            MW holds sunVis up past it, `elev` STEPS in one frame and the sky
-                    //            snaps. That is the one thing about this port MGE's source cannot
-                    //            settle, so it is on the line instead of in a comment.
-                    //   elev is the UNCLAMPED disc elevation and goes NEGATIVE at dusk. There is no
-                    //            `cook=` companion any more and that absence IS a result: the closed
-                    //            form had to be clamped at 0 because it was undefined below the
-                    //            horizon, so the two numbers parted company at dusk. A medium takes
-                    //            a negative elevation as an ordinary configuration and computes
-                    //            twilight, so there is only one elevation left to print.
-                    //   ⚠ nits — S2's new row, and it is per CHANNEL for a reason. q and sun% are
-                    //            scale-free BY CONSTRUCTION: they would read exactly the same if the
-                    //            whole sky were ten times too bright, or the right brightness and
-                    //            the wrong colour. A zenith in cd/m2 is checkable against published
-                    //            sky measurements, and the phase's success criterion is chromatic.
-                    //   ⚠ fogTarget — the row this session added, and it is a COMPARISON, not a
-                    //            reading. `below` is the medium 10 deg under the horizon: what the
-                    //            WATER, the reflection hole fill and every downhill vista melt into
-                    //            now that skyhw.frag is opaque there. `land` is fogColNear, what
-                    //            everything ABOVE the horizon melts into below applyFog's 0.85
-                    //            saturation knee, i.e. almost the whole visible world. They are the
-                    //            same quantity for two surfaces standing side by side, so a large
-                    //            gap between them IS the "fog discrepancy" defect, on one line.
-                    //   ⚠ ev — Sunny 16, riding along free. A textbook clear noon is EV 15, nothing
-                    //            is tuned to it and nothing reads it. It is on the line because a
-                    //            number nobody targeted is the only kind that can falsify anything.
-                    //   stars / sun disc — P2b's two element lanes, each printed next to the thing
-                    //            it has to be judged against: the star radiance against the DRAWN
-                    //            zenith it must hide under by day, and the sun's L against the solid
-                    //            angle MW's sprite actually covers (which is NOT the sun's 6.8e-5 sr
-                    //            — the ratio is a finding about MW's art).
-                    // `aim` is the elevation change aimSunLightAtDisc actually applied to the LIGHT
-                    // this frame and `w` its handover weight, printed beside the two suns they are
-                    // computed from. At w=1 the light IS the disc, so `light + aim` should equal
-                    // `elev`; at w=0 the light is MW's bounce untouched, which is what night wants.
-                    LOG::logline(">> [forge-hb][sky] MEDIUM mie=%.2fx (cal x%.2f) alb=%.2f elev=%.2fdeg (light=%.2fdeg"
-                                 " aim=%+.2fdeg w=%.2f)"
-                                 " ramp=%.2f blend=%.2f nightAmb=%.2f alt=%.0fm"
-                                 " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80,"
-                                 " a PREDICTION since S2)"
-                                 " | sky=%.0flx sunNormal=%.0flx ev100=%.2f (clear noon: 15)"
-                                 " | nits zenith=(%.0f,%.0f,%.0f) horizon=(%.0f,%.0f,%.0f) cd/m2"
-                                 " | fogTarget below=(%.0f,%.0f,%.0f) land=(%.0f,%.0f,%.0f) cd/m2"
-                                 " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2"
-                                 " | mwRef amb=%.3f sun=%.3f nl=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
-                                 " refDiv=(sun x%.2f amb x%.2f)"
-                                 " | zenith=%.5f stars=%.5f (%.1f%% of zenith)"
-                                 " cloud=%.5f (%.1fx zenith, albedo %.2f / q)"
-                                 " | sunDisc %s omega=%.3e sr (%.2fdeg, %.0fx solar) L=%.1f p=%.2f",
-                                 (double)g_skyPhys.turbidity, (double)g_atmosMieMul,
-                                 (double)g_skyPhys.albedo,
-                                 (double)g_skyPhys.elevDisc,
-                                 (double)g_skyPhys.elevLight,
-                                 (double)g_sunAimAppliedDeg, (double)g_sunAimWeight,
-                                 (double)g_skyPhys.nightRamp, (double)g_skyPhysBlend,
-                                 (double)nightAmbScaleNow(),
-                                 (double)(g_skyPhys.cameraRadiusM - Atmosphere::kGroundRadiusM),
-                                 g_skyPhys.qZenith, g_skyPhys.sunShare,
-                                 g_skyPhys.EskyLux, g_skyPhys.EsunLux, g_skyPhys.ev100,
-                                 (double)g_skyPhys.zenithNative[0] * 683.0,
-                                 (double)g_skyPhys.zenithNative[1] * 683.0,
-                                 (double)g_skyPhys.zenithNative[2] * 683.0,
-                                 (double)g_skyPhys.horizonNative[0] * 683.0,
-                                 (double)g_skyPhys.horizonNative[1] * 683.0,
-                                 (double)g_skyPhys.horizonNative[2] * 683.0,
-                                 (double)g_skyPhys.belowNative[0] * 683.0,
-                                 (double)g_skyPhys.belowNative[1] * 683.0,
-                                 (double)g_skyPhys.belowNative[2] * 683.0,
-                                 (double)g_fogNearScene[0] * SceneCal::kSceneUnitCd,
-                                 (double)g_fogNearScene[1] * SceneCal::kSceneUnitCd,
-                                 (double)g_fogNearScene[2] * SceneCal::kSceneUnitCd,
-                                 ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
-                                 SceneCal::kSceneUnitCd,
-                                 (double)g_mwAmbCodeRef, (double)g_mwSunCodeRef,
-                                 (double)(g_skyPhys.active
-                                     ? std::max(0.0f, std::sin(g_skyPhys.elevLight
-                                                               * (float)(SceneCal::kPi / 180.0)))
-                                     : kCalDayElevSin),
-                                 (double)mwRefLevel(), (double)(mwRefLevel() / calMwDayRef()),
-                                 (double)(g_calDayCentre * mwRefLevel() / calMwDayRef()),
-                                 // EVERYTHING DIVIDED OUT OF THE SETPOINT'S REFERENCE, as the ratio
-                                 // the wire lets us recover: MW's delivered light over the reference
-                                 // the servo aims by. TWO things now live in it — MGEgui's per-weather
-                                 // look table (Cloudy sun x1.60) and the per-weather DAY-ROW
-                                 // normalisation the client applies (renderprocess.cpp, sunColRef) —
-                                 // so it is no longer the ini dial alone and is named for what it is.
-                                 // Clear reads x1.00/x1.00 because both factors are the identity there.
-                                 // It stays on the line so the next person to read "cloudy is washed
-                                 // out" sees the divisor beside the setpoint rather than hunting an ini.
-                                 (g_mwSunCodeRef > 1.0e-6f) ? (double)(g_mwSunCode / g_mwSunCodeRef) : 0.0,
-                                 (g_mwAmbCodeRef > 1.0e-6f) ? (double)(g_mwAmbCode / g_mwAmbCodeRef) : 0.0,
-                                 g_skyPhys.zenithScene,
-                                 (double)g_skyPhys.starScene,
-                                 (g_skyPhys.zenithScene > 1.0e-9)
-                                     ? 100.0 * (double)g_skyPhys.starScene / g_skyPhys.zenithScene : 0.0,
-                                 (double)g_skyPhys.cloudScene, g_skyPhys.cloudOverZenith,
-                                 (double)g_skyCloudAlbedo,
-                                 g_skyPhys.sunDiscFound ? "ok" : "ABSENT",
-                                 (double)g_skyPhys.sunDiscOmega, (double)g_skyPhys.sunDiscHalfDeg,
-                                 (double)(g_skyPhys.sunDiscOmega / 6.80e-05f),
-                                 (double)SceneCal::luma709(g_skyPhys.sunDiscL),
-                                 (double)g_sunDiscExpand);
-                } else {
-                    // ⚠ THE MW REFERENCE HAS TO BE PRINTED HERE TOO, AND UNTIL NOW IT WAS NOT. The
-                    // exterior branch above reports `mwRef amb=.. sun=.. -> setpoint ..`, which is
-                    // the whole state of the setpoint rule; this branch reported nothing, so an
-                    // interior's authored light was latched every frame and never once shown. That
-                    // is exactly why "this interior looks nuclear" had no number attached to it for
-                    // as long as it did: the input to the rule was invisible from the outside, and a
-                    // calibration whose input you cannot read is not falsifiable.
-                    // Printed whatever g_calFollowMwInterior is set to, so the A/B has both arms.
-                    const float iref = mwRefLevelInterior();
-                    const float irat = iref / calMwDayRef();
-                    // B1: BOTH ARMS, ALWAYS. The floor-referred reference and the lamp-inclusive one
-                    // print side by side whatever `calInteriorLit` is set to, for the reason the
-                    // paragraph above gives about the exterior branch — a calibration whose input you
-                    // cannot read is not falsifiable, and this one has TWO inputs now. `pt` is the
-                    // lamps' own contribution in MW code space (mwRefLevelInteriorLit); `setpoint`
-                    // is what each arm would ask the servo for, AFTER g_calInteriorFloor — which is
-                    // the number to watch, because on both complaint saves the floor is what is
-                    // actually in force and the MW-referred value never reaches it.
-                    const float ilit = mwRefLevelInteriorLit();
-                    const float ilrat = ilit / calMwDayRef();
-                    LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting"
-                                 " | mwRef amb=%.3f sun=%.3f pt=%.3f n=%u"
-                                 " | FLOOR m=%.3f (%.3fx day -> setpoint %.1f)"
-                                 " | LIT m=%.3f (%.3fx day -> setpoint %.1f)"
-                                 " | armed=%s followMwInterior=%d",
-                                 g_skyHw ? "interior / no sun" : "master toggle",
-                                 (double)g_mwAmbCode, (double)g_mwSunCode, (double)g_mwPtCode,
-                                 g_lastLightCount,
-                                 (double)iref, (double)irat,
-                                 (double)std::max(g_calInteriorFloor, g_calDayCentre * irat),
-                                 (double)ilit, (double)ilrat,
-                                 (double)std::max(g_calInteriorFloor, g_calDayCentre * ilrat),
-                                 g_calInteriorLit ? "LIT" : "floor",
-                                 g_calFollowMwInterior ? 1 : 0);
-                }
-                // The medium MW's weather currently describes. Sits with the [sky] line because
-                // since S2 the two ARE the same object: the row below is what the LUTs above were
-                // built from, so a sky that looks wrong and a weather row that reads wrong are one
-                // diagnosis rather than two.
-                logAtmosphereRow("hb");
-            }
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
-                         "| refl sky=%u near=%u skin=%u mm=%u "
-                         "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, g_lastSkinAlphaDrawn, g_lastSkinAlphaPrepassDrawn,
-                         multiMapDrawn, skyDrawn, alphaDrawn,
-                         g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
-                         g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn, g_lastReflMMDrawn,
-                         g_recAccum / 300.0, g_gpuAccum / 300.0);
-            // H2 pool occupancy (external audit PR #2). The arenas grow by doubling to a HARD cap
-            // and then drop parts — i.e. objects go missing — so "how close are we" must be a
-            // standing number, not something reconstructed after a bug report. skipped= is SESSION
-            // CUMULATIVE and any non-zero value is a defect. frag= is free-region count: a high
-            // count against plenty of free bytes means the first-fit allocator is fragmenting and
-            // a grow can be refused while the arena looks empty.
-            {
-                // WHITE-TEXTURE TRIAGE. Slots a draw actually REFERENCED this window that are still
-                // the host's default white — geometry drawn untextured while nothing in either log
-                // complains. Slot 0 is the legitimate textureless case and is excluded; any other
-                // slot here means the client resolved a name to it and the DDS never became a
-                // texture (upload dropped, parse failed, or the batch never arrived). Reads the
-                // bitset packTexAlpha already maintains, so it costs one pass per 300 frames, and
-                // it must run BEFORE the clearing loop below. Pairs with the client's [tex-census]
-                // line, which is what maps the slot back to a texture NAME.
-                if (g_live.pDefaultWhite) {
-                    char list[220]; int n = 0; unsigned whites = 0;
-                    for (unsigned s = 1; s < (unsigned)MAX_TEXTURES; ++s) {
-                        if (!(g_texSeenBits[s >> 5] & (1u << (s & 31u)))) { continue; }
-                        if (g_live.pTextures[s] != g_live.pDefaultWhite) { continue; }
-                        ++whites;
-                        if (n < 200) {
-                            n += snprintf(list + n, sizeof(list) - (size_t)n, "%s%u", n ? "," : "", s);
-                        }
-                    }
-                    if (whites) {
-                        LOG::logline("!! [forge] %u referenced slot(s) still DEFAULT WHITE: %s",
-                                     whites, list);
-                    }
-                }
-                // NEAR-TEXTURE LEDGER + ITS ALARMS (tasks/forge-memory-shape.md). Read HERE, before the
-                // clearing loop below, because "sampled this window" is g_texSeenBits itself — every
-                // draw path, off-screen shadow casters included, marks it through packTexAlpha.
-                {
-                    constexpr uint32_t kHighRes = 4u << 20;   // 2048^2 BC3 with mips is 5.3 MB
-                    uint32_t nRes = 0, nResHi = 0, nHot = 0, nHotHi = 0;
-                    uint64_t bRes = 0, bHot = 0, bData = 0;
-                    for (unsigned s = 1; s < (unsigned)MAX_TEXTURES; ++s) {
-                        const uint32_t b = g_texSlotBytes[s];
-                        if (!b) { continue; }
-                        const bool hi  = b >= kHighRes;
-                        const bool hot = (g_texSeenBits[s >> 5] & (1u << (s & 31u))) != 0u;
-                        ++nRes; bRes += b; if (hi) { ++nResHi; }
-                        if (g_texIsData[s]) { bData += b; }
-                        if (hot) { ++nHot; bHot += b; if (hi) { ++nHotHi; } }
-                    }
-                    const double kMB = 1024.0 * 1024.0;
-                    LOG::logline(">> [forge-hb] mem near-tex: resident %u tex %.0f MB (high-res %u, _paramh %.0f MB)"
-                                 " | sampled this window %u tex %.0f MB (high-res %u) | unsampled %.0f MB"
-                                 " | flip arrays %.0f MB | evicted by client %llu this session",
-                                 nRes, (double)bRes / kMB, nResHi, (double)bData / kMB,
-                                 nHot, (double)bHot / kMB, nHotHi, (double)(bRes - bHot) / kMB,
-                                 (double)g_flipArrayBytes / kMB, (unsigned long long)g_texReleased);
-                    if (bRes != g_texResidentBytes) {
-                        LOG::logline("!! [mem] near-texture ledger DRIFT: running total %.0f MB, re-sum %.0f MB"
-                                     " — a writer of pTextures[] is not keeping g_texSlotBytes",
-                                     (double)g_texResidentBytes / kMB, (double)bRes / kMB);
-                    }
-                    if (nResHi > g_memHighResMax) {
-                        LOG::logline("!! [mem] near textures: %u HIGH-RES resident (envelope %u) — %u of them"
-                                     " unsampled this window; %.0f MB held that nothing is drawing",
-                                     nResHi, g_memHighResMax, nResHi - nHotHi, (double)(bRes - bHot) / kMB);
-                    }
-                    if (nHotHi > g_memHighResMax) {
-                        LOG::logline("!! [mem] near textures: %u high-res SAMPLED in one window (envelope %u) —"
-                                     " the working set itself is over, not just the residency",
-                                     nHotHi, g_memHighResMax);
-                    }
-                    if (bRes > (uint64_t)g_memNearTexMB << 20) {
-                        LOG::logline("!! [mem] near textures: %.0f MB resident (envelope %u MB, loose until"
-                                     " texel density is normalised)", (double)bRes / kMB, g_memNearTexMB);
-                    }
-                }
-                // Unique slots referenced since the LAST heartbeat, i.e. the working set over a
-                // 300-frame window — the number that is actually comparable to client residency
-                // (a per-frame count would undercount a set the player pans across). Cleared here,
-                // so each heartbeat reports its own window.
-                g_lastUniqueTex = 0;
-                for (unsigned w = 0; w < (unsigned)((MAX_TEXTURES + 31) / 32); ++w) {
-                    g_lastUniqueTex += (unsigned)__popcnt(g_texSeenBits[w]);
-                    g_texSeenBits[w] = 0;
-                }
-                const uint64_t vbUsed = g_arenaVB.total - g_arenaVB.freeBytes;
-                const uint64_t ibUsed = g_arenaIB.total - g_arenaIB.freeBytes;
-                LOG::logline(">> [forge-hb] pools: arenaVB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu)"
-                             " arenaIB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu) grows=%llu"
-                             " | meshBuf=%llu/%llu MB (peak %llu, refused %llu)"
-                             " | skipped=%llu parts (%llu KB VB / %llu KB IB) | uniqueTex/300f=%u",
-                             (unsigned long long)(vbUsed >> 20), (unsigned long long)(g_arenaVB.total >> 20),
-                             g_arenaVB.total ? 100.0 * (double)vbUsed / (double)g_arenaVB.total : 0.0,
-                             (unsigned long long)(kArenaVBMaxBytes >> 20), g_arenaVB.regions.size(),
-                             (unsigned long long)(ibUsed >> 20), (unsigned long long)(g_arenaIB.total >> 20),
-                             g_arenaIB.total ? 100.0 * (double)ibUsed / (double)g_arenaIB.total : 0.0,
-                             (unsigned long long)(kArenaIBMaxBytes >> 20), g_arenaIB.regions.size(),
-                             (unsigned long long)g_arenaGrowCount,
-                             // meshBuf= — what the NON-arena parts (skinned, multimap, morph rings,
-                             // i.e. every actor) hold in D3D12 buffers, against the hard cap that
-                             // keeps a refused allocation from AVing the host (kMeshBufMaxBytes).
-                             // `refused` is the number that matters: any non-zero means parts are
-                             // being dropped to stay alive, and the cap or the churn wants looking
-                             // at. In normal play this sits in single-digit MB.
-                             (unsigned long long)(g_meshBufBytes >> 20),
-                             (unsigned long long)(kMeshBufMaxBytes >> 20),
-                             (unsigned long long)(g_meshBufPeak >> 20),
-                             (unsigned long long)g_meshBufRefusals,
-                             (unsigned long long)g_skippedPartsTotal,
-                             (unsigned long long)(g_skippedVBTotal >> 10),
-                             (unsigned long long)(g_skippedIBTotal >> 10),
-                             g_lastUniqueTex);
-                // VRAM budget + EcoQoS, the two regime probes (see forgeVramAdapter above).
-                // Read `local` against its BUDGET, not against the card total: the budget is what
-                // the driver is currently willing to give US, it moves when another app takes
-                // memory, and crossing it — not filling the card — is what starts paging.
-                // `OVER` is therefore the whole point of the line; the percentage is context.
-                // nonlocal = system memory the GPU reaches over PCIe, which is where evicted
-                // resources LAND, so a rising nonlocal usage is the paging itself, in progress.
-                {
-                    // One mark per heartbeat, so the FIRST one closes the accounting: everything
-                    // between the end of buildOpaquePath and a live frame (terrain upload, distant
-                    // land, the bindless texture array, per-frame ring buffers) lands in this one
-                    // delta. If that residual is the biggest number in the list, the phase marks
-                    // above are in the wrong place and the next ones go here.
-                    static bool s_firstHb = true;
-                    if (s_firstHb) { vramMark(g_live.pRenderer, "FIRST FRAME (residual)"); s_firstHb = false; }
-                    const int eco = forgeEcoQoSState();
-                    if (IDXGIAdapter3* ad = forgeVramAdapter(g_live.pRenderer)) {
-                        DXGI_QUERY_VIDEO_MEMORY_INFO loc = {}, non = {};
-                        const bool okL = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,     &loc));
-                        const bool okN = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non));
-                        if (okL || okN) {
-                            char ecobuf[32];
-                            if (eco == 1)      { std::snprintf(ecobuf, sizeof(ecobuf), "THROTTLED"); }
-                            else if (eco == 0) { std::snprintf(ecobuf, sizeof(ecobuf), "off"); }
-                            else if (eco == -1){ std::snprintf(ecobuf, sizeof(ecobuf), "?(noexport)"); }
-                            else               { std::snprintf(ecobuf, sizeof(ecobuf), "?(err=%d)", -eco); }
-                            // streamTex/streamGeo are SUMS of per-call bracketed deltas, so they
-                            // are directly comparable to `local` and to each other. What they will
-                            // NOT do is add up to `local` — the difference is init (render targets,
-                            // LUTs, atlases) plus driver overhead, and that gap is the point: if
-                            // streamTex keeps climbing while residency sits at 872/872, a recycled
-                            // slot is not returning its texture's memory.
-                            LOG::logline(">> [forge-hb] vram-stream: textures=%+.0f MB geometry=%+.0f MB"
-                                         " (summed per-call, bracketed)",
-                                         (double)g_vramTexBytes / (1024.0 * 1024.0),
-                                         (double)g_vramGeoBytes / (1024.0 * 1024.0));
-                            // The lifetime ledger. Read LIVE (created - destroyed) per bucket:
-                            //   static live climbing        -> unique geometry accumulating
-                            //   DYN live climbing           -> particles/movers are NOT being
-                            //       released; "unique per upload" must still be BOUNDED
-                            //   all live flat, vram-stream high -> our lifetimes are right and the
-                            //       allocator is retaining freed heaps (a pooling fix, not a leak)
-                            {
-                                const double kMB = 1024.0 * 1024.0;
-                                auto liveMB = [&](const GeoLedger& g) {
-                                    return ((double)g.createdBytes - (double)g.destroyedBytes) / kMB;
-                                };
-                                LOG::logline(">> [forge-hb] geo-ledger: static live=%.0f MB (%llu/%llu) |"
-                                             " dyn live=%.0f MB (%llu/%llu) | arena live=%.0f MB (%llu/%llu)"
-                                             " | meshBuf gauge=%llu MB",
-                                             liveMB(g_geoStatic),
-                                             (unsigned long long)g_geoStatic.creates,
-                                             (unsigned long long)g_geoStatic.destroys,
-                                             liveMB(g_geoDyn),
-                                             (unsigned long long)g_geoDyn.creates,
-                                             (unsigned long long)g_geoDyn.destroys,
-                                             liveMB(g_geoArena),
-                                             (unsigned long long)g_geoArena.creates,
-                                             (unsigned long long)g_geoArena.destroys,
-                                             (unsigned long long)(g_meshBufBytes >> 20));
-                            }
-                            LOG::logline(">> [forge-hb] vram: local=%llu/%llu MB (%.0f%%%s)"
-                                         " nonlocal=%llu/%llu MB (%.0f%%%s) | resv=%llu MB"
-                                         " | ecoqos=%s prio=0x%lx",
-                                         (unsigned long long)(loc.CurrentUsage >> 20),
-                                         (unsigned long long)(loc.Budget >> 20),
-                                         loc.Budget ? 100.0 * (double)loc.CurrentUsage / (double)loc.Budget : 0.0,
-                                         (loc.Budget && loc.CurrentUsage > loc.Budget) ? " OVER" : "",
-                                         (unsigned long long)(non.CurrentUsage >> 20),
-                                         (unsigned long long)(non.Budget >> 20),
-                                         non.Budget ? 100.0 * (double)non.CurrentUsage / (double)non.Budget : 0.0,
-                                         (non.Budget && non.CurrentUsage > non.Budget) ? " OVER" : "",
-                                         (unsigned long long)(loc.CurrentReservation >> 20),
-                                         ecobuf,
-                                         (unsigned long)GetPriorityClass(GetCurrentProcess()));
-                            // BUDGET + UNATTRIBUTED-GROWTH ALARMS (tasks/forge-memory-shape.md).
-                            if (okL) {
-                                const uint64_t useMB = loc.CurrentUsage >> 20, budMB = loc.Budget >> 20;
-                                const double   pct   = loc.Budget ? 100.0 * (double)loc.CurrentUsage
-                                                                  / (double)loc.Budget : 0.0;
-                                // A budget DROP is an event, and it was THE event: at the collapse our
-                                // usage sat at 5318 MB on both sides while the budget went 5116 -> 4893.
-                                // 64 MB of hysteresis, because the budget jitters by tens of MB.
-                                static uint64_t s_prevBudMB = 0;
-                                if (s_prevBudMB != 0 && budMB + 64u < s_prevBudMB) {
-                                    LOG::logline("!! [mem] DXGI budget DROPPED %llu -> %llu MB with our usage at %llu MB"
-                                                 " (now %.0f%%) — another process took VRAM; over budget the"
-                                                 " driver pages, and which of our resources it pages is its choice",
-                                                 (unsigned long long)s_prevBudMB, (unsigned long long)budMB,
-                                                 (unsigned long long)useMB, pct);
-                                }
-                                s_prevBudMB = budMB;
-                                if (pct >= (double)g_memBudgetWarnPct) {
-                                    LOG::logline("!! [mem] VRAM at %.0f%% of the DXGI budget (%llu/%llu MB)%s",
-                                                 pct, (unsigned long long)useMB, (unsigned long long)budMB,
-                                                 pct > 100.0 ? " — OVER: the driver is paging; expect one pass to"
-                                                               " collapse (sun shadow did, 1.3 -> 46 ms)"
-                                                             : " — headroom is below the alarm line");
-                                }
-                                // Everything NOT in a streamed ledger: render targets, terrain, DL,
-                                // atlases, LUTs — and allocator slack from freed resources, which is real
-                                // VRAM too. It should settle once the first exterior is resident and then
-                                // hold. Baseline = the max over the first three heartbeats after terrain
-                                // is ready, so DL and terrain landing a heartbeat apart cannot trip it.
-                                const uint64_t streamedB = g_texResidentBytes + g_flipArrayBytes
-                                                         + g_arenaVB.total + g_arenaIB.total + g_meshBufBytes;
-                                const int64_t  otherMB   = (int64_t)useMB - (int64_t)(streamedB >> 20);
-                                static int     s_settle  = 0;
-                                static int64_t s_otherBase = 0;
-                                if (g_terrainReady && s_settle < 3) {
-                                    s_otherBase = (s_settle == 0) ? otherMB : std::max(s_otherBase, otherMB);
-                                    ++s_settle;
-                                }
-                                LOG::logline(">> [forge-hb] mem other: %lld MB = local %llu - streamed %llu"
-                                             " (near tex %llu + flip %llu + arenas %llu + meshBuf %llu)"
-                                             " | baseline %s%lld MB",
-                                             (long long)otherMB, (unsigned long long)useMB,
-                                             (unsigned long long)(streamedB >> 20),
-                                             (unsigned long long)(g_texResidentBytes >> 20),
-                                             (unsigned long long)(g_flipArrayBytes >> 20),
-                                             (unsigned long long)((g_arenaVB.total + g_arenaIB.total) >> 20),
-                                             (unsigned long long)(g_meshBufBytes >> 20),
-                                             s_settle < 3 ? "(settling) " : "", (long long)s_otherBase);
-                                if (s_settle >= 3 && otherMB > s_otherBase + (int64_t)g_memOtherDriftMB) {
-                                    LOG::logline("!! [mem] unattributed VRAM GREW %lld MB past its baseline (%lld -> %lld MB,"
-                                                 " envelope +%u) — not textures, not flip books, not geometry"
-                                                 " arenas: something unmetered is accumulating",
-                                                 (long long)(otherMB - s_otherBase), (long long)s_otherBase,
-                                                 (long long)otherMB, g_memOtherDriftMB);
-                                }
-                            }
-                        }
-                    } else {
-                        LOG::logline(">> [forge-hb] vram: (adapter probe unavailable)"
-                                     " | ecoqos=%s prio=0x%lx",
-                                     eco < 0 ? "?" : (eco ? "THROTTLED" : "off"),
-                                     (unsigned long)GetPriorityClass(GetCurrentProcess()));
-                    }
-                }
-            }
-            // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
-            // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
-            // loads) + wait + record + post + other = the host's CPU frame. cull is the prime
-            // pre-record suspect.
-            //
-            // ⚠ `gpu=` IS NOT A TERM OF THAT SUM AND THE LINE NOW SAYS SO BY ITS SHAPE. It is the
-            // RESOLVED whole-frame GPU execution (kGpuPhaseFrame, one frame late) rather than this
-            // frame's submit->fence wall — deliberately, so it stays comparable across the change
-            // and cannot read ~0 just because the block moved. But it is the GPU's elapsed time, not
-            // time the host CPU spends, so listing it inline among the additive terms made the line
-            // read as a sum with `total=0.88` next to `gpu=5.38`. The CPU terms are bracketed
-            // together behind `cpu=` and the GPU sits outside them. `other` is the residual —
-            // tEntry..return minus the five bracketed spans, mostly settleFrameFence's readbacks and
-            // the submit — and it exists so the identity is CHECKABLE rather than approximately true.
-            // (The old name `total=` is now `cpu=`; nothing machine-parses it, and it was the word
-            // doing the lying.)
-            const double hbCpuNamed = g_lastSetupMs + g_lastCullMs + g_lastGpuWaitMs
-                                    + g_lastRecMs + g_lastPostMs;
-            const double hbCpuOther = (g_lastTotalMs > hbCpuNamed) ? (g_lastTotalMs - hbCpuNamed) : 0.0;
-            LOG::logline(">> [forge-hb] host split: cpu=%.2fms (setup=%.2f cull=%.2f wait=%.2f record=%.2f post=%.2f other=%.2f) | gpu=%.2f gpuOverlap=%.2f"
-                         " | cull examined=%u survivors=%u (%.3f us/1k examined) | gpuCull=%u %s hizOccl=%u",
-                         g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastGpuWaitMs, g_lastRecMs,
-                         g_lastPostMs, hbCpuOther, g_lastGpuMs, g_lastGpuOverlapMs,
-                         g_lastCullExamined, g_liveLastInst,
-                         g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
-                         g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
-                         g_lastGpuOccluded);
-            // M1 jitter, ONLY when armed (tasks/forge-upscale.md). Its own line rather than a field
-            // on the one above, so the fixed-format split stays fixed-format and so the line's mere
-            // PRESENCE says the lane is live. "Is the jitter actually moving" is otherwise
-            // unanswerable from a minimized run: a sub-pixel offset is invisible in every number the
-            // heartbeat already prints, and a jitter stuck on one phase looks exactly like a
-            // working one in the log while reconstructing nothing.
-            // M1 motion vectors, ONLY when the pass is live. Same reasoning as the jitter line
-            // below: presence says the lane ran, and "the field looks wrong" and "the dispatch never
-            // happened" are otherwise the same picture from a minimized run. `valid` is what the
-            // shader gates on — it is 0 for exactly one frame after a start or a discontinuity, and
-            // a `valid=0` that persists means the end-of-frame snapshot is not being reached.
-            // ⚠ SILENCE IS NOT A READING. When the pass is off this block used to print NOTHING, so
-            // a session spent standing still and spinning on the spot to test it produced an empty
-            // log and neither side could tell whether the vectors were fine or the lane had simply
-            // never run. That happened: a redeploy restarts the host, which resets g_debugMode to 0,
-            // and reaching mode 17 again costs seventeen F12 presses. Say it once per run instead —
-            // an instrument that is absent exactly when someone is trying to use it is the same
-            // defect as one that samples the wrong frame, wearing different clothes.
-            // ⚠ GATED ON WHETHER THE PASS **RAN**, NOT ON THE KNOB. `g_mvEnable` is only one of
-            // four things that can arm this pass — a temporal upscaler, F12 modes 17/18 and now
-            // MB-2 all force it on — so a gate naming the knob goes silent for three of them. That
-            // is not hypothetical: MB-2 arming the producer made the pass run in the default
-            // configuration while this block, keyed on the knob, printed the OFF notice instead.
-            // The line reports `ran=`, so `ran` is what it should be gated on.
-            if (!g_lastMvRan && !g_mvEnable && g_debugMode != 17u && g_debugMode != 18u) {
-                static bool s_mvOffOnce = false;
-                if (!s_mvOffOnce) {
-                    s_mvOffOnce = true;
-                    LOG::logline(">> [forge-hb] mv: OFF (ready=%d) — no vectors, no field stats. Arm it "
-                                 "with the 'Motion vectors' checkbox on the dev panel's Resolve tab, "
-                                 "or MGE_HOST_KNOBS=mvEnable=1. F12 mode 17 also forces it on, but "
-                                 "that is 17 presses from a fresh host and the NUMBERS are what "
-                                 "settle a still-vs-spin test — the picture is only the intuition.",
-                                 g_live.mvReady ? 1 : 0);
-                    LOG::flush();
-                }
-            }
-            // ─── MB-2 STATISTICS: OUTSIDE THE `mv:` BLOCK, AND THAT IS THE POINT ────────────
-            // ⚠⚠ THESE LIVED INSIDE THE MOTION-VECTOR HEARTBEAT FOR ONE BUILD, WHICH GATED THEM ON
-            // `g_mvEnable` — a knob MB-2 does not use and does not need. The moment MB-2 started
-            // arming the producer for itself, the pass ran by default and its own statistics went
-            // SILENT by default, so the run that was meant to confirm the fix printed nothing at
-            // all. Statistics belong to the PASS, never to a switch that happens to enclose it —
-            // the same correction `mvfieldstats` already made when it was gated on `objVelEnable`
-            // ([[feedback_isolation_lever_killed_its_own_subject]]), made twice in one file.
-            // ─── MB-2: WHAT THE GATHER ACTUALLY DID ─────────────────────────────────────────
-            // ⚠ `blurred%` IS THE VELOCITY FLOOR'S ACCEPTANCE TEST, and it is here rather than
-            // left to the eye for the reason MB-2 step 0 has just finished paying for: a claim
-            // that is read instead of measured survives for weeks. Parked on static geometry it
-            // must read **0.000%** — every pixel below the floor is copied verbatim, so a still
-            // frame is bit-identical to `mbEnable=0`. Anything else IS the smear, as a number.
-            //
-            // It is also the only thing that explains `mb=` on the gpu split. The gather's cost
-            // is (blurred pixels) x (their taps), so a millisecond that moved is one of those two
-            // moving, and avgTaps says which: more of the screen in motion, or the same motion
-            // gone faster. maxLen is the longest streak in delivered px — if it sits pinned at K
-            // the clamp is binding and the streaks are being cut short.
-            if (g_lastMbRan && g_live.pMbStatsReadback
-                && g_live.pMbStatsReadback->pCpuMappedAddress && g_lastMbPixels > 0u) {
-                const uint32_t* ms = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
-                float mlen = 0.0f;
-                std::memcpy(&mlen, &ms[2], sizeof(float));
-                // ⚠⚠ TWO PERCENTAGES, AND THEIR **RATIO** IS THE TILING TEST. `searched` is what the
-                // pass COSTS (pixels that ran the gather, i.e. whose tile carries motion); `changed`
-                // is what it DOES (pixels where at least one tap actually agreed). Before the
-                // velocity-agreement weights those were the same number BY CONSTRUCTION — every
-                // searched pixel was blurred — and that identity IS the rectangular-tile artifact,
-                // expressed as a number. With the weights, a mover in a still scene shows `searched`
-                // covering its tiles while `changed` collapses onto the mover itself.
-                // **searched ~= changed means the tiling is back.**
-                LOG::logline(">> [forge-hb] mb: searched=%.3f%% changed=%.3f%% of %llu px"
-                             " avgTaps=%.1f maxLen=%.2f px (K=%u x reach=%u = %u px cap,"
-                             " exposure=%.1fms @dt=%.1fms x%.2f floor=%.2fpx)"
-                             "  [both MUST be 0.000%% on a parked camera; searched ~= changed is the"
-                             " TILE artifact — the agreement weights are what separate them; maxLen"
-                             " pinned at the cap means the clamp is cutting streaks short, and since"
-                             " MB-2l the fix is mbTileReach, NOT a coarser K;"
-                             " maxLen/avgTaps is the TAP SPACING and beads mean raise mbMaxTaps]",
-                             100.0 * (double)ms[0] / (double)g_lastMbPixels,
-                             100.0 * (double)ms[3] / (double)g_lastMbPixels,
-                             (unsigned long long)g_lastMbPixels,
-                             ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
-                             (double)mlen, g_lastMbK, g_lastMbReach,
-                             g_lastMbK * g_lastMbReach,
-                             // The exposure in ms, the frame interval it is divided by, and the
-                             // resulting multiplier on the per-frame vector. ⚠ THE MULTIPLIER IS THE
-                             // NUMBER THAT ANSWERS "is it framerate independent": it must RISE as
-                             // dt falls, holding exposure fixed. A build where it sat at a constant
-                             // (0.50 for a 180 degree shutter) is the one that read "too subtle".
-                             (double)((std::max(0.0f, g_mbShutter) / 360.0f)
-                                      * (1000.0f / std::max(1.0f, g_mbShutterFps))),
-                             g_frameDtMs,
-                             (g_frameDtMs > 0.0)
-                                 ? (double)((std::max(0.0f, g_mbShutter) / 360.0f)
-                                            * (1000.0f / std::max(1.0f, g_mbShutterFps))) / g_frameDtMs
-                                 : 0.0,
-                             (double)g_mbMinPx);
-                // ⚠⚠ AND THE BUSIEST FRAME, WHICH IS THE ONE THAT EXPLAINS `mb=`. The line above
-                // is a SAMPLE and the pass's load is BURSTY — a camera is parked far more often
-                // than it is turning — so the sampled frame is usually a parked one while the
-                // millisecond on the gpu split came from a moving one. Measured: eight sampled
-                // heartbeats caught ONE moving frame (0.684%) across a window where `mb=` ranged
-                // 0.22 to 2.09 ms. Same defect as MB-2 step 0's parked lane, one level down.
-                //
-                // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
-                //
-                // MB-2m: `held=` is the frozen-FIELD count — frames where the sim clock was frozen
-                // (a menu) and the pass ran against the velocity the last advancing frame left in
-                // pMbVelocity. A long-open menu shows held climbing IN STEP with ran, which is the
-                // shape to check it by; held climbing while ran stands still would mean the old
-                // output hold had come back.
-                LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
-                             " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
-                             " | held=%u (sim frozen — menu, blurring by the HELD field)"
-                             " | arms: recon=%d bg=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
-                             " K=%u reach=%u cap=%u px dbg=%u"
-                             "  [this is the frame `mb=` is priced by — cost is (searched px) x"
-                             " (their taps); the sampled line above is usually a PARKED frame]",
-                             g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
-                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames,
-                             g_mbRecon ? 1 : 0, (int)std::min(g_mbBgMode, 2u), g_mbTwoDir ? 1 : 0,
-                             g_mbObjectOnly ? 1 : 0,
-                             (double)g_mbTileJitter, (double)g_mbSoftZ,
-                             g_lastMbK, g_lastMbReach, g_lastMbK * g_lastMbReach, g_mbDebug);
-                g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
-                g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0;
-            }
-            if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
-                LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
-                             "dBake=(%+.3f, %+.3f, %+.3f) rect=%ux%u out=%ux%u",
-                             g_lastMvRan ? 1 : 0, g_live.mvReady ? 1 : 0,
-                             g_prevViewProjValid ? 1 : 0,
-                             (double)g_eyeAbsShadow[0], (double)g_eyeAbsShadow[1], (double)g_eyeAbsShadow[2],
-                             g_lastMvDelta[0], g_lastMvDelta[1], g_lastMvDelta[2],
-                             g_live.width, g_live.height, g_live.outWidth, g_live.outHeight);
-                // ⚠ THE SAMPLE **AND** THE POPULATION. `parked=` is this frame; `parkedFrames=` is
-                // every frame since the last heartbeat. Only the second can say whether the parked
-                // short circuit is reachable at all in this engine — see the counter's declaration.
-                LOG::logline(">> [forge-hb] mv camera: parked(bit-identical)=%d worstMatrixDelta=%.9g"
-                             " parkedFrames=%u/%u since last hb"
-                             "  [parked=1 => any non-zero vector is round-off and IS an error;"
-                             " parked=0 => the camera moved and a small vector is the right answer;"
-                             " parkedFrames=0/N => the bit-identity branch never fires here]",
-                             g_mvCamParked ? 1 : 0, (double)g_mvCamDelta,
-                             g_mvParkedFrames, g_mvRanFrames);
-                g_mvParkedFrames = 0;
-                g_mvRanFrames    = 0;
-                // MB-1, THE RIGID LANE. `drawn` covers doors, activators, thrown clutter and rigid
-                // animated parts. `skipPair` should be small and nonzero (anything re-entering the
-                // frame after a cull spends one frame there); a LARGE skipPair with a small drawn
-                // means the pairing key is rejecting real movers, which is what a slot-churn or an
-                // ordering bug looks like from here. `skipKind` is skinned/multimap parts seen in
-                // items[] and reads ~0 by construction — skinned parts arrive in their own blob, so
-                // it never said anything about actors; the skinned line below is where they live.
-                // ⚠ `mm=` IS THE GLOW-MAPPED-WEAPON FIX, AS A NUMBER. Multimap parts were skipped
-                // by this lane for two builds — the symptom was an enchanted weapon staying sharp
-                // while the plain one in the other hand blurred — and "drawn went up" is not
-                // evidence they are the parts now being drawn, because a door would raise it too.
-                // mm=0 with something glowing in frame means the MM pipelines did not build and the
-                // old skip is still firing; `kind=` should fall by roughly the amount mm= rises.
-                LOG::logline(">> [forge-hb] objvel: on=%d ready=%d examined=%u drawn=%u/%u (mm=%u)"
-                             " still=%u(%s) skinnedInFrame=%u skip(static=%u pair=%u kind=%u cap=%u)"
-                             " gpu=%.3f ms",
-                             g_objVelEnable ? 1 : 0, g_live.objVelReady ? 1 : 0,
-                             g_objVelExamined, g_objVelDrawn, kObjVelBatch, g_objVelDrawnMM,
-                             g_objVelStill,
-                             (g_objVelSkipStill && !g_objVelAllItems) ? "skipped" : "DRAWN",
-                             g_objVelSkinnedInFrame,
-                             g_objVelSkipStatic, g_objVelSkipPair, g_objVelSkipKind,
-                             g_objVelSkipCap, g_lastGpuPhaseMs[kGpuPhaseObjVel]);
-                // MB-1b, THE SKINNED LANE — and `drawn/inFrame` IS the deliverable, as a number:
-                // the seven skinned draws of the Caius test scene, the NPC's torso among them, are
-                // exactly what MB-1a structurally could not reach. Anything short of parity is
-                // itemised by the skip counters rather than left to inference:
-                //   pair  — small and nonzero is healthy (one frame per part entering the scene); a
-                //           LARGE pair against a small drawn is slot churn defeating the key, which
-                //           is the failure that tears a limb rather than dimming one.
-                //   bones — the ONE 64 KB bone window filled. Nonzero means add a second window; it
-                //           is never a wrap, and `bonesUsed` says how close the frame ran.
-                //   blend — ghosts and mane cards, deliberately not drawn (see the record loop).
-                LOG::logline(">> [forge-hb] objvel skinned: on=%d ready=%d drawn=%u/%u (cap %u)"
-                             " still=%u bonesUsed=%u/%u"
-                             " skip(pair=%u bones=%u blend=%u kind=%u cap=%u)"
-                             " maxBoneDelta=%.2f u (window peak %.2f u)%s",
-                             g_objVelSkinnedLane ? 1 : 0, g_live.objVelSkinReady ? 1 : 0,
-                             g_objVelSkinDrawn, g_objVelSkinnedInFrame, kObjVelSkinned,
-                             g_objVelSkinStill, g_objVelSkinBonesUsed, kObjVelBones,
-                             g_objVelSkinSkipPair, g_objVelSkinSkipBones, g_objVelSkinSkipBlend,
-                             g_objVelSkinSkipKind, g_objVelSkinSkipCap,
-                             (double)g_objVelSkinMaxBoneDelta,
-                             (double)g_objVelSkinMaxBoneDeltaPeak,
-                             g_objVelSkinIgnoreGen ? "  [!! objVelSkinIgnoreGen=1 — GENERATION CLAUSE"
-                                                     " DISABLED, this is the TEAR arm, never ship]" : "");
-                // ⚠ THE PEAK, ATTRIBUTED. |dBake| on the peak frame is the discriminator: a large
-                // delta at |dBake| ~ 0 is real animation (nothing moved the origin, so the bones
-                // moved); the same delta at a large |dBake| means the origin restamped and the
-                // -dBake rebase did not cancel it, which is a defect in this pass and not in the
-                // actor. Reported together because either number alone is unactionable.
-                LOG::logline(">> [forge-hb] objvel skinned peak: %.2f u on slot %u (%u bones) at"
-                             " |dBake|=%.3f u  [large delta at |dBake|~0 = real animation;"
-                             " large delta WITH a large |dBake| = the rebase failed to cancel]",
-                             (double)g_objVelSkinMaxBoneDeltaPeak, g_objVelSkinPeakSlot,
-                             g_objVelSkinPeakBones, (double)g_objVelSkinPeakDBake);
-                // ⚠ MB-1d, AND `rigid=N/M` IS THE NUMBER THE LANE'S ABSENCE SHOWS UP IN. Zero with
-                // arms on screen means the walk is not reaching them — which is the reading MB-1c's
-                // `mm=0` cost a whole build to learn to ask for, and it is the ONLY reading that
-                // distinguishes "the arms have no velocity" from "the arms' velocity is wrong".
-                // `why=` names the gate when the lane did not run at all, because "rigid=0" and
-                // "never entered" are otherwise the same line and need opposite fixes.
-                if (g_objVelFPRan || g_objVelFPInFrame || g_objVelFPSkinInFrame
-                    || g_objVelFPMMInFrame || g_debugMode == 17u || g_debugMode == 18u) {
-                    static const char* kWhyFP[7] = {
-                        "ran", "lane knob OFF", "not ready", "camera MV pass did not run",
-                        "no previous ARM camera (first FP frame / arms absent last frame)",
-                        "nothing paired", "no FP pass this frame" };
-                    // `mm=N/M` is FP1e's own denominator, and it is the same reading `rigid=N/M`
-                    // is: 0 with a glow-mapped weapon in hand means the MM walk is not reaching it.
-                    LOG::logline(">> [forge-hb] objvel fp: on=%d ready=%d ran=%d why=%s |"
-                                 " rigid=%u/%u skinned=%u/%u mm=%u/%u still=%u/%u/%u bonesUsed=%u/%u |"
-                                 " skip rigid(pair=%u kind=%u cap=%u)"
-                                 " skinned(pair=%u kind=%u blend=%u bones=%u cap=%u)"
-                                 " mm(pair=%u kind=%u)"
-                                 " gpu=%.3f ms",
-                                 g_objVelFPLane ? 1 : 0, g_live.objVelFPReady ? 1 : 0,
-                                 g_objVelFPRan ? 1 : 0,
-                                 kWhyFP[g_objVelFPWhyNot < 7u ? g_objVelFPWhyNot : 0u],
-                                 g_objVelFPDrawn, g_objVelFPInFrame,
-                                 g_objVelFPSkinDrawn, g_objVelFPSkinInFrame,
-                                 g_objVelFPMMDrawn, g_objVelFPMMInFrame,
-                                 g_objVelFPStill, g_objVelFPSkinStill, g_objVelFPMMStill,
-                                 g_objVelFPBonesUsed, kObjVelBones,
-                                 g_objVelFPSkipPair, g_objVelFPSkipKind, g_objVelFPSkipCap,
-                                 g_objVelFPSkinSkipPair, g_objVelFPSkinSkipKind,
-                                 g_objVelFPSkinSkipBlend, g_objVelFPSkinSkipBones,
-                                 g_objVelFPSkinSkipCap,
-                                 g_objVelFPMMSkipPair, g_objVelFPMMSkipKind,
-                                 g_lastGpuPhaseMs[kGpuPhaseObjVelFP]);
-                    // ⚠⚠ THE ACCEPTANCE TEST, AND IT IS THIS LINE. `arm` must stay ~0 while `world`
-                    // is tens of pixels: that IS "the arms stay sharp on a camera turn while the
-                    // world streams", measured instead of looked at. An arm reading that TRACKS the
-                    // world one means the FP camera pair is not reaching the draws (a stale arm
-                    // camera, or descriptor-set instance 0 bound by mistake) and the arms are still
-                    // wearing the world's motion — the exact defect MB-1d exists to remove, and it
-                    // is indistinguishable from "working" in every other number in this log.
-                    // `world` near 0 means the camera never turned in the window and the line has
-                    // not been tested; look at samples= and the mv camera delta before reading it.
-                    LOG::logline(">> [forge-hb] objvel fp identity: arm=%.3f px turn=%.2f px"
-                                 " pose=%.2f px rel=%.2f px (ratio %.4f) on the BUSIEST of %u on-screen frames"
-                                 "  [THE ACCEPTANCE TEST: `turn` is what that pixel carried BEFORE"
-                                 " this lane (the same point held world-still through last frame's"
-                                 " arm camera); `arm` is what it carries NOW. arm << turn IS the"
-                                 " arms staying sharp on a camera turn. arm ~ turn = the FP camera"
-                                 " pair never reached the draws; turn ~0 = the camera did not turn,"
-                                 " so nothing was tested. `rel` is the vector MB-2d's object-only"
-                                 " rule WOULD put in the BLUR field here, and it tracks `pose` — the"
-                                 " arm's motion through the WORLD — where `arm`, its motion across the"
-                                 " SCREEN, is what a viewer sees. rel >> arm is the camera term the"
-                                 " rule failed to cancel, and is why the FP lane pins opts.z to 0]",
-                                 (double)g_objVelFPIdArmPx, (double)g_objVelFPIdTurnPx,
-                                 (double)g_objVelFPIdPosePx, (double)g_objVelFPIdRelPx,
-                                 (double)(g_objVelFPIdTurnPx > 1.0e-6f
-                                          ? g_objVelFPIdArmPx / g_objVelFPIdTurnPx : 0.0f),
-                                 g_objVelFPIdSamples);
-                    // ...and the AGGREGATE, which is the one to read first: a peak is one frame and
-                    // a camera cut owns it. mean small + peak large = a cut in the window (look at
-                    // peakFrame); both large = the lane really is writing the wrong vector.
-                    LOG::logline(">> [forge-hb] objvel fp identity, mean over the %u TURNING"
-                                 " frames of %u: arm=%.3f px turn=%.2f px pose=%.2f px rel=%.2f px"
-                                 " ratio=%.4f | peak was frame %u"
-                                 "  [three legs of one triangle: `pose` = the arm's own motion in a"
-                                 " FIXED camera, `turn` = a FIXED point's motion under the camera"
-                                 " change, `arm` = what this lane writes. arm/turn is only the"
-                                 " acceptance test when the arms are IDLE, which MW's never are —"
-                                 " read the CANCELLATION line below instead]",
-                                 g_objVelFPIdMoved, g_objVelFPIdSamples,
-                                 g_objVelFPIdMoved ? g_objVelFPIdSumArm / g_objVelFPIdMoved : 0.0,
-                                 g_objVelFPIdMoved ? g_objVelFPIdSumTurn / g_objVelFPIdMoved : 0.0,
-                                 g_objVelFPIdMoved ? g_objVelFPIdSumPose / g_objVelFPIdMoved : 0.0,
-                                 g_objVelFPIdMoved ? g_objVelFPIdSumRel  / g_objVelFPIdMoved : 0.0,
-                                 g_objVelFPIdSumTurn > 1.0e-6
-                                     ? g_objVelFPIdSumArm / g_objVelFPIdSumTurn : 0.0,
-                                 g_objVelFPIdPeakFrame);
-                    // ⚠⚠ AND THIS IS THE VERDICT LINE — the one that does not need idle arms.
-                    if (g_objVelFPIdMoved) {
-                        const double rc = g_objVelFPIdResCancel / g_objVelFPIdMoved;
-                        const double ra = g_objVelFPIdResAdd    / g_objVelFPIdMoved;
-                        LOG::logline(">> [forge-hb] objvel fp CAMERA CANCELLATION: %s"
-                                     " (residual vs |pose-turn| = %.1f px, vs pose+turn = %.1f px,"
-                                     " over %u frames)"
-                                     "  [the arm's screen velocity is the pose term plus the camera"
-                                     " term; MB-1d's whole claim is that the camera term is"
-                                     " SUBTRACTED. Hugging |pose-turn| = it is. Hugging pose+turn ="
-                                     " the two ADD, i.e. a stale/inverted FP camera or the WORLD"
-                                     " table bound — and that is the bug, whatever the arms were"
-                                     " doing]",
-                                     (rc < ra) ? "CANCELLING (pass)" : "COMPOUNDING (FAIL)",
-                                     rc, ra, g_objVelFPIdMoved);
-                    }
-                    // Reset AFTER printing: each line reports the worst frame of its OWN window, so
-                    // a defect that STOPS is visible rather than latched forever.
-                    g_objVelFPIdArmPx = g_objVelFPIdTurnPx = g_objVelFPIdPosePx = 0.0f;
-                    g_objVelFPIdRelPx = 0.0f;
-                    g_objVelFPIdSamples = g_objVelFPIdMoved = 0;
-                    g_objVelFPIdSumArm = g_objVelFPIdSumTurn = g_objVelFPIdSumPose = 0.0;
-                    g_objVelFPIdSumRel = 0.0;
-                    g_objVelFPIdResCancel = g_objVelFPIdResAdd = 0.0;
-                }
-                // Reset AFTER printing, so each line reports the worst frame of its own window
-                // rather than of the whole session — a session peak would latch on one bad frame
-                // and then report it forever, which hides a defect that STOPS.
-                g_objVelSkinMaxBoneDeltaPeak = 0.0f;
-                g_objVelSkinPeakSlot = g_objVelSkinPeakBones = 0;
-                g_objVelSkinPeakDBake = 0.0f;
-                // ⚠ THE CHURN SOAK, AS A RUNNING TOTAL — the line above samples ONE frame in 300
-                // and reads pair=0 on a static save whether the key is working or dead. These count
-                // every rejection since startup, so a cell load or a doorway shows up between
-                // heartbeats instead of falling through the sampling. `stale` and `count` are the
-                // two that mean CHURN WAS CAUGHT: a stale or differently-shaped palette differenced
-                // against this frame's is what tears a limb across the screen, and a session that
-                // accumulates them while the picture stays clean is this key doing its job.
-                // `first` is inert — a part being seen for the first time, one per appearance.
-                LOG::logline(">> [forge-hb] objvel skinned pair rejects (cumulative): first=%llu"
-                             " stale=%llu count=%llu range=%llu dup=%llu"
-                             "  [first is inert (one per appearance); stale/count are CHURN CAUGHT;"
-                             " dup must stay 0 — a slot packed twice in one frame is the miss the"
-                             " other clauses cannot see]",
-                             (unsigned long long)g_objVelSkinPairFirstTot,
-                             (unsigned long long)g_objVelSkinPairStaleTot,
-                             (unsigned long long)g_objVelSkinPairCountTot,
-                             (unsigned long long)g_objVelSkinPairRangeTot,
-                             (unsigned long long)g_objVelSkinPairDupTot);
-                // ⚠ THE DEPTH TEST, MEASURED RATHER THAN ASSUMED. frags = fragments that survived
-                // and wrote. Run again with objVelDepthTest=0: if the count does not change, the
-                // test is inert and occluded movers are painting over what is in front of them.
-                if (g_live.pObjVelFragsReadback && g_live.pObjVelFragsReadback->pCpuMappedAddress) {
-                    const uint32_t fr = *(const uint32_t*)g_live.pObjVelFragsReadback->pCpuMappedAddress;
-                    static const char* const kDepthModeName[4] = { "OFF", "GEQUAL", "NEVER", "ALWAYS" };
-                    LOG::logline(">> [forge-hb] objvel frags: depthMode=%s survived=%u px  "
-                                 "[NEVER must give 0 — anything else means the DepthStateDesc never "
-                                 "reached the PSO, which no comparison-function A/B could show]",
-                                 kDepthModeName[g_objVelDepthMode & 3u], fr);
-                }
-                // ⚠ THE LINE THAT DESCRIBES THE FINISHED FIELD. `mv field:` above measures the
-                // CAMERA pass alone (its statistics are computed inside that shader, before the
-                // overwrite); this measures the finished texture that F12 mode 17 draws. Toggling
-                // objVelEnable moves only this line.
-                //
-                // ⚠⚠ `nonzero%` IS STRICTER THAN THE PICTURE AND IS KEPT THAT WAY. It counted the
-                // pixels mvview.frag did NOT paint grey back when that branch was `m == 0.0f`
-                // exactly; the view now uses `m < 0.01f` (the exact branch was unreachable — MW's
-                // camera matrix is not bit-stable standing still) and `still(<0.01px)` beside it is
-                // the counter that matches mode 17. This one did not follow, because a counter that
-                // tracks the view can only ever confirm the view. It is THE acceptance test for the
-                // parked-camera lane: on a frame `mv camera:` calls `parked(bit-identical)=1` it
-                // must read **0.000%**, and for three weeks it did not, because the host cleared
-                // opts.y after computing it (fixed in MB-2 step 0). It is also the only readout that
-                // can see the ~1e-3 px residue MB-2's gather would smear a still frame with.
-                if (g_live.pMvFsReadback && g_live.pMvFsReadback->pCpuMappedAddress) {
-                    const uint32_t* fs = (const uint32_t*)g_live.pMvFsReadback->pCpuMappedAddress;
-                    const uint32_t tot = fs[3];
-                    if (tot > 0u) {
-                        float fmx = 0.0f, fmn = 0.0f;
-                        std::memcpy(&fmx, &fs[0], sizeof(float));
-                        std::memcpy(&fmn, &fs[1], sizeof(float));
-                        char fmnTxt[32];
-                        if (fs[1] == 0xFFFFFFFFu) { std::snprintf(fmnTxt, sizeof(fmnTxt), "n/a"); }
-                        else { std::snprintf(fmnTxt, sizeof(fmnTxt), "%.6f", (double)fmn); }
-                        // ⚠ `wasParked` COMES OUT OF THE SAME BUFFER, not from g_mvCamParked. The
-                        // readback lags by a frame or more (no fence, pAplReadback's arrangement),
-                        // so the flag beside it would describe a different frame — and the test
-                        // this line exists to settle is a conjunction over ONE frame.
-                        LOG::logline(">> [forge-hb] mv final: nonzero=%.3f%% max=%.6f px min=%s px "
-                                     "still(<0.01px)=%.1f%% of %u px wasParked=%u  [nonzero%% is the"
-                                     " fraction not EXACTLY zero — stricter than mode 17's 0.01 px"
-                                     " grey branch on purpose; wasParked=1 with nonzero%% > 0 means"
-                                     " opts.y never reached the dispatch]",
-                                     100.0 * (double)fs[5] / (double)tot, (double)fmx, fmnTxt,
-                                     100.0 * (double)fs[2] / (double)tot, tot, fs[6]);
-                    }
-                }
-                // ⚠⚠ THE ACCEPTANCE TEST FOR THE PARKED LANE, AND IT IS A SEPARATE LINE BECAUSE THE
-                // LINE ABOVE CANNOT ANSWER IT. That one describes whichever frame the readback
-                // happened to hold, and in six sampled heartbeats it held a parked frame zero times
-                // out of a population that was up to 24% parked. This is the latch: the most recent
-                // measurement that CARRIED wasParked=1, with the count that proves one was seen.
-                //
-                // **nonzero MUST BE 0.000%.** Anything else means opts.y is not reaching the
-                // dispatch — the exact defect MB-2 step 0 fixed, which lived through three weeks of
-                // a heartbeat cheerfully reporting `parked(bit-identical)=1` while the GPU read 0.
-                // `n=0` is not a pass: it means no parked frame has been measured yet.
-                if (g_mvParkedSamples > 0u) {
-                    LOG::logline(">> [forge-hb] mv parked latch: nonzero=%.3f%% max=%.6f px over %u"
-                                 " parked measurements  [MUST be 0.000%% — a parked camera's true"
-                                 " vector is identically zero, so anything else is opts.y not"
-                                 " reaching the shader]",
-                                 g_mvParkedNonzeroPct, (double)g_mvParkedMaxPx, g_mvParkedSamples);
-                } else {
-                    LOG::logline(">> [forge-hb] mv parked latch: NO PARKED FRAME MEASURED YET"
-                                 " (parkedFrames above says how often the condition fires; 0/N there"
-                                 " means the bit-identity branch is unreachable in this scene)");
-                }
-                // ⚠ REPORTED TWICE, AND THE SECOND NUMBER IS THE USABLE ONE. The reference point
-                // (screen centre, device depth 0.5) lands only ~8 units out under reverse-Z, which
-                // makes it a very SENSITIVE canary and a very misleading absolute: the origin error
-                // is Delta-eye/distance, so a reading taken a few units from the camera is two
-                // orders of magnitude larger than the same error on real geometry. `@1000u` divides
-                // that dependence out — error x distance is the invariant — and is the figure to
-                // compare between frames, between speeds and against "does this matter".
-                // ⚠ THE PEAK IS THE HEADLINE, the instantaneous value is the footnote — see
-                // g_mvDeltaMaxLen for why an arbitrary-frame sample reports zero exactly when there
-                // is something to measure. `@1000u` divides out the reference point's distance
-                // (~8 u under reverse-Z, a sensitive canary and a misleading absolute) because the
-                // origin error is Delta-eye/distance; that is the figure to compare between speeds.
-                //
-                // ⚠ A `peak dBake` OF EXACTLY 0.000 OVER A WHOLE WINDOW IS NOT PROOF THE CAMERA WAS
-                // STILL. bakeEye arrives as float32 ABSOLUTE world coordinates and Morrowind's map
-                // reaches six figures — at x=120000 the ULP is ~0.008 u, so two consecutive frames
-                // of slow motion can round to the same float and difference to a hard zero. Below
-                // roughly 0.05 u/frame this lane is quantisation, not signal. It does not matter for
-                // the vectors (the resulting error is ~1e-4 px at 1000 u) but it is why the reading
-                // is sometimes an exact zero rather than a small number.
-                // ─── AND WHAT THE FIELD ITSELF SAYS (gMvStats, one frame late) ────────────────
-                // ⚠ min |mv| IS THE ONE TO READ. A uniform DC offset — the bakeEye signature — lifts
-                // the WHOLE field, so the quietest pixel in the frame stops being quiet, and min is
-                // exactly the offset's size. max only reports how fast the camera was going, and by
-                // eye a lifted field and a moving field are the same picture. That indistinguishable
-                // -by-eye property is why this readback exists at all.
-                //
-                // HOW TO READ IT: stand still. `still%` should go to ~100 and `min` to ~0. Under
-                // PURE ROTATION there is legitimately no still pixel, so min is large and still% is
-                // 0 — that is correct, not a fault. Translating, min is the smallest true motion in
-                // frame (distant geometry), which is small but not zero.
-                if (g_live.pMvStatsReadback && g_live.pMvStatsReadback->pCpuMappedAddress) {
-                    const uint32_t* st = (const uint32_t*)g_live.pMvStatsReadback->pCpuMappedAddress;
-                    const uint32_t total = st[3];
-                    if (total > 0u) {
-                        float mx = 0.0f, mn = 0.0f;
-                        std::memcpy(&mx, &st[0], sizeof(float));
-                        std::memcpy(&mn, &st[1], sizeof(float));
-                        // min stays at the 0xFFFFFFFF sentinel if the reduction never ran; that bit
-                        // pattern is a NaN, so it is spelled out rather than printed as a float.
-                        char mnTxt[32];
-                        if (st[1] == 0xFFFFFFFFu) { std::snprintf(mnTxt, sizeof(mnTxt), "n/a"); }
-                        else                      { std::snprintf(mnTxt, sizeof(mnTxt), "%.4f", (double)mn); }
-                        LOG::logline(">> [forge-hb] mv field: max=%.3f px min=%s px still(<0.01px)=%.1f%% "
-                                     "reactive=%.1f%% of %u px | STILL CAMERA => still%%~100 and "
-                                     "min~0; PURE ROTATION has no still pixel (min large, "
-                                     "still%%=0) and that is correct; a min that will not go to 0 "
-                                     "when you stop IS the DC offset.",
-                                     (double)mx, mnTxt,
-                                     100.0 * (double)st[2] / (double)total,
-                                     100.0 * (double)st[4] / (double)total, total);
-                        // ⚠ A MASK THAT COVERS THE SCREEN IS NOT A MASK, IT IS THE UPSCALER SWITCHED
-                        // OFF — and that failure mode reads as "slightly soft", never as an error.
-                        // Standing still it should be ~0; walking, single-digit percent (moving
-                        // things plus the disocclusion rim). Persistently high means the thresholds
-                        // are catching the reprojection's own round-off rather than real motion.
-                        if (st[3] > 0u && (100.0 * (double)st[4] / (double)total) > 40.0) {
-                            LOG::logline("!! [mv] reactive mask covers %.1f%% of the frame — that is "
-                                         "not a mask, it is the upscaler turned off. Raise "
-                                         "mvReactiveT0 (now %.3f) until a still camera reads ~0%%.",
-                                         100.0 * (double)st[4] / (double)total,
-                                         (double)g_mvReactiveT0);
-                        }
-                    }
-                }
-                LOG::logline(">> [forge-hb] mv origin-fold: PEAK %.3f px (= %.4f px @1000u) at "
-                             "|dBake| %.4f u over the window | this frame %.3f px (ref dist %.0f u). "
-                             "A peak of 0.000 with |dBake| > 0.05 = the fold is not reaching the matrix.",
-                             (double)g_mvFoldMaxPx, (double)g_mvFoldMaxAt1k, g_mvDeltaMaxLen,
-                             (double)g_lastMvOriginFixPx, (double)g_lastMvRefDist);
-                g_mvDeltaMaxLen = 0.0; g_mvFoldMaxPx = 0.0f; g_mvFoldMaxAt1k = 0.0f;
-            }
-            // ⚠ THE **EFFECTIVE** AMPLITUDE, not the knob. Gating on the raw global would print a
-            // jitter line every heartbeat of every session now that the slider ships at 1.0, while
-            // the offset actually applied was zero — a row that describes a frame that never
-            // happened, on the one instrument an unattended run has. `gated` names the state.
-            // ⚠ THE GATED CASE IS SAID **ONCE**, NOT EVERY HEARTBEAT — measured 2026-09-02, a
-            // single passthrough session emitted 114 identical all-zero rows. That inverts the
-            // line's whole reason to exist ("its PRESENCE says the lane is live") and buries the
-            // rows that carry information, on the one instrument an unattended run has. But it is
-            // still worth saying once: a knob that is set and doing nothing is the inert-control
-            // complaint the panel label also answers, and silence would leave "I dragged the jitter
-            // slider and nothing happened" undiagnosable.
-            if (jitterAmp() <= 0.0f && g_jitterAmp > 0.0f) {
-                if (!g_jitterGateReported) {
-                    g_jitterGateReported = true;
-                    LOG::logline(">> [forge-hb] jitter: knob is %.2f px but GATED OFF — no temporal "
-                                 "backend is armed, so the applied offset is exactly 0. Arm one with "
-                                 "MGE_HOST_KNOBS=upscaleBackend=ngx, or jitterForce=1 to run the "
-                                 "step-1 isolation test without an upscaler. Said once per session.",
-                                 (double)g_jitterAmp);
-                }
-            } else if (jitterAmp() > 0.0f) {
-                g_jitterGateReported = false;   // re-arm, so a later gating is reported again
-                LOG::logline(">> [forge-hb] jitter: amp=%.2fpx%s phases=%u idx=%u -> (%+.3f, %+.3f) px "
-                             "[NDC %+.5f, %+.5f on a %ux%u rect]",
-                             (double)jitterAmp(),
-                             g_jitterForce ? " (FORCED, no temporal backend)" : "",
-                             jitterPhases(), g_jitterIndex,
-                             (double)g_jitterPx[0], (double)g_jitterPx[1],
-                             (double)(2.0f * g_jitterPx[0] / (float)g_live.width),
-                             (double)(-2.0f * g_jitterPx[1] / (float)g_live.height),
-                             g_live.width, g_live.height);
-            }
-            // CPU record split: WHERE inside record (tRec0..tRec1) the CPU ms are spent recording
-            // commands. Same phase brackets as the gpu split; "other" = record − Frame bracket
-            // (pre-phase barriers, query resolve, endCmd). shadow further split static vs dyn —
-            // the dyn pass re-records 6 face passes per dyn-flagged slot EVERY frame.
-            LOG::logline(">> [forge-hb] rec split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) postdepth=%.2f reflect=%.2f color=%.2f (sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f) water=%.2f glow=%.2f alpha=%.2f resolve=%.2f other=%.2f ms",
-                         g_lastCpuPhaseMs[kGpuPhaseCull], g_lastCpuPhaseMs[kGpuPhasePrepass],
-                         g_lastCpuPhaseMs[kGpuPhaseShadow],
-                         g_lastCpuPhaseMs[kGpuPhaseShadowStatic], g_lastCpuPhaseMs[kGpuPhaseShadowDyn],
-                         g_lastCpuPhaseMs[kGpuPhasePostDepth], g_lastCpuPhaseMs[kGpuPhaseReflect],
-                         g_lastCpuPhaseMs[kGpuPhaseColor],
-                         g_lastCpuPhaseMs[kGpuPhaseColorSky], g_lastCpuPhaseMs[kGpuPhaseColorNear],
-                         g_lastCpuPhaseMs[kGpuPhaseColorSkin], g_lastCpuPhaseMs[kGpuPhaseColorMM],
-                         g_lastCpuPhaseMs[kGpuPhaseColorDL],
-                         g_lastCpuPhaseMs[kGpuPhaseWater], g_lastCpuPhaseMs[kGpuPhaseColorGlow],
-                         g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
-                         g_lastCpuPhaseMs[kGpuPhaseResolve],
-                         g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            // The upscale term's bracket: WHICH BACKEND and the INPUT rect it actually read from,
-            // or "off" when no pass ran. Two states that look identical in the timing alone — the
-            // feature absent, and the passthrough at scale 1.0 taking its identity fast path — read
-            // differently here.
-            //
-            // ⚠ THE BACKEND NAME IS ON IT SINCE 4d, and it is not decoration for the same reason it
-            // is on the `[rect]` line: at DLAA the rects are equal, so "ngx-dlss 1680x1050" and
-            // "passthrough 1:1" are the two readings that tell a DLSS session from a Catmull-Rom
-            // one, and nothing else on this line can. A backend that silently declined at startup
-            // otherwise produces a heartbeat indistinguishable from a working one.
-            char upscaleRectText[96];
-            // ⚠ A NON-RUN IS NO LONGER CALLED "1:1", and that wording was a wart worth removing:
-            // for the PASSTHROUGH 1:1 correctly means the identity fast path, but a temporal backend
-            // has no such path — so `ngx-dlss 1:1` read as "running at native" when it actually
-            // meant "did not run at all". The three states are now named as themselves.
-            if (g_lastUpscaleRan) {
-                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s %s %ux%u",
-                              g_upscaleName ? g_upscaleName : "?",
-                              kUpscaleModeNames[g_upscaleMode < (uint32_t)kUpscaleModeCount
-                                                ? g_upscaleMode : 0u],
-                              g_live.width, g_live.height);
-            } else if (!g_upscaleName) {
-                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "no backend");
-            } else if (!upscaleActive()) {
-                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s OFF", g_upscaleName);
-            } else {
-                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s REFUSED",
-                              g_upscaleName);
-            }
-            // The motion-blur term's bracket: the tile GRID and the K it actually ran at, or "off"
-            // when no dispatch happened. Two states that are identical in the timing alone — the knob
-            // off, and the pass failing to build — read differently here, which is the same argument
-            // the upscale bracket beside it is made of.
-            char mbText[80];
-            if (g_lastMbRan) {
-                std::snprintf(mbText, sizeof(mbText), "K%u %ux%u tiles",
-                              g_lastMbK, g_lastMbTilesX, g_lastMbTilesY);
-            } else if (!g_live.mbReady) {
-                // ⚠ NAME THE GATE. "NOT BUILT" is true and useless. Above 1x the blur needs a
-                // single-sample source and takes it from the resolve's compute pre-filter, so when
-                // THAT did not build the blur cannot exist either — for a reason that has nothing to
-                // do with the motion-blur knobs the reader just checked. Unnamed, this is how
-                // "motion blur is broken" gets reported from play against a build where it was never
-                // built: a wasted bisect that a word prevents.
-                if (g_live.sampleCount != 1) {
-                    std::snprintf(mbText, sizeof(mbText),
-                                  "NOT BUILT — MSAA %ux and no resolve pre-filter",
-                                  g_live.sampleCount);
-                } else {
-                    std::snprintf(mbText, sizeof(mbText), "NOT BUILT");
-                }
-            } else if (!g_mbEnable) {
-                std::snprintf(mbText, sizeof(mbText), "off");
-            } else if (g_live.sampleCount != 1 && !g_lastRfRan) {
-                // Built, enabled, and starved: above 1x its only source is the pre-filter's output,
-                // and that pass is a live knob (resolveCompute) with a diameter limit behind it.
-                std::snprintf(mbText, sizeof(mbText),
-                              "ON but the resolve pre-filter did not run — no 1x source at MSAA %ux",
-                              g_live.sampleCount);
-            } else {
-                // ⚠ THE STATE THAT SHIPPED BROKEN FOR ONE BUILD AND HAD NO NAME. `mbEnable` on,
-                // everything built, and no field to consume — which is what "there is no motion blur
-                // by default" looked like from inside the log: `mb=0.28(K20 128x80 tiles)`, a pass
-                // that ran, dispatched, cost time, and blurred nothing because pMotionVectors had
-                // never been written. It now says so, so this failure is a LOG LINE rather than a
-                // report from play.
-                std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
-            }
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
-                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
-                         " | nearTris=%.2fM atDraws=%u"
-                         " | atmos=%.2f (LUT chain, every frame)"
-                         // The histogram is RUNG-indexed AND FAMILY-indexed since 4b: `patch` counts
-                         // 512-unit sub-cell instances (8..128 u) and reads 0 unless the
-                         // displacement disc is live, `cell` counts whole-cell instances (128 u and
-                         // coarser). Both are spelled out in the line because a silent widening is
-                         // exactly the kind of change that makes an old log and a new one look
-                         // comparable when they are not — and because the whole point of 4b is that
-                         // the triangles moved from one family to the other.
-                         " | terrain=%u/%u cells (nearCut=%u) %.2fM tris"
-                         " (patch 8u:%u 16u:%u 32u:%u 64u:%u 128u:%u"
-                         " | cell 128u:%u/%u/%u/%u/%u/%u)%s",
-                         g_lastGpuPhaseMs[kGpuPhaseCull],
-                         g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
-                         g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
-                         g_lastGpuPhaseMs[kGpuPhaseShadowSun],
-                         g_lastGpuPhaseMs[kGpuPhasePostDepth],
-                         g_lastGpuPhaseMs[kGpuPhaseLinearize],
-                         g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
-                         g_lastGpuPhaseMs[kGpuPhaseAODown],  g_lastGpuPhaseMs[kGpuPhaseAOSearch],
-                         g_lastGpuPhaseMs[kGpuPhaseAOBlur],  g_lastGpuPhaseMs[kGpuPhaseAOUp],
-                         g_lastGpuPhaseMs[kGpuPhaseShadowMask],
-                         g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
-                         g_lastGpuPhaseMs[kGpuPhaseWater],
-                         // caustic=<ms> — W23/W24. The whole pure-compute block: static scatter +
-                         // whichever dynamic scatters were armed + both resolves. 0.00 means the
-                         // block did not run at all (caustics off, or strength 0), which is the
-                         // distinction worth logging; the DYNAMIC half is proportional to the
-                         // DISTURBED AREA, so this number is expected to move with swimmers and rain
-                         // and to sit at its static floor on calm water.
-                         g_lastGpuPhaseMs[kGpuPhaseCaustic],
-                         // grasscrush=<ms>(<discs>) — G7. Three dispatches over a 512² field: two
-                         // full-grid passes whose cost is fixed, and a scatter whose cost is
-                         // proportional to the DISC COUNT in brackets beside it. A 0.00 with a
-                         // non-zero count would be a timing problem; a 0.00 with (0) is the block
-                         // not running at all — interior, knob off, or nobody near the player.
-                         g_lastGpuPhaseMs[kGpuPhaseGrassCrush], g_grassCrushLastCount,
-                         // mv=<ms> — M1 camera-only motion vectors, one 8x8 dispatch over the render
-                         // rect at the colour->water seam. 0.00 means the pass did not run (off, and
-                         // it ships off because nothing consumes the vectors yet) — `[forge-hb] mv:`
-                         // beside it says which. This is the baseline the DLSS win gets measured
-                         // against, and it also carries the extra depth re-linearize the pass forces
-                         // when water and volumetric fog are both off, which lands in `lin` above.
-                         g_lastGpuPhaseMs[kGpuPhaseMotionVec],
-                         // upscale=<ms>(<in>x<in>) — M1 step 4b. ⚠ IT IS HALF OF A TWO-PART CLAIM
-                         // and neither half means anything alone. `upscale=` appearing says the pass
-                         // ran; `gpu=` DROPPING at the same time is what proves the input rect really
-                         // shrank rather than the viewport merely being clamped — a quarter-res scene
-                         // raster has to show up in `color`, `postdepth` and `reflect` too. A
-                         // 0.00 with a rect that is not the output rect would be a timing problem; a
-                         // 0.00 at in == out is the IDENTITY FAST PATH, which records nothing on
-                         // purpose and is the correct reading of the shipped default.
-                         g_lastGpuPhaseMs[kGpuPhaseUpscale],
-                         upscaleRectText,
-                         // mb=<ms>(K<k> <gx>x<gy> tiles) — MB-2, all three passes in one bracket.
-                         // ⚠ THE DILATION IS ~2% OF THIS NUMBER BY CONSTRUCTION (1.0 taps/px for the
-                         // tile max, 9/K^2 for the neighbour pass), so a `mb=` that moves is the
-                         // GATHER moving, and the gather's cost is proportional to how much of the
-                         // screen is moving fast enough to clear the velocity floor. Standing still
-                         // it should approach the floor's early-out cost; the budget context is that
-                         // the whole MB-1 producer costs 0.030 ms.
-                         g_lastGpuPhaseMs[kGpuPhaseMotionBlur], mbText,
-                         // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
-                         // (checkbox off, not scene-referred, or the pyramid failed to build), which is
-                         // the distinction worth logging: a 0.00 with L7 would be a timing problem,
-                         // with L0 it is a gate.
-                         g_lastGpuPhaseMs[kGpuPhaseBloom], g_lastBloomLevels,
-                         // rfilter=<ms> — the resolve's separable LDS pre-filter, which used to be
-                         // INSIDE `resolve=` and moved above the motion blur so the blur could read
-                         // its output. ⚠ Add the two when comparing against anything measured before
-                         // 2026-09-05. A 0.00 with a non-zero `resolve=` is the frag tap loop doing
-                         // the work instead — resolveCompute off, diameter past 5.002, or 1x.
-                         g_lastGpuPhaseMs[kGpuPhaseResolveFilter],
-                         g_lastGpuPhaseMs[kGpuPhaseResolve],
-                         g_lastHizGpuMs, g_hizOverruns,
-                         (unsigned)g_shadowCasters.size(),
-                         g_lastShadowActive, g_lastShadowDyn,
-                         (double)g_lastNearTris / 1e6, g_lastNearATDraws,
-                         // atmos=<ms> — S2. The whole four-dispatch LUT chain: transmittance,
-                         // multiscatter, sky-view and the SH measurement, rebuilt EVERY frame. It is
-                         // on the line from the FIRST build rather than from the first complaint,
-                         // because a pass whose cost first appears three sub-steps later has no
-                         // baseline to be compared against. Budget: <= 0.25 ms. A 0.00 means the
-                         // chain did not run at all — interior, master toggle off, or a build
-                         // failure — which is the distinction worth logging.
-                         g_lastGpuPhaseMs[kGpuPhaseAtmos],
-                         g_lastTerrainCells, g_lastTerrainInRange, g_lastTerrainNearCut,
-                         (double)g_lastTerrainTris / 1e6,
-                         g_lastTerrainLodHist[kTerrainFamPatch][0], g_lastTerrainLodHist[kTerrainFamPatch][1],
-                         g_lastTerrainLodHist[kTerrainFamPatch][2], g_lastTerrainLodHist[kTerrainFamPatch][3],
-                         g_lastTerrainLodHist[kTerrainFamPatch][4],
-                         g_lastTerrainLodHist[kTerrainFamCell][4], g_lastTerrainLodHist[kTerrainFamCell][5],
-                         g_lastTerrainLodHist[kTerrainFamCell][6], g_lastTerrainLodHist[kTerrainFamCell][7],
-                         g_lastTerrainLodHist[kTerrainFamCell][8], g_lastTerrainLodHist[kTerrainFamCell][9],
-                         g_terrainEyeCellMissing ? "  (no LAND record within 1 cell of the eye)" : "");
-            // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
-            // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
-            // ⚠ `grass=` IS INSIDE `dl=`, and `grassdep=` is inside `prepass=` on the line above —
-            // drawGrass is recorded in the DL block and its Z-prepass half in the prepass block. Do
-            // not add them to anything. They are printed because grass had NO bracket of its own
-            // until G1f and was therefore invisible: `dl=4.48` for 0.23M triangles was read as a
-            // draw-call problem for a whole session, when DL + statics is 1.00 and the rest was
-            // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
-            // prepass paid for itself is `grassdep + grass` now against `grass` alone at
-            // grassPrepass=0.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
-                         " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
-                         g_lastGpuPhaseMs[kGpuPhaseColorSky],
-                         g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
-                         g_live.froxelNearActive ? "on" : "off", g_live.froxelNearLightCount,
-                         g_lastGpuPhaseMs[kGpuPhaseColorNear],
-                         g_lastGpuPhaseMs[kGpuPhaseColorSkin], g_lastGpuPhaseMs[kGpuPhaseColorMM],
-                         g_lastGpuPhaseMs[kGpuPhaseColorDL],
-                         g_lastGpuPhaseMs[kGpuPhaseGrassColor],
-                         g_lastGpuPhaseMs[kGpuPhaseGrassDepth],
-                         // WHICH PIPELINE THE COLOUR DRAW ACTUALLY USED, not which one it was asked
-                         // for. "EQ" is the only proof the pair is live: a build where the depth PSO
-                         // failed non-fatally still logs grassPrepass=1 and still draws grass, just
-                         // with none of the win, and the ms alone cannot tell those apart.
-                         g_grassPrepassRecorded ? "EQ" : (g_grassPrepass ? "GEQUAL(prepass unavailable)"
-                                                                        : "GEQUAL(off)"),
-                         g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
-                         g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
-                         // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
-                         // interior / DL not resident / knob off), which is the distinction worth
-                         // logging: a 0.00 with "on" would be a timing problem, with "off" it is a gate.
-                         g_lastGpuPhaseMs[kGpuPhaseVolFog],
-                         (g_volFog && g_live.pVolFogPipeline && g_live.sunShadowReady) ? "on" : "off",
-                         (unsigned)g_volFogSteps,
-                         // waterclamp off + fog on over open sea = the horizon band is over-marching.
-                         g_volFogWaterOn ? "on" : "off",
-                         g_lastGpuPhaseMs[kGpuPhaseReflGeo],
-                         g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
-            // ===== DOES THE FRAME ADD UP? THE LINE THAT MAKES THAT CHECKABLE ====================
-            // `gpu split:` and `gpu color sub:` above print 30-odd phases and there is no way to
-            // tell from them whether the phases COVER the frame — so for a long time they did not,
-            // and nobody could see it. Three dispatches ran in no bracket at all, and two more
-            // (ColorFP and ObjVel) were bracketed but printed nowhere, so the only way to notice was
-            // to add up two log lines by hand and compare against `gpu=` on a third.
-            //
-            // The sum is driven off a TABLE, not off the format string, because the failure being
-            // fixed is precisely a phase that exists and is not in the sum. Add a top-level phase to
-            // the enum and it must be added here too, or UNBRACKETED grows and says so.
-            // ⚠ TOP-LEVEL ONLY. Every nested phase (Linearize/ShadowMask/AO* inside PostDepth,
-            // ColorSky/Near/Skin/MM/DL inside Color, ShadowStatic/Dyn/Sun inside Shadow, ReflGeo
-            // inside Reflect, ObjVelFP inside ColorFP) is DELIBERATELY ABSENT: counting one twice
-            // would drive the residual negative and make a real gap look closed.
-            {
-                static const uint32_t kTopLevel[] = {
-                    kGpuPhaseAtmos,      kGpuPhaseCull,       kGpuPhaseCaustic,
-                    kGpuPhaseGrassCrush, kGpuPhaseFroxelNear, kGpuPhasePrepass,
-                    kGpuPhaseShadow,     kGpuPhasePostDepth,  kGpuPhaseReflect,
-                    kGpuPhaseColor,      kGpuPhaseHizMip0,    kGpuPhaseReLinear,
-                    kGpuPhaseMotionVec,  kGpuPhaseObjVel,     kGpuPhaseWater,
-                    kGpuPhaseColorGlow,  kGpuPhaseColorAlpha, kGpuPhaseVolFog,
-                    kGpuPhaseColorFP,    kGpuPhaseApl,        kGpuPhaseUpscale,
-                    kGpuPhaseResolveFilter, kGpuPhaseMotionBlur, kGpuPhaseBloom,
-                    kGpuPhaseResolve,
-                };
-                double bracketed = 0.0;
-                for (uint32_t i = 0; i < (uint32_t)(sizeof(kTopLevel) / sizeof(kTopLevel[0])); ++i) {
-                    bracketed += g_lastGpuPhaseMs[kTopLevel[i]];
-                }
-                const double frameMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
-                const double resid   = frameMs - bracketed;
-                LOG::logline(">> [forge-hb] gpu residual: frame=%.2f bracketed=%.2f UNBRACKETED=%.2f (%.0f%%)"
-                             " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f"
-                             " | measured but never printed: fp=%.2f(objvelFP=%.2f) objvel=%.2f",
-                             frameMs, bracketed, resid,
-                             (frameMs > 0.01) ? (100.0 * resid / frameMs) : 0.0,
-                             g_lastGpuPhaseMs[kGpuPhaseHizMip0],
-                             g_lastGpuPhaseMs[kGpuPhaseReLinear],
-                             g_lastGpuPhaseMs[kGpuPhaseApl],
-                             g_lastGpuPhaseMs[kGpuPhaseColorFP],
-                             g_lastGpuPhaseMs[kGpuPhaseObjVelFP],
-                             g_lastGpuPhaseMs[kGpuPhaseObjVel]);
-            }
-
-            // ===== WHICH PHASE IS BURSTY, OR IS IT NONE OF THEM? ================================
-            // Drains the stall latch: min/max per phase over the WHOLE window, not the one frame
-            // the lines above happen to print. Read the SPREAD column, not the max:
-            //   several phases each ~+1.7 ms  => one wandering stall external to all of them;
-            //                                    optimising any of those passes is chasing a ghost
-            //   one phase far above the rest  => that pass is genuinely bursty and is the subject
-            // `over` is how often the frame ran >10% above the window's cheapest frame, i.e. how
-            // much of the time the excursion is actually costing anything.
-            if (g_stallWinN > 1) {
-                struct Spread { const char* name; double lo, hi, d; };
-                static const struct { uint32_t id; const char* name; } kNamed[] = {
-                    { kGpuPhaseAtmos, "atmos" },   { kGpuPhaseCull, "cull" },
-                    { kGpuPhaseCaustic, "caustic" },{ kGpuPhaseFroxelNear, "froxel" },
-                    { kGpuPhasePrepass, "prepass" },{ kGpuPhaseShadow, "shadow" },
-                    { kGpuPhasePostDepth, "postdepth" }, { kGpuPhaseReflect, "reflect" },
-                    { kGpuPhaseColor, "color" },   { kGpuPhaseHizMip0, "hizmip0" },
-                    { kGpuPhaseReLinear, "relin" },{ kGpuPhaseMotionVec, "mv" },
-                    { kGpuPhaseObjVel, "objvel" }, { kGpuPhaseWater, "water" },
-                    { kGpuPhaseColorAlpha, "alpha" }, { kGpuPhaseVolFog, "volfog" },
-                    { kGpuPhaseColorFP, "fp" },    { kGpuPhaseApl, "apl" },
-                    { kGpuPhaseResolveFilter, "rfilter" }, { kGpuPhaseMotionBlur, "mb" },
-                    { kGpuPhaseBloom, "bloom" },   { kGpuPhaseResolve, "resolve" },
-                };
-                const uint32_t nNamed = (uint32_t)(sizeof(kNamed) / sizeof(kNamed[0]));
-                Spread sp[sizeof(kNamed) / sizeof(kNamed[0])];
-                for (uint32_t i = 0; i < nNamed; ++i) {
-                    sp[i].name = kNamed[i].name;
-                    sp[i].lo   = g_stallWinMin[kNamed[i].id];
-                    sp[i].hi   = g_stallWinMax[kNamed[i].id];
-                    sp[i].d    = sp[i].hi - sp[i].lo;
-                }
-                // Insertion sort by spread, descending. 22 entries once per 300 frames.
-                for (uint32_t i = 1; i < nNamed; ++i) {
-                    Spread k = sp[i];
-                    int32_t j = (int32_t)i - 1;
-                    while (j >= 0 && sp[j].d < k.d) { sp[j + 1] = sp[j]; --j; }
-                    sp[j + 1] = k;
-                }
-                char buf[512];
-                int off = 0;
-                for (uint32_t i = 0; i < 6 && i < nNamed; ++i) {
-                    const int w = std::snprintf(buf + off, sizeof(buf) - (size_t)off,
-                                                "%s %.2f->%.2f(+%.2f) ",
-                                                sp[i].name, sp[i].lo, sp[i].hi, sp[i].d);
-                    if (w <= 0 || (size_t)(off + w) >= sizeof(buf)) { break; }
-                    off += w;
-                }
-                const double mean = g_stallWinSum / (double)g_stallWinN;
-                LOG::logline(">> [forge-hb] gpu stall latch: frames=%u frame min=%.2f MEAN=%.2f max=%.2f"
-                             " | excursion: mean-min=%.2f (%.0f%% of mean) max-min=%.2f"
-                             " | over(+10%%)=%u (%.0f%%) | worst spreads: %s",
-                             g_stallWinN,
-                             g_stallWinMin[kGpuPhaseFrame], mean, g_stallWinMax[kGpuPhaseFrame],
-                             mean - g_stallWinMin[kGpuPhaseFrame],
-                             (mean > 0.01) ? (100.0 * (mean - g_stallWinMin[kGpuPhaseFrame]) / mean) : 0.0,
-                             g_stallWinMax[kGpuPhaseFrame] - g_stallWinMin[kGpuPhaseFrame],
-                             g_stallWinOver,
-                             (g_stallWinN > 0) ? (100.0 * (double)g_stallWinOver / (double)g_stallWinN) : 0.0,
-                             buf);
-                // ===== THE COST MODEL, WITH THE STALL TAKEN OUT =================================
-                // Every number in `gpu split:` above is one sampled frame, and roughly half the
-                // frames carry part of a ~2.1 ms excursion that belongs to no pass. So the split's
-                // `mask=0.80` and `ao=1.33` are costs PLUS whatever stall that frame caught, and
-                // they are what a whole session of tuning would have been aimed at. These are the
-                // per-phase MINIMA over the window -- the cheapest frame each pass ever ran in,
-                // which is the closest thing to its true cost the GPU will report. Nested phases
-                // included, because "postdepth floors at 1.72" does not say whether that is AO or
-                // the mask.
-                LOG::logline(">> [forge-hb] gpu floors (ONE frame, the window's cheapest): frame=%.2f | prepass=%.2f"
-                             " shadow=%.2f(sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f"
-                             " blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f(geo=%.2f) color=%.2f cull=%.2f"
-                             " caustic=%.2f atmos=%.2f mv=%.2f mb=%.2f bloom=%.2f rfilter=%.2f resolve=%.2f",
-                             g_stallBest[kGpuPhaseFrame],
-                             g_stallBest[kGpuPhasePrepass],
-                             g_stallBest[kGpuPhaseShadow], g_stallBest[kGpuPhaseShadowSun],
-                             g_stallBest[kGpuPhasePostDepth],
-                             g_stallBest[kGpuPhaseLinearize],
-                             g_stallBest[kGpuPhaseAODown] + g_stallBest[kGpuPhaseAOSearch]
-                                 + g_stallBest[kGpuPhaseAOBlur] + g_stallBest[kGpuPhaseAOUp],
-                             g_stallBest[kGpuPhaseAODown],  g_stallBest[kGpuPhaseAOSearch],
-                             g_stallBest[kGpuPhaseAOBlur],  g_stallBest[kGpuPhaseAOUp],
-                             g_stallBest[kGpuPhaseShadowMask],
-                             g_stallBest[kGpuPhaseReflect], g_stallBest[kGpuPhaseReflGeo],
-                             g_stallBest[kGpuPhaseColor],   g_stallBest[kGpuPhaseCull],
-                             g_stallBest[kGpuPhaseCaustic], g_stallBest[kGpuPhaseAtmos],
-                             g_stallBest[kGpuPhaseMotionVec], g_stallBest[kGpuPhaseMotionBlur],
-                             g_stallBest[kGpuPhaseBloom],
-                             g_stallBest[kGpuPhaseResolveFilter], g_stallBest[kGpuPhaseResolve]);
-                g_stallWinN     = 0;   // next window starts clean
-                g_stallWinOver  = 0;
-                g_stallWinSum   = 0.0;
-                g_stallBestValid = false;
-            }
-
-            // The atmosphere LUT cache, reported as a RATE rather than a boolean. `builds` is the
-            // number that matters: it is how many times in the window the 0.71 ms chain actually
-            // ran, and it should sit at a handful. A builds count that tracks the frame count means
-            // something in the packed block is moving every frame -- the weather row blending as
-            // the player walks is the candidate -- and the cache has degraded to a memcmp, which is
-            // the honest failure and is visible here rather than as a mysteriously unchanged atmos=.
-            if (g_atmosSkips + g_atmosBuilds > 0) {
-                const uint32_t tot = g_atmosSkips + g_atmosBuilds;
-                LOG::logline(">> [forge-hb] atmos cache: builds=%u skips=%u (%.0f%% skipped)"
-                             " | quantum: sun %.3f deg alt %.1f m | cache=%s",
-                             g_atmosBuilds, g_atmosSkips,
-                             100.0 * (double)g_atmosSkips / (double)tot,
-                             (double)g_atmosCacheDeg, (double)g_atmosCacheAltM,
-                             g_atmosCache ? "on" : "OFF (control arm)");
-                g_atmosSkips  = 0;
-                g_atmosBuilds = 0;
-            }
-            // Skinned-loop CPU RECORD probe: rec-split skin= is prep(palette+instance memcpy, IPC-blob
-            // reads → faults) + rec(bindVB/IB+draw). Only rec is removable by a skinned mega-VB.
-            // SETUP split: localizes the 1400-line setup bucket. gather= is the O(dirty x meshHigh)
-            // caster scan; iters/kept shows how much of that scan is WASTED (kept << iters ⇒ the
-            // scan is the wrong data structure, not just slow).
-            // casters= the index size: the sweeps' real iteration domain. It should stay ~flat while
-            // meshHigh churns upward — if casters tracks meshHigh, the index is leaking.
-            LOG::logline(">> [forge-hb] setup split: casterRefresh=%.2f shadowMgr=%.2f (gather=%.2f,"
-                         " slots=%u iters=%llu kept=%u) drawMemcpy=%.2f other=%.2f ms"
-                         " | meshHigh=%u casters=%u",
-                         g_lastSetupCasterRefreshMs, g_lastSetupShadowMgrMs, g_lastSetupGatherMs,
-                         g_lastSetupGatherSlots, (unsigned long long)g_lastSetupGatherIters,
-                         g_lastSetupGatherKept, g_lastSetupDrawMemcpyMs,
-                         g_lastSetupMs - g_lastSetupCasterRefreshMs - g_lastSetupShadowMgrMs
-                             - g_lastSetupDrawMemcpyMs,
-                         g_meshHigh, (unsigned)g_casterSlots.size());
-            // shadowMgr sub-buckets — where its ~1.5-2.3ms ACTUALLY lives (the gather is ~0.2ms of it).
-            {
-                char blk[256]; int off = 0;
-                for (uint32_t b = 0; b < kSetupBlkCount && off < (int)sizeof(blk) - 1; ++b) {
-                    off += std::snprintf(blk + off, sizeof(blk) - off, "%s%s=%.2f",
-                                         b ? " " : "", kSetupBlkName[b], g_lastSetupBlkMs[b]);
-                }
-                LOG::logline(">> [forge-hb] shadowMgr blk: %s ms", blk);
-            }
-            // max vs mean is the tell: max~=mean = uniform (contention/cache, NOT this loop's fault);
-            // one big max = a single stall to hunt at that slot.
-            LOG::logline(">> [forge-hb] skin rec probe: prep=%.2f rec=%.2f ms (n=%u parts, mean=%.1fus,"
-                         " max=%.1fus @slot%u, pipeSwitches=%u)",
-                         g_lastSkinPrepMs, g_lastSkinRecMs, g_lastSkinnedDrawn,
-                         g_lastSkinnedDrawn ? ((g_lastSkinPrepMs + g_lastSkinRecMs) * 1000.0 / g_lastSkinnedDrawn) : 0.0,
-                         g_lastSkinMaxPartMs * 1000.0, g_lastSkinMaxSlot, g_lastSkinPipeSwitches);
-            // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
-            // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
-            // Tier 1: `wall` is no longer submit->fence around OUR OWN frame — it is the residual
-            // block at the TOP of this frame waiting for the PREVIOUS one. exec is the real GPU
-            // execution (resolved timestamps, one frame late). So the reading inverts: a SMALL
-            // residual with a large exec means the overlap is working; residual ~= exec means the
-            // host is right back to serial. overruns = frames that were still executing when we
-            // came back for them, which is the saturated-GPU signal, not a fault.
-            const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
-            LOG::logline(">> [forge-hb] gpu frame: exec=%.2f residualWait=%.2f hidden=%.2f ms"
-                         " (overruns=%u) (%s)",
-                         frameExec, g_lastGpuWaitMs, frameExec - g_lastGpuWaitMs, g_frameOverruns,
-                         (g_lastGpuWaitMs < 0.5 * frameExec) ? "OVERLAPPED (host ran under the GPU)"
-                                                             : "still serial (host waits the GPU)");
-            // APL instrument (tasks/forge-postprocess.md step 2). Three numbers, deliberately:
-            //   apl  = luma of the mean colour — the literal average picture level.
-            //   geo  = exp(mean log luma) — the geometric mean, the exposure metric, and later the
-            //          input to the ported Eye Adaptation. It moves differently from apl when the
-            //          distribution changes shape rather than its level, which is precisely what a
-            //          gamma->linear migration does, so reporting only one of the two would hide it.
-            //   cast = mean RGB divided by apl — the colour cast with overall level DIVIDED OUT.
-            //          This is the "hues" half: it stays put under an exposure change and moves the
-            //          moment the migration tints anything, so the two failure modes are separable
-            //          instead of being one number that drifted.
-            if (g_aplN > 0u) {
-                const double inv = 1.0 / (double)g_aplN;
-                const double r = g_aplAccum[0] * inv;
-                const double g = g_aplAccum[1] * inv;
-                const double b = g_aplAccum[2] * inv;
-                const double apl = 0.299 * r + 0.587 * g + 0.114 * b;
-                const double geo = std::exp(g_aplAccum[3] * inv);
-                const double n   = (apl > 1.0e-6) ? (1.0 / apl) : 0.0;
-                // S3a: the same line now carries the SETPOINT this context is aimed at, and the
-                // factor still missing. Reported here rather than in the dev panel for three
-                // reasons: apl already lives on this line, the harness runs minimized with nobody
-                // at the panel, and t.label() is implicated in the 2026-08-07 null-resource crash
-                // (see the Resolve tab — it has had zero callers since).
-                // S3a: the DISTRIBUTION in display levels beside the mean, and the target as the
-                // RANGE or PAIR it actually is. `need` is computed off the frame MEAN, so it is only
-                // a gate where the target is also a frame mean — the first interior run reported
-                // 3.51x against the user's ~2.5x, and most of that was comparing a range's top end
-                // as if it were a point. What is left over is the mean-vs-region question, which is
-                // what p50/p90 are here to answer: a value someone reads off a lit surface is
-                // comparable to p90, never to the mean of a frame full of dark corners.
-                const CalTarget ct = calTarget();
-                const double meanLvl = apl * 255.0;
-                // ...in the domain the KNOBS live in, not in display levels — see calGainDomain().
-                const double gm = calGainDomain(meanLvl);
-                const double kLo = (gm > 1.0e-9) ? (calGainDomain(ct.lo) / gm) : 0.0;
-                const double kHi = (gm > 1.0e-9) ? (calGainDomain(ct.hi) / gm) : 0.0;
-                // ⚠ `exp=` IS NOT DECORATION, and the line is invalid without it. With a servo
-                // running, every level on this line was measured through an exposure that moves, so
-                // an `apl` recorded here is meaningless unless the E it was taken at is recorded
-                // beside it — the whole calibration table is built out of these lines, and a table
-                // built from readings against an unknown gain is worse than no table. `need`
-                // settling toward 1.00x while `exp` moves is exactly what "the servo is working"
-                // looks like, since `need` is the residual the servo is closing.
-                //
-                // ⚠ AND THE CURVE JOINS THE SAME TUPLE at step 3, by exactly the argument `exp=`
-                // itself is here for: an APL reading taken against an unknown curve is
-                // uninterpretable, and these lines are what the calibration table gets built out of.
-                // It reports the curve that ARMED (agxActive()), not the checkbox — a build where
-                // the scene is not linear says `legacy` truthfully.
-                // WHICH POPULATION THIS LINE DESCRIBES, on the line itself. `scene` means sky was
-                // rejected and every number here is the world only; `frame` is the old whole-image
-                // reading. sky= is the rejected fraction, and it is what makes two readings
-                // comparable — a scene mean taken at sky=0.45 and one at sky=0.05 sampled very
-                // different parts of the world even though both say `scene`.
-                const double cover = g_aplCoverAccum * inv;
-                // ⚠ RAIL CONTACT (P2), and it is NOT decoration either. The clamp was widened from
-                // five stops to twenty for the physical sky's day-night cycle, which trades the
-                // guard it used to be for the range it now needs — and a servo pinned AT its limit
-                // is indistinguishable from one that happens to want that value unless the pinning
-                // is reported. `free` is the healthy state; `MIN 4.2s` means the loop has been
-                // refused for 4.2 seconds and the answer is a CAL gain or a calTarget row, not a
-                // bigger clamp. `worst` is the longest contact this session, so a night spent on the
-                // rail is still visible in the morning.
-                char railTxt[48];
-                if (g_expRail == 0) {
-                    std::snprintf(railTxt, sizeof(railTxt), "free(worst %.1fs)", g_expRailWorstMs * 0.001);
-                } else {
-                    std::snprintf(railTxt, sizeof(railTxt), "**%s %.1fs**(worst %.1fs)",
-                                  (g_expRail < 0) ? "MIN" : "MAX",
-                                  g_expRailMs * 0.001, g_expRailWorstMs * 0.001);
-                }
-                LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
-                             " cast=(%.3f,%.3f,%.3f) n=%u [%s sky=%.0f%%]"
-                             " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
-                             " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
-                             " exp=%.3g(%s,%s,%s) rail=%s(ceil %.3g) cal=(sun %.2f amb %.2f emis %.2f)",
-                             r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
-                             g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
-                             meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
-                             g_aplPctAccum[2] * inv,
-                             ct.name, ct.lo, ct.hi, kLo, kHi,
-                             g_live.linearScene ? "linear" : "gamma",
-                             g_exposure,
-                             g_expEnable ? "servo" : "OFF",
-                             (g_expStat < 0.5f) ? "mean" : ((g_expStat < 1.5f) ? "p90" : "geo"),
-                             agxActive() ? "agx" : "legacy",
-                             railTxt, (double)g_expMaxNow,
-                             g_calSunGain, g_calAmbGain, g_calEmisGain);
-
-                // --- THE REGION SPLIT, ON ITS OWN LINE -------------------------------------
-                //
-                // Its own line and not more fields on the one above, because it answers a
-                // different question and has a different divisor: the line above is ONE
-                // population over g_aplN frames, this is TWO populations over two frame counts
-                // that need not match either it or each other.
-                //
-                // `w/l` IS THE WHOLE INSTRUMENT. Both halves were metered in the same frame,
-                // through the same exposure and the same curve, so their ratio is a property of
-                // the renderer and survives a change of weather, of time of day, or of E — which
-                // is exactly what a single-population reading cannot do. The standing target
-                // (user, 2026-08-21) is 0.50: water at half the APL of the land beside it.
-                //
-                // ⚠ THE RATIO IS OF DISPLAY LEVELS, NOT OF RADIANCE. Every number here is read
-                // off the DELIVERED image, after AgX and after the sRGB encode, and that curve is
-                // strongly compressive — so 0.50 in these units is a much larger ratio upstream,
-                // and no scene-referred coefficient can be read off this line directly. It is a
-                // TARGET to servo the physics onto, not a value to paste into a constant.
-                //
-                // p50/p90 come along because a mean over a region is still a mean: a bay with a
-                // bright specular streak and a dark body has the same mean as a uniform grey one,
-                // and only the spread tells them apart.
-                if (g_aplLandN > 0u || g_aplWaterN > 0u) {
-                    const double li = (g_aplLandN  > 0u) ? (1.0 / (double)g_aplLandN)  : 0.0;
-                    const double wi = (g_aplWaterN > 0u) ? (1.0 / (double)g_aplWaterN) : 0.0;
-                    const double lApl = (0.299 * g_aplLandAccum[0] + 0.587 * g_aplLandAccum[1]
-                                       + 0.114 * g_aplLandAccum[2]) * li;
-                    const double wApl = (0.299 * g_aplWaterAccum[0] + 0.587 * g_aplWaterAccum[1]
-                                       + 0.114 * g_aplWaterAccum[2]) * wi;
-                    const double ratio = (lApl > 1.0e-6) ? (wApl / lApl) : 0.0;
-                    // ⚠ AND THE RATIO PER CHANNEL, because a luma ratio can sit exactly on target
-                    // while the picture is wrong. MW's ground art measures 0.043/0.037/0.017 linear
-                    // — its BLUE albedo is under half its red — and a water column is blue by
-                    // construction (absorption is 4x higher in red, so omega' is blue-dominant
-                    // whatever the medium). The two can agree on luma and still differ by 2x in
-                    // blue, which is what "the bright blue is scatter" describes and what a single
-                    // w/l number structurally cannot show.
-                    double wl[3] = { 0.0, 0.0, 0.0 };
-                    for (int i = 0; i < 3; ++i) {
-                        const double lc = g_aplLandAccum[i] * li;
-                        wl[i] = (lc > 1.0e-6) ? ((g_aplWaterAccum[i] * wi) / lc) : 0.0;
-                    }
-                    LOG::logline(">> [forge-hb] apl-split: LAND lvl=%.1f p50=%.0f p90=%.0f"
-                                 " rgb=(%.4f,%.4f,%.4f) n=%u"
-                                 " | WATER lvl=%.1f p50=%.0f p90=%.0f rgb=(%.4f,%.4f,%.4f) n=%u"
-                                 " | w/l=%.3f (target 0.50) per-ch=(%.2f,%.2f,%.2f)"
-                                 " land=%.0f%% of scene%s",
-                                 lApl * 255.0, g_aplLandPct[1] * li, g_aplLandPct[2] * li,
-                                 g_aplLandAccum[0] * li, g_aplLandAccum[1] * li,
-                                 g_aplLandAccum[2] * li, g_aplLandN,
-                                 wApl * 255.0, g_aplWaterPct[1] * wi, g_aplWaterPct[2] * wi,
-                                 g_aplWaterAccum[0] * wi, g_aplWaterAccum[1] * wi,
-                                 g_aplWaterAccum[2] * wi, g_aplWaterN,
-                                 ratio, wl[0], wl[1], wl[2],
-                                 100.0 * g_aplLandFrac * inv,
-                                 g_waterNoReflect ? " [NO-REFLECT: transmitted path only]" : "");
-                }
-            }
-            dlLogHeartbeat();
-            g_recAccum = 0.0;
-            g_gpuAccum = 0.0;
-            g_aplAccum[0] = g_aplAccum[1] = g_aplAccum[2] = g_aplAccum[3] = 0.0;
-            g_aplPctAccum[0] = g_aplPctAccum[1] = g_aplPctAccum[2] = 0.0;
-            g_aplCoverAccum = 0.0;
-            g_aplN = 0;
-            for (int i = 0; i < 4; ++i) { g_aplLandAccum[i] = g_aplWaterAccum[i] = 0.0; }
-            for (int i = 0; i < 3; ++i) { g_aplLandPct[i]   = g_aplWaterPct[i]   = 0.0; }
-            g_aplLandFrac = 0.0;
-            g_aplLandN = g_aplWaterN = 0;
-        }
+        // ===================== THE FRAME EPILOGUE (accounting, heartbeat, cost model) ============
+        frameEpilogue(drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
+                      tEntry, tSubmit1, rzViewProj, fpRzSaved, fpRzValid);
         return true;
     }
 

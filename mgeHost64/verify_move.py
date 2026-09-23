@@ -27,30 +27,23 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else 'HEAD'
 # name, baseline first line, baseline last line, current signature prefix, banner kept at call site,
 # extra lines past the last anchor
 CASES = [
-    ("TIER 2 linearize + GTAO",
-     '        gpuPhaseBegin(kGpuPhasePostDepth);',
-     '        gpuPhaseEnd(kGpuPhasePostDepth);',
-     '    bool passLinearizeAndGtao(', False, 0),
-    ("P1 point-light shadow faces",
-     '        // ===================== P1: POINT-LIGHT SHADOW FACES (atlas tile re-render) ==========',
-     '        gpuPhaseEnd(kGpuPhaseShadow);',
-     '    void passPointLightShadowFaces(', True, 0),
-    ("Z-PREPASS",
-     '        // ===================== Z-PREPASS (depth-only, opaque set) =====================',
-     '        gpuPhaseEnd(kGpuPhasePrepass);',
-     '    void passZPrepass(', True, 0),
-    ("Hi-Z prologue",
-     '        // ===================== Hi-Z prologue: reduce mips 1..N (tail submit) =====================',
-     '            g_hizValid = true;',
-     '    void passHiZPrologue(', True, 1),
+    ("Frame epilogue",
+     "        // --- M1: SNAPSHOT THIS FRAME'S CAMERA FOR NEXT FRAME'S REPROJECTION -----------------------",
+     '            g_aplLandN = g_aplWaterN = 0;',
+     '    void frameEpilogue(', False, 1),
 ]
 
-# Landed and verified, no longer checkable from HEAD:
+# Landed and verified, no longer checkable from HEAD (each was VERBATIM against the baseline named):
 #   baseline a8cc463a -> commit 39a73d84 (batch 1)
-#       passDistantLightGlow          18 lines   VERBATIM
-#       passVolumetricFogAndBackstop  52 lines   VERBATIM
-#       passResolvePreFilter          41 lines   VERBATIM
-#       passForgeWaterSurface        195 lines   VERBATIM
+#       passDistantLightGlow           18 lines
+#       passVolumetricFogAndBackstop   52 lines
+#       passResolvePreFilter           41 lines
+#       passForgeWaterSurface         195 lines
+#   baseline 39a73d84 -> commit 1c10da77 (batch 2)
+#       passLinearizeAndGtao          370 lines  (+ the single-output `return aoBlockRan;`)
+#       passPointLightShadowFaces     600 lines
+#       passZPrepass                  419 lines
+#       passHiZPrologue                95 lines
 
 base = subprocess.run(['git', '-C', REPO, 'show', f'{BASE}:{PATH}'],
                       capture_output=True, text=True, check=True).stdout.split('\n')
