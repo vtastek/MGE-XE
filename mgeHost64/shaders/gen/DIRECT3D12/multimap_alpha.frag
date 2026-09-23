@@ -3467,20 +3467,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-#line 136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
-                    if (gFrameData.alphaShadowParams.y > 0.5f)
-                    {
-                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
-                    }
-                    else
-                    {
-                        uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                        uint s = slotP1 - 1u;
-                        uint lane = s >> 3u;
-                        uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                        uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
-                        att *= float(nib) * (1.0f / 15.0f);
-                    }
+#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+                    att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
                 }
 
                 float lambert = saturate(dot(N, toLight) * invDist);
@@ -3578,7 +3566,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
         return (float4(g, g, g, 1.0f));
     }
-#line 260 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+#line 256 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
     float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }

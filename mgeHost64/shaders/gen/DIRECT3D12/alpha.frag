@@ -3791,18 +3791,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
             uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-
-
-
-
-
-
-
-
-
-
-            if (receiveShadows && slotP1 != 0u && !inReflect
-                && (In.DrawIdx == 0xFFFFFFFFu || gFrameData.alphaShadowParams.y > 0.5f))
+#line 197 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+            if (receiveShadows && slotP1 != 0u && !inReflect)
             {
                 att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
             }
@@ -3853,7 +3843,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (albedo.a < In.AlphaRef) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
-#line 251 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 264 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
     if (In.DrawIdx != 0xFFFFFFFFu)
     {
         uint4 stg = gAlphaStages[In.DrawIdx];

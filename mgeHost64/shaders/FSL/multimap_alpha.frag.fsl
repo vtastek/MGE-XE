@@ -133,19 +133,15 @@ float4 PS_MAIN( VSOutput In )
                     // all ("aoSample belongs to the opaque surface BEHIND the sheet"), which is the
                     // same argument the FP guard makes, reached first for transparency. aoSample
                     // survives only for the F12 debug views.
-                    if (gFrameData.alphaShadowParams.y > 0.5f)
-                    {
-                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
-                    }
-                    else
-                    {
-                        uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                        uint  s    = slotP1 - 1u;
-                        uint  lane = s >> 3u;
-                        uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                        uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                        att *= float(nib) * (1.0f / 15.0f);
-                    }
+                    //
+                    // ⚠ AND SINCE 2026-09-23 EVERY PART DOES, NOT ONLY FP. A blended multi-map part
+                    // is never drawn into the alpha receiver scratch (that pass is opaque.vert-only),
+                    // so the mask texel under it ALWAYS described some other surface — the world
+                    // behind it or another sheet — and under MSAA an edge pixel's texel is FAR, i.e.
+                    // fully LIT (see alpha.frag, where the same fix removed bright MSAA edge lines in
+                    // a shadowed cave). Route C draws bind only the main and FP PerFrame sets, both
+                    // of which carry gShadowAtlas, so the direct test is always legal here.
+                    att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);
