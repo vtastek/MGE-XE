@@ -583,6 +583,17 @@ float4 PS_MAIN( VSOutput In )
     // Metallic workflow: a metal's reflectance is all specular (F0 = its albedo, below), so its diffuse
     // and ambient go to zero; the emissive addend is untouched. PBR draws only.
     if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
+    // ...and the DIELECTRIC's share, which nothing used to take. See pbrKdEnergy: the specular
+    // below is added, never deducted, so without this the surface reflects more than it receives
+    // and the excess is achromatic — which is what buries the albedo. albedo is already in scope
+    // here (the AO multi-bounce term above needed it), so f0 can be formed at the same point the
+    // metalness kill happens rather than 25 lines later where the specular uses it.
+    if (pbrOn && gShadowParams.pbrShade2.z > 0.0f)
+    {
+        const float3 kE = pbrKdEnergy(pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x),
+                                      pbrNoV, pbrRough, gShadowParams.pbrShade2.z);
+        d *= kE; a *= kE;
+    }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
@@ -607,6 +618,11 @@ float4 PS_MAIN( VSOutput In )
     // Coverage is 1: this pass writes opaque pixels (its alpha test is binary and already ran),
     // so the exposed value the encode clipped is albedo.rgb itself.
     float3 c = albedo.rgb * (lit + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f));
+    // Mode 27 needs the specular ON ITS OWN, and the only honest way to get it is to accumulate it
+    // as it is added rather than to re-derive it afterwards — a view that recomputes a term can
+    // agree with itself while disagreeing with the frame, which is the trap mode 3's comment
+    // already spells out for AO. Costs one float3 add on a path that is about to do several.
+    float3 dbgSpec = float3(0.0f, 0.0f, 0.0f);
     if (pbrOn)
     {
         const float3 f0 = pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x);
@@ -617,8 +633,10 @@ float4 PS_MAIN( VSOutput In )
         const float3 R = reflect(-pbrV, pbrNb);
         float3 env = gFrameData.ambCol.rgb * skyAmbFactor(R, In.WorldPos) * pbrTAmb * gFrameData.dbgScales.x;
         if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
-        c += (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
-           + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+        const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
+                             + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+        c       += specAdd;
+        dbgSpec += specAdd;
         // MULTIPLE-SCATTERING SPECULAR, added as the DIFFERENCE from the line above rather than as
         // a factor on it — the house rule this file states for the W32 gobo, so at strength 0 the
         // original expression is textually untouched and the A/B is bit-exact by inspection. CSE
@@ -627,8 +645,10 @@ float4 PS_MAIN( VSOutput In )
         {
             const float3 comp = pbrSpecMulti(f0, pbrEnvAB(pbrNoV, pbrRough), gShadowParams.pbrShade.w)
                               - float3(1.0f, 1.0f, 1.0f);
-            c += ((f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
-                  + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * comp;
+            const float3 msAdd = ((f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
+                                  + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * comp;
+            c       += msAdd;
+            dbgSpec += msAdd;
         }
     }
     // MW's enchanted-item glow. MW draws the item a second time as base*caustic*DIFFUSE and blends
@@ -664,6 +684,18 @@ float4 PS_MAIN( VSOutput In )
         // itself while disagreeing with the frame, and "is the tint on, or is it just subtle?" is
         // exactly the question this mode has to be able to answer.
         RETURN(float4(aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags), 1.0f));
+    }
+    if (dbg == 27u) {   // mode 27: the PBR SPECULAR, alone — the term nothing could see
+        // ⚠ THIS IS THE ADDEND, NOT A RATIO. 5 albedo, 6 lit and 7 ambient all show pieces of the
+        // DIFFUSE product; specular is the one term that is ADDED to it, so its size relative to
+        // `albedo * lit` is the whole question and no existing view could answer it. Shown raw and
+        // pre-tonemap, in the same scene-referred units the frame works in, so what you read here
+        // is literally what was added to that pixel.
+        //
+        // Read it against mode 5 in the SAME spot: specular that is a visible fraction of the
+        // albedo is specular that will bury the albedo's colour, because this addend is achromatic
+        // on a dielectric while mode 5 is the only term carrying hue.
+        RETURN(float4(dbgSpec, 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }                     // mode 5: albedo only (texture, no lighting)
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                            // mode 6: lit only (lighting, no texture)

@@ -431,9 +431,18 @@ PSOut PS_MAIN( VSOutput In )
         // than an oversight: statics.vert folds ambient and emissive into ONE interpolator (Color),
         // so this frag cannot tell them apart. It only bites where a glowing subset ALSO ships a
         // metallic `_paramh`, which the lit-window and ghostfence sets do not.
-        result  *= pbrKd;
-        litTerm *= pbrKd;
         const float3 f0 = pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x);
+        // THE DIELECTRIC'S SHARE, taken out of diffuse before the specular below adds it back.
+        // Folded into pbrKd rather than applied separately so the metallic kill and the energy
+        // split stay ONE multiply on each of the two terms, and so it lands HERE — after the
+        // specular AA has widened pbrRough — because pbrEnvBRDF must be asked about the same lobe
+        // the specular line actually uses. Setting it at the pbrKd assignment 150 lines above would
+        // have used the pre-AA roughness and quietly disagreed. See pbrKdEnergy.
+        const float3 pbrKdE = (gShadowParams.pbrShade2.z > 0.0f)
+            ? pbrKd * pbrKdEnergy(f0, pbrNoV, pbrRough, gShadowParams.pbrShade2.z)
+            : pbrKd;
+        result  *= pbrKdE;
+        litTerm *= pbrKdE;
         // The environment is the SAME sky the vertex ambient integrates (lodSunAmb through
         // skyAmbFactor — statics.vert's own ambient source), evaluated in the mirror direction, so
         // what lights a distant static and what it reflects cannot drift apart.

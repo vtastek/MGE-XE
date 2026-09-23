@@ -1979,13 +1979,20 @@ float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
     const float2 AB = pbrEnvAB(NoV, rough);
     return f0 * AB.x + AB.y;
 }
-#line 426 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 448 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+float3 pbrKdEnergy(float3 f0, float NoV, float rough, float strength)
+{
+    const float3 eSpec = saturate(pbrEnvBRDF(f0, NoV, rough));
+    return lerp(float3(1.0f, 1.0f, 1.0f), saturate(float3(1.0f, 1.0f, 1.0f) - eSpec),
+                saturate(strength));
+}
+#line 467 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float3 pbrSpecMulti(float3 f0, float2 ab, float strength)
 {
     const float ess = max(ab.x + ab.y, 1e-2f);
     return float3(1.0f, 1.0f, 1.0f) + (strength * (1.0f / ess - 1.0f)) * f0;
 }
-#line 449 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 490 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float pbrSpecAAAlpha2(float alpha2, float3 dNdx, float3 dNdy, float strength, float clampMax)
 {
     const float variance = 0.25f * strength * (dot(dNdx, dNdx) + dot(dNdy, dNdy));
@@ -2013,7 +2020,7 @@ float3 pbrF0(float4 param, float3 albedo, float specBase)
     const float b = saturate(param.b);
     return lerp(float3(specBase, specBase, specBase) * (b * b), albedo, pbrMetalness(param));
 }
-#line 512 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float2 eonAB(float sigma)
 {
     const float A = 1.0f / (1.0f +  0.287793409f  * sigma);
@@ -2038,7 +2045,7 @@ float eonG(float mu)
     const float u = 1.0f - saturate(mu);
     return  0.287793409f  * u * (0.132551f + u * (2.136720f + u * (-1.914293f + u * 0.645021f)));
 }
-#line 548 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 589 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float eonMsWeight(float mu) { return  0.287793409f  - eonG(mu); }
 float eonMsScale(float2 ab, float sigma, float NoV)
 {
@@ -4329,9 +4336,20 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
+
+
+
+
+
+    if (pbrOn && gShadowParams.pbrShade2.z > 0.0f)
+    {
+        const float3 kE = pbrKdEnergy(pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x),
+                                      pbrNoV, pbrRough, gShadowParams.pbrShade2.z);
+        d *= kE; a *= kE;
+    }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 602 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 613 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
@@ -4340,6 +4358,11 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float3 c = albedo.rgb * (lit + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f));
+
+
+
+
+    float3 dbgSpec = float3(0.0f, 0.0f, 0.0f);
     if (pbrOn)
     {
         const float3 f0 = pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x);
@@ -4350,8 +4373,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         const float3 R = reflect(-pbrV, pbrNb);
         float3 env = gFrameData.ambCol.rgb * skyAmbFactor(R, In.WorldPos) * pbrTAmb * gFrameData.dbgScales.x;
         if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }
-        c += (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
-           + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+        const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
+                             + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+        c += specAdd;
+        dbgSpec += specAdd;
 
 
 
@@ -4360,8 +4385,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         {
             const float3 comp = pbrSpecMulti(f0, pbrEnvAB(pbrNoV, pbrRough), gShadowParams.pbrShade.w)
                               - float3(1.0f, 1.0f, 1.0f);
-            c += ((f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
-                  + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * comp;
+            const float3 msAdd = ((f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
+                                  + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * comp;
+            c += msAdd;
+            dbgSpec += msAdd;
         }
     }
 
@@ -4397,6 +4424,18 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
         return (float4(aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags), 1.0f));
+    }
+    if (dbg == 27u) {
+
+
+
+
+
+
+
+
+
+        return (float4(dbgSpec, 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }

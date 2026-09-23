@@ -1979,13 +1979,20 @@ float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
     const float2 AB = pbrEnvAB(NoV, rough);
     return f0 * AB.x + AB.y;
 }
-#line 426 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 448 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+float3 pbrKdEnergy(float3 f0, float NoV, float rough, float strength)
+{
+    const float3 eSpec = saturate(pbrEnvBRDF(f0, NoV, rough));
+    return lerp(float3(1.0f, 1.0f, 1.0f), saturate(float3(1.0f, 1.0f, 1.0f) - eSpec),
+                saturate(strength));
+}
+#line 467 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float3 pbrSpecMulti(float3 f0, float2 ab, float strength)
 {
     const float ess = max(ab.x + ab.y, 1e-2f);
     return float3(1.0f, 1.0f, 1.0f) + (strength * (1.0f / ess - 1.0f)) * f0;
 }
-#line 449 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 490 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float pbrSpecAAAlpha2(float alpha2, float3 dNdx, float3 dNdy, float strength, float clampMax)
 {
     const float variance = 0.25f * strength * (dot(dNdx, dNdx) + dot(dNdy, dNdy));
@@ -2013,7 +2020,7 @@ float3 pbrF0(float4 param, float3 albedo, float specBase)
     const float b = saturate(param.b);
     return lerp(float3(specBase, specBase, specBase) * (b * b), albedo, pbrMetalness(param));
 }
-#line 512 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float2 eonAB(float sigma)
 {
     const float A = 1.0f / (1.0f +  0.287793409f  * sigma);
@@ -2038,7 +2045,7 @@ float eonG(float mu)
     const float u = 1.0f - saturate(mu);
     return  0.287793409f  * u * (0.132551f + u * (2.136720f + u * (-1.914293f + u * 0.645021f)));
 }
-#line 548 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 589 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float eonMsWeight(float mu) { return  0.287793409f  - eonG(mu); }
 float eonMsScale(float2 ab, float sigma, float NoV)
 {
@@ -3825,9 +3832,18 @@ PSOut PS_MAIN( VSOutput In )
 
 
 
-        result *= pbrKd;
-        litTerm *= pbrKd;
         const float3 f0 = pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x);
+
+
+
+
+
+
+        const float3 pbrKdE = (gShadowParams.pbrShade2.z > 0.0f)
+            ? pbrKd * pbrKdEnergy(f0, pbrNoV, pbrRough, gShadowParams.pbrShade2.z)
+            : pbrKd;
+        result *= pbrKdE;
+        litTerm *= pbrKdE;
 
 
 
@@ -3870,7 +3886,7 @@ PSOut PS_MAIN( VSOutput In )
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f); RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     if (dbg == 19u) {
-#line 492 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 501 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
         const float3 srcCol = pbrLive ? float3(0.06f, 1.00f, 0.18f) : float3(0.10f, 0.10f, 0.11f);
 
 

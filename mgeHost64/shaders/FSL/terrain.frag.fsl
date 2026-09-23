@@ -1263,9 +1263,20 @@ float4 PS_MAIN( VSOutput In )
         // `result` is now the WHOLE diffuse+ambient response (sun, ambient and both point-light
         // arms), which is exactly what a metal does not have — so the metallic kill is ONE multiply
         // here rather than one per term. pbrKd is exactly 1.0 when this branch is not taken.
-        result *= pbrKd;
-        litTerm *= pbrKd;
         const float3 f0 = pbrF0(pbrMat, albedo, gShadowParams.pbrShade2.x);
+        // THE DIELECTRIC'S SHARE, taken out of diffuse before the specular below adds it back.
+        // ⚠ SCALED BY COVERAGE, like every other PBR term in this file: where only part of the
+        // blend carries a `_paramh`, only that part has a specular lobe to pay for, and a split
+        // applied at full strength across a coverage boundary would draw the same seam the texture
+        // blend spent a day removing. At cover 0 the factor is exactly 1 — Lambert, to the bit.
+        // Placed at the point of USE so pbrRough is the spec-AA-widened value the specular below
+        // actually integrates. See pbrKdEnergy.
+        const float3 pbrKdE = (gShadowParams.pbrShade2.z > 0.0f)
+            ? pbrKd * lerp(float3(1.0f, 1.0f, 1.0f),
+                           pbrKdEnergy(f0, pbrNoV, pbrRough, gShadowParams.pbrShade2.z), pbrCover)
+            : pbrKd;
+        result *= pbrKdE;
+        litTerm *= pbrKdE;
         // The environment is the SAME sky the ambient term above integrates, evaluated in the
         // mirror direction — so what lights the ground and what it reflects cannot drift apart.
         // lodSunAmb, not ambCol: that is terrain's own ambient source (see `amb` above).

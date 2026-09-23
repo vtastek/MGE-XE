@@ -4858,10 +4858,10 @@ namespace RenderProcess {
             // ...and 21 (terrain height AO) had ALREADY drifted the same way 15/16 did — its view
             // was in terrain.frag with no name and no modulus, so it was unreachable. 22 (terrain
             // filter width) and 23 (terrain texture size) land with both, which is what the
-            // paragraph above asks for. Cycle is %27 (25 parallax uv delta, 26 terrain height
-            // blend — both land with a name here and an entry in kDebugModeNames, which is the
-            // whole of what the paragraph above asks for).
-            g_debugMode = (g_debugMode + 1) % 27;
+            // paragraph above asks for. Cycle is %28 — 27 (PBR specular only) lands with a name
+            // here AND an entry in kDebugModeNames in the same commit, which is the whole of what
+            // the paragraph above asks for and what nobody did the three times it drifted.
+            g_debugMode = (g_debugMode + 1) % 28;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"

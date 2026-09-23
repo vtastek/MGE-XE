@@ -7329,6 +7329,28 @@ namespace {
     //   level 2 on one measured map, so ~2.6x is roughly the compensation a blur arm needs to read
     //   as the same relief. The DX9 baseline is still exactly reachable and is the A/B: mode 0,
     //   radius 1.5, depth 0.01171875.
+    // ─── THE ENERGY SPLIT: WHAT SPECULAR TAKES, DIFFUSE MUST LOSE ──────────────────────────────
+    // ⚠⚠ UNTIL THIS SHIPPED THERE WAS NO FRESNEL SPLIT ANYWHERE, IN ANY OF THE THREE PBR FRAGS.
+    // opaque, statics and terrain all built colour as `albedo * lit` plus a specular term ADDED on
+    // top; the only thing ever deducted from diffuse was metalness. So a dielectric reflected more
+    // light than it received, and the excess was ACHROMATIC — specular on a dielectric has no
+    // colour, and albedo was the only term that did. Reported from play as *"sheen is really
+    // strong. Albedo almost doesn't survive. I am looking at gray and shade."*
+    //
+    // ⚠ IT IS NOT A specBase PROBLEM, which is what it looks like at first. pbrEnvBRDF is the
+    // split-sum `f0 * A + B`, and **B does not depend on f0**: a material with zero reflectance
+    // still had `env * B` added to it at every pixel, rising steeply toward grazing. No value of
+    // specBase reaches that half — it changes how much grey there is, not that the grey is free.
+    //
+    // 1 = the specular's own directional-hemispherical reflectance is deducted from diffuse, using
+    // the SAME pbrEnvBRDF the specular side adds with, so the two cannot drift apart. 0 is the
+    // shader that shipped before it, bit for bit — pbrKdEnergy returns exactly (1,1,1) there, so
+    // the A/B is exact by inspection rather than by measurement.
+    //
+    // ⚠ EXPECT specBase TO WANT RE-JUDGING WITH THIS ON. 0.25 was settled while diffuse was paying
+    // nothing for its specular, so some of that 0.25 may have been compensating for a surface that
+    // was already too bright. 0.16 is Disney's 0.04 exactly; both are one token away.
+    float    g_pbrEnergySplit = 1.0f;
     float    g_pbrDepth     = 0.025f;
     // pbrGradRadius — the central difference's half-span in BASE texels. 1.5 IS the live DX9 shader,
     // and it is the dial that came back from the first play session rather than a knob added on
@@ -7517,15 +7539,43 @@ namespace {
     // It is correctness for the metal ladder. It is NOT the answer to "rough ground reads plasticy"
     // — that is the diffuse lobe above, and saying so is most of what this knob is here to settle.
     float    g_pbrSpecMulti   = 1.0f;
-    // THE DIELECTRIC F0 BASE — the constant pbrF0 multiplies by b^2. The decode ported from DX9
-    // uses 0.04, which at the export's default b = 0.5 gives F0 = 0.01: four times darker than a
-    // standard dielectric, while the comment it was carried across with called 0.5 "standard
-    // dielectric". It has been flagged since the port and is fixed here rather than re-flagged.
-    // ⚠ 0.16 is the value that makes b = 0.5 land on Disney's 0.04 EXACTLY (0.16 * 0.25 = 0.04).
-    // 0.25 ships on the user's call — a deliberately hot dielectric, F0 = 0.0625 at b = 0.5, which
-    // is 6.25x the reflectance every `_paramh` in the library has been judged against. That is a
-    // whole-frame look change and the single biggest one in this build.
-    float    g_pbrSpecBase    = 0.25f;
+    // THE DIELECTRIC F0 BASE — the constant pbrF0 multiplies by b^2.
+    //
+    // ⚠⚠ 0.25 SHIPPED HERE AND WAS MEASURED WRONG. It was set on the user's call as a deliberately
+    // hot dielectric and it came back from play as *"sheen is really strong. Albedo almost doesn't
+    // survive. I am looking at gray and shade."* Decoding the library settles why, and it is
+    // arithmetic rather than taste. All 209 `_paramh` textures measured, against their base maps:
+    //
+    //     linear albedo luma   p10 0.034   MEDIAN 0.072   p90 0.292
+    //     roughness            p10 0.690   MEDIAN 0.813   p90 0.929
+    //     B (IOR/spec)         UNSET on ALL 209 — not one map authors it
+    //
+    // ⚠ B IS UNSET EVERYWHERE, so b^2 = 0.247 universally and this knob is simply a direct F0 dial;
+    // the squaring in the decode does nothing but scale it. And the ratio that decides whether a
+    // surface keeps its colour — the achromatic specular against the albedo that carries the hue:
+    //
+    //     specBase     p10   MEDIAN    p90
+    //       0.25       11%     47%    101%   <- shipped. On the darkest tenth the specular
+    //       0.16        7%     30%     67%      EXCEEDS the albedo outright.
+    //       0.06        3%     12%     27%
+    //       0.04        2%      8%     18%   <- the DX9 decode the maps were authored against
+    //
+    // ⚠ 0.16 IS THE PHYSICALLY CORRECT VALUE AND IS STILL TOO HOT HERE, which is the part worth
+    // understanding before anyone "fixes" this back. 0.16 makes b = 0.5 land on Disney's 0.04
+    // exactly — right for a dielectric, and it still leaves a 30% median. The reason is that MW's
+    // albedo maps are NOT physical albedo: real dirt is 0.15-0.25 linear and these median 0.072, so
+    // a correct F0 lands ~3x hotter against them than it would against real-world albedo.
+    //
+    // 0.06 IS DERIVED, NOT PICKED. A real dielectric (F0 0.04) on real albedo (0.20) has a
+    // spec/albedo ratio of 11.5%. Putting the MEDIAN MW texture at that same ratio needs
+    // F0 = 0.0145, i.e. specBase = 0.0145 / 0.247 = 0.059. So this matches the RATIO a correct
+    // material would show, which is the right invariant when the albedo is known to be non-physical
+    // and re-authoring 209 maps is not on the table. It is a stated compensation, not a claim that
+    // 0.0148 is a dielectric's F0.
+    //
+    // Both other answers are one token away: `pbrSpecBase=0.16` for the physical value,
+    // `pbrSpecBase=0.04` for the decode the art was judged against.
+    float    g_pbrSpecBase    = 0.06f;
     // ─── TERRAIN ALBEDO SAMPLING (the distant-ground sparkle hunt) ───────────────────────────────
     // From play: one land texture (tx_RM_rock_01) sparkles on distant GROUND while the same texture
     // on ROCKS at comparable tiling does not. Ruled out by measurement, in order: the DDS (complete
@@ -21840,7 +21890,18 @@ namespace {
                                             // commit, which is the whole of what the note above
                                             // asks for. 25 is also the only GPU test of the
                                             // parallax tangent frame's sign that exists.
-                                            "25 parallax uv delta", "26 terrain height blend" };
+                                            "25 parallax uv delta", "26 terrain height blend",
+                                            // 27 answers "how big is the specular actually", which
+                                            // nothing could until now: 5 albedo, 6 lit and 7 ambient
+                                            // all show the DIFFUSE side, and the specular is the one
+                                            // term that is ADDED rather than multiplied into them.
+                                            // Reported from play as a grey sheen burying the albedo
+                                            // under shadow — a claim about a magnitude that no view
+                                            // in this list could display. Lands WITH the client's
+                                            // `% 28` in the same commit, which is the whole of what
+                                            // the note above asks for and what nobody did three
+                                            // times running.
+                                            "27 PBR specular only" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -22137,6 +22198,7 @@ namespace {
             // AO multi-bounce look dials (aomultibounce.h.fsl). 1.0 = the published fit exactly.
             // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
             { "aoBounceGain",        &g_aoBounceGain        },
+            { "pbrEnergySplit",      &g_pbrEnergySplit      },
             { "pbrDepth",            &g_pbrDepth            },
             { "pbrTerrainDepth",     &g_pbrTerrainDepth     },
             { "pbrTerrainHeightAOStr", &g_pbrTerrainHeightAOStr },
@@ -24163,13 +24225,19 @@ namespace {
           t.sliderF("  multiple scattering (albedo^2 — darker AND more saturated; 1 = energy-preserving)",
                     &g_eonMulti, 0.0f, 1.0f, 0.05f);
           // ─── THE SPECULAR'S ENERGY. Read the F0 row LAST: it scales the two above it.
+          // ⚠ AND READ THE ENERGY-SPLIT ROW FIRST: it decides whether the three below it are being
+          // ADDED to a full-strength diffuse (0 — what shipped until now, and what made albedo
+          // vanish under a grey sheen) or TAKEN OUT of it (1). Every one of them means something
+          // different depending on which.
+          t.sliderF("ENERGY SPLIT: deduct the specular's own reflectance from diffuse (0 = the old add-on-top)",
+                    &g_pbrEnergySplit, 0.0f, 1.0f, 0.05f);
           t.sliderF("SPECULAR AA: fold normal variance into the lobe (0 = off; kills distant shimmer)",
                     &g_pbrSpecAA, 0.0f, 2.0f, 0.05f);
           t.sliderF("  variance clamp (Tokuyoshi kappa; a silhouette texel is not a mirror)",
                     &g_pbrSpecAAClamp, 0.0f, 0.5f, 0.01f);
           t.sliderF("SPECULAR multi-scatter (Turquin) — scales WITH F0: ~+1% dielectric, +122% metal",
                     &g_pbrSpecMulti, 0.0f, 1.0f, 0.05f);
-          t.sliderF("DIELECTRIC F0 base x b^2 (0.04 = the DX9 decode = F0 0.01; 0.16 = Disney 0.04)",
+          t.sliderF("DIELECTRIC F0 base x b^2 (0.06 = median tex at a correct RATIO; 0.16 = Disney 0.04; 0.04 = DX9)",
                     &g_pbrSpecBase, 0.0f, 0.4f, 0.01f);
           t.sliderU("  gradient: 0 cd (DX9) | 1 cdbs | 2 bspline | 3 retired (=4) | 4 cdblur (soft, no ghost)",
                     &g_pbrGradMode, 0u, 4u, 1u);
@@ -36637,7 +36705,7 @@ void destroyHostWindow(Renderer* R);
             mp[kPbrShadeFloat + 3] = std::clamp(g_pbrSpecMulti, 0.0f, 1.0f);
             mp[kPbrShade2Float + 0] = std::max(0.0f, g_pbrSpecBase);
             mp[kPbrShade2Float + 1] = std::max(0.0f, g_pbrSpecAAClamp);
-            mp[kPbrShade2Float + 2] = 0.0f;
+            mp[kPbrShade2Float + 2] = std::max(0.0f, g_pbrEnergySplit);
             mp[kPbrShade2Float + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)

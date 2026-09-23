@@ -411,6 +411,47 @@ float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
     return f0 * AB.x + AB.y;
 }
 
+// ─── THE ENERGY SPLIT: WHAT SPECULAR TAKES, DIFFUSE MUST LOSE ───────────────────────────────────
+//
+// ⚠⚠ UNTIL THIS EXISTED THERE WAS NONE, AND THAT IS A STRUCTURAL LEAK, NOT A TUNING ERROR. All
+// three PBR fragment shaders built their colour the same way:
+//
+//     c  = albedo * lit;                        // diffuse, at FULL strength
+//     c += f0 * specA + specB;                  // direct specular   — ADDED
+//     c += env * pbrEnvBRDF(f0, NoV, rough);    // ambient specular  — ADDED
+//
+// The only thing ever removed from diffuse was metalness. Nothing took the DIELECTRIC's specular
+// energy out of it, so every specular photon was energy the surface never paid for. Specular on a
+// dielectric is achromatic and albedo is the only term carrying colour, so the visible result is
+// white light piling onto full-strength colour: the reported symptom was *"sheen is really strong.
+// Albedo almost doesn't survive. I am looking at gray and shade."* That is what an unpaid specular
+// lobe looks like, and no amount of retuning specBase fixes it — it changes how much grey, not
+// whether the grey is free.
+//
+// ⚠ THE BIAS TERM IS WHY IT SURVIVES A DARK F0. pbrEnvBRDF is the split-sum form `f0 * A + B`, and
+// **B does not depend on f0 at all**. A material with zero reflectance still had `env * B` added to
+// it, at every pixel, rising steeply toward grazing angles. Lowering specBase could never reach
+// that half.
+//
+// What is subtracted is exactly what the specular side adds: pbrEnvBRDF IS the directional-
+// hemispherical reflectance of the specular lobe for this view, so `1 - it` is the fraction left
+// for diffuse. Using the same function on both sides is the point — the two cannot drift apart,
+// and a change to one is a change to the other by construction.
+//
+// ⚠ STRENGTH 0 RETURNS EXACTLY (1,1,1), so the arm off is bit-identical to the shader that shipped
+// before it and the A/B is exact by inspection rather than by measurement — the house rule this
+// project already applies to the W32 gobo and the multi-scatter specular.
+//
+// The same factor is applied to the AMBIENT diffuse as to the direct: the ambient term is the sky's
+// irradiance on the same surface, and the same lobe takes the same fraction of it. Applying it to
+// one and not the other would make a surface's energy depend on which light it stood under.
+float3 pbrKdEnergy(float3 f0, float NoV, float rough, float strength)
+{
+    const float3 eSpec = saturate(pbrEnvBRDF(f0, NoV, rough));
+    return lerp(float3(1.0f, 1.0f, 1.0f), saturate(float3(1.0f, 1.0f, 1.0f) - eSpec),
+                saturate(strength));
+}
+
 // ─── MULTIPLE-SCATTERING SPECULAR (Turquin / Frostbite) ─────────────────────────────────────────
 //
 // Single-scattering GGX loses the energy that bounced between microfacets more than once — at
