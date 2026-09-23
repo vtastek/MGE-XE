@@ -102,6 +102,12 @@ STRUCT(SkyViewData)
     //     the light the frame is actually casting fixes both ends at once — the ratio to the zenith
     //     is albedo/q (~6.4x at the reference, the physical band), and at night the ramp takes it to
     //     0 so the clouds go dark WITH the sky while still occluding the stars through their alpha.
-    // zw spare.
+    //     ⚠ S2j: WITH skyCloudBeam > 0 THIS IS ONLY THE DIFFUSE-SKY PART, albedo * E_sky/pi (+ the
+    //     night floor); the direct beam moved to z/w and is evaluated per channel at the deck. With
+    //     skyCloudBeam = 0 it is the full E_total anchor above, to the bit.
+    // z = albedo/pi * native->scene scale, for the BEAM (sky.frag multiplies it by atmosSunBeamAt()).
+    //     0 = beam off (skyCloudBeam = 0, or no physical sky) and sky.frag skips the lookup.
+    // w = the radius the beam is taken at: the cloud deck's BASE, metres from the planet centre
+    //     (Rg + cloudBottomKm, 1.5 km when a weather states none).
     DATA(float4, elemRadiance, None);
 };

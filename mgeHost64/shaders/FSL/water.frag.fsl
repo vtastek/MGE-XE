@@ -2617,7 +2617,7 @@ float4 PS_MAIN( VSOutput In )
 	    result *= E;
 	    kDst   *= E;      // ...and the destination with it — see above.
 	    result  = result * fog
-	            + fogSkyColorAt(In.Position.xy, fog) * ((1.0f - fog) * (1.0f - kDst));
+	            + fogSkyColorAt(In.Position.xy, fog, In.WorldPos) * ((1.0f - fog) * (1.0f - kDst));
 	}
 
 	// ─── THE DISTORTION RESIDUAL, LAST AND UNFOGGED ──────────────────────────────────────────────

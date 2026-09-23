@@ -52,6 +52,7 @@
 
 #include "opaque.srt.h"
 #include "atmosphere.h.fsl" // THE MEDIUM — one copy. See the warning at the top of that file.
+#include "skyradiance.h.fsl" // ...and the one sample of it this pass draws (fog melts toward it too)
 #include "tonemap.h.fsl"    // the curve, for the display-referred (LDR) build
 #include "linearize.h.fsl"  // linearToSrgb(), for the gamma-domain build
 #include "scenecolor.h.fsl" // tonemapInPass()/sceneIsLinear() — which units the target wants
@@ -92,6 +93,10 @@ float4 PS_MAIN(VSOutput In)
     // The camera radius rides gSkyView.sunDirW.w: the LUT was cooked at a specific altitude and the
     // deparameterisation needs that same radius, which this frag has no world position to derive.
     //
+    // ⚠⚠ SUPERSEDED (S2j, 2026-09-23): below the horizon the helper now returns the HORIZON RING.
+    // The lit ground below was right for the light and wrong as a fog target. It drew a line across
+    // statics at the horizon and turned the distant sea grey. See skyradiance.h.fsl. The note below is
+    // the history.
     // ⚠ BELOW THE HORIZON THIS IS A REAL ANSWER NOW, AND THAT IS A BEHAVIOUR CHANGE THIS PHASE OWNS.
     // Hosek INVERTED beneath the horizon (its c1 goes negative, so the exponent ran to +inf) and had
     // to be clamped to the horizon ring — which incidentally made that ring the fog target for
@@ -99,7 +104,6 @@ float4 PS_MAIN(VSOutput In)
     // the ground actually looks like from here. gSkyColor is opaque everywhere, so this IS what
     // distant surfaces melt into: the control is "look down from a height" (skydome.h.fsl), and it
     // must show a horizon-haze-coloured ground rather than fading a downhill vista to black.
-    float2 svUv = atmosSkyViewUvFromDir(gAtmosParams, gSkyView.sunDirW.w, dir);
     // ─── S2i: THE IMAGE DOES NOT GET THE LIGHT'S MEAN FIELD ──────────────────────────────────────
     // gAtmosSkyView is lerp(gap, deck, cover) — correct for the SH light, which integrates over
     // directions. It is wrong HERE, where one direction is sampled: a direction is cloud or gap and
@@ -111,9 +115,10 @@ float4 PS_MAIN(VSOutput In)
     // cloud MESH supply the cloud (it is already anchored to the deck's radiance, sky.frag.fsl), 1
     // draws the mixed field for a deck that really is a closed lid. A lerp between the two fields
     // rather than a second lerp from the arms, so the cover=1 path is the byte-identical old one.
-    float3 Lgap  = SampleLvlTex2D(gAtmosSkyViewClear, gSamplerBilinearClamp, svUv, 0).rgb;
-    float3 Lmix  = SampleLvlTex2D(gAtmosSkyView,      gSamplerBilinearClamp, svUv, 0).rgb;
-    float3 Lnative = lerp(Lgap, Lmix, saturate(gAtmosParams.deckMix.z));
+    //
+    // ⚠ S2j: THE SAMPLE LIVES IN skyradiance.h.fsl NOW, because fog melts toward it too
+    // (skydome.h.fsl's fogHazeTarget). Two spellings of it is how the fog and the dome drift apart.
+    float3 Lnative = atmosSkyRadianceNative(dir, gSkyView.sunDirW.w);
 
     // Native W/(m^2 sr) -> SCENE units, with the strength lane already folded in host-side. A zero
     // scale here is LEGITIMATE (interior, feature off) and must read as a black sky.
@@ -123,7 +128,7 @@ float4 PS_MAIN(VSOutput In)
     // is what makes it violet/indigo rather than muddy brown — and carries a moon and an airglow
     // floor, so there is nothing left for a fade to stand in for. The ramp's OTHER job, handing the
     // LIGHTING back to MW's authored night, is untouched and still runs host-side.
-    float3 L = max(Lnative, f3(0.0f)) * gSkyView.radiance.w;
+    float3 L = Lnative * gSkyView.radiance.w;
 
     // --- the sky is behind water too (W8) ----------------------------------------------------
     // Verbatim the gate and the reasoning sky.frag carries: the sky has no POSITION, only a

@@ -14,7 +14,7 @@
 // ⚠ THE SKY IS REPRODUCED DATA, NOT GENERATED RADIANCE — and step 6a shipped once believing the
 // opposite, which is what this include pair exists to prevent recurring. Everything below is MW's
 // OWN authored output: its per-vertex atmosphere colours (vColSource 2, re-shipped by the client
-// since SK4 — see the dead branch in PS_MAIN), its sky/cloud/star textures, its moon material
+// since SK4 — the host-gradient branch that preceded it was deleted in S2j), its sky/cloud/star textures, its moon material
 // colours. Display-referred, every one of them.
 //
 // This pass has never called tonemap(), so moving the curve into resolve.frag would have applied it
@@ -34,6 +34,7 @@
 #include "scenecolor.h.fsl" // liftInPass() + expandExposedEmissiveP() — see the P2b block below
 #include "agx.h.fsl"        // agxInverseNeutral() — the moon pin's half of the round trip
 #include "atmosphere.h.fsl" // THE MEDIUM — the moon's SHADOW layer paints the real sky (S2c)
+#include "skyradiance.h.fsl" // ...through the dome's own sample, and the clouds' beam (S2j)
 #include "waterfog.h.fsl"   // the sky is behind water too, and nothing else was going to fog it
 
 STRUCT(VSOutput)
@@ -66,28 +67,14 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     float4 tex = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
-    // Base colour routing (mirrors opaque.frag's vColSource + the C4 host-gradient dome):
-    //   3 host-gradient dome: pure vertical gradient fogColNear(horizon)->skyZenith(zenith) computed
-    //     from the vertex world DIRECTION (MW Z-up). The dome's baked per-vertex colour is now
-    //     irrelevant (no longer re-uploaded per frame) — only the mesh shape matters. alpha = 1
-    //     (the atmosphere dome is the opaque sky backdrop).
+    // Base colour routing (mirrors opaque.frag's vColSource):
     //   1/2 (emissive/diffamb): a VertexColorProperty drives this shape (star mask) → per-vertex colour.
     //   0 none: the constant material colour (moon disc/shadow).
-    float4 base;
-    if (In.VColSource == 3u) {
-        // DEAD BRANCH since SK4 — kept only so the enum stays complete. The client retired the
-        // host-gradient dome and re-ships MW's OWN per-vertex atmosphere colours, which arrive as
-        // vColSource 2 and render pixel-exact with vanilla through the In.Color path below; this
-        // gradient was a slightly-bright approximation of it and is never selected now.
-        // Do NOT resurrect it as "the definition of the sky" for anything else to match: fog melts
-        // into the sky by SAMPLING what this pass drew (skydome.h.fsl / gSkyColor), precisely so
-        // there is no second definition to keep in step.
-        float3 dir = normalize(In.WorldDir);
-        float  t   = saturate(dir.z);
-        base = float4(lerp(gFrameData.fogColNear.rgb, gFrameData.skyZenith.rgb, t), 1.0f);
-    } else {
-        base = (In.VColSource != 0u) ? In.Color : float4(In.MatDiffuse, 1.0f);
-    }
+    // ⚠ vColSource 3 (the C4 host-gradient dome, lerp(fogColNear, skyZenith, dir.z)) is GONE, not
+    // dead: the client retired it at SK4 and nothing has selected it since. Deleted in S2j so the
+    // skyZenith lanes it read could carry the fog's haze target (skydome.h.fsl) with ONE meaning. A
+    // stray 3 now takes the vertex-colour path, which is what SK4 re-ships for the dome anyway.
+    float4 base = (In.VColSource != 0u) ? In.Color : float4(In.MatDiffuse, 1.0f);
     float4 c = tex * base;
     c.a *= In.MatAlpha;   // per-element weather/night fade (1 = no-op; dome unaffected)
     // SK2 dev "ownership tell": tint toward magenta by gFrameData.skyParams.x (dev-panel slider).
@@ -146,9 +133,11 @@ float4 PS_MAIN( VSOutput In )
         // medium computes a real night sky — moonlit, airglow-floored, Rayleigh-blue — so this now
         // paints the colour that is genuinely there, and the limb blends into a sky rather than into
         // a hole. Same one line, and that is the point: one definition of the sky, sampled twice.
-        float2 mUv = atmosSkyViewUvFromDir(gAtmosParams, gSkyView.sunDirW.w,
-                                           normalize(In.WorldDir));
-        c.rgb = max(SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, mUv, 0).rgb, f3(0.0f))
+        //
+        // ⚠ S2j: THROUGH skyradiance.h.fsl, WHICH IS THE SAME SAMPLE AND NOW PROVABLY SO. This read
+        // the cover-MIXED field alone, while skyhw.frag has drawn lerp(gap, mixed, deckMix.z) since
+        // S2i — so under broken cloud the dark limb was the veiled sky on an unveiled one.
+        c.rgb = atmosSkyRadianceNative(normalize(In.WorldDir), gSkyView.sunDirW.w)
               * gSkyView.radiance.w;
     } else if (cls == SKY_CLASS_MOON && gShadowParams.agxCurve.w > 0.5f) {
         // ─── THE MOON PIN ────────────────────────────────────────────────────────────────────────
@@ -264,7 +253,25 @@ float4 PS_MAIN( VSOutput In )
         // authored image modulates it. Day lands at albedo/q times the zenith — the physical band,
         // printed on the heartbeat — and night goes dark WITH the sky, while still occluding the
         // stars, because this touches rgb and never alpha.
-        c.rgb *= gSkyView.elemRadiance.y;
+        //
+        // ─── S2j: THE BEAM AT THE DECK'S ALTITUDE, PER CHANNEL ───────────────────────────────────
+        // E_total above is the GROUND's irradiance, as one grey luma. At sunset that is backwards:
+        // the ground's direct beam dies first while a deck 1-2 km up is still in it, reddened, and
+        // stays in it for a few minutes after the ground has set. Real sunset clouds glow orange
+        // against a darkening land; these dimmed grey with it.
+        //
+        // So the anchor splits. elemRadiance.y keeps the DIFFUSE sky part (albedo * E_sky/pi, grey,
+        // plus the night floor), and the beam is evaluated here, per primary, at the deck radius
+        // (elemRadiance.w) with the medium's own transmittance: albedo/pi * scale (elemRadiance.z)
+        // times atmosSunBeamAt(). At a high sun E_sky + E_beam*mu IS E_total and T(deck) ~ T(ground),
+        // so noon is unchanged to a few percent; only the low sun moves.
+        //
+        // z == 0 is the `skyCloudBeam = 0` A/B, and then y is the old E_total anchor to the bit.
+        float3 anchor = f3(gSkyView.elemRadiance.y);
+        if (gSkyView.elemRadiance.z > 0.0f) {
+            anchor += gSkyView.elemRadiance.z * atmosSunBeamAt(gSkyView.elemRadiance.w);
+        }
+        c.rgb *= anchor;
     } else {
         // CLOUD / DOME / OTHER, and every class at all when the physical sky is not drawing.
         // Class 2 (scenecolor.h.fsl): lift the authored colour so resolve.frag's curve returns it

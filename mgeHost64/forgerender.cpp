@@ -4936,6 +4936,15 @@ namespace {
     // sky: ~31700 vs ~90500 cd/m2 in clear weather, a 2.9x step, reported as "static reflections are
     // fogged brighter blue while statics assume MW fog color". LOWER closes it.
     float              g_fogSkyKnee      = 0.85f;
+    // S2j: THE HAZE LIFT, degrees. Below the knee the fog target is the medium's sky in the
+    // fragment's own direction (skydome.h.fsl fogHazeTarget), and just above the horizon that sky
+    // has a band that is sharp in ANGLE, made by near-horizontal rays running through tens of km of
+    // air. The short air path in front of a NEAR object carries none of that, yet it inherited it at
+    // a fixed screen row: "in blizzard, I still see the horizon line, on very close object too". So
+    // a near fragment reads the sky at an elevation of at least this many degrees, and the lift falls
+    // to 0 as the fragment reaches the knee, where the snapshot takes over and the two must agree
+    // exactly. 0 = the per-direction target unlifted (the first S2j build).
+    float              g_fogHazeLiftDeg  = 4.0f;
     // THE NEAR HAZE, density per world unit. MW's ramp is exactly clear inside fogStart — ~490 m in
     // clear weather at 16 cells — so the whole near and middle field has no air in it, reported as
     // "close fog being ignored". A Beer-Lambert term from the EYE fills that dead zone without
@@ -6292,6 +6301,9 @@ namespace {
         float  sunDiscExpand;       // the disc's OWN whiteness-falloff exponent (NOT skyAO2.w)
         float  starScene;           // the star layer's radiance in SCENE units (NOT strength-scaled)
         float  cloudScene;          // a fully-lit cloud texel's radiance, SCENE units: albedo*E_tot/pi
+                                    //   (S2j: minus the beam share skyCloudBeam moves to the deck)
+        float  cloudBeamScale;      // S2j: albedo/pi * sceneScale * skyCloudBeam; 0 = no deck beam
+        float  cloudDeckRadiusM;    // S2j: where that beam is taken — the deck BASE, from centre (m)
         double cloudOverZenith;     // reported: the ratio the anchor implies, = albedo / q
         bool   sunDiscFound;        // a SUN-class item with an uploaded mesh was in this frame's list
         bool   active;              // exterior, armed, model cooked and non-degenerate
@@ -6423,6 +6435,16 @@ namespace {
     // lighting block already runs on.
     bool g_skyViewPub[2] = { false, false };
 
+    // MW's current zenith sky colour, decoded to the scene's domain (lighting[28..30]). The legacy SH
+    // projection's upper pole — its only reader. It rode FrameData.skyZenith until S2j re-used those
+    // lanes for the fog's haze target; a host copy also keeps the SH off the write-combined CBV.
+    float g_mwSkyZenith[3] = { 0.0f, 0.0f, 0.0f };
+
+    // S2j: what was published into FrameData.skyZenith.x this frame (the fog haze target's native ->
+    // scene scale; 0 = fog targets fogColNear). Kept host-side for the [sky] heartbeat's `haze=`, so
+    // the heartbeat never reads the write-combined CBV back.
+    float g_fogHazeScale = 0.0f;
+
     // Fill ONE view's gSkyView (skyview.h.fsl). view 0 = main, 1 = reflect; `invVP` is THAT view's
     // inverse viewProj, which is the only field that differs between them and the entire reason the
     // cbuffer exists rather than four more lanes in gShadowParams.
@@ -6479,7 +6501,8 @@ namespace {
         v[31] = g_skyPhys.sunDiscExpand;
         v[32] = g_skyPhys.starScene;
         v[33] = g_skyPhys.cloudScene;
-        v[34] = 0.0f; v[35] = 0.0f;
+        v[34] = g_skyPhys.active ? g_skyPhys.cloudBeamScale : 0.0f;   // S2j: the deck beam
+        v[35] = g_skyPhys.cloudDeckRadiusM;
         g_skyViewPub[view] = true;
     }
 
@@ -6539,7 +6562,7 @@ namespace {
             return;
         }
 
-        // FrameData floats: sunDir 16..18, sunCol 20..22, fogColNear 28..30, skyZenith 68..70.
+        // FrameData floats: sunDir 16..18, sunCol 20..22, fogColNear 28..30; zenith = g_mwSkyZenith.
         //
         // ⚠ fogColNear IS LIFTED IN THE CBUFFER when the scene target is scene-referred (step 6a),
         // and this projection must NOT see the lift. Step 6a's criterion is that lighting inputs are
@@ -6573,7 +6596,7 @@ namespace {
                 if (g_live.linearScene) { horiz[i] = srgbToLinearF(horiz[i]); }
             }
         }
-        const float zenith[3] = { fd[68], fd[69], fd[70] };
+        const float zenith[3] = { g_mwSkyZenith[0], g_mwSkyZenith[1], g_mwSkyZenith[2] };
 
         // Fixed ~uniform direction table, built once. Fibonacci sphere: z is uniform over [-1,1],
         // which IS uniform in solid angle, so every sample carries the same weight 4*pi/N and the
@@ -19702,6 +19725,14 @@ namespace {
     // buys 58 -> 65 codes of sky spread while clipping goes 0.57% -> 60.94%. Wrong trade, measured.
     float g_skyCloudAlbedo = 0.50f;
 
+    // ...and how much of that anchor's DIRECT BEAM is taken at the deck's own altitude, per channel,
+    // instead of at the ground as one grey luma (S2j; sky.frag's CLOUD branch). At sunset the ground's
+    // beam dies first while a deck 1-2 km up is still in it, reddened; E_total/pi dimmed the clouds
+    // grey with the land, which is the reverse of a sunset. 1 ships the split; 0 = the E_total anchor
+    // above to the bit (sky.frag skips the lookup when elemRadiance.z is 0). In between moves the
+    // beam from the ground's scalar to the deck's colour linearly — it is an A/B, not a look dial.
+    float g_skyCloudBeam = 1.0f;
+
     // ...and the clouds' NIGHT floor, in absolute scene units, because the anchor above cannot reach
     // night and pretending otherwise shipped a black cloud layer.
     //
@@ -22062,6 +22093,7 @@ namespace {
             { "upscaleSharpness",   &g_upscaleSharpness   },
             { "upscaleAntiRing",    &g_upscaleAntiRing    },
             { "fogSkyKnee",         &g_fogSkyKnee         },
+            { "fogHazeLiftDeg",     &g_fogHazeLiftDeg     },
             { "fogNearHaze",        &g_fogNearHaze        },
             { "atmosCacheDeg",      &g_atmosCacheDeg      },
             { "atmosCacheAltM",     &g_atmosCacheAltM     },
@@ -22070,6 +22102,7 @@ namespace {
             { "atmosMs",            &g_atmosMs            },
             { "atmosDeckDown",      &g_atmosDeckDown      },
             { "skyCloudAlbedo",     &g_skyCloudAlbedo     },
+            { "skyCloudBeam",       &g_skyCloudBeam       },
             // ⚠ THE AgX LOOK, ON THE HARNESS. Four panel sliders that the minimized rig could not
             // reach, so "what does Punchy actually do to the sky" was a question no unattended run
             // could answer and every judgement of it had to be taken by hand at the keyboard. Same
@@ -24650,6 +24683,10 @@ namespace {
           // reference). Lower it if the silver linings read hot; it is not a dimmer, it is an albedo.
           t.sliderF("Sky: CLOUD albedo (anchors the layer to E_total/pi; hb prints albedo/q)",
                     &g_skyCloudAlbedo, 0.0f, 1.5f, 0.02f, "%.2f");
+          // S2j: the anchor's direct beam, taken at the DECK's altitude per channel (1) or at the
+          // ground as a grey luma (0 = the pre-S2j anchor, bit for bit). The sunset A/B.
+          t.sliderF("Sky: CLOUD sunset beam (1 = lit at the deck's altitude, 0 = ground E_total)",
+                    &g_skyCloudBeam, 0.0f, 1.0f, 0.05f, "%.2f");
           // ⚠ THE ALBEDO ABOVE DOES NOTHING AT NIGHT, BY CONSTRUCTION: it multiplies E_total/pi
           // through sceneScale, which carries the night ramp, so after dusk it is albedo x zero.
           // This is the term that survives there. It is authored rather than derived because the
@@ -25088,6 +25125,11 @@ namespace {
           // never sample the sky. Watch a shoreline with statics reflected in it.
           t.sliderF("Fog: sky-target KNEE (lower = sky enters earlier, closes the reflection gap)",
                     &g_fogSkyKnee, 0.0f, 0.999f, 0.01f);
+          // S2j: flattens the sky's sharp horizon band out of the fog target for NEAR fragments
+          // (falls to 0 at the knee). Raise it if a horizon line still crosses close objects in thick
+          // weather; 0 = the unlifted per-direction target.
+          t.sliderF("Fog: haze LIFT, deg (hides the horizon band on near objects)",
+                    &g_fogHazeLiftDeg, 0.0f, 20.0f, 0.5f);
           // ⚠ THE NEAR FIELD. MW's ramp is perfectly clear inside fogStart (~490 m in clear weather
           // at 16 cells), so nothing between the camera and the middle distance has any air in front
           // of it. This is a Beer-Lambert haze from the eye that fills that dead zone; it multiplies
@@ -29115,8 +29157,27 @@ void destroyHostWindow(Renderer* R);
         // sky" always meant. g_skyCloudNight survives as the floor beneath that, for the same reason
         // the airglow lane exists: full moonlight on a cloud is ~2.5e-6 scene units, which is display
         // code 0 at any exposure this renderer runs.
-        p.cloudScene = std::max(0.0f, g_skyCloudAlbedo) * (float)(EtotW / SceneCal::kPi) * p.sceneScale
+        //
+        // ⚠ S2j: THE BEAM HALF OF E_total MOVES TO THE DECK, and skyCloudBeam says how much of it.
+        // E_total is the GROUND's irradiance, so at sunset — where the ground loses its beam first —
+        // the clouds dimmed grey with the land while a real deck 1-2 km up is still in a reddened
+        // beam. sky.frag now adds that beam per channel at the deck radius (atmosSunBeamAt), and
+        // this lane keeps the rest: E_total - k*E_beam_ground = E_sky at k = 1, the whole E_total at
+        // k = 0. `EtotW - 0*x` is EtotW exactly, so the 0 arm is the pre-S2j anchor to the bit.
+        const float beamK  = std::max(0.0f, std::min(g_skyCloudBeam, 1.0f));
+        const float albPi  = std::max(0.0f, g_skyCloudAlbedo) / (float)SceneCal::kPi;
+        const double EkeepW = EtotW - (double)beamK * lumSun * (double)sinE;
+        p.cloudScene = std::max(0.0f, g_skyCloudAlbedo) * (float)(EkeepW / SceneCal::kPi) * p.sceneScale
                      + std::max(0.0f, g_skyCloudNight);
+        p.cloudBeamScale = albPi * p.sceneScale * beamK;
+        {
+            // The deck BASE: the beam that lights the underside you see has crossed the whole deck
+            // (the transmittance LUT's .a from there up). A weather that states no base gets 1.5 km,
+            // the middle of where MW's cloud art reads as sitting.
+            const Atmosphere::Params row = Atmosphere::atmosphereAt(g_eyeAbsShadow[0], g_eyeAbsShadow[1]);
+            const float baseM = (row.cloudBottomKm > 0.0f) ? row.cloudBottomKm * 1000.0f : 1500.0f;
+            p.cloudDeckRadiusM = Atmosphere::kGroundRadiusM + baseM;
+        }
         p.cloudOverZenith = (p.qZenith > 1.0e-9) ? ((double)g_skyCloudAlbedo / p.qZenith) : 0.0;
         p.active = true;
         g_skyPhys = p;
@@ -32276,6 +32337,13 @@ void destroyHostWindow(Renderer* R);
                     //            saturation knee, i.e. almost the whole visible world. They are the
                     //            same quantity for two surfaces standing side by side, so a large
                     //            gap between them IS the "fog discrepancy" defect, on one line.
+                    //   ⚠ haze (S2j) — what applyFog now melts toward BELOW the knee in the `horizon`
+                    //            probe's direction: the published lane (skyZenith.x) times that
+                    //            probe, or fogColNear when the lane is 0. `land` is the pre-S2j
+                    //            target, kept beside it as the before. The gate is haze == nits
+                    //            horizon x sky strength. It checks the lane and its units; it does NOT
+                    //            prove the shader (and the probe reads the cover-MIXED field, where
+                    //            the dome draws lerp(gap, mixed, deckMix.z), so broken cloud differs).
                     //   ⚠ ev — Sunny 16, riding along free. A textbook clear noon is EV 15, nothing
                     //            is tuned to it and nothing reads it. It is on the line because a
                     //            number nobody targeted is the only kind that can falsify anything.
@@ -32284,6 +32352,12 @@ void destroyHostWindow(Renderer* R);
                     //            zenith it must hide under by day, and the sun's L against the solid
                     //            angle MW's sprite actually covers (which is NOT the sun's 6.8e-5 sr
                     //            — the ratio is a finding about MW's art).
+                    double hazeCd[3];
+                    for (int c = 0; c < 3; ++c) {
+                        hazeCd[c] = (g_fogHazeScale > 0.0f)
+                            ? (double)g_skyPhys.horizonNative[c] * (double)g_fogHazeScale * SceneCal::kSceneUnitCd
+                            : (double)g_fogNearScene[c] * SceneCal::kSceneUnitCd;
+                    }
                     // `aim` is the elevation change aimSunLightAtDisc actually applied to the LIGHT
                     // this frame and `w` its handover weight, printed beside the two suns they are
                     // computed from. At w=1 the light IS the disc, so `light + aim` should equal
@@ -32295,7 +32369,8 @@ void destroyHostWindow(Renderer* R);
                                  " a PREDICTION since S2)"
                                  " | sky=%.0flx sunNormal=%.0flx ev100=%.2f (clear noon: 15)"
                                  " | nits zenith=(%.0f,%.0f,%.0f) horizon=(%.0f,%.0f,%.0f) cd/m2"
-                                 " | fogTarget below=(%.0f,%.0f,%.0f) land=(%.0f,%.0f,%.0f) cd/m2"
+                                 " | fogTarget below=(%.0f,%.0f,%.0f) land=(%.0f,%.0f,%.0f)"
+                                 " haze=(%.0f,%.0f,%.0f) cd/m2"
                                  " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2"
                                  " | mwRef amb=%.3f sun=%.3f nl=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
                                  " refDiv=(sun x%.2f amb x%.2f)"
@@ -32324,6 +32399,7 @@ void destroyHostWindow(Renderer* R);
                                  (double)g_fogNearScene[0] * SceneCal::kSceneUnitCd,
                                  (double)g_fogNearScene[1] * SceneCal::kSceneUnitCd,
                                  (double)g_fogNearScene[2] * SceneCal::kSceneUnitCd,
+                                 hazeCd[0], hazeCd[1], hazeCd[2],
                                  ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
                                  SceneCal::kSceneUnitCd,
                                  (double)g_mwAmbCodeRef, (double)g_mwSunCodeRef,
@@ -34123,16 +34199,18 @@ void destroyHostWindow(Renderer* R);
                 g_casterSlots.clear();
                 g_casterEpoch = g_renderFrame;
             }
-            // C2: lighting[28..31] = skyZenith.rgb (current interpolated zenith sky colour). Host dome
-            // gradient (sky.frag) reads FrameData.skyZenith at float index 68..71 (after gReflWaterClip
-            // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
+            // C2: lighting[28..31] = MW's current interpolated ZENITH sky colour. The scene-probe
+            // passes only 24 floats, so guard on the null-lighting path.
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
-            fd[68] = lighting[28]; fd[69] = lighting[29]; fd[70] = lighting[30]; fd[71] = lighting[31];
-            // Step 5: the zenith is an authored sky colour like the horizon one above — but with NO
-            // lift, because unlike fogColNear it never reaches the render target. It is a lighting
-            // input (the SH projection's upper pole) and, in the dead vColSource==3 branch, a
-            // gradient endpoint. .w is the enchant-glow slot packed in below, not a colour.
-            decodeAuthoredRGB(fd + 68);
+            // ⚠ S2j: IT NO LONGER RIDES FrameData. Its one shader reader (sky.frag's vColSource==3
+            // dome, dead since SK4) is deleted, and skyZenith.xyz carries the fog's haze target now —
+            // written after skyPhysicalMeasure below. Its one remaining reader is the legacy SH
+            // projection (publishSkyAmbientSH, the g_skyHw = 0 partner), which takes this host copy.
+            // Step 5: decoded like the horizon colour, with NO lift, because unlike fogColNear it never
+            // reaches the render target — it is a lighting input.
+            g_mwSkyZenith[0] = lighting[28]; g_mwSkyZenith[1] = lighting[29]; g_mwSkyZenith[2] = lighting[30];
+            decodeAuthoredRGB(g_mwSkyZenith);
+            fd[71] = lighting[31];
             // ...and skyZenith.w (71), which the dome never used, carries the enchanted-item glow:
             // the client's bindless slot for MW's current caustic frame, plus the texgen mode bit
             // ORed in here. Packed into the one lane because bindless slots are < kMaxTextures
@@ -34228,6 +34306,26 @@ void destroyHostWindow(Renderer* R);
             // publishSkyView further down, so it must precede that. Both halves are why it is called
             // here rather than from either of them.
             sunDiscMeasure(skyBlob, skyCount, skyBytes);
+            // S2j: THE FOG'S HAZE TARGET (skydome.h.fsl fogHazeTarget). x = the SAME scale skyhw.frag
+            // draws the sky with (gSkyView.radiance.w), so below the knee the fog melts toward the sky
+            // actually on screen instead of MW's flat fog colour. y = this view's eye offset, 0 here;
+            // the mirror's copy overrides it (dlReflectGeoCull). Must follow skyPhysicalMeasure and
+            // precede the reflect/FP/sun-cascade copies, which carry it across.
+            //
+            // 0 whenever there is no physical sky to melt into, AND whenever the target is not
+            // linear scene-referred: skyhw applies linearToSrgb/tonemapInPass for those builds, and
+            // rather than a third copy of that in every lit frag, those builds keep fogColNear —
+            // their pre-S2j image, bit for bit.
+            // Also 0 at fog-sky strength 0 (the knob fd[31] was written from — NOT fd[31] itself,
+            // which is write-combined): the target is multiplied by it, so the LUT tap buys nothing.
+            g_fogHazeScale = (g_skyPhys.active && g_live.linearScene && g_fogSkyStrength > 0.0f)
+                           ? g_skyPhys.sceneScale : 0.0f;
+            fd[68] = g_fogHazeScale;
+            fd[69] = 0.0f;
+            // z = sin(the near-field haze lift): the minimum elevation a NEAR fragment's target is read
+            // at, ramped to 0 at the knee in the shader. Clamped to a sane range; 0 = unlifted.
+            fd[70] = std::sin(std::max(0.0f, std::min(g_fogHazeLiftDeg, 45.0f))
+                              * (float)(SceneCal::kPi / 180.0));
             if (g_skyPhys.active) {
                 const float w = std::max(0.0f, std::min(1.0f, g_skyPhysBlend)) * g_skyPhys.nightRamp;
                 if (w > 0.0f) {
@@ -56231,6 +56329,12 @@ void destroyHostWindow(Renderer* R);
             // sky at the wrong rate and slide it against the geometry it is supposed to melt into.
             gp[34] = 1.0f / (float)kReflectSize;
             gp[35] = 1.0f / (float)kReflectSize;
+            // ...and S2j's haze target (skyZenith.y, float 69) is aimed from THIS view's eye. MG above
+            // reflects about z = dRel, so the mirror renders from a virtual eye at z = 2*dRel relative
+            // to the real one, and its sky copy was drawn along that eye's rays. worldPosRel stays
+            // measured from the real eye, so the fog ray is `worldPosRel - (0, 0, 2*dRel)`: the
+            // direction the mirror actually sees this static in, against the sky it melts into.
+            gp[69] = 2.0f * dRel;
         }
         // The mirror matrix + clip plane are now live, which is all the NEAR reflect record needs.
         // This used to sit behind `!g_dlExterior` along with the DL cull below, so an interior — which

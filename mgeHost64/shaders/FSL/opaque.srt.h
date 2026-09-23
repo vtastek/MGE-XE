@@ -123,10 +123,16 @@ STRUCT(FrameData)
     // 272B struct → host frame cbuffers bumped to 512B (256B min CBV, 256B-aligned). Only these two
     // verts read it; no frag change (SV_ClipDistance is a rasterizer system-value). 272B.
     DATA(float4, gReflWaterClip, None);
-    // C2 host-computed sky dome: the current interpolated ZENITH sky colour (client ships MW's
-    // per-frame getCurrentWeatherSkyCol via lighting[28..31]). sky.frag's dome branch builds a
-    // vertical gradient fogColNear(horizon) -> skyZenith(zenith), so the atmosphere dome no longer
-    // needs its baked per-vertex gradient re-uploaded each frame. Only sky.frag reads it. 288B < 512B.
+    // ⚠ THE NAME IS HISTORICAL (S2j, tasks/forge-atmosphere.md). This carried C2's zenith sky colour
+    // for sky.frag's host-gradient dome, which SK4 retired; S2j deleted that branch and re-used the
+    // lanes. The host keeps MW's zenith colour for the legacy SH projection in a host global.
+    //   x = the physical sky's native -> scene scale for the FOG's haze target (skydome.h.fsl's
+    //       fogHazeTarget); 0 = no physical sky this frame -> fog targets fogColNear (pre-S2j image).
+    //   y = this view's eye z relative to the worldPosRel origin: 0 main, 2*dRel in the water mirror.
+    //   z = sin(near-field haze lift): the minimum elevation a NEAR fragment's haze is read at,
+    //       ramped to 0 at the knee in-shader (knob fogHazeLiftDeg; 0 = unlifted).
+    //   w = the enchanted-item glow word (enchantglow.h.fsl) — unchanged.
+    // 288B < 512B.
     DATA(float4, skyZenith, None);
     // Shadow-atlas debug view (F12 mode 11/12): per-slot state bitmasks as REAL uints (asuint —
     // float lanes drop bits >= 24). x = ACTIVE-slot mask (static atlas view), y = DYNAMIC-slot mask

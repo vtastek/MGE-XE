@@ -1,0 +1,72 @@
+// mgeHost64 — THE DRAWN SKY'S RADIANCE IN ONE DIRECTION, native units. ONE COPY.
+// (tasks/forge-atmosphere.md S2j)
+//
+// skyhw.frag draws this, the moon's shadow layer paints it, and every fogged surface melts toward it
+// (skydome.h.fsl's fogHazeTarget). Three readers of one expression is exactly the case where one
+// of them drifts: S2i taught the dome to re-mix the gap sky against the cover-mixed field, and the
+// moon shadow kept sampling the mixed field alone, so under broken cloud its dark limb stopped
+// matching the sky around it. Now none of them spells the sample out.
+//
+// ⚠ NOT IN atmosphere.h.fsl, AND ON PURPOSE. That header is included by the LUT cooks, which write
+// gAtmosSkyView/gAtmosSkyViewClear/gAtmosTransmittance through their own SRT, so a function there
+// that READS the PerFrame textures would not compile in the shaders that make them. This one needs opaque.srt.h
+// (the textures + gAtmosParams) and atmosphere.h.fsl (the uv mapping), both included first.
+#ifndef SKY_RADIANCE_H_FSL
+#define SKY_RADIANCE_H_FSL
+
+// `r` = the radius the sky-view LUT was cooked at (the camera's, in metres from the planet centre).
+// Native W/(m^2 sr), clamped non-negative; the caller owns the native -> scene scale.
+//
+// S2i: gAtmosSkyView is lerp(gap, deck, cover), right for the SH light, which integrates over
+// directions, and wrong for an image, where one direction is either cloud or gap. The clear arm rides
+// its own LUT and deckMix.z re-mixes: 0 draws the gap sky and lets MW's cloud MESH supply the cloud,
+// 1 draws the mixed field for a deck that really is a closed lid.
+//
+// ⚠ BELOW THE HORIZON THIS RETURNS THE HORIZON RING, NOT THE LUT'S LIT GROUND (S2j, 2026-09-23).
+// The LUT's lower half is "air, then the ground at the end of the ray", and it is right for the SH
+// light (atmos_sh reads the LUT directly, not through here). It is wrong as a FOG TARGET: a fogged
+// fragment IS the surface at the end of its ray, so its ground term is the fragment's own shading,
+// and what the fog adds on top is the air's in-scatter, whose saturated limit is the horizon haze.
+// Used as-is it produced both reported defects at once: "horizon line is visible over statics" (the
+// LUT steps from bright sky to dim lit ground across one texel row, and a static straddling the
+// horizon wore that step) and "below horizon, water turns gray, doesn't match sky" (the sea melted
+// into the lit ground). The dome draws through here too, so the snapshot (which the fog takes above
+// the knee) and the haze (below it) keep agreeing below the horizon.
+//
+// Clamped in UV, not in angle: Hillaire's v axis splits at the camera's own horizon at exactly
+// uv.y = 0.5 whatever the altitude, so the top sky row's centre is 0.5 - 0.5/H (H even; 108 ships).
+// Clamping to a texel CENTRE keeps the bilinear tap off the ground row entirely.
+float3 atmosSkyRadianceNative(float3 dir, float r)
+{
+    float2 uv   = atmosSkyViewUvFromDir(gAtmosParams, r, dir);
+    uv.y = min(uv.y, 0.5f - 0.5f / max(gAtmosParams.lutDims.y, 2.0f));
+    float3 Lgap = SampleLvlTex2D(gAtmosSkyViewClear, gSamplerBilinearClamp, uv, 0).rgb;
+    float3 Lmix = SampleLvlTex2D(gAtmosSkyView,      gSamplerBilinearClamp, uv, 0).rgb;
+    return max(lerp(Lgap, Lmix, saturate(gAtmosParams.deckMix.z)), f3(0.0f));
+}
+
+// THE SUN'S BEAM ON A HORIZONTAL SURFACE AT RADIUS r, per primary, native W/m^2 (S2j / sunsets).
+// sky.frag's cloud layer is lit by this at the DECK's altitude instead of by the ground's E_total.
+// At sunset the ground loses its direct beam first; a deck 1-2 km up is still in it, reddened, and
+// stays in it for the ~1.2 degrees the horizon dips at that height. That afterglow is the drama.
+//
+// The beam term is atmos_sh.comp's E_sun, taken at r instead of at the camera: the air's transmittance
+// times the cover-weighted deck share (the LUT's .a), for the same Jensen reason written there.
+//
+// ⚠ THE COSINE IS MEASURED FROM THE DECK'S OWN HORIZON, (mu - muH)/(1 - muH), not from its local
+// horizontal plane. It reaches 0 exactly where the sun sets for that altitude and never before, and
+// it is exactly 1 at the zenith, so a high sun lights the deck like the ground (noon is unchanged
+// up to T(r)/T(ground), a few percent). Bruneton's LUT has no meaning for a ray that hits the ground,
+// and the gate below keeps every lookup off that half of it.
+float3 atmosSunBeamAt(float r)
+{
+    float mu  = gAtmosParams.sunDir.w;
+    float muH = atmosHorizonCos(r, gAtmosParams.planet.x);
+    if (!(mu > muH)) { return f3(0.0f); }
+    float4 tr = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp,
+                               atmosTransmittanceUv(gAtmosParams, r, mu), 0);
+    float cosF = (mu - muH) / max(1.0f - muH, 1.0e-6f);
+    return tr.rgb * lerp(1.0f, tr.a, saturate(gAtmosParams.deckMix.x)) * gAtmosParams.solar.xyz * cosF;
+}
+
+#endif // SKY_RADIANCE_H_FSL
