@@ -2038,13 +2038,11 @@ float2 eonAB(float sigma)
     const float A = 1.0f / (1.0f +  0.287793409f  * sigma);
     return float2(A, sigma * A);
 }
-
-
-
-float eonSingle(float2 ab, float NoL, float NoV, float LoV)
+#line 571 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+float eonSingle(float2 ab, float NoL, float NoV, float LoV, float nlCarried)
 {
     const float s = LoV - NoL * NoV;
-    const float t = (s > 0.0f) ? max(max(NoL, NoV), 1e-4f) : 1.0f;
+    const float t = (s > 0.0f) ? max(max(max(NoL, NoV), nlCarried), 1e-4f) : 1.0f;
     return ab.x + ab.y * (s / t);
 }
 
@@ -2057,7 +2055,7 @@ float eonG(float mu)
     const float u = 1.0f - saturate(mu);
     return  0.287793409f  * u * (0.132551f + u * (2.136720f + u * (-1.914293f + u * 0.645021f)));
 }
-#line 589 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 599 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float eonMsWeight(float mu) { return  0.287793409f  - eonG(mu); }
 float eonMsScale(float2 ab, float sigma, float NoV)
 {
@@ -4894,7 +4892,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     {
         const float nlb = saturate(dot(-gFrameData.sunDir.xyz, nShade));
         pbrDiffMs += (sunDiff * tSunW) * eonMsWeight(nlb);
-        sunDiff *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+        sunDiff *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV), nlb);
     }
     float3 result = albedo
                   * (sunDiff
@@ -5000,7 +4998,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                     const float3 Ld = toL * invD;
                     const float nlb = saturate(dot(nShade, Ld));
                     pbrDiffMs += lightAdd * eonMsWeight(nlb);
-                    lightAdd *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                    lightAdd *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV), nlb);
                 }
                 pointDiffuse += lightAdd;
 
@@ -5077,7 +5075,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                     const float3 Ld = toL * invD;
                     const float nlb = saturate(dot(nShade, Ld));
                     pbrDiffMs += lightAdd * eonMsWeight(nlb);
-                    lightAdd *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                    lightAdd *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV), nlb);
                 }
                 pointDiffuse += lightAdd;
                 if (pbrLive)

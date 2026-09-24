@@ -301,7 +301,7 @@ PSOut PS_MAIN( VSOutput In )
             {
                 const float nlb = saturate(dot(nShade, -gFrameData.sunDir.xyz));
                 pbrDiffMs += (sunTerm * sunVis) * eonMsWeight(nlb);
-                sunTerm *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+                sunTerm *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV), nlb);
             }
             // Sun specular. sunCol directly, NOT through SunLight: a dielectric's highlight is not
             // tinted by the diffuse colour the vertex baked into that lane (the same reason
@@ -390,7 +390,7 @@ PSOut PS_MAIN( VSOutput In )
                     const float3 Ld  = toL * invD;
                     const float  nlb = saturate(dot(N, Ld));
                     pbrDiffMs += lightAdd * eonMsWeight(nlb);
-                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV), nlb);
                 }
                 pointDiffuse += lightAdd;
                 // Point-light specular, every light — this loop is already walking them, and a lamp

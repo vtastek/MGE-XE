@@ -321,7 +321,8 @@ float4 PS_MAIN( VSOutput In )
     {
         const float nlb = saturate(dot(pbrNb, -gFrameData.sunDir.xyz));
         pbrDiffMs += d * eonMsWeight(nlb);
-        d *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+        // `d` carries ndl, taken against the possibly-BENT N — so ndl, not nlb, bounds s/t.
+        d *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV), ndl);
     }
     // Sun specular (PBR draws): the same light, shadow and water column as the sun's diffuse above.
     if (pbrOn)
@@ -475,7 +476,8 @@ float4 PS_MAIN( VSOutput In )
                     const float3 Ld  = toLight * invDist;
                     const float  nlb = saturate(dot(pbrNb, Ld));
                     pbrDiffMs += lightAdd * eonMsWeight(nlb);
-                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                    // lightAdd carries `lambert` (bent N) — that, not nlb, bounds s/t.
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV), lambert);
                 }
                 d += lightAdd;
                 // Point-light specular (PBR draws). Every light, not pbr.hlsl's light 0 only — that was

@@ -1010,7 +1010,7 @@ float4 PS_MAIN( VSOutput In )
     {
         const float nlb = saturate(dot(-gFrameData.sunDir.xyz, nShade));
         pbrDiffMs += (sunDiff * tSunW) * eonMsWeight(nlb);
-        sunDiff *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+        sunDiff *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV), nlb);
     }
     float3 result = albedo
                   * (sunDiff
@@ -1153,7 +1153,7 @@ float4 PS_MAIN( VSOutput In )
                     const float3 Ld  = toL * invD;
                     const float  nlb = saturate(dot(nShade, Ld));
                     pbrDiffMs += lightAdd * eonMsWeight(nlb);
-                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV), nlb);
                 }
                 pointDiffuse += lightAdd;
                 // Point-light specular. Every light, as opaque.frag does — this loop is already
@@ -1230,7 +1230,7 @@ float4 PS_MAIN( VSOutput In )
                     const float3 Ld  = toL * invD;
                     const float  nlb = saturate(dot(nShade, Ld));
                     pbrDiffMs += lightAdd * eonMsWeight(nlb);
-                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV), nlb);
                 }
                 pointDiffuse += lightAdd;
                 if (pbrLive)   // see the near loop for why the gobo is not in `w`

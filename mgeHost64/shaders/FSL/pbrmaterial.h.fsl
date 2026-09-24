@@ -558,10 +558,20 @@ float2 eonAB(float sigma)
 
 // The single-scattering (qualitative Oren-Nayar) shape, as a multiplier on an N.L-carrying term.
 // EXACTLY 1.0 when sigma == 0, because eonAB returns (1, 0) there.
-float eonSingle(float2 ab, float NoL, float NoV, float LoV)
+//
+// ⚠ nlCarried = THE N.L THE CALLER'S TERM ACTUALLY CARRIES, and it joins t. The bound above
+// (N.L * s/t <= 1) holds only when the N.L being multiplied is one of the two t is the max of. opaque.frag
+// shapes the lobe with the unbent pbrNb (right: s/t is surface microstructure) but its sun `ndl` and
+// point `lambert` are taken against the AO-BENT normal. On a face turned from the light the unbent
+// N.L and N.V are both ~0, so t hit its 1e-4 floor, while the bend had tilted N toward the light:
+// s/t reached ~1e4 on a nonzero term. Reported 2026-09-24 with the bent-normal tick on: dark pixels on
+// flora_bc_tree_13 turned white and bloomed. Taking t over the carried N.L too restores
+// N.Lc * s/t <= s <= 1 for any normal. A caller whose term carries nlb itself passes nlb, which is
+// bit-identical (max(x, x) == x exactly).
+float eonSingle(float2 ab, float NoL, float NoV, float LoV, float nlCarried)
 {
     const float s = LoV - NoL * NoV;                       // cos(dphi) * sin(th_l) * sin(th_v)
-    const float t = (s > 0.0f) ? max(max(NoL, NoV), 1e-4f) : 1.0f;
+    const float t = (s > 0.0f) ? max(max(max(NoL, NoV), nlCarried), 1e-4f) : 1.0f;
     return ab.x + ab.y * (s / t);
 }
 
