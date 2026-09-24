@@ -125,6 +125,12 @@ namespace Atmosphere {
     constexpr float kMieScatterSeaLevel  = 3.996e-6f;   // 1/m  (Bruneton; x40 measured, see above)
     constexpr float kMieHeightKm         = 1.2f;
     constexpr float kMieAbsorbFractionClear = 0.10f;    // 1 - single-scattering albedo
+    // The aerosol's diffraction SPIKE (S2l). One constant for every weather because free fits put it
+    // at 0.965-0.972 for all three BHMIE references; a row says how much light is in it (mieSpike),
+    // never how sharp it is. ⚠ The sky-view LUT resolves ~3 deg near the zenith, so the inner
+    // degrees of this lobe are integrated rather than drawn — that is S2l/P4's business, not a reason
+    // to blunt it here.
+    constexpr float kMieSpikeG           = 0.97f;
     // Ozone: a stratospheric TENT, peak absorption at 25 km, zero by 10 and 40 km. It has no
     // scattering term at all — it only removes light, and it removes it where Rayleigh does not,
     // which is the entire reason twilight is violet rather than brown. Hosek has no ozone term.
@@ -240,6 +246,17 @@ namespace Atmosphere {
                                   // a bright haze into an overcast lid or an ash sky.
         float mieG;               // Henyey-Greenstein asymmetry. 0.8 = clean air's forward lobe;
                                   // large mineral grains and ice scatter more broadly.
+                                  // ⚠ READ ONLY BY THE SINGLE-HG ARM (atmosMiePhase 0) since S2l.
+        // -- the aerosol's PHASE since S2l: a smooth BODY plus a sharp diffraction SPIKE ---------
+        // ⚠ NOT A SECOND WAY TO SAY mieG. Single HG is the wrong SHAPE at any g (see
+        // atmosPhaseAerosol in atmosphere.h.fsl), so these are fitted to BHMIE over real aerosols by
+        // mgeHost64/tools/aerosol_phase_fit.py, not tuned. The fit's finding is that the body barely
+        // moves between aerosol types (CS g ~0.60 for continental AND wet haze) while the spike
+        // weight is what separates them: dry fine particles 0.00, a wet coarse mode 0.12. Rows with
+        // no sphere reference (ash: irregular dust; snow: ice) keep their AUTHORED asymmetry — the
+        // CS g whose own <cos> equals the row's HG g (script section 4) — and no spike.
+        float mieBodyG;           // Cornette-Shanks shape g (NOT <cos>, which runs ~0.06 higher)
+        float mieSpike;           // weight of the HG(kMieSpikeG) diffraction spike, 0..1
         float mieHeightKm;        // aerosol scale height. Fog and ash HUG THE GROUND; this is the
                                   // lane that says so, and it is why fog is not just "more Mie".
         float mieTint[3];         // per-primary multiplier on aerosol EXTINCTION, 1,1,1 = grey.
@@ -316,13 +333,13 @@ namespace Atmosphere {
         // Clear — the reference atmosphere, unmodified. Every gate S2 has to pass (q_zenith,
         // E_sun/E_total, direct-normal illuminance) is measured HERE, so this row is not a look and
         // must not be tuned: if clear looks wrong the model is wrong.
-        { /*ray*/ 1.00f, /*mie*/ 0.60f, /*abs*/ 0.10f, /*g*/ 0.80f, /*hkm*/ 1.20f,
+        { /*ray*/ 1.00f, /*mie*/ 0.60f, /*abs*/ 0.10f, /*g*/ 0.80f, /*body*/ 0.60f, /*spike*/ 0.00f, /*hkm*/ 1.20f,
           /*tint*/ { 1.00f, 1.00f, 1.00f }, /*ozone*/ 1.00f,
           /*cover*/ 0.00f, /*type*/ 0.30f, /*bot*/ 2.00f, /*thick*/ 0.40f, /*precip*/ 0.00f,
           0,0,0,0,0 },
         // Cloudy — fair-weather cumulus over otherwise clean air. Slightly more aerosol than clear
         // because a sky with cumulus in it is a sky with moisture in it.
-        { 1.00f, 1.00f, 0.10f, 0.80f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 1.00f, 0.10f, 0.80f, 0.60f, 0.00f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           0.35f, 0.50f, 1.80f, 0.80f, 0.00f, 0,0,0,0,0 },
         // Foggy — NOT "more haze". Fog is a thick, near-white, ground-hugging aerosol: the defining
         // lane is mieHeightKm 0.25, which puts almost all of it below the player. Droplets are large
@@ -346,7 +363,7 @@ namespace Atmosphere {
         // double-counting the fog; IT WAS DOING THE FOG, and the aerosol lane has been decorative.
         // Thickening it is the actual fix and it is a look change with its own picture, not part of
         // a rollback. Until then the deck stays and the overlap is the lesser error.
-        { 1.00f, 6.00f, 0.02f, 0.85f, 0.25f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 6.00f, 0.02f, 0.85f, 0.60f, 0.12f, 0.25f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           0.40f, 0.00f, 0.05f, 0.30f, 0.00f, 0,0,0,0,0 },
         // Overcast — ⚠⚠ C5 ROLLED THIS ROW BACK, AND ITS OLD COMMENT IS THE CONFESSION. It read:
         // "THE LID ... High Mie with real absorption de-blues AND dims the whole atmosphere, so MW's
@@ -365,7 +382,7 @@ namespace Atmosphere {
         // the mixture it means 5% of the sky is CLEAR, which measured as a 5,506 lx direct beam and
         // sun% 0.159: an overcast day casting shadows. "Overcast" is 8/8 oktas by definition, so the
         // authored intent was always 1.00 and 0.95 was an artefact of a semantics that rounded it off.
-        { 1.00f, 1.20f, 0.10f, 0.80f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 1.20f, 0.10f, 0.80f, 0.60f, 0.00f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 0.00f, 1.00f, 1.20f, 0.00f, 0,0,0,0,0 },
         // Rain — full cover, a low wet base, and the aerosol below the deck that rain actually is.
         // ⚠ C5: the DENSITY was always real and the ABSORPTION never was. Falling rain is large water
@@ -373,7 +390,7 @@ namespace Atmosphere {
         // (abs 0.02) and a strong forward lobe (g 0.85). abs 0.35 was the fake lid's dimming, doing
         // in the aerosol what cover 1.00 (tau 24 through 2.5 km) now does as cloud.
         //   was  mie 2.50  abs 0.35  g 0.76        now  mie 2.00  abs 0.03  g 0.85
-        { 1.00f, 2.00f, 0.03f, 0.85f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 2.00f, 0.03f, 0.85f, 0.60f, 0.12f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 0.35f, 0.70f, 2.50f, 0.60f, 0,0,0,0,0 },
         // Thunder — cumulonimbus: the same medium as rain with a deck six kilometres deep, which is
         // what makes a storm cloud dark underneath and bright on top. The underlit-at-sunset case
@@ -382,18 +399,18 @@ namespace Atmosphere {
         // "Dark underneath" is the DECK's job now and it does it properly: type 1.00 is the raised
         // cosine, 6 km deep at tau 24, so the base really is starved while the top is lit.
         //   was  mie 3.00  abs 0.40  g 0.74        now  mie 3.00  abs 0.03  g 0.85
-        { 1.00f, 3.00f, 0.03f, 0.85f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 3.00f, 0.03f, 0.85f, 0.60f, 0.12f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 1.00f, 0.60f, 6.00f, 1.00f, 0,0,0,0,0 },
         // Ash — Vvardenfell's signature, and the clearest case for the tint lane. Mineral dust is a
         // heavy, strongly ABSORBING, ground-hugging aerosol that scatters broadly (large irregular
         // grains, so a weaker forward lobe than clean air) and removes blue far harder than red.
         // The result is a dim brown-orange sky that darkens the ground rather than glowing, which
         // is what separates an ash storm from fog of the same density.
-        { 1.00f, 10.00f, 0.55f, 0.65f, 0.80f, { 1.00f, 0.80f, 0.55f }, 1.00f,
+        { 1.00f, 10.00f, 0.55f, 0.65f, 0.58f, 0.00f, 0.80f, { 1.00f, 0.80f, 0.55f }, 1.00f,
           0.50f, 0.20f, 1.20f, 1.00f, 0.00f, 0,0,0,0,0 },
         // Blight — ash, sicker: denser, more absorbing, and pushed further toward red so the sky
         // reads diseased rather than merely dusty. Same medium, different point in it.
-        { 1.00f, 12.00f, 0.60f, 0.62f, 0.80f, { 1.00f, 0.62f, 0.45f }, 1.00f,
+        { 1.00f, 12.00f, 0.60f, 0.62f, 0.55f, 0.00f, 0.80f, { 1.00f, 0.62f, 0.45f }, 1.00f,
           0.60f, 0.20f, 1.20f, 1.20f, 0.00f, 0,0,0,0,0 },
         // Snow — a deck like overcast, but the medium below it is ice crystals: they scatter almost
         // without absorbing and much more isotropically than droplets, which is why falling snow is
@@ -409,12 +426,12 @@ namespace Atmosphere {
         // is a complete deck; 10% of clear sky over falling snow is a configuration weather does not
         // have. Ash (0.50), Blight (0.60), Foggy (0.40) and Cloudy (0.35) were left ALONE — their
         // cover is genuinely partial, and for those rows the mixture is the whole point.
-        { 1.00f, 3.00f, 0.05f, 0.60f, 1.00f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 3.00f, 0.05f, 0.60f, 0.53f, 0.00f, 1.00f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 0.00f, 0.90f, 1.20f, 0.50f, 0,0,0,0,0 },
         // Blizzard — snow's medium at storm density and pulled down to the ground. Non-absorbing
         // like snow, so a whiteout is BRIGHT; the ash rows are the dark counterpart and the pair is
         // the clearest demonstration that density and absorption are two different lanes.
-        { 1.00f, 12.00f, 0.05f, 0.55f, 0.40f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        { 1.00f, 12.00f, 0.05f, 0.55f, 0.48f, 0.00f, 0.40f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 0.00f, 0.80f, 1.50f, 1.00f, 0,0,0,0,0 },
     };
 
@@ -443,6 +460,11 @@ namespace Atmosphere {
             o.mieScale         = lerpf(a.mieScale,         b.mieScale,         t);
             o.mieAbsorption    = lerpf(a.mieAbsorption,    b.mieAbsorption,    t);
             o.mieG             = lerpf(a.mieG,             b.mieG,             t);
+            // ⚠ LERPING THE PARAMETERS, NOT THE PHASE FUNCTIONS — and for the spike weight those are
+            // the same thing (the mixture is linear in it). For the body g they are not, but both
+            // ends share g ~0.60 wherever a reference exists, so the walk barely leaves the fit.
+            o.mieBodyG         = lerpf(a.mieBodyG,         b.mieBodyG,         t);
+            o.mieSpike         = lerpf(a.mieSpike,         b.mieSpike,         t);
             o.mieHeightKm      = lerpf(a.mieHeightKm,      b.mieHeightKm,      t);
             for (int c = 0; c < 3; ++c) {
                 o.mieTint[c]   = lerpf(a.mieTint[c],       b.mieTint[c],       t);
@@ -835,6 +857,7 @@ namespace Atmosphere {
                            float moonIrradiance,
                            float airglow,
                            float mieScaleMul,
+                           int   miePhaseModel,
                            float ozoneMul,
                            float deckMul,
                            float msMul,
@@ -930,7 +953,8 @@ namespace Atmosphere {
         for (int c = 0; c < 3; ++c) {
             dst[i++] = kOzoneAbsorb[c] * std::max(0.0f, p.ozoneScale) * std::max(0.0f, ozoneMul);
         }
-        dst[i++] = 0.0f;
+        // .w: the aerosol spike's HG g (S2l) — riding a spare lane, not an ozone property.
+        dst[i++] = kMieSpikeG;
         // row 4: the geometry of the two BOUNDED profiles, metres above the ground — the ozone tent
         // and the cloud deck. ⚠ A DECK WITH NO EXTINCTION STILL PUBLISHES ITS GEOMETRY, and that is
         // deliberate: atmosDeckSpan() gates on beta_ext, so a clear sky costs one compare rather than
@@ -958,7 +982,13 @@ namespace Atmosphere {
         // row 9: the airglow floor (native radiance) — the night sky's own emission, which is what
         // stops "no sun" from meaning "no photons" once the sun is genuinely below the horizon.
         dst[i++] = std::max(0.0f, airglow);
-        dst[i++] = 0.0f; dst[i++] = 0.0f; dst[i++] = 0.0f;
+        // .yzw: THE AEROSOL PHASE (S2l) — body g, spike weight, model. Model 0 is the single-HG A/B
+        // arm on row 2's .w and the shader evaluates exactly the pre-S2l expression there; the two
+        // lanes before it are then unread. Clamped like mieG, for the same reason: |g| -> 1 is a
+        // delta function the march cannot integrate.
+        dst[i++] = std::max(-0.95f, std::min(0.95f, p.mieBodyG));
+        dst[i++] = std::max(0.0f, std::min(1.0f, p.mieSpike));
+        dst[i++] = (miePhaseModel != 0) ? 1.0f : 0.0f;
         // row 10: march budgets. .w is the DECK's own step budget — the quadrature fix S4a needed,
         // because all three marches are tuned for smooth exponentials and a 1.2 km lid is not one.
         // ⚠ 0 HERE DISARMS THE DECK IN EVERY MARCH, whatever the coefficients say, so it is a second

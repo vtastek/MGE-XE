@@ -966,6 +966,15 @@ namespace {
     // and why the value that survives belongs folded into kMieScatterSeaLevel with this deleted.
     float g_atmosMieMul = 1.0f;
 
+    // S2l: WHICH aerosol phase function the sky-view cook evaluates. 0 = single Henyey-Greenstein on
+    // the row's mieG (the pre-S2l sky, bit for bit — the A/B arm); 1 = a sharp HG spike on a smooth
+    // Cornette-Shanks body, both fitted to BHMIE over real aerosols (mgeHost64/tools/
+    // aerosol_phase_fit.py). ⚠ THIS AND g_atmosMieMul ARE ONE DECISION, NOT TWO: x40 was calibrated
+    // under HG, which under-reads a real aerosol by 1.8x at the gate's 49 deg and over-reads it by
+    // 2.2x at 11 deg, so a mieMul measured under one phase says nothing about the other. Swept as a
+    // pair (tasks/forge-atmosphere.md S2l). A float because the knob table is.
+    float g_atmosMiePhase = 0.0f;
+
     // A UNIFORM multiplier on the OZONE column, applied in the same one place. See the long note at
     // its use in atmosphere.h: ozone is the only term in the medium that makes a sky LESS GREEN
     // (absorption 0.650 / 1.881 / 0.085 per primary), so it is the deep-blue lever — and x1 is
@@ -6366,6 +6375,8 @@ namespace {
     };
     // The gate + readback state machine. 0 = waiting for an armed frame, 1 = the GATE frame is in
     // flight (reference parameters forced), 2 = the gate has been reported and the lane is live.
+    // Then the same pair again for the deck (2 -> 3 -> 4) and the high sun (4 -> 5 -> 6, S2l); see
+    // the forcing block in atmosDispatch.
     // ⚠ The gate runs ONCE per host session and the LUTs keep rebuilding from live weather after it
     // — the reference forcing is one frame's cbuffer, not a mode.
     uint32_t g_atmosGateState = 0;
@@ -22015,6 +22026,7 @@ namespace {
             { "atmosCacheDeg",      &g_atmosCacheDeg      },
             { "atmosCacheAltM",     &g_atmosCacheAltM     },
             { "atmosMieMul",        &g_atmosMieMul        },
+            { "atmosMiePhase",      &g_atmosMiePhase      },
             { "atmosOzoneMul",      &g_atmosOzoneMul      },
             { "atmosMs",            &g_atmosMs            },
             { "atmosDeckDown",      &g_atmosDeckDown      },
@@ -24554,6 +24566,10 @@ namespace {
           // measuring, so this is a lever for after the gate settles rather than before.
           t.sliderF("Atmos: multiscatter directions, sqrt (THE cost dial; 8 = Hillaire's value)",
                     &g_atmosMsDirs, 2.0f, 8.0f, 1.0f, "%.0f");
+          // S2l: the aerosol's PHASE. 0 = single HG on the row's mieG (the pre-S2l sky, bit for
+          // bit), 1 = the fitted spike + Cornette-Shanks body. An A/B arm, not a look knob.
+          t.sliderF("Atmos: aerosol phase (0 = single HG, 1 = spike + CS body, fitted to Mie)",
+                    &g_atmosMiePhase, 0.0f, 1.0f, 1.0f, "%.0f");
           // ⚠ WHAT STOPS "THE SUN IS DOWN" FROM MEANING "THERE ARE NO PHOTONS". A medium is happy to
           // return exactly zero, and zero is a level the exposure servo cannot meter — it would ramp
           // E to its ceiling against a black frame. The real quantity (airglow + zodiacal light +
@@ -29619,7 +29635,9 @@ void destroyHostWindow(Renderer* R);
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
     void atmosDispatch();                // S2: the atmosphere's four-pass LUT chain, every frame
-    void atmosReportGate(bool deckArm);  // S2b/S4a: the GATE, reported from settleFrameFence
+    // S2b/S4a/S2l: the GATE, reported from settleFrameFence — one arm per forced frame.
+    enum AtmosGateArm { kGateClear, kGateDeck, kGateHighSun };
+    void atmosReportGate(AtmosGateArm arm);
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
     bool buildGlowPath(Renderer* R);                                        // Phase F glow billboards: build (idempotent)
     void dlDrawGlowBillboards();                                            // Phase F glow billboards: per-frame fill + draw
@@ -29943,7 +29961,8 @@ void destroyHostWindow(Renderer* R);
             // thing that would look exactly like a large one if it ever coincided with a bug.
             // The gate reads the bytes, reports, and the light waits one more frame for a
             // measurement taken under the weather that is actually outside.
-            const bool gateBytes = (g_atmosGateState == 1 || g_atmosGateState == 3);
+            const bool gateBytes = (g_atmosGateState == 1 || g_atmosGateState == 3
+                                    || g_atmosGateState == 5);
             if (g_atmosShLastRan == 1u && !gateBytes) {
                 if (!g_atmosShValid) {
                     LOG::logline(">> [forge-atmos] first SH measurement landed (frame %u):"
@@ -29961,11 +29980,14 @@ void destroyHostWindow(Renderer* R);
             // ...and if this was a GATE frame, report it. Twice per host session now: the clear
             // reference, then the lid. State 2 re-arms atmosDispatch for the second configuration.
             if (g_atmosGateState == 1) {
-                atmosReportGate(false);
+                atmosReportGate(kGateClear);
                 g_atmosGateState = 2;
             } else if (g_atmosGateState == 3) {
-                atmosReportGate(true);
+                atmosReportGate(kGateDeck);
                 g_atmosGateState = 4;
+            } else if (g_atmosGateState == 5) {
+                atmosReportGate(kGateHighSun);
+                g_atmosGateState = 6;
             }
         }
 
@@ -54496,15 +54518,20 @@ void destroyHostWindow(Renderer* R);
         // "overcast ~1000-2000 cd/m2 flat" nit row sat untested for the whole of S2.
         //   state 0 -> force CLEAR    -> 1 (bytes in flight) -> report -> 2
         //   state 2 -> force OVERCAST -> 3 (bytes in flight) -> report -> 4 (done)
+        // ⚠ AND A THIRD (S2l): THE SAME CLEAR AIR UNDER A HIGH SUN, because the first frame's 41.34
+        // deg puts the zenith 49 deg from the sun and the aerosol's forward lobe never reaches it —
+        // which is how atmosMieMul x40 passed this gate and turned the sky white in play.
+        //   state 4 -> force CLEAR @ 78.6 deg -> 5 (bytes in flight) -> report -> 6 (done)
         const bool gateClear = (g_atmosGate && g_atmosGateState == 0 && g_live.pAtmosShPipeline);
         const bool gateDeck  = (g_atmosGate && g_atmosGateState == 2 && g_live.pAtmosShPipeline);
-        const bool gateFrame = gateClear || gateDeck;
+        const bool gateHigh  = (g_atmosGate && g_atmosGateState == 4 && g_live.pAtmosShPipeline);
+        const bool gateFrame = gateClear || gateDeck || gateHigh;
         if (gateFrame) {
             row = gateDeck ? Atmosphere::overcastGateRow()   // row 0's air under a full lid
                            : Atmosphere::referenceRow();     // kWeatherTable[0]: Clear, not a look
             albedo    = (float)SceneCal::kRefAlbedo;
             camRadius = Atmosphere::kGroundRadiusM + (float)Atmosphere::kGroundEpsM;  // sea level
-            const float e = (float)SceneCal::kRefElevation;
+            const float e = (float)(gateHigh ? SceneCal::kRefHighElevation : SceneCal::kRefElevation);
             toSun[0] = std::cos(e); toSun[1] = 0.0f; toSun[2] = std::sin(e);
             moonE = 0.0f;
             // ⚠ THE DECK KNOB IS **NOT** FORCED ON FOR THE SECOND FRAME. A gate that armed its own
@@ -54536,6 +54563,7 @@ void destroyHostWindow(Renderer* R);
         static_assert(sizeof(pk) == kAtmosParamsCbvBytes,  "cache key must be the WHOLE cbuffer");
         Atmosphere::packParams(row, albedo, toSun, camRadius - Atmosphere::kGroundRadiusM,
                                toMoon, moonE, std::max(0.0f, g_atmosAirglow), g_atmosMieMul,
+                               (g_atmosMiePhase >= 0.5f) ? 1 : 0,
                                g_atmosOzoneMul,
                                g_atmosDeck, g_atmosMs, g_atmosDeckDown,
                                g_atmosSkySteps, 20.0f, g_atmosMsDirs,
@@ -54624,25 +54652,30 @@ void destroyHostWindow(Renderer* R);
         cmdEndDebugMarker(g_live.pCmd);
 
         if (gateFrame) {
-            g_atmosGateState = gateDeck ? 3u : 1u;
+            g_atmosGateState = gateDeck ? 3u : (gateHigh ? 5u : 1u);
             g_atmosGateFrame = g_renderFrame;
         }
     }
 
     // ─── S2b/S4a — THE GATE, REPORTED ────────────────────────────────────────────────────────────
-    // Called from settleFrameFence, which is where a readback becomes valid. TWO ARMS, run on two
-    // consecutive forced frames, and five tables between them:
+    // Called from settleFrameFence, which is where a readback becomes valid. THREE ARMS, run on three
+    // consecutive forced frames:
     //
-    //   CLEAR  (deckArm = false, Atmosphere::referenceRow)
+    //   CLEAR  (kGateClear, Atmosphere::referenceRow, sun 41.34 deg)
     //     PHYSICS    the medium is a real atmosphere     q in the measured clear band, sun% ~ 0.80,
     //                                                    direct-normal ~ 94 klx
     //     NITS       the sky reads in real luminance     zenith 2000-8000 cd/m2, hor/zen 2-4x
     //
-    //   OVERCAST (deckArm = true, Atmosphere::overcastGateRow — row 0's AIR under a full lid)
+    //   OVERCAST (kGateDeck, Atmosphere::overcastGateRow — row 0's AIR under a full lid)
     //     LEVEL      the lid is bright and FLAT          zenith 1000-2000 cd/m2, hor/zen 0.5-2x
     //     LIGHT      the beam dies, the diffuse does not beam <= 5 klx, E_sky 10-25 klx
     //     CONVERGE   the drawn sky meets MW's painted     zenith ~ albedo*E_tot/pi
     //                cloud layer, which nobody tuned
+    //
+    //   HIGH-SUN (kGateHighSun, Atmosphere::referenceRow, sun 78.6 deg — S2l)
+    //     NEAR-SOLAR the zenith, 11.4 deg from the sun,  B/R >= 1
+    //                stays blue
+    //     HOR/ZEN    the aureole's contrast, two-sided   CIE clear skies 0.33-0.70
     //
     // ⚠ THE OVERCAST ARM EXISTS BECAUSE S2 COULD NOT PRODUCE AN OVERCAST AT ALL. Its "~1000-2000
     // cd/m2 flat" row sat in the plan untested for a whole phase, because `cloudCoverage` reached the
@@ -54661,7 +54694,11 @@ void destroyHostWindow(Renderer* R);
     // scene unit would move every absolute lane in the renderer at once under the guise of a sky
     // change ([[project_forge_exposure_couples_every_level]]); fitting E_TOA would turn the whole
     // gate back into the identity it was under Hosek. Report the gap and have the conversation.
-    void atmosReportGate(bool deckArm)
+    // The clear arm's hor/zen, kept for the high-sun arm's CIE cross-check (see scenecal.h). 0 until
+    // the clear arm has reported, which the state machine guarantees happens first.
+    double g_atmosGateClearHorZen = 0.0;
+
+    void atmosReportGate(AtmosGateArm arm)
     {
         const float* rb = g_atmosShLast;
         float Esky[3] = { rb[kAtmosShEsky + 0], rb[kAtmosShEsky + 1], rb[kAtmosShEsky + 2] };
@@ -54669,7 +54706,9 @@ void destroyHostWindow(Renderer* R);
         float zen[3]  = { rb[kAtmosShZenith + 0], rb[kAtmosShZenith + 1], rb[kAtmosShZenith + 2] };
         float hor[3]  = { rb[kAtmosShHorizon + 0], rb[kAtmosShHorizon + 1], rb[kAtmosShHorizon + 2] };
 
-        const double sinE   = std::sin(SceneCal::kRefElevation);
+        const double elev   = (arm == kGateHighSun) ? SceneCal::kRefHighElevation
+                                                    : SceneCal::kRefElevation;
+        const double sinE   = std::sin(elev);
         const double lumSky = (double)SceneCal::luma709(Esky);
         const double lumSun = (double)SceneCal::luma709(Esun);
         const double EtotW  = lumSky + lumSun * sinE;
@@ -54714,8 +54753,54 @@ void destroyHostWindow(Renderer* R);
         const double EoutLx = (lumSky + lumSun * sinE) * 683.0;    // horizontal, at the ground
         const double budget = (EinLx > 1.0e-9) ? (EoutLx / EinLx) : 0.0;
         const bool   okBudget = (budget <= 1.0);
+        const char*  phaseName = (g_atmosMiePhase >= 0.5f) ? "spike+CS" : "HG";
 
-        if (!deckArm) {
+        // ═══ S2l — THE HIGH SUN ══════════════════════════════════════════════════════════════════
+        // The same clear air at 78.6 deg, where the zenith sits 11.4 deg from the sun: THE ZENITH
+        // PROBE IS THE NEAR-SOLAR PROBE HERE, so the washout that refuted atmosMieMul x40 — zenith
+        // (1399, 2128, 4154) -> (20650, 17737, 16926) cd/m2, q 0.058 -> 0.510 — reads directly off
+        // rows that already exist. Two gated rows, both derived before any run:
+        //   BLUE     zenith B/R >= 1: a clear sky 11 deg from the sun is still blue-white, not white
+        //            (Bruneton x1 reads 2.97, the refuted x40 0.82)
+        //   HOR/ZEN  the CIE standard clear skies' own ratio at these two probes (scenecal.h)
+        // and the ENERGY row, which binds every arm. q, the zenith level and the cross-frame hor/zen
+        // ratio are printed, not gated: they have no band that is not a restatement of the two above.
+        if (arm == kGateHighSun) {
+            const double br     = (zenCd[0] > 1.0e-6) ? (zenCd[2] / zenCd[0]) : 0.0;
+            const bool   okBlue = (br >= 1.0);
+            const bool   okHorH = (horOverZen >= SceneCal::kHighHorZenLo
+                                   && horOverZen <= SceneCal::kHighHorZenHi);
+            const bool   allH   = okBlue && okHorH && okRan && okBudget;
+            const double cross  = (g_atmosGateClearHorZen > 1.0e-6)
+                                ? (horOverZen / g_atmosGateClearHorZen) : 0.0;
+            LOG::logline("%s [forge-atmos] gate HIGH-SUN %s @ reference (Clear, albedo %.2f, sun %.2fdeg,"
+                         " zenith %.1fdeg from it, frame %u) | aerosol x%.1f phase %s",
+                         allH ? ">>" : "!!", allH ? "PASS" : "**MISSED**",
+                         SceneCal::kRefAlbedo, elev * 180.0 / SceneCal::kPi,
+                         90.0 - elev * 180.0 / SceneCal::kPi, g_atmosGateFrame,
+                         (double)g_atmosMieMul, phaseName);
+            LOG::logline("%s [forge-atmos] gate HIGH-SUN NEAR-SOLAR: zenith (%.0f, %.0f, %.0f) cd/m2 luma %.0f"
+                         " | B/R %.2f [%s, >= 1.0; Bruneton x1 2.97, refuted x40 0.82]"
+                         " | q_zenith %.4f (x1 0.058, refuted x40 0.510)",
+                         okBlue ? ">>" : "!!", zenCd[0], zenCd[1], zenCd[2], zenLumCd,
+                         br, okBlue ? "OK" : "OUT", q);
+            LOG::logline("%s [forge-atmos] gate HIGH-SUN HOR/ZEN: %.3fx [%s, CIE clear skies %.2f-%.2f]"
+                         " | horizon (%.0f, %.0f, %.0f) luma %.0f | vs the 41deg frame %.3f (CIE 0.21-0.23,"
+                         " printed not gated) | sun%% %.3f | E_sky %.0f lx E_sun %.0f lx",
+                         okHorH ? ">>" : "!!", horOverZen, okHorH ? "OK" : "OUT",
+                         SceneCal::kHighHorZenLo, SceneCal::kHighHorZenHi,
+                         horCd[0], horCd[1], horCd[2], horLumCd, cross,
+                         sunPct, lumSky * 683.0, lumSun * 683.0);
+            LOG::logline("%s [forge-atmos] gate HIGH-SUN ENERGY: %.0f lx reaches the ground against %.0f"
+                         " arriving -> %.1f%% [%s]",
+                         okBudget ? ">>" : "!!", EoutLx, EinLx, budget * 100.0,
+                         okBudget ? "OK" : "**IMPOSSIBLE — energy is being created**");
+            LOG::flush();
+            return;
+        }
+
+        if (arm == kGateClear) {
+            g_atmosGateClearHorZen = horOverZen;
             const bool okQ   = (q >= SceneCal::kQZenithLo && q <= SceneCal::kQZenithHi);
             const bool okSun = (sunPct >= SceneCal::kSunShareLo && sunPct <= SceneCal::kSunShareHi);
             const bool okKlx = (sunKlx >= 80.0 && sunKlx <= 108.0);
@@ -54735,10 +54820,10 @@ void destroyHostWindow(Renderer* R);
             const bool all   = okQ && okSun && okKlx && okZen && okHor && okRan && okBudget;
 
             LOG::logline("%s [forge-atmos] gate %s @ reference (Clear, albedo %.2f, sun %.2fdeg, frame %u)"
-                         " — the beam is a PREDICTION now, not a solve",
+                         " — the beam is a PREDICTION now, not a solve | aerosol x%.1f phase %s",
                          all ? ">>" : "!!", all ? "PASS" : "**MISSED**",
                          SceneCal::kRefAlbedo, SceneCal::kRefElevation * 180.0 / SceneCal::kPi,
-                         g_atmosGateFrame);
+                         g_atmosGateFrame, (double)g_atmosMieMul, phaseName);
             // ⚠ f AND ITS SERIES SUM RIDE THE CLEAR ROW NOW. This arm never printed them: the only
             // f in the log came off the OVERCAST arm at the DECK's altitude, and "clear air runs
             // f~0.05" was an assertion in a shader comment that no run had ever tested. f near the

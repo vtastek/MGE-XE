@@ -65,6 +65,19 @@ namespace SceneCal {
     // extrapolation to either end.
     constexpr double kRefAlbedo    = 0.10;      // Vvardenfell is ash
     constexpr double kRefElevation = 41.34 * kPi / 180.0;
+    // ...and a HIGH sun (S2l), because 41.34 puts the zenith 49 deg from the sun and the aerosol's
+    // forward lobe never reaches it. 78.6 deg is the Sadrith Mora frame that refuted atmosMieMul x40:
+    // the zenith there sits 11.4 deg from the sun, so the gate's own zenith probe IS the near-solar
+    // probe at this elevation and a washout is a number rather than a picture.
+    constexpr double kRefHighElevation = 78.6 * kPi / 180.0;
+    // Its hor/zen band is the CIE STANDARD CLEAR SKIES' (ISO 15469 types 11-14, the four cloudless
+    // distributions, clean to turbid), evaluated at exactly the gate's two probes — the zenith and
+    // 1 deg above the horizon away from the sun. Two-sided by construction: a smeared aureole
+    // brightens the zenith and drives the ratio LOW, too little forward scatter drives it HIGH.
+    // At 41.34 deg the same four types give 1.46-3.31; the ratio of the two frames is 0.21-0.23 for
+    // every type, which the report prints as a cross-check rather than a gate row.
+    constexpr double kHighHorZenLo = 0.33;      // CIE 11 (0.337) / 13 (0.348)
+    constexpr double kHighHorZenHi = 0.70;      // CIE 14 (0.685)
     constexpr double kRefSunShare  = 0.80;      // §0.1's measured clear-sky energy split (MEDIAN)
     // ...and its measured spread, over the same eight clear sunlit HDRIs. ⚠ THE GATE CHECKS AGAINST
     // THE BAND, NOT AGAINST THE MEDIAN +- SOMETHING. A tolerance invented around a median is exactly

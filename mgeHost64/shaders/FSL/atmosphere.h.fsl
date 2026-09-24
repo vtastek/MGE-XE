@@ -193,6 +193,36 @@ float atmosPhaseMie(float cosT, float g)
     den = max(den, 1.0e-6f);
     return ((1.0f - g2) / (4.0f * ATMOS_PI)) / (den * sqrt(den));
 }
+// Cornette-Shanks: HG reshaped by Rayleigh's (1+cos^2), normalised to 1 over the sphere. Its g is a
+// SHAPE parameter, not the asymmetry — <cos> comes out ~0.06 above it (CS 0.604 has <cos> 0.669).
+float atmosPhaseCornetteShanks(float cosT, float g)
+{
+    float g2  = g * g;
+    float den = 1.0f + g2 - 2.0f * g * cosT;
+    den = max(den, 1.0e-6f);
+    return (3.0f / (8.0f * ATMOS_PI)) * (1.0f - g2) * (1.0f + cosT * cosT)
+         / ((2.0f + g2) * den * sqrt(den));
+}
+// ─── THE AEROSOL's PHASE (S2l) ───────────────────────────────────────────────────────────────────
+// ⚠⚠ THE ONE PLACE THE AIR'S MIE LOBE IS DECIDED; the deck keeps atmosPhaseMie with its own g.
+// Single HG at g 0.80 was measured against BHMIE over OPAC's aerosols (mgeHost64/tools/
+// aerosol_phase_fit.py) and it is the wrong SHAPE, not the wrong g: 2.2x too bright 11 deg from the
+// sun (where a 78 deg sun puts the zenith — the x40 washout) and 1.8x too DARK at 49 deg (where the
+// gate's 41 deg sun puts it, so the gate under-read every aerosol it calibrated). No single g fixes
+// both. What does is a smooth Cornette-Shanks BODY plus a sharp HG SPIKE (the diffraction peak):
+//
+//     P = a * HG(cos, gSpike) + (1 - a) * CS(cos, gBody)
+//
+// and the fit says the body is the same for every aerosol measured (g ~0.60); what separates a
+// continental haze (a 0.00) from a wet coarse one (a 0.12) is only how much light is in the spike.
+// ⚠ nightP.w SELECTS: 0 = the single-HG A/B, which evaluates EXACTLY the pre-S2l expression.
+float atmosPhaseAerosol(AtmosphereParams P, float cosT)
+{
+    if (P.nightP.w < 0.5f)
+        return atmosPhaseMie(cosT, P.mieExt.w);
+    return P.nightP.z * atmosPhaseMie(cosT, P.ozone.w)
+         + (1.0f - P.nightP.z) * atmosPhaseCornetteShanks(cosT, P.nightP.y);
+}
 
 // ─── GEOMETRY ────────────────────────────────────────────────────────────────────────────────────
 // Nearest POSITIVE intersection of a ray with a sphere centred on the origin. -1 = no hit ahead.

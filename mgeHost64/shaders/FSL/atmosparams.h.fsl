@@ -18,7 +18,9 @@ STRUCT(AtmosphereParams)
     DATA(float4, rayleigh,  None);  // xyz = beta_R scattering (1/m at sea level), w = scale height (m)
     DATA(float4, mieSca,    None);  // xyz = beta_M SCATTERING (1/m, tinted),      w = scale height (m)
     DATA(float4, mieExt,    None);  // xyz = beta_M EXTINCTION (1/m, grey),        w = HG asymmetry g
-    DATA(float4, ozone,     None);  // xyz = beta_O3 absorption (1/m at the tent's peak), w spare
+                                    //   (read ONLY by the single-HG arm, nightP.w = 0)
+    DATA(float4, ozone,     None);  // xyz = beta_O3 absorption (1/m at the tent's peak),
+                                    // w = the aerosol SPIKE's HG g (S2l; one constant, host-owned)
     DATA(float4, profGeom,  None);  // THE TWO NON-EXPONENTIAL PROFILES' GEOMETRY, metres:
                                     // x = ozone tent centre,      y = ozone tent half-width
                                     // z = cloud deck centre,      w = cloud deck half-thickness
@@ -26,7 +28,11 @@ STRUCT(AtmosphereParams)
     DATA(float4, sunDir,    None);  // xyz = unit vector TOWARD the sun (world, Z up), w = its z
     DATA(float4, solar,     None);  // xyz = E_TOA per primary (W/m^2), w spare
     DATA(float4, moonDir,   None);  // xyz = unit vector TOWARD the moon, w = its E_TOA-equivalent
-    DATA(float4, nightP,    None);  // x = airglow radiance (native), yzw spare
+    DATA(float4, nightP,    None);  // x = airglow radiance (native)
+                                    // ─ THE AEROSOL PHASE (S2l), here only because the row had lanes:
+                                    // y = Cornette-Shanks BODY g, z = SPIKE weight 0..1,
+                                    // w = model: 0 = single HG on mieExt.w (the pre-S2l A/B arm),
+                                    //            1 = spike + body. See atmosPhaseAerosol().
     DATA(float4, marchP,    None);  // x = sky-view steps, y = MS steps, z = MS directions (sqrt),
                                     // w = the DECK's own step budget (S4a; 0 disarms the deck)
     DATA(float4, lutDims,   None);  // xy = sky-view WxH, zw = transmittance WxH
