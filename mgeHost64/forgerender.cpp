@@ -27241,7 +27241,9 @@ namespace {
     // work — same queue, no barriers, and therefore ZERO cost on the hot path when nothing is armed.
     // Self-contained: its own cmd pool / cmd / fence / temp target / readback buffers, all torn down
     // before it returns, following drawTriangleAndVerify()'s idiom rather than reinventing one.
-    void hdrDumpIfArmed() {
+    // viewProj = the matrix THIS frame was rasterised with (renderScene's rzViewProj), written into the
+    // dump's JSON sidecar so a picture carries its own screen geometry (see the sidecar note below).
+    void hdrDumpIfArmed(const float* viewProj) {
         if (!g_hdrDumpArmed) { return; }
         g_hdrDumpArmed = false;   // one shot, and cleared FIRST so no failure path can re-arm it
 
@@ -27452,6 +27454,42 @@ namespace {
                          exrPath, W, H, exrOK ? "ok" : "FAILED", tgaOK ? "ok" : "FAILED",
                          E, wx, hostNowMs() - t0);
             LOG::flush();
+
+            // ─── THE SIDECAR: the camera this picture was taken with (tasks/forge-atmosphere.md S3.0) ──
+            // A fog measurement needs to know where the eye's horizontal plane, the world's edge and the
+            // sun fall ON THIS IMAGE: "the horizon line follows the eye" is a claim about a screen row.
+            // Rather than decide those rows here (every definition of "the world's edge" is a choice),
+            // the RAW inputs ride beside the picture and mgeHost64/tools/fogprobe.py derives the rows.
+            // A file and not only the log line, because the host log is truncated at every start and a
+            // dump outlives it.
+            //   viewProj — D3D row-vector convention: clip = [x y z 1] * M, with the position RELATIVE to
+            //              eyeAbs (the payload is camera-relative); includes this frame's half-pixel and
+            //              jitter, i.e. exactly what rasterised the image. A direction (w = 0) projects
+            //              through the rotation rows alone.
+            //   toSun    — -FrameData.sunDir (MW's light, aimed at the disc; see aimSunLightAtDisc).
+            //   fog      — FrameData.fogParams.xy, MW's near fog start/end in world units.
+            // One-shot reads of the write-combined frame cbuffer: slow, correct, and paid once per dump.
+            char jsonPath[MAX_PATH] = {};
+            std::snprintf(jsonPath, sizeof(jsonPath), "hdrdump\\mge_%04u.json", s_next);
+            if (FILE* jf = std::fopen(jsonPath, "w")) {
+                const float* fdr = (g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress)
+                                 ? (const float*)g_live.pFrameCbv->pCpuMappedAddress : nullptr;
+                std::fprintf(jf, "{\n  \"exr\": \"mge_%04u.exr\",\n  \"render\": [%u, %u],\n", s_next, W, H);
+                std::fprintf(jf, "  \"viewProjConvention\": \"row-vector clip=[x y z 1]*M, pos relative to eyeAbs\",\n");
+                std::fprintf(jf, "  \"viewProj\": [");
+                for (int i = 0; i < 16; ++i) {
+                    std::fprintf(jf, "%s%.9g", i ? ", " : "", viewProj ? (double)viewProj[i] : 0.0);
+                }
+                std::fprintf(jf, "],\n  \"eyeAbs\": [%.3f, %.3f, %.3f],\n",
+                             (double)g_eyeAbsShadow[0], (double)g_eyeAbsShadow[1], (double)g_eyeAbsShadow[2]);
+                if (fdr) {
+                    std::fprintf(jf, "  \"toSun\": [%.6f, %.6f, %.6f],\n  \"fog\": [%.1f, %.1f],\n",
+                                 -(double)fdr[16], -(double)fdr[17], -(double)fdr[18],
+                                 (double)fdr[32], (double)fdr[33]);
+                }
+                std::fprintf(jf, "  \"weather\": \"%s\",\n  \"E\": %.6f\n}\n", wx, (double)E);
+                std::fclose(jf);
+            }
 
             if (pHdrRb) { removeResource(pHdrRb); }
             if (pLdrRb) { removeResource(pLdrRb); }
@@ -43565,7 +43603,7 @@ void destroyHostWindow(Renderer* R);
             g_dumpAtFrame = 0.0f;
             armHdrDump();
         }
-        hdrDumpIfArmed();
+        hdrDumpIfArmed(rzViewProj);
         // Tier 1: NO fence wait here — the wait moved to the top of the NEXT renderScene
         // (settleFrameFence). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
         // queue-ordered behind the frame we just submitted. That signal is the client's only proof
