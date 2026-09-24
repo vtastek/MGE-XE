@@ -973,7 +973,10 @@ namespace {
     // under HG, which under-reads a real aerosol by 1.8x at the gate's 49 deg and over-reads it by
     // 2.2x at 11 deg, so a mieMul measured under one phase says nothing about the other. Swept as a
     // pair (tasks/forge-atmosphere.md S2l). A float because the knob table is.
-    float g_atmosMiePhase = 0.0f;
+    // DEFAULT 1 since 2026-09-24, together with x30 folded into kMieScatterSeaLevel (S3.1): the pair
+    // the sweep passed on every gate row and the user chose from the pictures. 0 is the A/B arm, and
+    // only means the old sky together with atmosMieMul 1/30.
+    float g_atmosMiePhase = 1.0f;
 
     // A UNIFORM multiplier on the OZONE column, applied in the same one place. See the long note at
     // its use in atmosphere.h: ozone is the only term in the medium that makes a sky LESS GREEN

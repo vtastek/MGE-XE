@@ -122,7 +122,16 @@ namespace Atmosphere {
     // [[feedback_the_standin_was_doing_the_real_job]] in reverse: here the physically-correct number
     // was the one the picture rejected, and the gate could not see it because its ONE sun angle
     // never puts the zenith near the sun.
-    constexpr float kMieScatterSeaLevel  = 3.996e-6f;   // 1/m  (Bruneton; x40 measured, see above)
+    //
+    // ⚠⚠ FOLDED 2026-09-24: x30, UNDER THE S2l PHASE (spike + Cornette-Shanks, atmosMiePhase 1).
+    // The phase function WAS the blocker, as the note above said. With a phase fitted to BHMIE over
+    // real aerosols, the S2l P3 sweep found x30 the ONLY optical depth that passes every row of both
+    // clear frames (the 41.34 deg gate and the 78.6 deg Sadrith Mora frame); the window is ~x29-31,
+    // and Koschmieder puts Clear at 49 km, inside the 20-50 km cross-check. The user chose it from the
+    // pictures (hdrdump/pics/s31-ebonheart, S3.1: "more dramatic, as it should be") over the deep-blue
+    // x1. It is also the medium S3's aerial perspective will put on the ground, so this sets the look
+    // of both. Bruneton's 3.996e-6 x 30. A/B: atmosMieMul 0.0333 + atmosMiePhase 0 = the old sky.
+    constexpr float kMieScatterSeaLevel  = 3.996e-6f * 30.0f;   // 1/m  (Bruneton x30, S2l/S3.1)
     constexpr float kMieHeightKm         = 1.2f;
     constexpr float kMieAbsorbFractionClear = 0.10f;    // 1 - single-scattering albedo
     // The aerosol's diffraction SPIKE (S2l). One constant for every weather because free fits put it
@@ -894,8 +903,9 @@ namespace Atmosphere {
         // kMieScatterSeaLevel: the gate's single 41 deg sun cannot see the solar aureole, and at a
         // 78 deg sun x40 turned the zenith white. So this is back to being the SWEEP HANDLE, and the
         // value that survives is still not known — it is blocked on the aerosol PHASE FUNCTION, not
-        // on more sweeping. 1.0 is Bruneton's coefficient (what ships); 40 is the arm the gate
-        // prefers and the camera does not. [[project_forge_no_ini_flips]]
+        // on more sweeping. [[project_forge_no_ini_flips]]
+        // ⚠ RESOLVED 2026-09-24: the S2l phase unblocked it and x30 is folded into kMieScatterSeaLevel
+        // (see there). This is the A/B arm again: 1.0 = what ships (x30), 1/30 = Bruneton.
         const float mieBase = kMieScatterSeaLevel * std::max(0.0f, p.mieScale)
                             * std::max(0.0f, mieScaleMul);
         const float ssa     = 1.0f - std::max(0.0f, std::min(0.999f, p.mieAbsorption));
