@@ -4959,6 +4959,19 @@ namespace {
     // to 0 as the fragment reaches the knee, where the snapshot takes over and the two must agree
     // exactly. 0 = the per-direction target unlifted (the first S2j build).
     float              g_fogHazeLiftDeg  = 4.0f;
+    // THE SUN FLOOR, degrees (skydome.h.fsl fogHazeSunFloor). The haze target is the medium's sky in
+    // the fragment's direction, and toward the sun that sky holds the aerosol forward lobe. An opaque
+    // fragment near the sun's direction stands between the eye and the sun, so the air in front of
+    // it lies in its own shadow along those rays and scatters no sunlight: the lobe on a surface is a
+    // LEAK — reported as a round sun halo on a dark cabin wall with the sun behind it, shrinking when
+    // the aerosol phase narrowed. The target's angle to the sun is floored smoothly at this value
+    // (elevation kept; only the azimuth moves). Unramped: the shadow argument holds at any distance,
+    // and the knee's share is what brings the sky, lobe and all, back as the fog saturates.
+    // 0 = the unfloored target (the A/B). Packed with the lift into skyZenith.z, so whole degrees.
+    // 90 by the user's eye (2026-09-24): lower values left a soft sun-side glow on near objects,
+    // 90 "looks natural and gets rid of the sun spot". Interim until S3's aerial perspective
+    // replaces the whole haze-target apparatus (tasks/forge-atmosphere.md).
+    float              g_fogHazeSunFloorDeg = 90.0f;
     // THE NEAR HAZE, density per world unit. MW's ramp is exactly clear inside fogStart — ~490 m in
     // clear weather at 16 cells — so the whole near and middle field has no air in it, reported as
     // "close fog being ignored". A Beer-Lambert term from the EYE fills that dead zone without
@@ -22032,6 +22045,7 @@ namespace {
             { "upscaleAntiRing",    &g_upscaleAntiRing    },
             { "fogSkyKnee",         &g_fogSkyKnee         },
             { "fogHazeLiftDeg",     &g_fogHazeLiftDeg     },
+            { "fogHazeSunFloorDeg", &g_fogHazeSunFloorDeg },
             { "fogNearHaze",        &g_fogNearHaze        },
             { "atmosCacheDeg",      &g_atmosCacheDeg      },
             { "atmosCacheAltM",     &g_atmosCacheAltM     },
@@ -25073,6 +25087,10 @@ namespace {
           // weather; 0 = the unlifted per-direction target.
           t.sliderF("Fog: haze LIFT, deg (hides the horizon band on near objects)",
                     &g_fogHazeLiftDeg, 0.0f, 20.0f, 0.5f);
+          // The sun's forward lobe off fogged surfaces (the "halo on a dark cabin with the sun behind
+          // it" leak). Whole degrees — it shares the lift's lane. 0 = the unfloored target (A/B).
+          t.sliderF("Fog: haze SUN FLOOR, deg (keeps the sun's glow off fogged surfaces)",
+                    &g_fogHazeSunFloorDeg, 0.0f, 90.0f, 1.0f);
           // ⚠ THE NEAR FIELD. MW's ramp is perfectly clear inside fogStart (~490 m in clear weather
           // at 16 cells), so nothing between the camera and the middle distance has any air in front
           // of it. This is a Beer-Lambert haze from the eye that fills that dead zone; it multiplies
@@ -34271,9 +34289,13 @@ void destroyHostWindow(Renderer* R);
                            ? g_skyPhys.sceneScale : 0.0f;
             fd[68] = g_fogHazeScale;
             fd[69] = 0.0f;
-            // z = sin(the near-field haze lift): the minimum elevation a NEAR fragment's target is read
-            // at, ramped to 0 at the knee in the shader. Clamped to a sane range; 0 = unlifted.
-            fd[70] = std::sin(std::max(0.0f, std::min(g_fogHazeLiftDeg, 45.0f))
+            // z = TWO values in one lane (FrameData is full at 512 B, and this lane already reaches
+            // every view copy): the WHOLE part is the haze sun floor in degrees, the FRACTION is
+            // sin(the near-field haze lift) — the minimum elevation a NEAR fragment's target is read
+            // at, ramped to 0 at the knee in the shader. The lift is clamped to 45 deg, so its sine
+            // stays < 1 and cannot carry into the whole part. 0 = unlifted and unfloored.
+            fd[70] = std::floor(std::max(0.0f, std::min(g_fogHazeSunFloorDeg, 90.0f)))
+                   + std::sin(std::max(0.0f, std::min(g_fogHazeLiftDeg, 45.0f))
                               * (float)(SceneCal::kPi / 180.0));
             if (g_skyPhys.active) {
                 const float w = std::max(0.0f, std::min(1.0f, g_skyPhysBlend)) * g_skyPhys.nightRamp;

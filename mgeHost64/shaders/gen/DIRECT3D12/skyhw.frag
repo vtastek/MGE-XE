@@ -2091,7 +2091,25 @@ float3 atmosHorizonDirSameAngle(float3 d)
     float sphi = sqrt(max(0.0f, 1.0f - cphi * cphi)) * ((dot(dH, side) < 0.0f) ? -1.0f : 1.0f);
     return sh * cphi + side * sphi;
 }
-#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
+#line 112 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
+float3 atmosSunFloorDir(float3 d, float thetaF)
+{
+    if (!(thetaF > 0.0f)) { return d; }
+    float3 s = gAtmosParams.sunDir.xyz;
+    float sH = sqrt(max(0.0f, 1.0f - s.z * s.z));
+    float dHl = sqrt(max(0.0f, 1.0f - d.z * d.z));
+    float den = sH * dHl;
+    if (!(den > 1.0e-4f)) { return d; }
+    float th = acos(clamp(dot(d, s), -1.0f, 1.0f));
+    float thF = min(sqrt(th * th + thetaF * thetaF), 3.14159265f);
+    float cphi = clamp((cos(thF) - d.z * s.z) / den, -1.0f, 1.0f);
+    float sphi = sqrt(max(0.0f, 1.0f - cphi * cphi));
+    float3 sh = float3(s.x, s.y, 0.0f) / sH;
+    float3 side = float3(-sh.y, sh.x, 0.0f);
+    if (dot(float3(d.x, d.y, 0.0f), side) < 0.0f) { sphi = -sphi; }
+    return float3((sh * cphi + side * sphi).xy * dHl, d.z);
+}
+#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
 float3 atmosSunBeamAt(float r)
 {
     float mu = gAtmosParams.sunDir.w;

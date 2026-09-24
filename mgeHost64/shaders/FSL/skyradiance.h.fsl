@@ -93,6 +93,40 @@ float3 atmosHorizonDirSameAngle(float3 d)
     return sh * cphi + side * sphi;
 }
 
+// THE SUN FLOOR: the unit direction at the SAME elevation as unit `d` whose angle to the sun is
+// sqrt(theta^2 + thetaF^2) instead of theta. For fogHazeTarget (skydome.h.fsl), which must not hand
+// an opaque surface the aerosol forward lobe: a fragment near the sun's direction stands between the
+// eye and the sun, so the air in front of it is in its own shadow along those rays. See the host's
+// g_fogHazeSunFloorDeg for the report this closes.
+//
+// Three choices, each against a specific artifact:
+//   - ELEVATION IS KEPT and only the azimuth to the sun moves. Rotating in the (d, sun) plane instead
+//     sends a direction just left of the sun to the left of the ring and one just right to the right,
+//     and the ring's radiance varies with elevation — a pinwheel squeezed into the sun's disc. The
+//     LUT is symmetric in the azimuth's sign, so the two sides of the sun's vertical plane sample the
+//     same value at the centre: no seam. (It also keeps the near-field lift's elevation guarantee.)
+//   - THE FLOOR IS SMOOTH, sqrt(theta^2 + thetaF^2), not max(theta, thetaF). A hard floor is a
+//     constant plateau inside a gradient, and the kink draws a ring round the sun.
+//   - Where no azimuth can reach the angle (sun or ray near the zenith), it clamps to the farthest
+//     one, anti-sun. thetaF <= 0 returns d untouched — the A/B is exact.
+float3 atmosSunFloorDir(float3 d, float thetaF)
+{
+    if (!(thetaF > 0.0f)) { return d; }
+    float3 s   = gAtmosParams.sunDir.xyz;
+    float  sH  = sqrt(max(0.0f, 1.0f - s.z * s.z));
+    float  dHl = sqrt(max(0.0f, 1.0f - d.z * d.z));
+    float  den = sH * dHl;
+    if (!(den > 1.0e-4f)) { return d; }                 // sun or ray at the zenith: azimuth is moot
+    float  th  = acos(clamp(dot(d, s), -1.0f, 1.0f));
+    float  thF = min(sqrt(th * th + thetaF * thetaF), 3.14159265f);
+    float  cphi = clamp((cos(thF) - d.z * s.z) / den, -1.0f, 1.0f);
+    float  sphi = sqrt(max(0.0f, 1.0f - cphi * cphi));
+    float3 sh   = float3(s.x, s.y, 0.0f) / sH;
+    float3 side = float3(-sh.y, sh.x, 0.0f);
+    if (dot(float3(d.x, d.y, 0.0f), side) < 0.0f) { sphi = -sphi; }
+    return float3((sh * cphi + side * sphi).xy * dHl, d.z);
+}
+
 // THE SUN'S BEAM ON A HORIZONTAL SURFACE AT RADIUS r, per primary, native W/m^2 (S2j / sunsets).
 // sky.frag's cloud layer is lit by this at the DECK's altitude instead of by the ground's E_total.
 // At sunset the ground loses its direct beam first; a deck 1-2 km up is still in it, reddened, and

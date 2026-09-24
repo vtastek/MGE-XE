@@ -142,7 +142,25 @@ float3 fogHazeTarget(float3 worldPosRel, float fogAir)
     // ground there is NEAR (full lift) and every bearing meets at the nadir, so each pixel took the
     // sun-side-or-not haze of its compass direction. See atmosHorizonDirSameAngle.
     if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
-    dir.z = max(dir.z, gFrameData.skyZenith.z * nearW);
+    // skyZenith.z packs two knobs (FrameData is full): whole part = the sun floor in degrees,
+    // fraction = sin(lift). The host clamps the lift to 45 deg so the fraction never carries.
+    float floorDeg = floor(gFrameData.skyZenith.z);
+    float sinLift  = gFrameData.skyZenith.z - floorDeg;
+    dir.z = max(dir.z, sinLift * nearW);
+    // ⚠ THE SUN FLOOR, AFTER THE LIFT (it keeps elevation, so the lift's floor survives it) and
+    // UNRAMPED: the fragment shadows the air in front of it along sun-ward rays at any distance, so
+    // the lobe is a leak at every depth. The knee's share is what brings the sky back, lobe and all,
+    // as the fog saturates and the surface stops being seen.
+    // ⚠ The lifted dir is not unit, and it must NOT be normalised: the LUT reads dir.z AS the zenith
+    // cosine (atmosSkyViewUvFromDir), so normalising would lower the lift. Build the unit vector with
+    // that same z and the same bearing instead; the floor then keeps it, and the lift with it.
+    if (floorDeg > 0.0f)
+    {
+        float  mu  = clamp(dir.z, -1.0f, 1.0f);
+        float2 hz  = dir.xy * rsqrt(max(dot(dir.xy, dir.xy), 1.0e-12f));
+        float3 dU  = float3(hz * sqrt(max(0.0f, 1.0f - mu * mu)), mu);
+        dir = atmosSunFloorDir(dU, radians(floorDeg));
+    }
     return atmosSkyRadianceNative(dir, gAtmosParams.planet.w) * scale;
 }
 
