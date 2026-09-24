@@ -1290,7 +1290,9 @@ STRUCT(AtmosphereParams)
     float4 rayleigh;
     float4 mieSca;
     float4 mieExt;
+
     float4 ozone;
+
     float4 profGeom;
 
 
@@ -1299,18 +1301,22 @@ STRUCT(AtmosphereParams)
     float4 solar;
     float4 moonDir;
     float4 nightP;
+
+
+
+
     float4 marchP;
 
     float4 lutDims;
     float4 lutDims2;
-#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 cloud;
-#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 deckMsA;
     float4 deckMsB;
-#line 101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 107 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 deckMix;
-#line 102
+#line 108
 };
 #line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

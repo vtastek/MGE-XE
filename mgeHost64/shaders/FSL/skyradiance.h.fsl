@@ -36,13 +36,61 @@
 // Clamped in UV, not in angle: Hillaire's v axis splits at the camera's own horizon at exactly
 // uv.y = 0.5 whatever the altitude, so the top sky row's centre is 0.5 - 0.5/H (H even; 108 ships).
 // Clamping to a texel CENTRE keeps the bilinear tap off the ground row entirely.
+//
+// ⚠⚠ AND THE RING IS ENTERED AT THE SAME SCATTERING ANGLE, NOT THE SAME AZIMUTH (the "fan fog").
+// Keeping the ray's own azimuth made every direction below the ring melt toward the horizon haze of
+// its compass bearing, and all bearings meet at the NADIR: looking straight down in ash, the fog
+// fanned out from the point under the camera, sun-side horizon on one side, anti-sun on the other.
+// A saturated haze's radiance depends on the angle to the SUN (the phase function), not on the
+// bearing. A horizontal ray toward the sun sits a few degrees from it; a vertical one sits at
+// 90 deg + elevation on every bearing. So the ring's azimuth is solved from
+//     cos(theta) = muRow*muS + sqrt(1-muRow^2) sqrt(1-muS^2) cos(phi)
+// with theta the real ray's scattering angle and muRow the clamped row's own zenith cosine. That is
+// the identity AT the row (no new seam where the clamp begins), and at the nadir it is one value for
+// every bearing, which is what removes the fan. A theta the ring cannot reach (sun far below, or
+// overhead) clamps to the nearest bearing that it can.
 float3 atmosSkyRadianceNative(float3 dir, float r)
 {
     float2 uv   = atmosSkyViewUvFromDir(gAtmosParams, r, dir);
-    uv.y = min(uv.y, 0.5f - 0.5f / max(gAtmosParams.lutDims.y, 2.0f));
+    float  vRow = 0.5f - 0.5f / max(gAtmosParams.lutDims.y, 2.0f);
+    if (uv.y > vRow)
+    {
+        uv.y = vRow;
+        float muRow, unusedLvc;
+        atmosSkyViewParams(gAtmosParams, float2(0.5f, vRow), r, muRow, unusedLvc);
+        float3 toSun = gAtmosParams.sunDir.xyz;
+        float3 d     = dir * rsqrt(max(dot(dir, dir), 1.0e-12f));   // fog's lifted dir is not unit
+        float  den   = sqrt(max(0.0f, 1.0f - muRow * muRow))
+                     * sqrt(max(0.0f, 1.0f - toSun.z * toSun.z));
+        float  lvc   = (den > 1.0e-6f)
+                     ? clamp((dot(d, toSun) - muRow * toSun.z) / den, -1.0f, 1.0f) : 1.0f;
+        uv.x = atmosSkyViewUv(gAtmosParams, r, muRow, lvc).x;
+    }
     float3 Lgap = SampleLvlTex2D(gAtmosSkyViewClear, gSamplerBilinearClamp, uv, 0).rgb;
     float3 Lmix = SampleLvlTex2D(gAtmosSkyView,      gSamplerBilinearClamp, uv, 0).rgb;
     return max(lerp(Lgap, Lmix, saturate(gAtmosParams.deckMix.z)), f3(0.0f));
+}
+
+// The unit direction ON THE GEOMETRIC HORIZON (z = 0) that sits at the same angle to the sun as the
+// unit direction `d` — the bearing-free key the note above explains. For the fog's near-field lift
+// (skydome.h.fsl), which raises a downward ray above the horizon and would otherwise carry the ray's
+// own bearing up with it: that path, not the clamp, is what the ground right under the camera takes,
+// so it needs the same key or the nadir still fans. The identity for any d already on the horizon,
+// so the lift stays continuous where it starts. The side of the sun's vertical plane is kept; the
+// LUT is symmetric in it, so which side is only a matter of keeping the vector continuous.
+float3 atmosHorizonDirSameAngle(float3 d)
+{
+    float3 s   = gAtmosParams.sunDir.xyz;
+    float  sH  = sqrt(max(0.0f, 1.0f - s.z * s.z));
+    float3 dH  = float3(d.x, d.y, 0.0f);
+    float  dHl = length(dH);
+    if (!(sH > 1.0e-4f))    // sun overhead: every bearing is the same angle from it
+        return (dHl > 1.0e-6f) ? (dH / dHl) : float3(1.0f, 0.0f, 0.0f);
+    float3 sh   = float3(s.x, s.y, 0.0f) / sH;
+    float3 side = float3(-sh.y, sh.x, 0.0f);
+    float  cphi = clamp(dot(d, s) / sH, -1.0f, 1.0f);
+    float  sphi = sqrt(max(0.0f, 1.0f - cphi * cphi)) * ((dot(dH, side) < 0.0f) ? -1.0f : 1.0f);
+    return sh * cphi + side * sphi;
 }
 
 // THE SUN'S BEAM ON A HORIZONTAL SURFACE AT RADIUS r, per primary, native W/m^2 (S2j / sunsets).

@@ -137,6 +137,11 @@ float3 fogHazeTarget(float3 worldPosRel, float fogAir)
     float3 dir = ray * rsqrt(max(dot(ray, ray), 1.0e-12f));
     float knee = clamp(gFrameData.froxelZ.z, 1.0e-3f, 0.999f);   // fogSkyShare's own lane
     float nearW = 1.0f - saturate((1.0f - fogAir) / knee);       // 1 at the eye, 0 at the knee
+    // ⚠ A DOWNWARD RAY IS FIRST MOVED TO THE HORIZON BEARING WITH ITS OWN ANGLE TO THE SUN, then
+    // lifted. Lifting it with its own bearing fanned the fog out from the point under the camera: the
+    // ground there is NEAR (full lift) and every bearing meets at the nadir, so each pixel took the
+    // sun-side-or-not haze of its compass direction. See atmosHorizonDirSameAngle.
+    if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
     dir.z = max(dir.z, gFrameData.skyZenith.z * nearW);
     return atmosSkyRadianceNative(dir, gAtmosParams.planet.w) * scale;
 }

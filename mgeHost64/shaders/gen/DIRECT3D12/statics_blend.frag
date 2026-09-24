@@ -1290,7 +1290,9 @@ STRUCT(AtmosphereParams)
     float4 rayleigh;
     float4 mieSca;
     float4 mieExt;
+
     float4 ozone;
+
     float4 profGeom;
 
 
@@ -1299,18 +1301,22 @@ STRUCT(AtmosphereParams)
     float4 solar;
     float4 moonDir;
     float4 nightP;
+
+
+
+
     float4 marchP;
 
     float4 lutDims;
     float4 lutDims2;
-#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 cloud;
-#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 deckMsA;
     float4 deckMsB;
-#line 101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 107 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 deckMix;
-#line 102
+#line 108
 };
 #line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2927,6 +2933,24 @@ float atmosPhaseMie(float cosT, float g)
 }
 
 
+float atmosPhaseCornetteShanks(float cosT, float g)
+{
+    float g2 = g * g;
+    float den = 1.0f + g2 - 2.0f * g * cosT;
+    den = max(den, 1.0e-6f);
+    return (3.0f / (8.0f *  3.14159265358979323846f )) * (1.0f - g2) * (1.0f + cosT * cosT)
+         / ((2.0f + g2) * den * sqrt(den));
+}
+#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+float atmosPhaseAerosol(AtmosphereParams P, float cosT)
+{
+    if (P.nightP.w < 0.5f)
+        return atmosPhaseMie(cosT, P.mieExt.w);
+    return P.nightP.z * atmosPhaseMie(cosT, P.ozone.w)
+         + (1.0f - P.nightP.z) * atmosPhaseCornetteShanks(cosT, P.nightP.y);
+}
+
+
 
 
 
@@ -2949,7 +2973,7 @@ float atmosHorizonCos(float r, float Rg)
     float s = Rg / max(r, 1.0f);
     return -sqrt(max(0.0f, 1.0f - s * s));
 }
-#line 249 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 bool atmosDeckSpan(AtmosphereParams P, float3 ro, float3 rd, float tMax,
                    out(float) tIn, out(float) tOut)
 {
@@ -3132,11 +3156,11 @@ void atmosMultiScatterParams(AtmosphereParams P, float2 uv, out(float) r, out(fl
     float xS = atmosUnitFromUv(uv.x, P.lutDims2.x);
     float xR = atmosUnitFromUv(uv.y, P.lutDims2.y);
     muSun = clamp(saturate(xS) * 2.0f - 1.0f, -1.0f, 1.0f);
-#line 455 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 485 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
     float rGround = P.planet.x +  10.0f ;
     r = max(rGround, P.planet.x + saturate(xR) * (P.planet.y - P.planet.x));
 }
-#line 470 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 500 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 void atmosSkyViewParams(AtmosphereParams P, float2 uv, float r,
                         out(float) viewZenithCos, out(float) lightViewCos)
 {
@@ -3212,16 +3236,51 @@ float2 atmosSkyViewUvFromDir(AtmosphereParams P, float r, float3 dir)
 }
 #line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
-#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
 float3 atmosSkyRadianceNative(float3 dir, float r)
 {
     float2 uv = atmosSkyViewUvFromDir(gAtmosParams, r, dir);
-    uv.y = min(uv.y, 0.5f - 0.5f / max(gAtmosParams.lutDims.y, 2.0f));
+    float vRow = 0.5f - 0.5f / max(gAtmosParams.lutDims.y, 2.0f);
+    if (uv.y > vRow)
+    {
+        uv.y = vRow;
+        float muRow, unusedLvc;
+        atmosSkyViewParams(gAtmosParams, float2(0.5f, vRow), r, muRow, unusedLvc);
+        float3 toSun = gAtmosParams.sunDir.xyz;
+        float3 d = dir * rsqrt(max(dot(dir, dir), 1.0e-12f));
+        float den = sqrt(max(0.0f, 1.0f - muRow * muRow))
+                     * sqrt(max(0.0f, 1.0f - toSun.z * toSun.z));
+        float lvc = (den > 1.0e-6f)
+                     ? clamp((dot(d, toSun) - muRow * toSun.z) / den, -1.0f, 1.0f) : 1.0f;
+        uv.x = atmosSkyViewUv(gAtmosParams, r, muRow, lvc).x;
+    }
     float3 Lgap = SampleLvlTex2D(gAtmosSkyViewClear, gSamplerBilinearClamp, uv, 0).rgb;
     float3 Lmix = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, uv, 0).rgb;
     return max(lerp(Lgap, Lmix, saturate(gAtmosParams.deckMix.z)), f3(0.0f));
 }
-#line 61 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
+
+
+
+
+
+
+
+
+float3 atmosHorizonDirSameAngle(float3 d)
+{
+    float3 s = gAtmosParams.sunDir.xyz;
+    float sH = sqrt(max(0.0f, 1.0f - s.z * s.z));
+    float3 dH = float3(d.x, d.y, 0.0f);
+    float dHl = length(dH);
+    if (!(sH > 1.0e-4f))
+        return (dHl > 1.0e-6f) ? (dH / dHl) : float3(1.0f, 0.0f, 0.0f);
+    float3 sh = float3(s.x, s.y, 0.0f) / sH;
+    float3 side = float3(-sh.y, sh.x, 0.0f);
+    float cphi = clamp(dot(d, s) / sH, -1.0f, 1.0f);
+    float sphi = sqrt(max(0.0f, 1.0f - cphi * cphi)) * ((dot(dH, side) < 0.0f) ? -1.0f : 1.0f);
+    return sh * cphi + side * sphi;
+}
+#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
 float3 atmosSunBeamAt(float r)
 {
     float mu = gAtmosParams.sunDir.w;
@@ -3247,10 +3306,15 @@ float3 fogHazeTarget(float3 worldPosRel, float fogAir)
     float3 dir = ray * rsqrt(max(dot(ray, ray), 1.0e-12f));
     float knee = clamp(gFrameData.froxelZ.z, 1.0e-3f, 0.999f);
     float nearW = 1.0f - saturate((1.0f - fogAir) / knee);
+
+
+
+
+    if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
     dir.z = max(dir.z, gFrameData.skyZenith.z * nearW);
     return atmosSkyRadianceNative(dir, gAtmosParams.planet.w) * scale;
 }
-#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 163 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 float3 fogSkyTarget(float4 s, float skyShare, float3 haze)
 {
     float3 mw = gFrameData.fogColNear.rgb;
@@ -3258,7 +3322,7 @@ float3 fogSkyTarget(float4 s, float skyShare, float3 haze)
     float3 sky = s.rgb + haze * (1.0f - s.a);
     return lerp(mw, sky, w * skyShare) + (haze - mw) * (w * (1.0f - skyShare));
 }
-#line 208 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 float fogSkyShare(float fogAir)
 {
 
@@ -3284,13 +3348,13 @@ float3 fogSkyColorAt(float2 pixelXy, float fogAir, float3 worldPosRel)
 {
     return fogSkyTarget(fogSkySample(pixelXy), fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir));
 }
-#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 262 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 float fogExtinction(float fogAir, float skyBehind)
 {
     float ramp = pow(1.0f - fogAir, gFrameData.timeParams.w);
     return 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
 }
-#line 274 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 {
     float4 s = fogSkySample(pixelXy);
@@ -3309,14 +3373,14 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 
 
     fog = saturate(fog);
-#line 362 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 367 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float fogAir = mwFogAirShare(fog, wf.y, length(worldPosRel));
-#line 388 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 393 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     if (waterCameraSubmerged()) { fogAir = 1.0f; }
-#line 422 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 427 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
     float skyBehind = max(s.a, saturate(upness *  38.0f ));
-#line 479 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 484 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float3 behind = waterFogComposite(lit, worldPosRel, wf);
 
 

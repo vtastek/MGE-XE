@@ -984,7 +984,9 @@ STRUCT(AtmosphereParams)
     float4 rayleigh;
     float4 mieSca;
     float4 mieExt;
+
     float4 ozone;
+
     float4 profGeom;
 
 
@@ -993,18 +995,22 @@ STRUCT(AtmosphereParams)
     float4 solar;
     float4 moonDir;
     float4 nightP;
+
+
+
+
     float4 marchP;
 
     float4 lutDims;
     float4 lutDims2;
-#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 cloud;
-#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 deckMsA;
     float4 deckMsB;
-#line 101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+#line 107 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 deckMix;
-#line 102
+#line 108
 };
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.srt.h"
 
@@ -1126,6 +1132,24 @@ float atmosPhaseMie(float cosT, float g)
 }
 
 
+float atmosPhaseCornetteShanks(float cosT, float g)
+{
+    float g2 = g * g;
+    float den = 1.0f + g2 - 2.0f * g * cosT;
+    den = max(den, 1.0e-6f);
+    return (3.0f / (8.0f *  3.14159265358979323846f )) * (1.0f - g2) * (1.0f + cosT * cosT)
+         / ((2.0f + g2) * den * sqrt(den));
+}
+#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+float atmosPhaseAerosol(AtmosphereParams P, float cosT)
+{
+    if (P.nightP.w < 0.5f)
+        return atmosPhaseMie(cosT, P.mieExt.w);
+    return P.nightP.z * atmosPhaseMie(cosT, P.ozone.w)
+         + (1.0f - P.nightP.z) * atmosPhaseCornetteShanks(cosT, P.nightP.y);
+}
+
+
 
 
 
@@ -1148,7 +1172,7 @@ float atmosHorizonCos(float r, float Rg)
     float s = Rg / max(r, 1.0f);
     return -sqrt(max(0.0f, 1.0f - s * s));
 }
-#line 249 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 bool atmosDeckSpan(AtmosphereParams P, float3 ro, float3 rd, float tMax,
                    out(float) tIn, out(float) tOut)
 {
@@ -1331,11 +1355,11 @@ void atmosMultiScatterParams(AtmosphereParams P, float2 uv, out(float) r, out(fl
     float xS = atmosUnitFromUv(uv.x, P.lutDims2.x);
     float xR = atmosUnitFromUv(uv.y, P.lutDims2.y);
     muSun = clamp(saturate(xS) * 2.0f - 1.0f, -1.0f, 1.0f);
-#line 455 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 485 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
     float rGround = P.planet.x +  10.0f ;
     r = max(rGround, P.planet.x + saturate(xR) * (P.planet.y - P.planet.x));
 }
-#line 470 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 500 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 void atmosSkyViewParams(AtmosphereParams P, float2 uv, float r,
                         out(float) viewZenithCos, out(float) lightViewCos)
 {
@@ -1456,7 +1480,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         int steps = (int)max(gAtmosParams.marchP.x, 8.0f);
 
         float phaseR = atmosPhaseRayleigh(cosTheta);
-        float phaseM = atmosPhaseMie(cosTheta, gAtmosParams.mieExt.w);
+        float phaseM = atmosPhaseAerosol(gAtmosParams, cosTheta);
 
 
 
@@ -1541,10 +1565,10 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                     moonT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, muv, 0).rgb;
                 }
                 sunInC += (scaR * atmosPhaseRayleigh(cosM)
-                         + scaM * atmosPhaseMie(cosM, gAtmosParams.mieExt.w))
+                         + scaM * atmosPhaseAerosol(gAtmosParams, cosM))
                         * moonT * gAtmosParams.moonDir.w;
                 sunIn += (scaR * atmosPhaseRayleigh(cosM)
-                         + scaM * atmosPhaseMie(cosM, gAtmosParams.mieExt.w)
+                         + scaM * atmosPhaseAerosol(gAtmosParams, cosM)
                          + scaC * atmosPhaseMie(cosM, gAtmosParams.cloud.z))
                         * moonT * gAtmosParams.moonDir.w;
             }
