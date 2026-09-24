@@ -3903,7 +3903,15 @@ namespace {
     // In.Base is written per part into the skinned instance buffer, so it is an arbitrary offset —
     // nothing requires the old {0,32,…,992} alignment.
     constexpr uint32_t kMaxBonesPerPart = 128;   // per-part clamp; census max is 94
-    constexpr uint32_t kMaxSkinned      = 256;   // skinned instance-buffer entries (Base + texAlpha + matAlpha)
+    // Skinned instance-buffer entries (Base + texAlpha + matAlpha), i.e. skinned PARTS drawn per frame.
+    // ⚠ 256 WAS A CROWD LIMIT, NOT A SCENE LIMIT. An NPC is 8-15 skinned parts (hand = 3 shapes
+    // each, feet, chest, tail, skinned clothing), so ~20 NPCs in view hit it — Dragonstar East
+    // (Skyrim: Home of the Nords) pinned `skinned=256` all session and every NPC past it lost its
+    // skinned body. What actually bounds this is the BONE pool: kMaxBatches windows x kBatchSize =
+    // 8192 matrices, and the logged parts average ~5 bones, so 1024 parts sits inside it with room
+    // for heavier rigs. The entry costs 12 B, so the cap itself is free. Overflow of EITHER is
+    // counted and logged to mgeHost64.log from the colour loop.
+    constexpr uint32_t kMaxSkinned      = 1024;
     // Skinned per-instance stride, in uint32s: { Base, texAlpha, matAlphaBits }. The third lane
     // arrived with blended skinned parts (ghosts, mane cards): alpha.frag needs the real
     // MaterialProperty alpha, and there is no room left in the packed word for a float. Shared by
@@ -3948,8 +3956,10 @@ namespace {
     // pass has. A typical scene runs ~42 skinned parts averaging well under 32 bones, so one
     // window covers it; a crowded market of a dozen NPCs is what would make the counter fire.
     constexpr uint32_t kObjVelBones   = 1024;
-    // Skinned parts drawn per frame. Matched to kMaxSkinned so this lane can never be the reason a
-    // part the colour pass drew is missing here — in practice the bone window fills first.
+    // Skinned parts per frame IN THIS PASS. It was matched to kMaxSkinned; it no longer is (1024 since
+    // the crowd fix) and does not need to be: the single 1024-matrix bone window above fills at
+    // ~200 parts of ~5 bones, well before this count, and overflow here only costs a part its OBJECT
+    // velocity (it keeps the camera's) — skipped and counted, never a missing draw.
     constexpr uint32_t kObjVelSkinned = 256;
     // ⚠⚠ THE PREVIOUS FRAME'S PALETTES, KEPT HOST-SIDE, AND THIS IS THE ONLY COPY THERE IS. The
     // client ships the palette every frame; the host packs it into the shared bone buffer and
@@ -38865,7 +38875,7 @@ void destroyHostWindow(Renderer* R);
         // The blob is [SkinnedDrawWire][palette]* (palette = numBones * 64 bytes, each a
         // model->world matrix). Each drawn part p packs its palette into bone window p/32
         // at base = (p%32)*32, then draws with firstInstance=base so the per-instance Base
-        // attribute selects gBatch.worlds[base + BoneIdx]. Capped at kMaxSkinned (256).
+        // attribute selects gBatch.worlds[base + BoneIdx]. Capped at kMaxSkinned.
         uint32_t skinnedDrawn = 0;
         g_skinAlphaCmds.clear();   // blended parts recorded here, drawn in the alpha stage below
         if (skinnedBlob && skinnedCount && skinnedBytes &&
@@ -38880,7 +38890,12 @@ void destroyHostWindow(Renderer* R);
             uint32_t boundWindow = UINT32_MAX;
             int      boundSkinMirror = 0;
             uint32_t packWin = 0, packCur = 0;   // must mirror the caster/prepass cursors
-            bool     dropLogged = false;
+            // ⚠ BOTH WAYS A SHIPPED PART CAN FAIL TO DRAW, COUNTED. A crowded modded city (Dragonstar,
+            // 2026-09-24) pinned `skinned=256` on the heartbeat for a whole session and every NPC past
+            // the cap lost its chest, hands, feet and tail while its rigid parts drew — and the only
+            // warning went to LOGF + stdout, neither of which reaches mgeHost64.log. A cap that drops
+            // silently is a lottery by walk order ([[feedback_guard_fallback_is_the_bug]]).
+            uint32_t skinCapDropped = 0, skinPackDropped = 0;
             double   skinPrepMs = 0.0, skinRecMs = 0.0;   // record probe (see g_lastSkinPrepMs)
             double   skinMaxPartMs = 0.0;
             uint32_t skinMaxSlot = 0, skinPipeSwitches = 0;
@@ -38900,20 +38915,7 @@ void destroyHostWindow(Renderer* R);
                 sp = palette + paletteBytes;   // advance regardless of whether we draw
 
                 if (skinnedDrawn >= kMaxSkinned) {
-                    // Rate-limited (night-collapse finding 2026-07-17): with the count PINNED
-                    // over the cap (dense crowds), the per-frame-local dropLogged fired this
-                    // LOGF+printf pair EVERY frame — ~4.7ms of logger/console tax INSIDE the
-                    // record loop (the rec-split skin= spikes; same disease as the A1 upload
-                    // log). Keep the warning, cap it at ~1 line/s.
-                    static double s_lastCapLogMs = 0.0;
-                    if (!dropLogged && hostNowMs() - s_lastCapLogMs >= 1000.0) {
-                        s_lastCapLogMs = hostNowMs();
-                        LOGF(eWARNING, "[forge] skinned over cap %u — dropping extra parts (count=%u)",
-                             kMaxSkinned, skinnedCount);
-                        std::printf("[forge] skinned over cap %u — dropping extra parts (count=%u)\n",
-                                    kMaxSkinned, skinnedCount);
-                        dropLogged = true;
-                    }
+                    ++skinCapDropped;   // reported once per second after the loop, in mgeHost64.log
                     continue;
                 }
                 const uint32_t slot = item.slot;
@@ -38923,7 +38925,7 @@ void destroyHostWindow(Renderer* R);
 
                 const double tPrep0 = hostNowMs();
                 uint32_t base = 0;
-                if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
+                if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { ++skinPackDropped; continue; }
                 const uint32_t window = packWin;
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
@@ -39004,6 +39006,19 @@ void destroyHostWindow(Renderer* R);
                 skinRecMs += hostNowMs() - tRec0s;
                 const double partMs = hostNowMs() - tPrep0;   // prep + rec for THIS part
                 if (partMs > skinMaxPartMs) { skinMaxPartMs = partMs; skinMaxSlot = slot; }
+            }
+            // Rate-limited to ~1 line/s: pinned over the cap this fires every frame, and a per-frame
+            // log inside the record loop was a measured 4.7 ms tax (night-collapse, 2026-07-17).
+            if (skinCapDropped || skinPackDropped) {
+                static double s_lastSkinDropLogMs = 0.0;
+                if (hostNowMs() - s_lastSkinDropLogMs >= 1000.0) {
+                    s_lastSkinDropLogMs = hostNowMs();
+                    LOG::logline("!! [forge] skinned parts NOT DRAWN this frame: %u over the %u-part cap,"
+                                 " %u with the %u bone windows full (shipped %u, drawn %u) — whole body"
+                                 " parts vanish, rigid parts stay",
+                                 skinCapDropped, kMaxSkinned, skinPackDropped, kMaxBatches,
+                                 skinnedCount, skinnedDrawn);
+                }
             }
             g_lastSkinPrepMs      = skinPrepMs;
             g_lastSkinRecMs       = skinRecMs;
