@@ -2359,7 +2359,12 @@ float mwFogFactor(float dist)
     if (waterCameraSubmerged()) { return 1.0f; }
     return mwFogRamp(dist);
 }
-#line 266 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 225 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogFactorAt(float3 worldPos)
+{
+    return mwFogFactor(length(worldPos - gFrameData.eyePos.xyz));
+}
+#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 float mwFogAirShare(float fog, float waterShare, float dist)
 {
 
@@ -2573,7 +2578,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(In.Fog, In.WorldPos)));
+
+    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
     return (float4(m, 1.0f));
 }
 #line 261 "FSL/shaders.list"

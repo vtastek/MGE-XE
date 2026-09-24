@@ -295,7 +295,7 @@ float4 PS_MAIN( VSOutput In )
     c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.Packed & 0x20u) != 0u);
     c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
     c = tonemapInPass(c);
-    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
+    c = applyFog(c, In.WorldPos, In.Position.xy);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {

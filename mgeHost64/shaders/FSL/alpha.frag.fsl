@@ -305,7 +305,7 @@ float4 PS_MAIN( VSOutput In )
     c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.ClampMode & 8u) != 0u);
     c *= gFrameData.dbgScales.w;
     c = tonemapInPass(c);
-    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
+    c = applyFog(c, In.WorldPos, In.Position.xy);
 
     // F12 debug views (opaque.frag's, alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

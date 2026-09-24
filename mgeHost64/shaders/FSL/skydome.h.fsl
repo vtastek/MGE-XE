@@ -290,12 +290,16 @@ float fogExtinction(float fogAir, float skyBehind)
 // keep the horizon from being a hard line.
 #define FOG_SKY_HORIZON_RAMP 38.0f
 
-// THE fog operation: extinguish, then melt. `fog` is MW's scalar — 1 = clear, 0 = fully fogged.
+// THE fog operation: extinguish, then melt. The fog is MW's scalar — 1 = clear, 0 = fully fogged —
+// evaluated per pixel from worldPosRel (no longer passed in from a per-vertex interpolator).
 // worldPosRel = the camera-relative world position every lit path already carries.
 // Every lit path calls this rather than writing its own lerp, so the ORDER above cannot drift back
 // apart one shader at a time.
-float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 {
+    // PER PIXEL (fog.h.fsl mwFogFactorAt): the interpolated vertex fog a long wall carried was the
+    // average of its far corners', not the fog at the point you are looking at.
+    float fog = mwFogFactorAt(worldPosRel);
     float4 s = fogSkySample(pixelXy);
 
     // WATER FOG — the segment of this ray that runs through water (waterfog.h.fsl). Exactly (0, 0)

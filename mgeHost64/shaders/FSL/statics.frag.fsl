@@ -462,7 +462,7 @@ PSOut PS_MAIN( VSOutput In )
     // rolls off identically (opaque.frag order).
     result = tonemapInPass(result);
 
-    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy);
 
     // Every exit carries the same coverage — the debug views are still the same silhouette.
     PSOut Out;

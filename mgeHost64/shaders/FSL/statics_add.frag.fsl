@@ -51,5 +51,7 @@ float4 PS_MAIN( VSOutput In )
     // mwFogAirShareAt, matching applyFog, so this pass and the base pass cannot disagree about how
     // much air ramp a fragment owns at a waterline pixel — the disagreement is what made the old
     // leak show up "seen through alpha blending" rather than on the surfaces themselves.
-    RETURN(float4(liftInPass(tex.rgb) * saturate(mwFogAirShareAt(In.Fog, In.WorldPos)), 0.0f));
+    // Per pixel, like the base pass's applyFog now is — an interpolated factor here against a per-pixel
+    // one there would put the layer and its surface on two different fogs (fog.h.fsl mwFogFactorAt).
+    RETURN(float4(liftInPass(tex.rgb) * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
 }

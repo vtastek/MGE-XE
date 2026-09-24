@@ -68,6 +68,7 @@ float4 PS_MAIN( VSOutput In )
     // above, because THAT is about what "twice as bright" means, which is a units question.
     // mwFogAirShareAt, matching applyFog, so this pass and the base pass cannot disagree about how
     // much air ramp a fragment owns at a waterline pixel.
-    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(In.Fog, In.WorldPos)));
+    // Per pixel, matching the base pass's applyFog (fog.h.fsl mwFogFactorAt).
+    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
     RETURN(float4(m, 1.0f));
 }

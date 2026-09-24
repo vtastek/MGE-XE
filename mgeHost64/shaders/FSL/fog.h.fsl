@@ -206,6 +206,27 @@ float mwFogFactor(float dist)
     return mwFogRamp(dist);
 }
 
+// ─── THE FOG FACTOR AT A PIXEL, NOT AT A VERTEX ───────────────────────────────────────────────────
+// ⚠ Every fogged surface used to take `fog` from a per-vertex interpolator, and the ramp is not linear
+// in anything a triangle interpolates: distance across a flat wall bends (it is smallest at the point
+// nearest the eye, not at a corner), and the ramp itself is curved on top of that. A LONG triangle
+// therefore carried the average of its far corners' fog into its middle. Reported 2026-09-24, dump
+// mge_0052: standing a metre from a Karthgad cabin, the log wall wore "about 100 metres" of fog while
+// the window frame a few centimetres in front of it (small triangles, corners as near as the middle)
+// was crisp. Twenty metres back the two agreed, because at range the distance is near-linear
+// across the wall.
+//
+// So the factor is taken HERE, per pixel, with the vertex stages' own definition —
+// |worldPos - gFrameData.eyePos| — which makes every view (main, water mirror, first person) agree with
+// what its vertex fog meant, minus the interpolation error. Water already fogged per pixel
+// (water.frag's mwFogRamp(dist)), so this also takes the shoreline off two different fog laws.
+// Terrain measures its vertex distance before displacement; the few units a displacement knob carves
+// are invisible to a ramp thousands of units long.
+float mwFogFactorAt(float3 worldPos)
+{
+    return mwFogFactor(length(worldPos - gFrameData.eyePos.xyz));
+}
+
 
 // ─── THE AIR RAMP OVER ITS OWN SHARE OF THE RAY ───────────────────────────────────────────────────
 // The air ramp only owns the part of the ray that is AIR. MW's fog is LINEAR in distance, i.e. a
@@ -258,11 +279,12 @@ float mwFogFactor(float dist)
 //     dAir = dist * (1 - waterShare)          // waterShare is len/d, so this is the air length
 //     opacity ratio = (1 - mwFogRamp(dAir)) / (1 - mwFogRamp(dist))
 //
-// Applied as a RATIO against the caller's own interpolated `fog` rather than by returning
-// mwFogRamp(dAir) outright, because `fog` arrives interpolated across the triangle and recomputing
-// it per pixel would shift every above-water fragment by the interpolation error. The early-out
-// keeps `waterShare == 0` returning `fog` bit for bit, which is the property everything else rests
-// on.
+// Applied as a RATIO against the caller's own `fog` rather than by returning mwFogRamp(dAir) outright.
+// That `fog` used to arrive interpolated across the triangle, and the ratio kept this from shifting
+// every above-water fragment by the interpolation error. Since 2026-09-24 every caller passes the
+// per-pixel mwFogFactorAt() instead (the interpolation error WAS the defect — see it), so the ratio is
+// now simply exact. The early-out keeps `waterShare == 0` returning `fog` bit for bit, which is the
+// property everything else rests on.
 float mwFogAirShare(float fog, float waterShare, float dist)
 {
     // Exactly 0 water on this ray -> exactly `fog`. The common case, and the guarantee.

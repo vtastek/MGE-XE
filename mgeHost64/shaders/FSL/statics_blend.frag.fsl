@@ -62,7 +62,7 @@ float4 PS_MAIN( VSOutput In )
     // the lift is exact here rather than lossy: Color + SunLight can exceed 1, and the UNORM target
     // this reproduces clipped it there anyway, so the lift reproduces what was on screen.
     result = liftInPass(result);
-    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy);
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching statics.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

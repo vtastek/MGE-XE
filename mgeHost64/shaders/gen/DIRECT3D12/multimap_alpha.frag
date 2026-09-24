@@ -2731,7 +2731,12 @@ float mwFogFactor(float dist)
     if (waterCameraSubmerged()) { return 1.0f; }
     return mwFogRamp(dist);
 }
-#line 266 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 225 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogFactorAt(float3 worldPos)
+{
+    return mwFogFactor(length(worldPos - gFrameData.eyePos.xyz));
+}
+#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 float mwFogAirShare(float fog, float waterShare, float dist)
 {
 
@@ -3298,9 +3303,12 @@ float fogExtinction(float fogAir, float skyBehind)
     float ramp = pow(1.0f - fogAir, gFrameData.timeParams.w);
     return 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
 }
-#line 297 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
-float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
+#line 298 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 {
+
+
+    float fog = mwFogFactorAt(worldPosRel);
     float4 s = fogSkySample(pixelXy);
 
 
@@ -3317,14 +3325,14 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 
 
     fog = saturate(fog);
-#line 385 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 389 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float fogAir = mwFogAirShare(fog, wf.y, length(worldPosRel));
-#line 411 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 415 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     if (waterCameraSubmerged()) { fogAir = 1.0f; }
-#line 445 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 449 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
     float skyBehind = max(s.a, saturate(upness *  38.0f ));
-#line 502 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 506 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float3 behind = waterFogComposite(lit, worldPosRel, wf);
 
 
@@ -3634,7 +3642,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.Packed & 0x20u) != 0u);
     c *= gFrameData.dbgScales.w;
     c = tonemapInPass(c);
-    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
+    c = applyFog(c, In.WorldPos, In.Position.xy);
 
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

@@ -664,7 +664,7 @@ float4 PS_MAIN( VSOutput In )
     // Near fog: lerp toward the SKY as Fog -> 0. At the horizon and below that target IS fogColNear,
     // so this is FFE's lerp(fogColNear, c, fog) for everything at or under the eye; above it the
     // target follows the dome so a tower cannot end up brighter than the sky behind it (skydome.h).
-    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
+    c = applyFog(c, In.WorldPos, In.Position.xy);
     // F12 debug views. gAO is sampled at SV_Position.xy * invAlloc (screenAlloc.zw). The isolation
     // views (5 albedo / 6 lit / 7 ambient) output one shading component so surfaces Forge does NOT
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.

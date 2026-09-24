@@ -2359,7 +2359,12 @@ float mwFogFactor(float dist)
     if (waterCameraSubmerged()) { return 1.0f; }
     return mwFogRamp(dist);
 }
-#line 266 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 225 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogFactorAt(float3 worldPos)
+{
+    return mwFogFactor(length(worldPos - gFrameData.eyePos.xyz));
+}
+#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 float mwFogAirShare(float fog, float waterShare, float dist)
 {
 
@@ -2555,16 +2560,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     uint bucket = In.TexIndex >> 16;
     uint layer = In.TexIndex & 0xFFFFu;
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
-
-
-
-
-
-
-
-
-
-
-    return (float4(liftInPass(tex.rgb) * saturate(mwFogAirShareAt(In.Fog, In.WorldPos)), 0.0f));
+#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_add.frag.fsl"
+    return (float4(liftInPass(tex.rgb) * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
 }
 #line 273 "FSL/shaders.list"

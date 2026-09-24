@@ -212,7 +212,7 @@ PSOut PS_MAIN( VSOutput In )
     }
 
     result = tonemapInPass(result);
-    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy);
 
     PSOut Out;
 #if !GRASS_EARLY_Z
