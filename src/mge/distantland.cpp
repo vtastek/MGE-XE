@@ -9,6 +9,7 @@
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "enginecull.h"
+#include "exactpos.h"
 #include "renderprocess.h"
 #include "mge_tracy.h"
 #include "statusoverlay.h"
@@ -1207,6 +1208,18 @@ void DistantLand::setView(const D3DMATRIX* m) {
 
     D3DXMatrixInverse(&invView, 0, &view);
     D3DXVec4Transform(&eyePos, &origin, &invView);
+
+    // The view-matrix inverse inherits MW's float rounding of eye·R, so its error turns with the
+    // camera. ExactPos resolves the eye from the scene graph in double instead; eyePos takes its
+    // rounding for every float consumer, and the Forge payload subtracts the double itself.
+    const float viewInvEye[3] = { eyePos.x, eyePos.y, eyePos.z };
+    MGE::ExactPos::beginFrame(viewInvEye);
+    if (MGE::ExactPos::on(MGE::ExactPos::kEye)) {
+        const double* e = MGE::ExactPos::eye();
+        eyePos.x = (float)e[0];
+        eyePos.y = (float)e[1];
+        eyePos.z = (float)e[2];
+    }
     eyeVec.x = m->_13;
     eyeVec.y = m->_23;
     eyeVec.z = m->_33;

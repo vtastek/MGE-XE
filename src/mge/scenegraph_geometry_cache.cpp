@@ -34,6 +34,7 @@
 #include "worldcontroller_view.h"
 #include "renderprocess.h"
 #include "distantland.h"   // DistantLand::mwWorldSuppress (MW-ONLY-UI suppression level)
+#include "exactpos.h"
 #include "ipc/geomwire.h"
 #include "support/log.h"
 
@@ -2241,9 +2242,11 @@ namespace MGE::GeometryCache {
                               NI::SkinInstance* si, NI::SkinData* sd) {
             const uint32_t numBones = sd->numBones;
             e.bonePalette.resize(numBones * 16);
+            e.bonePaletteT.resize(numBones * 3);
             bool partHadNullBone = false;
             for (uint32_t b = 0; b < numBones; ++b) {
                 float* m = &e.bonePalette[b * 16];
+                double* t = &e.bonePaletteT[b * 3];
                 NI::AVObject* boneNode = si->bones[b];
                 if (!boneNode) {
                     // Phase 0: a null bone influence. Fall back to the geometry's own
@@ -2258,11 +2261,13 @@ namespace MGE::GeometryCache {
                         if (e.textureName) g_nullBoneSampleTex = e.textureName;
                     }
                     buildD3DTransform(m, geom);
+                    ExactPos::worldT(geom, t);
                     continue;
                 }
                 // Compose: apply bone offset, then bone world (matches CPU-skin math).
                 const NI::Transform composed = boneNode->worldTransform * sd->boneData[b].transform;
                 buildD3DFromTransform(m, composed);
+                ExactPos::composeBone(boneNode, sd->boneData[b].transform, t);
             }
             e.numBones = numBones;
         }
@@ -2280,6 +2285,13 @@ namespace MGE::GeometryCache {
 
         void buildD3DTransform(float out[16], const NI::TriBasedGeometry* geom) {
             buildD3DFromTransform(out, geom->worldTransform);
+        }
+
+        // The one way an entry's pose is taken: the float D3D matrix AND its exact double
+        // translation together, so the emitters can never pair a translation with a stale twin.
+        void captureWorld(CachedGeometry& e, const NI::TriBasedGeometry* geom) {
+            buildD3DTransform(e.worldTransformD3D, geom);
+            ExactPos::worldT(geom, e.worldT);
         }
 
         // FP particle billboarding (see tasks/forge-fp-particles.md). MW's particle renderer
@@ -2845,7 +2857,7 @@ namespace MGE::GeometryCache {
                 } else {
                     uploadEntry(e, geom, data, key);
                 }
-                buildD3DTransform(e.worldTransformD3D, geom);       // bounds center
+                captureWorld(e, geom);                              // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
                 e.homeInteriorCell = g_captureInteriorCell;         // cell-grid eviction home tag
@@ -2896,7 +2908,7 @@ namespace MGE::GeometryCache {
                         buildSkinnedVB(e, geom, data, si, sd);
                     }
                     if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);  // per frame
-                    buildD3DTransform(e.worldTransformD3D, geom);            // bounds center
+                    captureWorld(e, geom);                                   // bounds center
                     e.dynamicHint = 4;
                 } else {
                     // Non-skinned upload decision:
@@ -2983,7 +2995,7 @@ namespace MGE::GeometryCache {
                     }
                     // Transform (orbit for sky) + dynamic hint, shared by sky and opaque.
                     if (inCharacter) {
-                        buildD3DTransform(e.worldTransformD3D, geom);
+                        captureWorld(e, geom);
                         e.dynamicHint = 4;
                     } else {
                         float newTransform[16];
@@ -2991,6 +3003,7 @@ namespace MGE::GeometryCache {
                         if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
                             e.dynamicHint = 4;
                             memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
+                            ExactPos::worldT(geom, e.worldT);   // captureWorld's twin, on change only
                         } else {
                             transformChanged = false;   // mirrored can't have flipped
                             if (e.dynamicHint > 0) {
@@ -4566,6 +4579,9 @@ namespace MGE::GeometryCache {
             g_walkingFP = true;
             walk(MWBridge::get()->getArmCameraRoot(), /*inCharacter*/true, /*bypassCull*/true);
             g_walkingFP = false;
+            // The arm camera's exact position, read at the same instant as the arm parts: they
+            // share the arm root, so its rounding cancels in (part - camera) — see exactpos.h.
+            ExactPos::captureArmCamera(MWBridge::get()->getArmCamera());
 
             // FP particle billboarding (P0, log-only): MW's particle renderer expands each
             // particle into a camera-facing quad at draw time; under FP suppression that draw
@@ -5564,7 +5580,7 @@ namespace MGE::GeometryCache {
                 reclassified = true;
             }
             if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
-            buildD3DTransform(e.worldTransformD3D, geom);
+            captureWorld(e, geom);
             e.dynamicHint = 4;
             e.mirrored = computeMirrored(e);
         } else {
@@ -5585,6 +5601,7 @@ namespace MGE::GeometryCache {
             buildD3DTransform(newTransform, geom);
             if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
                 memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
+                ExactPos::worldT(geom, e.worldT);   // captureWorld's twin, on change only
                 e.dynamicHint = 4;
                 e.mirrored = computeMirrored(e);
             } else if (e.dynamicHint > 0) {
@@ -5689,9 +5706,13 @@ namespace MGE::GeometryCache {
         return stampPlayer(static_cast<NI::AVObject*>(avObject));
     }
 
-    bool playerRootOrigin(float out[3]) {
+    bool playerRootOrigin(double out[3]) {
         auto* node = MWBridge::get()->getPlayer3rdPersonNode();
         if (!node) return false;
+        if (ExactPos::on(ExactPos::kRigid)) {
+            ExactPos::worldT(node, out);
+            return true;
+        }
         const NI::Point3& t = node->worldTransform.translation;
         out[0] = t.x; out[1] = t.y; out[2] = t.z;
         return true;

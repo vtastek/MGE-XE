@@ -161,6 +161,15 @@ fi
 # the moment the save is loaded so it can never reach an in-game dialog.
 ENVSET="${ENVSET}\$env:MGE_AUTODISMISS='1'; "
 
+# ExactPos A/B arm (client, src/mge/exactpos.h), taken from the caller's env. ALWAYS written for the
+# same reason as MGE_HOST_KNOBS below: a stale value in the user environment would mislabel the arm.
+if [ -n "${MGE_EXACT_POS:-}" ]; then
+  echo "[harness] MGE_EXACT_POS=$MGE_EXACT_POS"
+  ENVSET="${ENVSET}\$env:MGE_EXACT_POS='$MGE_EXACT_POS'; "
+else
+  ENVSET="${ENVSET}Remove-Item Env:MGE_EXACT_POS -ErrorAction SilentlyContinue; "
+fi
+
 # ALWAYS written, even when empty — a stale MGE_HOST_KNOBS left in the user environment would ride
 # along in every run exactly the way MGE_RDOC did for three days, and the arm would be mislabelled.
 if [ -n "$KNOBS" ]; then

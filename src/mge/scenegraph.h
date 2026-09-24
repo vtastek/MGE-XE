@@ -54,6 +54,7 @@ namespace MGE::SceneGraph {
     // attenuation formula directly.
     struct PointLight {
         float worldPos[3];   // worldTransform.translation
+        double worldPosExact[3];  // the same, composed in double (ExactPos::worldT)
         float diffuse[3];    // pl->diffuse.rgb * pl->dimmer
         float falloff[3];    // (constantAttenuation, linearAttenuation, quadraticAttenuation)
         float radius;        // specular.r — Bethesda's modder-set fade radius

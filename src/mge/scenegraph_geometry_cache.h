@@ -404,6 +404,13 @@ namespace MGE::GeometryCache {
         // Cast to D3DXMATRIX* for use with D3DXMatrixMultiply.
         // Skinned objects are CPU-skinned to world-space; worldTransformD3D is unused for them.
         float worldTransformD3D[16];
+        // ExactPos: the same translation composed in DOUBLE from the parent chain (see
+        // exactpos.h). Set wherever worldTransformD3D is (captureWorld), so the two always
+        // describe the same pose; the emitters ship (worldT - eye) instead of rounding twice.
+        double worldT[3];
+        // Skinned: each bone's exact composed translation, worldT(bone) + R_bone·(s_bone·offset.T)
+        // — the double twin of bonePalette's rows 12..14, filled by buildBonePalette.
+        std::vector<double> bonePaletteT;
     };
 
     // Must be called once before onFrameReady, with the D3D9 device.
@@ -564,8 +571,9 @@ namespace MGE::GeometryCache {
     // The player scene node's world translation right now. This is the ORIGIN the body moves
     // with, not its bound centre — a bound centre also shifts when the pose changes (arms out),
     // which would feed animation noise into a correction that only wants locomotion.
-    // False if there is no player node yet (menus, load).
-    bool playerRootOrigin(float out[3]);
+    // False if there is no player node yet (menus, load). Exact (ExactPos::worldT) under the
+    // rigid ExactPos mode, the stored float translation widened otherwise.
+    bool playerRootOrigin(double out[3]);
 
     // "The engine did not draw this shape this frame — is it merely off-screen, or is it GONE?"
     // The same vtable-validated parent climb the eviction sweep votes with, asked on demand at the

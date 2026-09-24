@@ -1106,6 +1106,29 @@ NI::Node* MWBridge::getPlayer3rdPersonNode() {
 
 //-----------------------------------------------------------------------------
 
+// getPlayerHeadCamera - MACP -> MobileActor::animationController (+0x244, the
+// PlayerAnimationController) -> firstPersonHeadCameraNode (+0xD4). Offsets from
+// MWSE's TES3MobileActor.h / TES3PlayerAnimationController.h.
+NI::Camera* MWBridge::getPlayerHeadCamera() {
+    if (IsLoadScreen()) {
+        return nullptr;
+    }
+
+    DWORD macp = getPlayerMACP();
+    if (macp == 0) {
+        return nullptr;
+    }
+
+    DWORD controller = read_dword(macp + 0x244);
+    if (controller == 0) {
+        return nullptr;
+    }
+
+    return (NI::Camera*)read_dword(controller + 0xD4);
+}
+
+//-----------------------------------------------------------------------------
+
 // FP1a - WorldController lives at *(0x7C67DC); WorldControllerRenderCamera structs are
 // INLINE members: worldCamera +0x124, armCamera +0x150 (root +0x8, cameraRoot +0xC,
 // CameraData +0x10 {NiCamera* +0, fovDeg +0x8, near +0xC, far +0x10}).

@@ -91,7 +91,17 @@ ls -1t "$ARCHIVE"/mgeXE-*.log 2>/dev/null | tail -n +21 | xargs -r rm -f
 ls -1t "$ARCHIVE"/MWSE-*.log  2>/dev/null | tail -n +21 | xargs -r rm -f
 
 # mgeXE.log is TRUNCATED at client init, and MWSE.log at MWSE init, so both read from 0 for this run.
-powershell.exe -Command "Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+# Env prefix, same discipline as forge-perf-run.sh: strip a stale MGE_RDOC, auto-dismiss the startup
+# dialogs, and ALWAYS write MGE_EXACT_POS (set from the caller's env, removed otherwise) so a stale
+# value in the user environment can never mislabel an arm of the ExactPos A/B.
+ENVSET="Remove-Item Env:MGE_RDOC -ErrorAction SilentlyContinue; \$env:MGE_AUTODISMISS='1'; "
+if [ -n "${MGE_EXACT_POS:-}" ]; then
+  echo "[popin] MGE_EXACT_POS=$MGE_EXACT_POS"
+  ENVSET="${ENVSET}\$env:MGE_EXACT_POS='$MGE_EXACT_POS'; "
+else
+  ENVSET="${ENVSET}Remove-Item Env:MGE_EXACT_POS -ErrorAction SilentlyContinue; "
+fi
+powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
 echo "[popin] launched Morrowind; waiting for the sweep..."
 
 t0=$(date +%s); done_seen=0
@@ -131,6 +141,10 @@ grep -E "^>> \[gc\] [0-9]+ frames" "$XELOG" 2>/dev/null | sed -E 's/.*(entries=[
 echo
 echo "=== build/frame timeline (burst + hitch tells) ==="
 grep -E "^>> \[hb\] [0-9]+ frames|^>> \[hb\] build split" "$XELOG" 2>/dev/null | sed -E 's/.*(dt=[0-9.]+).*(max feed=[0-9.]+ dt=[0-9.]+ \(~[0-9]+ fps\))/  \1 \2/; s/.*(maxBuild=[0-9.]+ captures\/f=[0-9.]+)/  \1/'
+
+echo
+echo "=== exactpos (mgeXE.log) ==="
+grep -E "\[exactpos\]" "$XELOG" 2>/dev/null | tail -40 || echo "  (none)"
 
 echo
 echo "=== VERDICT ==="

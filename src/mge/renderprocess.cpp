@@ -11,6 +11,7 @@
 #include "scenegraph.h"
 #include "datahandler_view.h"
 #include "worldcontroller_view.h"
+#include "exactpos.h"
 #include "morrowindbsa.h"
 #include "mge_tracy.h"
 #include "imgui.h"
@@ -565,7 +566,7 @@ namespace {
         std::uint32_t count;     // translations at 64-byte stride (bone count; 1 for rigid)
     };
     std::vector<PlayerPatch>                  g_playerPatch;
-    float                                     g_playerBake[3] = {};
+    double                                    g_playerBake[3] = {};
     bool                                      g_playerBakeValid = false;
     std::uint64_t                             g_buildCacheFrame = 0;   // cache frame the build read
     unsigned                                  g_seamSkipRun = 0;       // consecutive no-payload seam skips
@@ -575,6 +576,16 @@ namespace {
     // being dragged along by the correction.
     inline bool isPlayerOwned(const MGE::GeometryCache::CachedGeometry& e) {
         return g_playerBakeValid && e.playerFrame == g_buildCacheFrame;
+    }
+
+    // CAMERA-RELATIVE translation of a rigid entry (world rows 12..14): float(T - eye), with T the
+    // entry's exact double translation under ExactPos kRigid, else its stored float one — mode 0
+    // is float(stored - eyePos), bit for bit the old `world[12..14] -= eyePos`. Also feeds the
+    // [exactpos] shipped-vs-exact diagnostic. See exactpos.h.
+    inline void shipEntryT(float out[3], const MGE::GeometryCache::CachedGeometry& e) {
+        MGE::ExactPos::rel(out, &e.worldTransformD3D[12], e.worldT,
+                           MGE::ExactPos::on(MGE::ExactPos::kRigid));
+        MGE::ExactPos::noteShipped(MGE::ExactPos::kShipRigid, e.isFP, out, e.worldT);
     }
 
 
@@ -654,7 +665,7 @@ namespace {
         // describes a world that no longer exists. Dropping repeats one composite frame, which
         // during a POV cut is invisible; drawing it is not.
         bool bake3rd = true;
-        float bakeEye[3] = {};                // DistantLand::eyePos at build (payload's relative space)
+        double bakeEye[3] = {};               // ExactPos::eye() at build (payload's relative space)
         std::uint32_t drawCount = 0, skinnedCount = 0, multiMapCount = 0,
                       lightCount = 0, skyCount = 0, alphaCount = 0;
         IPC::FPFrame fpFrame;                 // shipped VERBATIM at fire — self-consistent
@@ -2783,9 +2794,8 @@ namespace {
             // in float32, and the combined viewProj's per-vertex cancellation then produces
             // orientation-dependent stretching. Shifting world + viewProj + lights + eyePos by
             // -eye keeps all vertex math small/precise. (viewProj is built translation-free below.)
-            item.world[12] -= DistantLand::eyePos.x;
-            item.world[13] -= DistantLand::eyePos.y;
-            item.world[14] -= DistantLand::eyePos.z;
+            // Far from the origin the eye and the translation are each exact in double (ExactPos).
+            shipEntryT(&item.world[12], e);
             // F12 diagnostic: displace each object by a deterministic per-slot vector. The
             // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per
             // slot means duplicates of one object (same or different slot) appear as two
@@ -2874,12 +2884,19 @@ namespace {
             // CAMERA-RELATIVE: the bone palette is world-space; shift each bone matrix's
             // translation by -eye so the skinned vertices land near the origin, consistent
             // with the translation-free viewProj + shifted lights (see buildDrawList).
+            // ExactPos kSkinned ships each bone's exact double translation instead (bonePaletteT,
+            // filled beside the palette by buildBonePalette); mode 0 is the old float subtraction.
             {
                 float* pal = reinterpret_cast<float*>(out);
+                const bool haveExact = e.bonePaletteT.size() >= (std::size_t)e.numBones * 3;
+                const bool useExact = haveExact && MGE::ExactPos::on(MGE::ExactPos::kSkinned);
                 for (std::uint32_t b = 0; b < e.numBones; ++b) {
-                    pal[b * 16 + 12] -= DistantLand::eyePos.x;
-                    pal[b * 16 + 13] -= DistantLand::eyePos.y;
-                    pal[b * 16 + 14] -= DistantLand::eyePos.z;
+                    const double* exactT = haveExact ? &e.bonePaletteT[b * 3] : nullptr;
+                    MGE::ExactPos::rel(&pal[b * 16 + 12], &e.bonePalette[b * 16 + 12], exactT, useExact);
+                    if (haveExact) {
+                        MGE::ExactPos::noteShipped(MGE::ExactPos::kShipSkinned, e.isFP,
+                                                   &pal[b * 16 + 12], exactT);
+                    }
                 }
             }
             // The palette IS this part's transform, so the whole palette carries the player's
@@ -2929,10 +2946,8 @@ namespace {
             IPC::MultiMapDrawWire item = {};
             item.slot = si.slot;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
-            // CAMERA-RELATIVE: shift translation by -eye (see buildDrawList).
-            item.world[12] -= DistantLand::eyePos.x;
-            item.world[13] -= DistantLand::eyePos.y;
-            item.world[14] -= DistantLand::eyePos.z;
+            // CAMERA-RELATIVE: shift translation by -eye (see emitStaticDraw).
+            shipEntryT(&item.world[12], e);
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
             // The AUTHORED emissive rides its own lane and gets decodeAuthored() on the host;
@@ -2994,9 +3009,7 @@ namespace {
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE: shift translation by -eye (see emitStaticDraw).
-            item.world[12] -= DistantLand::eyePos.x;
-            item.world[13] -= DistantLand::eyePos.y;
-            item.world[14] -= DistantLand::eyePos.z;
+            shipEntryT(&item.world[12], e);
             // AT3 captured-geometry locators unused for a cached-mesh (slot) item — the host
             // reads them only when slot == kAlphaSlotCaptured. Zero so they never alias garbage.
             item.vertexBase = item.indexBase = item.indexCount = 0;
@@ -3043,9 +3056,9 @@ namespace {
             item.emissiveGain[0] = item.emissiveGain[1] = item.emissiveGain[2] = 1.0f;
             item.vColSource = rec.vColSource;
             memcpy(item.world, rec.world, 16 * sizeof(float));
-            item.world[12] -= DistantLand::eyePos.x;
-            item.world[13] -= DistantLand::eyePos.y;
-            item.world[14] -= DistantLand::eyePos.z;
+            // Same eye as every other subtraction (ExactPos::eye); the record itself carries no
+            // node, so its translation stays the float one — a recorded residual.
+            MGE::ExactPos::rel(&item.world[12], &rec.world[12], nullptr, false);
             item.vertexBase = rec.vertexBase;
             item.indexBase  = rec.indexBase;
             item.indexCount = rec.indexCount;
@@ -3965,9 +3978,10 @@ namespace {
             IPC::PointLightWire w;
             // CAMERA-RELATIVE: light positions are compared against the (now camera-relative)
             // WorldPos in the frag, so shift them by -eye too (see buildDrawList).
-            w.posRadius[0] = pl.worldPos[0] - DistantLand::eyePos.x;
-            w.posRadius[1] = pl.worldPos[1] - DistantLand::eyePos.y;
-            w.posRadius[2] = pl.worldPos[2] - DistantLand::eyePos.z + zLift;
+            // Exact under ExactPos kRigid, like the rigid entries the light shades.
+            MGE::ExactPos::rel(w.posRadius, pl.worldPos, pl.worldPosExact,
+                               MGE::ExactPos::on(MGE::ExactPos::kRigid));
+            w.posRadius[2] += zLift;
             w.posRadius[3] = pl.radius;
             w.color[0] = diffuse[0] * pointLightMult;
             w.color[1] = diffuse[1] * pointLightMult;
@@ -4242,9 +4256,9 @@ namespace {
             if (isSunDisc) { g_sunDX9Texture = e.d3dTexture; }
             // CAMERA-RELATIVE: the sky is camera-attached; shift by -eye to match the host's
             // translation-free viewProj (see buildDrawList) and keep vertex math near the origin.
-            item.world[12] -= DistantLand::eyePos.x;
-            item.world[13] -= DistantLand::eyePos.y;
-            item.world[14] -= DistantLand::eyePos.z;
+            // Same eye as the park pre-cancel in flushAssignAndKick (ExactPos::eye), so the two
+            // cancel exactly.
+            MGE::ExactPos::rel(&item.world[12], &item.world[12], nullptr, false);
             const std::size_t at = g_skyScratch.size();
             g_skyScratch.resize(at + sizeof(item));
             memcpy(g_skyScratch.data() + at, &item, sizeof(item));
@@ -4405,9 +4419,13 @@ namespace {
         if (!MWBridge::get()->getRenderCameraState(1, pos, dir, up, right, cd)) {
             return false;
         }
-        const float rel[3] = { pos[0] - DistantLand::eyePos.x,
-                               pos[1] - DistantLand::eyePos.y,
-                               pos[2] - DistantLand::eyePos.z };
+        // ExactPos kFP: the arm camera's exact position, if it is still where the FP walk read it
+        // (the arm parts were composed at that instant, so camera and parts share one pose).
+        double camExact[3] = {};
+        const bool haveCamExact = MGE::ExactPos::armCameraExact(pos, camExact);
+        float rel[3];
+        MGE::ExactPos::rel(rel, pos, camExact, haveCamExact && MGE::ExactPos::on(MGE::ExactPos::kFP));
+        MGE::ExactPos::setFPCamera(rel, haveCamExact ? camExact : nullptr);
         D3DXMATRIX view, proj, viewProj;
         buildNiCameraView(dir, up, right, rel, &view);
         if (!buildArmCameraProj(&proj)) {
@@ -4634,9 +4652,8 @@ namespace {
                     // camera-relative eye (matches the world captured path + FP emit helpers).
                     memset(item.world, 0, sizeof(item.world));
                     item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.0f;
-                    item.world[12] = -DistantLand::eyePos.x;
-                    item.world[13] = -DistantLand::eyePos.y;
-                    item.world[14] = -DistantLand::eyePos.z;
+                    const float origin[3] = { 0.0f, 0.0f, 0.0f };
+                    MGE::ExactPos::rel(&item.world[12], origin, nullptr, false);
                     item.vertexBase = vBase;
                     item.indexBase  = iBase;
                     item.indexCount = rec.indexCount;
@@ -5629,7 +5646,7 @@ namespace RenderProcess {
                             IPC::FPFrame& fpFrame, std::uint32_t fpDraws,
                             std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws,
                             std::uint32_t fpMMDraws, bool fpHave,
-                            const float bakeEye[3], bool parkFired,
+                            const double bakeEye[3], bool parkFired,
                             double dtPresent, double tStart, double tBuild);   // fwd (defined below)
 
     // The produce+RPC-start body (Tier 1a made it D3D9-free). Runs either inline on the MW
@@ -5709,7 +5726,8 @@ namespace RenderProcess {
         // (gate → flushes → assigns → constants → renderSceneKickoff) is the extracted
         // flushAssignAndKick, shared verbatim with the mode-3 park fire. bakeEye == eyePos
         // here ⇒ the camera restamp inside is the exact identity (byte-identical constants).
-        const float bakeEye[3] = { DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z };
+        const double* eyeNow = MGE::ExactPos::eye();
+        const double bakeEye[3] = { eyeNow[0], eyeNow[1], eyeNow[2] };
         flushAssignAndKick(device, frame, drawCount, skinnedCount, multiMapCount, lightCount,
                            skyCount, alphaCount, fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws,
                            fpMMDraws, fpHave, bakeEye, /*parkFired=*/false, dtPresent, tStart, tBuild);
@@ -5730,7 +5748,7 @@ namespace RenderProcess {
                             IPC::FPFrame& fpFrame, std::uint32_t fpDraws,
                             std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws,
                             std::uint32_t fpMMDraws, bool fpHave,
-                            const float bakeEye[3], bool parkFired,
+                            const double bakeEye[3], bool parkFired,
                             double dtPresent, double tStart, double tBuild) {
         // Drive the host renderer into the shared RT. Async — the host fence-waits before
         // signalling completion, so at renderSceneFinish the draw is GPU-complete and the
@@ -5802,11 +5820,11 @@ namespace RenderProcess {
         // On the serial paths build and fire are the same instant, so the delta is exactly zero and
         // every byte matches the pre-correction code.
         if (!g_playerPatch.empty() && g_playerBakeValid) {
-            float now[3];
+            double now[3];
             if (MGE::GeometryCache::playerRootOrigin(now)) {
-                const float dx = now[0] - g_playerBake[0];
-                const float dy = now[1] - g_playerBake[1];
-                const float dz = now[2] - g_playerBake[2];
+                const float dx = static_cast<float>(now[0] - g_playerBake[0]);
+                const float dy = static_cast<float>(now[1] - g_playerBake[1]);
+                const float dz = static_cast<float>(now[2] - g_playerBake[2]);
                 if (dx != 0.0f || dy != 0.0f || dz != 0.0f) {
                     for (const PlayerPatch& p : g_playerPatch) {
                         std::vector<std::uint8_t>* s =
@@ -5872,9 +5890,10 @@ namespace RenderProcess {
         //
         // On the serial paths bakeEye == eyePos, so the delta is 0 and this is a no-op.
         {
-            const float ex = DistantLand::eyePos.x - bakeEye[0];
-            const float ey = DistantLand::eyePos.y - bakeEye[1];
-            const float ez = DistantLand::eyePos.z - bakeEye[2];
+            const double* eyeNow = MGE::ExactPos::eye();
+            const float ex = static_cast<float>(eyeNow[0] - bakeEye[0]);
+            const float ey = static_cast<float>(eyeNow[1] - bakeEye[1]);
+            const float ez = static_cast<float>(eyeNow[2] - bakeEye[2]);
             // ...and tell the host the same delta. The pre-cancel below makes the sky camera-attached
             // in the MAIN view, but the reflect pass mirrors it about "z = 0 camera-relative" — a
             // plane that, like everything in the payload, is BAKE-relative. The mirror therefore
@@ -5886,9 +5905,10 @@ namespace RenderProcess {
             if (g_client) { g_client->setSkyParkEyeDelta(ex, ey, ez); }
         }
         if (skyCount > 0 && !g_skyScratch.empty()) {
-            const float ex = DistantLand::eyePos.x - bakeEye[0];
-            const float ey = DistantLand::eyePos.y - bakeEye[1];
-            const float ez = DistantLand::eyePos.z - bakeEye[2];
+            const double* eyeNow = MGE::ExactPos::eye();
+            const float ex = static_cast<float>(eyeNow[0] - bakeEye[0]);
+            const float ey = static_cast<float>(eyeNow[1] - bakeEye[1]);
+            const float ez = static_cast<float>(eyeNow[2] - bakeEye[2]);
             if (ex != 0.0f || ey != 0.0f || ez != 0.0f) {
                 const std::size_t n = g_skyScratch.size() / sizeof(IPC::SkyDrawWire);
                 auto* sky = reinterpret_cast<IPC::SkyDrawWire*>(g_skyScratch.data());
@@ -6027,9 +6047,10 @@ namespace RenderProcess {
         // near the origin (no float32 large-world stretching) in every mode.
         D3DXMATRIX viewRel = DistantLand::mwView;
         {
-            const float dx = bakeEye[0] - DistantLand::eyePos.x;
-            const float dy = bakeEye[1] - DistantLand::eyePos.y;
-            const float dz = bakeEye[2] - DistantLand::eyePos.z;
+            const double* eyeNow = MGE::ExactPos::eye();
+            const float dx = static_cast<float>(bakeEye[0] - eyeNow[0]);
+            const float dy = static_cast<float>(bakeEye[1] - eyeNow[1]);
+            const float dz = static_cast<float>(bakeEye[2] - eyeNow[2]);
             viewRel._41 = dx * viewRel._11 + dy * viewRel._21 + dz * viewRel._31;
             viewRel._42 = dx * viewRel._12 + dy * viewRel._22 + dz * viewRel._32;
             viewRel._43 = dx * viewRel._13 + dy * viewRel._23 + dz * viewRel._33;
@@ -6504,7 +6525,7 @@ namespace RenderProcess {
             // resident DL by -this eye — it must match the payload's relative space, so on a
             // mode-3 park fire this is the BUILD-time eye, not the current one; serial paths
             // pass bakeEye == eyePos) + isExterior gate (1 = feed host-owned DL).
-            bakeEye[0],                bakeEye[1],                bakeEye[2],                isExterior ? 1.0f : 0.0f,
+            (float)bakeEye[0],         (float)bakeEye[1],         (float)bakeEye[2],         isExterior ? 1.0f : 0.0f,
             // C2 skyZenith (float4 28..31): zenith sky colour for the host dome gradient. Host reads
             // it into FrameData.skyZenith; only sky.frag (dome branch) consumes it.
             // [31] = skyZenith.w, which the dome never used: the enchanted-item glow's caustic
@@ -6965,9 +6986,9 @@ namespace RenderProcess {
         }
         g_park.epoch           = g_cellEpoch;
         g_park.bake3rd         = MWBridge::get()->is3rdPerson();
-        g_park.bakeEye[0]      = DistantLand::eyePos.x;
-        g_park.bakeEye[1]      = DistantLand::eyePos.y;
-        g_park.bakeEye[2]      = DistantLand::eyePos.z;
+        g_park.bakeEye[0]      = MGE::ExactPos::eye()[0];
+        g_park.bakeEye[1]      = MGE::ExactPos::eye()[1];
+        g_park.bakeEye[2]      = MGE::ExactPos::eye()[2];
         g_park.drawCount       = drawCount;
         g_park.skinnedCount    = skinnedCount;
         g_park.multiMapCount   = multiMapCount;

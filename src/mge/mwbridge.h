@@ -226,6 +226,11 @@ public:
     // The player reference's scene-graph node = the 3rd-person body (the engine
     // appCulls it while in 1st person). Null during load screens / before MACP exists.
     NI::Node* getPlayer3rdPersonNode();
+    // PlayerAnimationController::firstPersonHeadCameraNode — the node MW takes the first-person
+    // camera position from (MWSE's tes3.getCameraPosition reads the same one). ExactPos composes
+    // it in double to recover the rounding MW's float copy bakes into the camera. Null during load
+    // screens / before MACP exists.
+    NI::Camera* getPlayerHeadCamera();
     // FP1a: the WorldController armCamera scene root — the first-person arms/weapon
     // subtree MW renders in its own post-z-clear scene. Null when unavailable.
     NI::Node* getArmCameraRoot();

@@ -21,6 +21,7 @@
 
 #include "configuration.h"
 #include "datahandler_view.h"
+#include "exactpos.h"
 #include "mwbridge.h"
 #include "scenegraph.h"
 #include "distantland.h"                 // DistantLand::mwWorldSuppress (MW-ONLY-UI root cull)
@@ -116,6 +117,7 @@ namespace MGE::SceneGraph {
             out.worldPos[0] = pl->worldTransform.translation.x;
             out.worldPos[1] = pl->worldTransform.translation.y;
             out.worldPos[2] = pl->worldTransform.translation.z;
+            ExactPos::worldT(pl, out.worldPosExact);
 
             const float dimmer = pl->dimmer;
             out.diffuse[0] = pl->diffuse.r * dimmer;
