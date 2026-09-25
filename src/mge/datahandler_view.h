@@ -124,5 +124,16 @@ namespace MGE::DataHandlerView {
     inline int cellExteriorGridY(void* cell) {
         return *reinterpret_cast<int*>(static_cast<unsigned char*>(cell) + OFF_cellExteriorGridY);
     }
+    // The cell's own scene roots (MWSE TES3Cell.h: pickObjectsRoot @0x14, staticObjectsRoot @0x2C).
+    // Their children are the reference roots MW FILED under this cell — which is not always the cell
+    // the reference's position falls in. Null when the cell has no such root.
+    constexpr size_t OFF_cellPickObjectsRoot   = 0x14;
+    constexpr size_t OFF_cellStaticObjectsRoot = 0x2C;
+    inline NI::Node* cellPickObjectsRoot(void* cell) {
+        return *reinterpret_cast<NI::Node**>(static_cast<unsigned char*>(cell) + OFF_cellPickObjectsRoot);
+    }
+    inline NI::Node* cellStaticObjectsRoot(void* cell) {
+        return *reinterpret_cast<NI::Node**>(static_cast<unsigned char*>(cell) + OFF_cellStaticObjectsRoot);
+    }
 
 }

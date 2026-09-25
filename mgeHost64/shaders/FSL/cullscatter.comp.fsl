@@ -49,10 +49,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Dynamic visibility — VERBATIM copy of cull.comp.fsl's gate (see the rationale there). Same
     // inputs, same order, same fail-open bound, so the scatter agrees bit-for-bit with the counts
     // the prefix-sum sized the runs from.
-    if (inst.visIndex != 0u && inst.visIndex < DL_VIS_MASK_BITS)
+    uint visGroup = inst.visIndex & 0xFFFFu;   // high bits = the near-ownership override (cellown.h.fsl)
+    if (visGroup != 0u && visGroup < DL_VIS_MASK_BITS)
     {
-        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
-        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
+        uint visWord = asuint(gCullParams.visMask[visGroup >> 7u][(visGroup >> 5u) & 3u]);
+        if (((visWord >> (visGroup & 31u)) & 1u) == 0u)
             RETURN();
     }
 
@@ -74,7 +75,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // cull.comp.fsl), same order as cull.comp.fsl, so the scatter agrees bit-for-bit with the
     // counts the prefix-sum sized the runs from. Survivors carry the slab into InstParams.w below,
     // which is what lets statics.vert clip the half MW already draws instead of dropping the object.
-    float nearSlab = nearPathSlab(inst.wr3.x, inst.wr3.y);
+    float nearSlab = nearPathSlab(inst.wr3.x, inst.wr3.y, inst.visIndex);
     if (nearPathCovers(nearSlab, dNear2, inst.effR))
         RETURN();
     UNROLL

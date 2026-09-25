@@ -196,6 +196,9 @@ namespace IPC {
 			case Command::UpdateDynVis:
 				updateDynVis();
 				break;
+			case Command::UpdateNearRefs:
+				updateNearRefs();
+				break;
 			case Command::InitDistantStatics:
 				initDistantStatics();
 				break;
@@ -318,6 +321,19 @@ namespace IPC {
 				}
 			}
 		}
+	}
+
+	void Server::updateNearRefs() {
+		auto& params = m_ipcParameters->params.nearRefsParams;
+		auto& vec = getVec<NearRefWire>(params.id);
+		std::vector<ForgeRender::NearRef> refs;
+		refs.reserve(params.count);
+		std::uint32_t n = 0;
+		for (auto& r : vec) {
+			if (n++ >= params.count) break;
+			refs.push_back({ r.x, r.y, r.z, r.cellX, r.cellY });
+		}
+		ForgeRender::setNearRefs(refs.data(), (unsigned)refs.size());
 	}
 
 	bool Server::initDistantStatics() {

@@ -592,6 +592,17 @@ namespace MGE::GeometryCache {
     // reads how many first-sight keys were deferred since the last setCaptureBudget call.
     void setCaptureBudget(int budget);
     uint32_t captureDeferredLastBuild();
+    // Diagnostic: "shape <- parent .. reference-root world=(x,y,z) r=R" for a key. Only for a key
+    // from THIS frame's classify set (live by construction); never for a stored key.
+    void describeKey(uint32_t key, char* buf, size_t n);
+
+    // Statics near/far handover: every reference root MW holds in its LOADED exterior cells — the
+    // children of each cell's own static/pick roots — as (placement origin, grid of the cell it is
+    // FILED under). A reference can stand outside that cell, which is why the host needs this and
+    // not just the loaded mask. Returns a signature of the set (cells, roots, child counts); `out`
+    // is filled only when `fill` is true, so the per-frame change test costs no list.
+    struct HeldRef { float x, y, z; int cellX, cellY; };
+    std::uint64_t heldRefs(void* dataHandler, bool fill, std::vector<HeldRef>& out);
 
     // Running first-sight lazy-capture count for the current cache frame (reset by
     // onFrameReady). Snapshot before/after a build loop to count captures-this-build.

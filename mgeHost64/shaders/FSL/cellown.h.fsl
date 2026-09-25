@@ -29,24 +29,38 @@
 // so it is never submitted.
 //
 // The cull grid cell IS an MW cell (8192, same origin), so the instance's cell is just
-// floor(origin.xy / 8192) — no lookup table. Feed it the placement ORIGIN (wr3.xy), which is what MW
-// files a reference under; the bound centre can land in the next cell over.
+// floor(origin.xy / 8192) — no lookup table. Feed it the placement ORIGIN (wr3.xy); the bound centre
+// can land in the next cell over.
+//
+// ⚠ THE POSITION CELL IS NOT ALWAYS THE CELL MW FILES THE REFERENCE UNDER. A reference may stand
+// outside the cell it was placed in (Fort Pelagiad's ex_imp_wall_tower_01: position in (0,-8), filed
+// under (0,-7)), and MW loads and draws it with the cell it is FILED under. With (0,-7) unloaded and
+// (0,-8) loaded the position verdict clipped DL's wall while MW drew nothing: a hole that lasted as
+// long as MW's grid did. So the host matches the references MW actually holds against the instances
+// by origin and, where the answer differs from the position verdict, packs an OVERRIDE into
+// visIndex's spare high bits (kNearOwnOverride / kNearOwnYes). Everything else keeps the cell test.
 //
 // cellOwn.w == 0 (interior, standalone viewer, sun cull, or MW's own cell not committed yet)
 // disarms this entirely and CullParams.ranges.w — the old fixed near-cut distance — takes over.
 // The host arms exactly one of the two.
 
 #define kMWCellSize 8192.0f
+#define kVisIndexMask    0xFFFFu      // usage.data's dynamic-vis group (16-bit)
+#define kNearOwnOverride (1u << 16)   // the host's per-instance ownership verdict is armed
+#define kNearOwnYes      (1u << 17)   // ...and MW draws this instance
 
 // The view-Z plane where MW's near coverage ENDS for this instance: misc.z (MW's view distance) when
 // the instance's MW cell is confirmed LOADED, and 0 — DL owns it outright, pre-gate behaviour — when
 // it is not. A cell still background-loading therefore keeps its full DL cover, which is the
 // fail-open direction: a hole is worse than a duplicate. cullscatter.comp re-runs this through the
 // SAME header, so the scatter can never disagree with the counts the prefix-sum sized its runs from.
-float nearPathSlab(float originX, float originY)
+float nearPathSlab(float originX, float originY, uint visIndexRaw)
 {
     if (gCullParams.cellOwn.w < 0.5f)
         return 0.0f;
+
+    if ((visIndexRaw & kNearOwnOverride) != 0u)
+        return ((visIndexRaw & kNearOwnYes) != 0u) ? gCullParams.misc.z : 0.0f;
 
     int cx = (int)floor(originX * (1.0f / kMWCellSize));
     int cy = (int)floor(originY * (1.0f / kMWCellSize));

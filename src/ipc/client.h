@@ -225,6 +225,7 @@ namespace IPC {
 		* @return Whether the RPC was issued successfully.
 		*/
 		bool updateDynVis(VecId flags);
+		bool updateNearRefs(VecId refs, std::uint32_t count);
 
 		/**
 		* @brief Inform the server of distant static D3D resources.

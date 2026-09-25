@@ -218,6 +218,55 @@ namespace {
     // steady state stays capped (the eviction parent-chain rescue prevents re-capture churn).
     constexpr unsigned kCaptureEpochGraceFrames = 600;
 
+    // NEAR-MISS diagnostic. A classify key is a shape MW DREW this frame; the engine-cull skip drops
+    // MW's own display of it on category alone, and the DL slab clips the far copy at MW's reach — so
+    // every key the build fails to emit is drawn by NOBODY. Counted per reason and averaged into
+    // [nearmiss]; a key missed for kNearMissStreak consecutive frames is named once (the standing-
+    // still hole), and a transient burst shows up as the per-frame averages.
+    enum class NearMiss : std::uint8_t { Deferred, NoEntry, NoSlot, Count };
+    struct NearMissTrack { unsigned lastFrame; unsigned streak; bool named; };
+    std::unordered_map<std::uint32_t, NearMissTrack> g_nearMissTrack;
+    std::uint64_t g_nearMissCount[(int)NearMiss::Count] = {};
+    std::uint32_t g_nearMissFrameMax = 0, g_nearMissFrameN = 0;
+    unsigned      g_nearMissNamed = 0;
+    constexpr unsigned kNearMissStreak = 30;
+    constexpr unsigned kNearMissNameCap = 200;
+
+    void noteNearMiss(std::uint32_t key, NearMiss why) {
+        ++g_nearMissCount[(int)why];
+        ++g_nearMissFrameN;
+        auto& t = g_nearMissTrack[key];
+        t.streak = (t.streak != 0 && t.lastFrame + 1 == g_frame) ? t.streak + 1 : 1;
+        t.lastFrame = g_frame;
+        if (t.streak >= kNearMissStreak && !t.named && g_nearMissNamed < kNearMissNameCap) {
+            t.named = true;
+            ++g_nearMissNamed;
+            char desc[512];
+            MGE::GeometryCache::describeKey(key, desc, sizeof(desc));
+            static const char* kWhy[] = { "DEFERRED", "NO-ENTRY", "NO-SLOT" };
+            LOG::logline("!! [nearmiss] %s for %u frames: %s", kWhy[(int)why], t.streak, desc);
+        }
+    }
+
+    // Once per build, after the visible loop: fold this build's misses into the window, report it.
+    void nearMissEndBuild() {
+        if (g_nearMissFrameN > g_nearMissFrameMax) g_nearMissFrameMax = g_nearMissFrameN;
+        g_nearMissFrameN = 0;
+        static unsigned s_builds = 0;
+        if (++s_builds >= 300) {
+            LOG::logline(">> [nearmiss] %u builds: deferred=%.2f noEntry=%.2f noSlot=%.2f /build, worst build=%u, named=%u",
+                         s_builds, g_nearMissCount[0] / (double)s_builds, g_nearMissCount[1] / (double)s_builds,
+                         g_nearMissCount[2] / (double)s_builds, g_nearMissFrameMax, g_nearMissNamed);
+            s_builds = 0;
+            g_nearMissFrameMax = 0;
+            for (auto& c : g_nearMissCount) c = 0;
+            // Drop keys not missed in the window, so the table tracks only live holes.
+            for (auto it = g_nearMissTrack.begin(); it != g_nearMissTrack.end();) {
+                if (g_frame - it->second.lastFrame > 2) it = g_nearMissTrack.erase(it); else ++it;
+            }
+        }
+    }
+
     // Upload cost accounting (Part A). Two accumulators: g_upFrame is THIS frame's per-category
     // reship cost (parts + bytes), read into lighting[33..34] when the kickoff builds the frame
     // and then zeroed; g_upHb sums the same over the kHeartbeatFrames window for the [uploads]
@@ -3352,14 +3401,20 @@ namespace {
                     // construction. MUST run before the g_keySlot probe: a first-sight key
                     // has no slot until ensureLive's capture registers it (same frame).
                     const double te0 = nowMs();
+                    const std::uint32_t defBefore = MGE::GeometryCache::captureDeferredLastBuild();
                     const auto* e = MGE::GeometryCache::ensureLive(key);
                     ensureLiveMs += nowMs() - te0;
-                    if (!e) continue;                     // no model data / capture failed / deferred
+                    if (!e) {                             // no model data / capture failed / deferred
+                        noteNearMiss(key, MGE::GeometryCache::captureDeferredLastBuild() != defBefore
+                                              ? NearMiss::Deferred : NearMiss::NoEntry);
+                        continue;
+                    }
                     // The unusable-skinned filter buildFrustumVisibleSet applies on
                     // non-fold frames (never drawn; trips the bound helper).
                     if (e->isSkinned && (e->skinnedUnsupported || e->numBones == 0)) continue;
                     auto ks = g_keySlot.find(key);
                     if (ks == g_keySlot.end()) {
+                        noteNearMiss(key, NearMiss::NoSlot);
                         continue;   // not an uploaded part (or not yet shipped)
                     }
                     const double td0 = nowMs();
@@ -3386,6 +3441,7 @@ namespace {
         // Snapshot BEFORE the reset — setCaptureBudget clears the deferred counter.
         const std::uint32_t capDeferred = MGE::GeometryCache::captureDeferredLastBuild();
         MGE::GeometryCache::setCaptureBudget(-1);
+        if (foldKeys) nearMissEndBuild();
 
         // ---- STENCIL "FAKE HOLE" PORTALS: emit the deferred objects, in ROLE order ---------------
         // masks -> hulls -> the rest, per object. That is the order the trick is built on: the mask

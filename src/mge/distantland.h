@@ -126,6 +126,11 @@ public:
 
     static IPC::VecId dynVisFlagsSharedId;
 
+    // Statics near/far handover: the reference roots MW holds in its loaded exterior cells, with
+    // the cell each is FILED under (scanNearRefs). Shipped to the host only when the set changes.
+    static IPC::VecView<IPC::NearRefWire> nearRefsShared;
+    static IPC::VecId nearRefsSharedId;
+
     // Number of z-writing draws MW has issued in the current scene. Bumped in
     // inspectIndexedPrimitive, reset at scene 0 (renderStage0 / renderStage1). Its one
     // consumer is the sky predicate there: MW's sky is the first blended geometry of a
@@ -217,6 +222,7 @@ public:
     static bool isDistantCell();
     static void resolveDynamicVisGroups();
     static void scanDynamicVisGroups();
+    static void scanNearRefs();
 
     static void setView(const D3DMATRIX* m);
     static void setProjection(D3DMATRIX* proj);

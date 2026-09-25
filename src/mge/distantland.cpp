@@ -1070,6 +1070,10 @@ bool DistantLand::selectDistantCell() {
             scanDynamicVisGroups();
             lastDistantVisCell = playerCell;
         }
+        // Every frame, not on cell change: MW's grid loads and unloads cells on its own schedule
+        // (and does NOT recentre the moment the player crosses a border), so the player's cell is
+        // the wrong trigger. scanNearRefs sends only when the held set actually changed.
+        scanNearRefs();
 
         // Get worldspace key
         string cellname;
@@ -1196,6 +1200,33 @@ void DistantLand::scanDynamicVisGroups() {
     if (Configuration.UseSharedMemory && !dynVisFlagsShared.empty()) {
         ipcClient.updateDynVis(dynVisFlagsSharedId);
     }
+}
+
+// scanNearRefs - ship the reference roots MW holds in its loaded exterior cells to the Forge host,
+// whenever that set changes. The host's distant-statics cull hands an instance to the near path only
+// if MW holds a reference at its origin filed in a loaded cell — the cell its POSITION falls in is
+// not enough, because a reference can stand outside the cell MW loads it with (Fort Pelagiad's
+// walls: a hole that lasted as long as MW's grid did). Rides the same channel and site as
+// updateDynVis, ahead of this frame's RenderFrame, so the list and the frame's loaded mask agree.
+void DistantLand::scanNearRefs() {
+    if (!Configuration.UseSharedMemory || nearRefsSharedId == IPC::InvalidVector) return;
+    if (!MWBridge::get()->IsExterior()) return;
+    void* dh = MGE::SceneGraph::getDataHandler();
+    static std::uint64_t s_lastSig = 0;
+    static std::vector<MGE::GeometryCache::HeldRef> s_refs;
+    const std::uint64_t sig = MGE::GeometryCache::heldRefs(dh, false, s_refs);
+    if (sig == 0 || sig == s_lastSig) return;
+    s_lastSig = sig;
+
+    MGE::GeometryCache::heldRefs(dh, true, s_refs);
+    nearRefsShared.clear();
+    std::uint32_t n = 0;
+    for (const auto& r : s_refs) {
+        if (n >= 16384u) break;   // the vec's ceiling (distantinit.cpp)
+        nearRefsShared.push_back({ r.x, r.y, r.z, (std::int16_t)r.cellX, (std::int16_t)r.cellY });
+        ++n;
+    }
+    ipcClient.updateNearRefs(nearRefsSharedId, n);
 }
 
 // setView - Called once per frame to setup view dependent data

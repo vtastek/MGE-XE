@@ -5291,6 +5291,58 @@ namespace MGE::GeometryCache {
         return g_captureDeferred;
     }
 
+    std::uint64_t heldRefs(void* dh, bool fill, std::vector<HeldRef>& out) {
+        if (fill) out.clear();
+        std::uint64_t sig = 1469598103934665603ull;   // FNV-1a over the set's identity
+        auto mix = [&sig](std::uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+        if (!dh) return 0;
+        for (std::size_t i = 0; i < DataHandlerView::EXT_CELL_DATA_COUNT; ++i) {
+            void* ecd = DataHandlerView::exteriorCellData(dh, i);
+            if (!DataHandlerView::exteriorCellLoaded(ecd)) continue;
+            void* cell = DataHandlerView::exteriorCellRecord(ecd);
+            const int gx = DataHandlerView::cellExteriorGridX(cell);
+            const int gy = DataHandlerView::cellExteriorGridY(cell);
+            mix((std::uint64_t)(std::uintptr_t)cell);
+            NI::Node* roots[2] = { DataHandlerView::cellStaticObjectsRoot(cell),
+                                   DataHandlerView::cellPickObjectsRoot(cell) };
+            for (NI::Node* root : roots) {
+                if (!root) continue;
+                const auto count = root->children.getEndIndex();
+                mix((std::uint64_t)(std::uintptr_t)root ^ ((std::uint64_t)count << 32));
+                if (!fill) continue;
+                for (size_t c = 0; c < count; ++c) {
+                    NI::AVObject* ref = root->children.at(c).get();
+                    if (!ref) continue;
+                    const auto& t = ref->localTranslate;
+                    out.push_back({ t.x, t.y, t.z, gx, gy });
+                }
+            }
+        }
+        return sig;
+    }
+
+    void describeKey(uint32_t key, char* buf, size_t n) {
+        if (!buf || n == 0) return;
+        buf[0] = '\0';
+        auto* geom = reinterpret_cast<NI::AVObject*>(key);
+        if (!geom) return;
+        // The whole parent chain, printed shape-first: the reference is named somewhere in the
+        // middle and its depth differs by root, so print every level rather than guess one.
+        size_t used = 0;
+        int depth = 0;
+        for (const NI::AVObject* a = geom; a && depth < 12 && used + 2 < n; a = a->parentNode, ++depth) {
+            const char* nm = a->getName();
+            const int w = snprintf(buf + used, n - used, "%s%s", depth ? " <- " : "", nm ? nm : "?");
+            if (w < 0) break;
+            used += (size_t)w;
+        }
+        if (used + 2 < n) {
+            const auto& t = geom->worldTransform.translation;
+            snprintf(buf + used, n - used, "  world=(%.0f,%.0f,%.0f) r=%.0f",
+                     t.x, t.y, t.z, geom->worldBoundRadius);
+        }
+    }
+
     uint32_t liveCaptureCount() {
         return g_liveCaptureThisFrame;
     }

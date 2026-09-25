@@ -1260,11 +1260,14 @@ bool heightOccluded(float3 c_rel, float effR)
 }
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
-#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
-float nearPathSlab(float originX, float originY)
+#line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
+float nearPathSlab(float originX, float originY, uint visIndexRaw)
 {
     if (gCullParams.cellOwn.w < 0.5f)
         return 0.0f;
+
+    if ((visIndexRaw &  (1u << 16) ) != 0u)
+        return ((visIndexRaw &  (1u << 17) ) != 0u) ? gCullParams.misc.z : 0.0f;
 
     int cx = (int)floor(originX * (1.0f /  8192.0f ));
     int cy = (int)floor(originY * (1.0f /  8192.0f ));
@@ -1315,10 +1318,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-    if (inst.visIndex != 0u && inst.visIndex <  2048u )
+    uint visGroup = inst.visIndex & 0xFFFFu;
+    if (visGroup != 0u && visGroup <  2048u )
     {
-        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
-        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
+        uint visWord = asuint(gCullParams.visMask[visGroup >> 7u][(visGroup >> 5u) & 3u]);
+        if (((visWord >> (visGroup & 31u)) & 1u) == 0u)
             return;
     }
 
@@ -1340,7 +1344,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-    float nearSlab = nearPathSlab(inst.wr3.x, inst.wr3.y);
+    float nearSlab = nearPathSlab(inst.wr3.x, inst.wr3.y, inst.visIndex);
     if (nearPathCovers(nearSlab, dNear2, inst.effR))
         return;
     UNROLL

@@ -48,6 +48,7 @@ namespace IPC {
 		bool allocVec();
 		bool freeVec();
 		void updateDynVis();
+		void updateNearRefs();
 		bool initDistantStatics();
 		bool initLandscape();
 		void setWorldSpace();

@@ -161,6 +161,22 @@ namespace IPC {
         // [TexUploadWire][dds bytes]*texCount (see ipc/geomwire.h); the host decodes each DDS
         // into gTextures[slot]. Rides the same dedicated geometry channel as GeomUpload.
         TexUpload,
+
+        // Statics near/far handover: every reference root MW holds in its LOADED exterior cells,
+        // with the cell it is FILED under (NearRefWire). Sent only when that set changes. The host
+        // matches it against the DL instances by placement origin, because the cell a reference's
+        // POSITION falls in is not always the cell MW files — and loads, and draws — it under.
+        UpdateNearRefs,
+    };
+
+    struct NearRefWire {
+        float x, y, z;              // reference root local translation = the placement origin
+        std::int16_t cellX, cellY;  // grid of the cell MW filed it under (the cell record's own)
+    };
+
+    struct NearRefsParameters {
+        IN VecId id;
+        IN std::uint32_t count;
     };
 
     struct AllocVecParameters {
@@ -666,6 +682,7 @@ namespace IPC {
             RenderFrameParameters renderFrameParams;
             GeomUploadParameters geomUploadParams;
             TexUploadParameters texUploadParams;
+            NearRefsParameters nearRefsParams;
         } params;
 	};
 }

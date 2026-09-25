@@ -367,6 +367,14 @@ namespace IPC {
 		return beginRpc(Command::UpdateDynVis);
 	}
 
+	bool Client::updateNearRefs(VecId id, std::uint32_t count) {
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		m_ipcParameters->params.nearRefsParams.id = id;
+		m_ipcParameters->params.nearRefsParams.count = count;
+		return beginRpc(Command::UpdateNearRefs);
+	}
+
 	bool Client::initDistantStatics(VecId distantStatics, VecId distantSubsets) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 

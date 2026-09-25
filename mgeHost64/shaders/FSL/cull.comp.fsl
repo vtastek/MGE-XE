@@ -48,10 +48,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // DL_VIS_MASK_BITS: an over-eager gate silently deletes real world geometry, far worse than a
     // ghost. cullscatter.comp.fsl repeats this test VERBATIM — the two must agree bit-for-bit or the
     // prefix-sum sizes and the scatter disagree (shows up as a gpuCull MATCH failure, not corruption).
-    if (inst.visIndex != 0u && inst.visIndex < DL_VIS_MASK_BITS)
+    uint visGroup = inst.visIndex & 0xFFFFu;   // high bits = the near-ownership override (cellown.h.fsl)
+    if (visGroup != 0u && visGroup < DL_VIS_MASK_BITS)
     {
-        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
-        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
+        uint visWord = asuint(gCullParams.visMask[visGroup >> 7u][(visGroup >> 5u) & 3u]);
+        if (((visWord >> (visGroup & 31u)) & 1u) == 0u)
             RETURN();
     }
 
@@ -80,7 +81,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // functions — that is what keeps the scatter and the prefix-sum in agreement. Cell coords come
     // from wr3.xy (the placement ORIGIN — the position MW files the reference under), NOT from
     // posX/posY, which is the bound centre and can sit in the neighbouring cell.
-    if (nearPathCovers(nearPathSlab(inst.wr3.x, inst.wr3.y), dNear2, inst.effR))
+    if (nearPathCovers(nearPathSlab(inst.wr3.x, inst.wr3.y, inst.visIndex), dNear2, inst.effR))
         RETURN();
 
     // Frustum-cull the instance sphere (camera-relative center, radius effR).

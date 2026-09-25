@@ -68,6 +68,14 @@ namespace ForgeRender {
     // detail. Centre bit clear / reach 0 ⇒ gate off, the fixed near-cut distance applies instead.
     void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach);
 
+    // ...and WHICH references MW actually holds in those cells: each reference root's placement
+    // origin with the cell it is FILED under. A reference can stand outside its own cell, so the
+    // cell its position falls in says nothing certain about whether MW is drawing it; the DL cull
+    // overrides the per-cell verdict for exactly the instances where the two disagree.
+    // Plain pointer + count: this header stays STL-free (see the top), the host copies.
+    struct NearRef { float x, y, z; int cellX, cellY; };
+    void setNearRefs(const NearRef* refs, unsigned count);
+
     // The exported NT shared-RT handle — valid in the HOST process. Null until a
     // successful init(). The IPC server DuplicateHandles this into MW's process.
     void* sharedHandle();

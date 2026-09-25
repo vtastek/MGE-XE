@@ -16880,6 +16880,10 @@ namespace {
     // Viewer: draw DL statics all the way to the eye (same reason the water REFLECTION does — no near
     // path covers them, so the near-cut would just delete them).
     bool  g_dlNoStaticsNearCut = false;
+    // Handover A/B (knob "dlOwnOff"): 1 = the primary view's DL statics ignore near ownership and
+    // draw their whole LOD, slab and near-cut both off. A hole that FILLS under it is the near path
+    // failing to draw what the slab handed it; one that stays is DL's own.
+    float g_dlOwnOff = 0.0f;
 
     // ---- Statics near/far OWNERSHIP (setNearCells; see the gate in dlCullAndBuild) ---------------
     // MW's active exterior cell set + the reach of MW's own cull, shipped every frame. A distant
@@ -16904,6 +16908,41 @@ namespace {
         if (dx < -1 || dx > 1 || dy < -1 || dy > 1) { return false; }
         return (g_nearCellMask >> ((dy + 1) * 3 + (dx + 1))) & 1u;
     }
+
+    // ---- Ownership PER INSTANCE: what MW actually holds ----------------------------------------
+    // The cell verdict above keys on the cell an instance's POSITION falls in. MW files a reference
+    // under the cell it was PLACED in, and a reference may stand well outside it: Fort Pelagiad's
+    // ex_imp_wall_tower_01 at (5632,-58240) lies in grid (0,-8) but belongs to (0,-7). With (0,-7)
+    // unloaded and (0,-8) loaded, MW draws no wall while the cell verdict clipped DL's copy — a hole
+    // that held for as long as MW's grid did (walk back 20 m past a border and return: the grid
+    // does not recentre, the wall stays gone). The reverse misfile drew twice.
+    //
+    // So the client ships every reference root MW holds in its loaded cells (origin + the cell it
+    // is FILED under, setNearRefs), and the verdict per instance becomes "MW holds a reference at
+    // this origin, filed in a loaded cell". Only instances where that DISAGREES with the cell
+    // verdict carry an override, packed into visIndex's spare high bits (usage.data's group index
+    // is 16-bit): the common case costs the GPU nothing new and the buffer takes a handful of 4-byte
+    // writes when the grid moves. Every visIndex reader masks kVisIndexMask.
+    constexpr uint32_t kVisIndexMask      = 0xFFFFu;
+    constexpr uint32_t kNearOwnOverride   = 1u << 16;   // the per-instance verdict below is armed
+    constexpr uint32_t kNearOwnYes        = 1u << 17;   // ...and says MW draws this instance
+    std::vector<ForgeRender::NearRef> g_nearRefs;
+    uint32_t g_nearRefsVersion = 0;
+    bool     g_nearRefsValid   = false;   // at least one list has arrived
+    // Instances currently carrying an override (index -> the bits written). Diffed on refresh.
+    std::unordered_map<uint32_t, uint32_t> g_nearOwnOverrides;
+    uint32_t g_nearOwnApplied[4] = { ~0u, 0, 0, 0 };   // version, centreX, centreY, mask last applied
+    uint32_t g_nearOwnOrphans = 0;    // overrides: position cell loaded, MW holds NO such reference
+    uint32_t g_nearOwnAdopted = 0;    // overrides: MW holds it though its position cell is not loaded
+    uint32_t g_nearOwnMatched = 0;    // instances in the 5x5 window matched to a held reference
+    uint32_t g_nearOwnWindow  = 0;    // instances in the 5x5 window at all
+
+    // The one ownership verdict every consumer asks (CPU cull, heartbeat tally; cellown.h.fsl is
+    // the GPU copy). gx/gy = the grid cell of the instance's placement origin.
+    inline bool dlInstNearOwned(uint32_t visIndexRaw, int32_t gx, int32_t gy) {
+        if (visIndexRaw & kNearOwnOverride) { return (visIndexRaw & kNearOwnYes) != 0u; }
+        return dlCellResident(gx, gy);
+    }
     // Per-frame ownership diagnostics (dlLogHeartbeat + the dev panel), one counter per class the
     // handover sorts a resident-cell instance into:
     //   suppressed  — wholly in front of the slab: MW draws all of it, no proxy submitted.
@@ -16924,6 +16963,7 @@ namespace {
     // M2 A/B: OFF forces hizParams.w = 0 -> the GPU occlusion test passes everything through and
     // the draw is byte-identical to frustum-only (the pyramid still builds; PD1 explicit A/B).
     bool g_hizOcclusion  = true;
+    float g_hizOffKnob   = 0.0f;   // knob "hizOff": 1 = the same A/B from the harness
     // Hi-Z pyramid A/B: OFF = neither the mip-0 seam fill nor the tail reduce happens; g_hizValid
     // drops the same frame (a skipped rebuild means a stale pyramid), so occlusion passes through.
     bool g_hizPrologue   = true;
@@ -22046,6 +22086,8 @@ namespace {
             // arm can be taken unattended as well as by hand. See upscale.h.
             { "upscaleSharpness",   &g_upscaleSharpness   },
             { "upscaleAntiRing",    &g_upscaleAntiRing    },
+            { "dlOwnOff",           &g_dlOwnOff           },
+            { "hizOff",             &g_hizOffKnob         },
             { "fogSkyKnee",         &g_fogSkyKnee         },
             { "fogHazeLiftDeg",     &g_fogHazeLiftDeg     },
             { "fogHazeSunFloorDeg", &g_fogHazeSunFloorDeg },
@@ -28407,6 +28449,12 @@ void destroyHostWindow(Renderer* R);
             || g_live.outWidth != prevOutW || g_live.outHeight != prevOutH) {
             logRectLine();
         }
+    }
+
+    void setNearRefs(const NearRef* refs, unsigned count) {
+        g_nearRefs.assign(refs, refs + count);
+        ++g_nearRefsVersion;
+        g_nearRefsValid = true;
     }
 
     void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach) {
@@ -45467,6 +45515,7 @@ void destroyHostWindow(Renderer* R);
     // Cull-side read. Fail-open on anything past the mask: an over-eager gate silently deletes real
     // world geometry, which is far worse than a ghost building.
     inline bool dlVisEnabled(uint32_t v) {
+        v &= kVisIndexMask;                                  // high bits = near-ownership override
         if (v == 0u) { return true; }                        // ungated — the common case
         if (v >= DL_VIS_MASK_BITS) {
             static bool warned = false;
@@ -50375,9 +50424,12 @@ void destroyHostWindow(Renderer* R);
         // well above 0 — that band, from MW's ~reach out to the cell edge, is DL's alone).
         // gate=0 means no cell set arrived and the fixed near-cut distance is in charge.
         LOG::logline(">> [forge-hb][dl] cellown gate=%d centre=(%d,%d) mask=0x%03X reach=%.0f"
-                     " suppressed=%u clipped=%u residentDrawn=%u",
+                     " suppressed=%u clipped=%u residentDrawn=%u | refs=%zu window=%u matched=%u"
+                     " orphans=%u adopted=%u",
                      (int)dlCellOwnActive(), g_nearCellX, g_nearCellY, g_nearCellMask,
-                     g_nearCellReach, g_dlOwnSuppressed, g_dlOwnClipped, g_dlOwnResidentDrawn);
+                     g_nearCellReach, g_dlOwnSuppressed, g_dlOwnClipped, g_dlOwnResidentDrawn,
+                     g_nearRefs.size(), g_nearOwnWindow, g_nearOwnMatched, g_nearOwnOrphans,
+                     g_nearOwnAdopted);
         // REFLECTION FIDELITY (part 2). ⚠ THIS LINE EXISTS TO PROVE AN ARM TOOK. `waterNoReflect`
         // is the cautionary tale: it reads like the reflection's off switch, it is spelled exactly
         // like a cost lever, and it changes the frame by 0.05 ms — an arm that silently does not
@@ -52900,9 +52952,9 @@ void destroyHostWindow(Renderer* R);
                 if (ndx*ndx + ndy*ndy > farLimit*farLimit) { continue; }
             }
             ++cellsHit;
-            // Ownership half 1 (per CELL — kLiveGridCell IS one MW cell at the same origin, so a
-            // grid cell and an MW cell are the same thing). Half 2 is per-instance, below.
-            const bool residentCell = cellOwn && dlCellResident(c.gx, c.gy);
+            // Ownership half 1 is per INSTANCE now (dlInstNearOwned: the cell verdict — kLiveGridCell
+            // IS one MW cell at the same origin — unless the held-reference list overrides it for an
+            // instance that stands outside the cell it is filed under). Half 2 is the slab, below.
 
             for (uint32_t ii : c.inst) {
                 ++examined;
@@ -52926,7 +52978,7 @@ void destroyHostWindow(Renderer* R);
                 // cellown.h.fsl::nearPathCovers exactly (same order, same Euclidean-vs-view-Z
                 // under-reject) or the CPU and GPU culls disagree. Exactly one of slab / nearCut2
                 // is ever armed.
-                const float slab = residentCell ? ownReach : 0.0f;
+                const float slab = (cellOwn && dlInstNearOwned(gi.visIndex, c.gx, c.gy)) ? ownReach : 0.0f;
                 if (slab > 0.0f && gi.effR < slab) {
                     const float inner = slab - gi.effR;
                     if (dNear2 < inner * inner) { continue; }   // wholly MW-covered — nothing to draw
@@ -53033,7 +53085,7 @@ void destroyHostWindow(Renderer* R);
             const bool eyeJump = (dEx*dEx + dEy*dEy + dEz*dEz) > (2048.0f * 2048.0f);
             cp[52] = (float)g_live.width; cp[53] = (float)g_live.height;                            // hizParams.xy = mip0 dims
             cp[54] = (float)(g_live.hizMips > 0 ? g_live.hizMips - 1 : 0);                          // hizParams.z = mipCount-1
-            cp[55] = (g_hizValid && g_hizOcclusion && !eyeJump) ? 1.0f : 0.0f;                      // hizParams.w = valid
+            cp[55] = (g_hizValid && g_hizOcclusion && g_hizOffKnob < 0.5f && !eyeJump) ? 1.0f : 0.0f;                      // hizParams.w = valid
             cp[56] = dEx; cp[57] = dEy; cp[58] = dEz; cp[59] = 0.0f;                                // hizEyeDelta
             // Dynamic visibility mask (floats 60..123). Stored as raw bits — the shaders asuint it
             // back. The CPU gate above (dlVisEnabled) reads the SAME g_visMask, so the two cull paths
@@ -53068,16 +53120,18 @@ void destroyHostWindow(Renderer* R);
         if (T.primary) {
             g_dlOwnSuppressed = g_dlOwnClipped = g_dlOwnResidentDrawn = 0;
             if (cellOwn && !g_liveGrid.empty()) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (!dlCellResident(g_nearCellX + dx, g_nearCellY + dy)) { continue; }
-                        const uint64_t key = ((uint64_t)(uint32_t)(g_nearCellX + dx) << 32)
-                                           | (uint32_t)(g_nearCellY + dy);
+                // 5x5, not 3x3: an instance filed in a loaded cell can stand one cell outside the
+                // grid and still be near-owned (dlNearOwnRefresh's window).
+                for (int dy = -2; dy <= 2; ++dy) {
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        const int32_t cgx = g_nearCellX + dx, cgy = g_nearCellY + dy;
+                        const uint64_t key = ((uint64_t)(uint32_t)cgx << 32) | (uint32_t)cgy;
                         auto it = g_liveGridIndex.find(key);
                         if (it == g_liveGridIndex.end()) { continue; }
                         for (uint32_t ii : g_liveGrid[it->second].inst) {
                             const GpuCullInstance& gi = g_cullInst[ii];
                             if (gi.rangeEndIdx == 0xFFFFFFFFu || !dlVisEnabled(gi.visIndex)) { continue; }
+                            if (!dlInstNearOwned(gi.visIndex, cgx, cgy)) { continue; }
                             const float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd
                                                  : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
                             const float ex = gi.posX - eye[0], ey = gi.posY - eye[1];
@@ -53115,14 +53169,107 @@ void destroyHostWindow(Renderer* R);
     }
 
     // Main-path wrapper: cull into the LIVE globals (behaviour-identical to the pre-WV2 signature).
+    // Re-derive the per-instance ownership overrides (see kNearOwnOverride) when the held-reference
+    // list, the grid centre or the loaded mask changed, and write the changed visIndex words into
+    // the resident cull buffer. The window is the 5x5 around MW's centre: a reference filed in the
+    // 3x3 can stand up to a cell outside it. An instance whose position cell is loaded but whose
+    // origin matches no held reference is an ORPHAN (filed in an unloaded cell — MW is not drawing
+    // it), so DL keeps it whole; one that matches a reference filed in a loaded cell is OWNED even
+    // if its position cell is not. Origins match by exact float bits: DL baked them from the same
+    // ESM floats MW placed the node with.
+    void dlNearOwnRefresh(Renderer* R) {
+        if (!g_nearRefsValid || g_cullInst.empty() || g_liveGrid.empty()) { return; }
+        const uint32_t key[4] = { g_nearRefsVersion, (uint32_t)g_nearCellX, (uint32_t)g_nearCellY,
+                                  g_nearCellMask };
+        if (std::memcmp(key, g_nearOwnApplied, sizeof(key)) == 0) { return; }
+        std::memcpy(g_nearOwnApplied, key, sizeof(key));
+
+        auto originKey = [](float x, float y) -> uint64_t {
+            uint32_t bx, by;
+            std::memcpy(&bx, &x, 4);
+            std::memcpy(&by, &y, 4);
+            return ((uint64_t)bx << 32) | by;
+        };
+        std::unordered_map<uint64_t, uint32_t> held;   // origin -> index into g_nearRefs
+        held.reserve(g_nearRefs.size() * 2);
+        for (uint32_t i = 0; i < (uint32_t)g_nearRefs.size(); ++i) {
+            held.emplace(originKey(g_nearRefs[i].x, g_nearRefs[i].y), i);
+        }
+
+        std::unordered_map<uint32_t, uint32_t> next;
+        g_nearOwnOrphans = g_nearOwnAdopted = g_nearOwnMatched = g_nearOwnWindow = 0;
+        if (dlCellOwnActive()) {
+            for (int dy = -2; dy <= 2; ++dy) {
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const uint64_t ck = ((uint64_t)(uint32_t)(g_nearCellX + dx) << 32)
+                                      | (uint32_t)(g_nearCellY + dy);
+                    auto it = g_liveGridIndex.find(ck);
+                    if (it == g_liveGridIndex.end()) { continue; }
+                    for (uint32_t ii : g_liveGrid[it->second].inst) {
+                        const GpuCullInstance& gi = g_cullInst[ii];
+                        if (gi.rangeEndIdx == 0xFFFFFFFFu) { continue; }
+                        ++g_nearOwnWindow;
+                        const float ox = gi.world[12], oy = gi.world[13];
+                        const int32_t gx = (int32_t)std::floor(ox / 8192.0f);
+                        const int32_t gy = (int32_t)std::floor(oy / 8192.0f);
+                        const bool byCell = dlCellResident(gx, gy);
+                        auto h = held.find(originKey(ox, oy));
+                        bool held3 = false;
+                        if (h != held.end()) {
+                            const ForgeRender::NearRef& r = g_nearRefs[h->second];
+                            held3 = dlCellResident(r.cellX, r.cellY);
+                            ++g_nearOwnMatched;
+                        }
+                        if (held3 == byCell) { continue; }
+                        next[ii] = kNearOwnOverride | (held3 ? kNearOwnYes : 0u);
+                        if (held3) { ++g_nearOwnAdopted; } else { ++g_nearOwnOrphans; }
+                    }
+                }
+            }
+        }
+
+        // Diff against what the buffer holds now: clear stale overrides, write new/changed ones.
+        std::vector<uint32_t> dirty;
+        for (const auto& kv : g_nearOwnOverrides) {
+            if (next.find(kv.first) == next.end()) { dirty.push_back(kv.first); }
+        }
+        for (const auto& kv : next) {
+            auto o = g_nearOwnOverrides.find(kv.first);
+            if (o == g_nearOwnOverrides.end() || o->second != kv.second) { dirty.push_back(kv.first); }
+        }
+        g_nearOwnOverrides.swap(next);
+        if (dirty.empty()) { return; }
+
+        for (uint32_t ii : dirty) {
+            GpuCullInstance& gi = g_cullInst[ii];
+            auto o = g_nearOwnOverrides.find(ii);
+            gi.visIndex = (gi.visIndex & kVisIndexMask) | (o != g_nearOwnOverrides.end() ? o->second : 0u);
+            if (!g_live.pCullInstBuf) { continue; }
+            BufferUpdateDesc u = {};
+            u.pBuffer    = g_live.pCullInstBuf;
+            u.mDstOffset = (uint64_t)ii * sizeof(GpuCullInstance) + offsetof(GpuCullInstance, visIndex);
+            u.mSize      = sizeof(uint32_t);
+            beginUpdateResource(&u);
+            std::memcpy(u.pMappedData, &gi.visIndex, sizeof(uint32_t));
+            endUpdateResource(&u);
+        }
+        if (g_live.pCullInstBuf) { flushTextureUploads(R); }
+        LOG::logline(">> [forge][dl] near-own refresh: refs=%zu window=%u matched=%u orphans=%u adopted=%u "
+                     "wrote=%zu centre=(%d,%d) mask=0x%03X",
+                     g_nearRefs.size(), g_nearOwnWindow, g_nearOwnMatched, g_nearOwnOrphans,
+                     g_nearOwnAdopted, dirty.size(), g_nearCellX, g_nearCellY, g_nearCellMask);
+    }
+
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj) {
+        dlNearOwnRefresh(R);
         DlCullTargets T = {};
         T.instRing    = &g_pStaticsInstRing;
         T.argRing     = &g_pStaticsArgsRing;
         T.lastSubsets = &g_liveLastSubsets;
         T.lastInst    = &g_liveLastInst;
         T.primary     = true;
-        T.suppressNearCut = g_dlNoStaticsNearCut;   // viewer inspection: keep statics right up to the eye
+        T.suppressNearCut = g_dlNoStaticsNearCut    // viewer inspection: keep statics right up to the eye
+                         || g_dlOwnOff > 0.5f;      // handover A/B: DL draws its whole LOD, no slab
         T.distScale   = 1.0f;   // the camera IS the reference for both fidelity axes
         T.lodBias     = 0u;
         dlCullAndBuild(R, rzViewProj, T);

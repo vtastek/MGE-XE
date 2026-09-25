@@ -68,6 +68,8 @@ bool DistantLand::isDistantLandLoaded = false;
 IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
 
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
+IPC::VecView<IPC::NearRefWire> DistantLand::nearRefsShared;
+IPC::VecId DistantLand::nearRefsSharedId = IPC::InvalidVector;
 
 unsigned DistantLand::recordMWCount = 0;
 
@@ -265,6 +267,19 @@ bool DistantLand::initIpc() {
     auto& dynVisVec = maybeDynVisVec.value();
     dynVisFlagsSharedId = dynVisVec.id();
     dynVisFlagsShared = dynVisVec;
+
+    // Near/far handover: the held-reference list (scanNearRefs). A dense 3x3 of Tamriel Rebuilt runs
+    // to a few thousand reference roots; 16k is the ceiling, sent whole only when the set changes.
+    // ⚠ The vec reserves maxElements * windowBYTES (vec.cpp), not maxElements * elementBytes: a 64 KB
+    // window (4096 of these) at 16k elements is a 1 GB host-side RESERVATION (committed as used; the
+    // client maps one window at a time). 64k elements overflowed the 32-bit byte count and the host
+    // failed to map the vec, stalling the channel.
+    auto maybeNearRefs = ipcClient.allocVecBlocking<IPC::NearRefWire>(4096, 16384, 4096);
+    if (!maybeNearRefs.has_value()) {
+        return false;
+    }
+    nearRefsSharedId = maybeNearRefs.value().id();
+    nearRefsShared = maybeNearRefs.value();
 
     // D5: a 192KB single-window chunk vec was allocated here to ship msoc's occlusion
     // mask blob to the host. It was never written — no caller ever passed its VecId to
