@@ -217,6 +217,9 @@ namespace {
     // full post-transition 360; the capture spikes it allows hide inside the load hitch, and
     // steady state stays capped (the eviction parent-chain rescue prevents re-capture churn).
     constexpr unsigned kCaptureEpochGraceFrames = 600;
+    // ...and a short grace opened by a change in the references MW holds (a grid shift), for the same
+    // reason — see openCaptureGrace.
+    unsigned g_captureGraceUntil = 0;
 
     // NEAR-MISS diagnostic. A classify key is a shape MW DREW this frame; the engine-cull skip drops
     // MW's own display of it on category alone, and the DL slab clips the far copy at MW's reach — so
@@ -232,12 +235,27 @@ namespace {
     constexpr unsigned kNearMissStreak = 30;
     constexpr unsigned kNearMissNameCap = 200;
 
+    // This build's misses by reason, and the first few keys by name — a transient (one grid shift,
+    // one capture burst) is only attributable from the frame it happened in.
+    std::uint32_t g_nearMissBuild[(int)NearMiss::Count] = {};
+    char          g_nearMissSample[3][320] = {};
+    unsigned      g_nearMissBuildLines = 0;
+    std::uint32_t g_nearMissFresh = 0;
+    constexpr unsigned kNearMissBuildLineCap = 300;
+
     void noteNearMiss(std::uint32_t key, NearMiss why) {
         ++g_nearMissCount[(int)why];
+        ++g_nearMissBuild[(int)why];
         ++g_nearMissFrameN;
         auto& t = g_nearMissTrack[key];
         t.streak = (t.streak != 0 && t.lastFrame + 1 == g_frame) ? t.streak + 1 : 1;
         t.lastFrame = g_frame;
+        if (t.streak == 1) {   // FRESH: not missed last frame — the transient class
+            if (g_nearMissFresh < 3 && g_nearMissBuildLines < kNearMissBuildLineCap) {
+                MGE::GeometryCache::describeKey(key, g_nearMissSample[g_nearMissFresh], sizeof(g_nearMissSample[0]));
+            }
+            ++g_nearMissFresh;
+        }
         if (t.streak >= kNearMissStreak && !t.named && g_nearMissNamed < kNearMissNameCap) {
             t.named = true;
             ++g_nearMissNamed;
@@ -251,7 +269,17 @@ namespace {
     // Once per build, after the visible loop: fold this build's misses into the window, report it.
     void nearMissEndBuild() {
         if (g_nearMissFrameN > g_nearMissFrameMax) g_nearMissFrameMax = g_nearMissFrameN;
+        if (g_nearMissFresh > 0 && g_nearMissBuildLines < kNearMissBuildLineCap) {
+            ++g_nearMissBuildLines;
+            LOG::logline("!! [nearmiss] frame=%u t=%llu fresh=%u of missed=%u (deferred=%u noEntry=%u noSlot=%u) e.g. %s | %s | %s",
+                         g_frame, (unsigned long long)GetTickCount64(), g_nearMissFresh, g_nearMissFrameN,
+                         g_nearMissBuild[0], g_nearMissBuild[1], g_nearMissBuild[2],
+                         g_nearMissSample[0], g_nearMissFresh > 1 ? g_nearMissSample[1] : "-",
+                         g_nearMissFresh > 2 ? g_nearMissSample[2] : "-");
+        }
+        for (auto& c : g_nearMissBuild) c = 0;
         g_nearMissFrameN = 0;
+        g_nearMissFresh = 0;
         static unsigned s_builds = 0;
         if (++s_builds >= 300) {
             LOG::logline(">> [nearmiss] %u builds: deferred=%.2f noEntry=%.2f noSlot=%.2f /build, worst build=%u, named=%u",
@@ -702,8 +730,59 @@ namespace {
     // Invalidated (a) at every kickoffBody entry (a serial/inline kickoff supersedes it),
     // (b) at fire on a cell-epoch mismatch (teleport between build and fire → drop, one
     // repeated composite frame), (c) at fire on a POV flip (see bake3rd), (d) on fire (consumed).
+    // Statics near/far handover: MW's ACTIVE exterior cell set plus how far MW's own cull reaches,
+    // so the host can clip its distant-statics LOD proxies at the same plane the NEAR path stops at
+    // (both drawing = the handover z-fight; neither = a hole). MW culls per NiTriShape against its
+    // view distance, so that plane is what `reach` means — the host slices the proxies there rather
+    // than dropping whole objects. Read straight off DataHandler::exteriorCellData[9] — the engine's
+    // own residency table, no detour. Only a cell confirmed LOADED counts; everything else
+    // (background-loading, unloading, world edge, no DataHandler) leaves its bit clear so the host
+    // keeps drawing DL there. The CENTRE bit is the valid flag: without the player's own cell there
+    // is nothing to trust, and the host falls back to its fixed near-cut distance.
+    //
+    // ⚠ SNAPPED WHEN THE DRAW LIST IS BUILT, not when it is fired. The mask and the held-reference
+    // version describe which references the near path covers, and in park mode the payload is fired
+    // a frame after it was built: reading them at fire time handed the host the NEXT frame's cells
+    // with THIS frame's draw list — on a grid shift, DL cut for a whole cell row the fired near set
+    // did not carry yet.
+    struct NearCellsSnap {
+        std::int32_t  x = 0, y = 0;
+        std::uint32_t mask = 0;
+        float         reach = 0.0f;
+        std::uint32_t refsVersion = 0;
+    };
+    NearCellsSnap snapNearCells() {
+        NearCellsSnap n;
+        n.refsVersion = DistantLand::nearRefsVersion;
+        if (MWBridge::get()->IsExterior()) {
+            void* dh = MGE::SceneGraph::getDataHandler();
+            if (dh) {
+                n.x = MGE::DataHandlerView::centralGridX(dh);
+                n.y = MGE::DataHandlerView::centralGridY(dh);
+                for (std::size_t i = 0; i < MGE::DataHandlerView::EXT_CELL_DATA_COUNT; ++i) {
+                    void* ecd = MGE::DataHandlerView::exteriorCellData(dh, i);
+                    if (!MGE::DataHandlerView::exteriorCellLoaded(ecd)) { continue; }
+                    void* cell = MGE::DataHandlerView::exteriorCellRecord(ecd);
+                    // Grid coords come from the cell record, not the slot index — the CellGrid
+                    // slot order never has to be assumed correct.
+                    const int dx = MGE::DataHandlerView::cellExteriorGridX(cell) - n.x;
+                    const int dy = MGE::DataHandlerView::cellExteriorGridY(cell) - n.y;
+                    if (dx < -1 || dx > 1 || dy < -1 || dy > 1) { continue; }
+                    n.mask |= 1u << ((dy + 1) * 3 + (dx + 1));
+                }
+                // MW's cull reach = its view distance (the engine culls subtrees on view-z against
+                // it — the same bound distantland.cpp's cache gate uses). nearViewRange is that
+                // value, re-read every frame in adjustFog.
+                n.reach = DistantLand::nearViewRange;
+            }
+        }
+        if (n.reach <= 0.0f) { n.mask = 0; }   // no reach ⇒ nothing to hand over
+        return n;
+    }
+
     struct ParkedPayload {
         bool valid = false;
+        NearCellsSnap nearCells;              // at BUILD (see snapNearCells)
         std::uint32_t epoch = 0;              // g_cellEpoch at build → fire-time invalidation
         // POV at build. The camera restamp re-aims the payload with the CURRENT camera, and a
         // 3rd→1st switch moves the camera INSIDE the head — so frame N's body geometry, which was
@@ -3388,7 +3467,8 @@ namespace {
             static unsigned      s_epochFrame = 0;
             if (g_cellEpoch != s_seenEpoch) { s_seenEpoch = g_cellEpoch; s_epochFrame = g_frame; }
             const bool unlimited = !g_captureBudgetOn || cacheMap.empty()
-                                   || (g_frame - s_epochFrame < kCaptureEpochGraceFrames);
+                                   || (g_frame - s_epochFrame < kCaptureEpochGraceFrames)
+                                   || (int)(g_captureGraceUntil - g_frame) > 0;
             MGE::GeometryCache::setCaptureBudget(unlimited ? -1 : kCaptureBudgetPerFrame);
         }
         {
@@ -6890,44 +6970,10 @@ namespace RenderProcess {
             g_client->setWeather(ww);
         }
 
-        // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far
-        // MW's own cull reaches, so it can clip its distant-statics LOD proxies at the same plane
-        // the NEAR path stops at (both drawing = the handover z-fight; neither = a hole). MW culls
-        // per NiTriShape against its view distance, so that plane is what `reach` means — the host
-        // slices the proxies there rather than dropping whole objects. Read straight off
-        // DataHandler::exteriorCellData[9] — the engine's own residency table, no detour. Only a
-        // cell confirmed LOADED counts; everything else (background-loading, unloading, world
-        // edge, no DataHandler) leaves its bit clear so the host keeps drawing DL there. Erring
-        // toward a transient double-draw is right; erring the other way deletes world geometry.
-        // The CENTRE bit is the valid flag: without the player's own cell there is nothing to
-        // trust, and the host falls back to its fixed near-cut distance.
-        std::int32_t nearCellX = 0, nearCellY = 0;
-        std::uint32_t nearCellMask = 0;
-        float nearCellReach = 0.0f;
-        if (isExterior) {
-            void* dh = MGE::SceneGraph::getDataHandler();
-            if (dh) {
-                nearCellX = MGE::DataHandlerView::centralGridX(dh);
-                nearCellY = MGE::DataHandlerView::centralGridY(dh);
-                for (std::size_t i = 0; i < MGE::DataHandlerView::EXT_CELL_DATA_COUNT; ++i) {
-                    void* ecd = MGE::DataHandlerView::exteriorCellData(dh, i);
-                    if (!MGE::DataHandlerView::exteriorCellLoaded(ecd)) { continue; }
-                    void* cell = MGE::DataHandlerView::exteriorCellRecord(ecd);
-                    // Grid coords come from the cell record, not the slot index — the CellGrid
-                    // slot order never has to be assumed correct.
-                    const int dx = MGE::DataHandlerView::cellExteriorGridX(cell) - nearCellX;
-                    const int dy = MGE::DataHandlerView::cellExteriorGridY(cell) - nearCellY;
-                    if (dx < -1 || dx > 1 || dy < -1 || dy > 1) { continue; }
-                    nearCellMask |= 1u << ((dy + 1) * 3 + (dx + 1));
-                }
-                // MW's cull reach = its view distance (the engine culls subtrees on view-z against
-                // it — the same bound distantland.cpp's cache gate uses). nearViewRange is that
-                // value, re-read every frame in adjustFog.
-                nearCellReach = DistantLand::nearViewRange;
-            }
-        }
-        if (nearCellReach <= 0.0f) { nearCellMask = 0; }   // no reach ⇒ nothing to hand over
-        g_client->setNextNearCells(nearCellX, nearCellY, nearCellMask, nearCellReach);
+        // Statics near/far handover (snapNearCells): the park's BUILD-time snapshot when this is a
+        // parked fire, otherwise a fresh one — built and fired in the same frame, the two agree.
+        const NearCellsSnap nc = parkFired ? g_park.nearCells : snapNearCells();
+        g_client->setNextNearCells(nc.x, nc.y, nc.mask, nc.reach, nc.refsVersion);
 
         // Async kickoff: copy the frame params into shared memory and start the host, then
         // RETURN — the host renders while MW's frame-N work continues. All the pointer args
@@ -7041,6 +7087,7 @@ namespace RenderProcess {
             streamPendingTextures();   // worker-side, like the resolvers above (see its comment)
         }
         g_park.epoch           = g_cellEpoch;
+        g_park.nearCells       = snapNearCells();
         g_park.bake3rd         = MWBridge::get()->is3rdPerson();
         g_park.bakeEye[0]      = MGE::ExactPos::eye()[0];
         g_park.bakeEye[1]      = MGE::ExactPos::eye()[1];
@@ -7561,6 +7608,11 @@ namespace RenderProcess {
 
     bool registerFlipBook(const char* const* names, std::uint32_t count) {
         return registerFlipBookImpl(names, count);
+    }
+
+    void openCaptureGrace(unsigned frames) {
+        const unsigned until = g_frame + frames;
+        if ((int)(until - g_captureGraceUntil) > 0) g_captureGraceUntil = until;
     }
 
     bool forgeOwnsFrame() {

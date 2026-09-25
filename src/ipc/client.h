@@ -75,6 +75,7 @@ namespace IPC {
 		std::int32_t m_nearCellY = 0;
 		std::uint32_t m_nearCellMask = 0;
 		float m_nearCellReach = 0.0f;
+		std::uint32_t m_nearRefsVersion = 0;
 		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting.
 		std::uint32_t m_clientSyncsOnFence = 0;
 		// Mode-3 park sky re-anchor delta — see setSkyParkEyeDelta. 0 on the serial paths.
@@ -225,7 +226,7 @@ namespace IPC {
 		* @return Whether the RPC was issued successfully.
 		*/
 		bool updateDynVis(VecId flags);
-		bool updateNearRefs(VecId refs, std::uint32_t count);
+		bool updateNearRefs(VecId refs, std::uint32_t count, std::uint32_t version);
 
 		/**
 		* @brief Inform the server of distant static D3D resources.
@@ -421,8 +422,10 @@ namespace IPC {
 		// Statics near/far handover: stamp MW's active exterior cell set (centre grid coords +
 		// a 9-bit LOADED mask, bit (dy+1)*3 + (dx+1)) and its cull reach into every subsequent
 		// render RPC. Refreshed per frame by the seam; mask 0 disables the host's ownership gate.
-		void setNextNearCells(std::int32_t cx, std::int32_t cy, std::uint32_t mask, float reach) {
+		void setNextNearCells(std::int32_t cx, std::int32_t cy, std::uint32_t mask, float reach,
+		                      std::uint32_t nearRefsVersion) {
 			m_nearCellX = cx; m_nearCellY = cy; m_nearCellMask = mask; m_nearCellReach = reach;
+			m_nearRefsVersion = nearRefsVersion;
 		}
 
 		// Tier 1: tell the host whether we hold an imported timeline semaphore for its shared frame

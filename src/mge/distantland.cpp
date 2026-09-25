@@ -1226,7 +1226,15 @@ void DistantLand::scanNearRefs() {
         nearRefsShared.push_back({ r.x, r.y, r.z, (std::int16_t)r.cellX, (std::int16_t)r.cellY });
         ++n;
     }
-    ipcClient.updateNearRefs(nearRefsSharedId, n);
+    ++nearRefsVersion;
+    ipcClient.updateNearRefs(nearRefsSharedId, n, nearRefsVersion);
+    // MW just brought references into (or out of) its grid. The near path must be able to draw every
+    // newly held shape THIS build, or the host — which now hands those references to it — draws
+    // nothing there until the first-sight capture budget (32/frame) catches up: 248 shapes, ~8 frames
+    // of missing fort wall on the Pelagiad approach. The capture cost lands inside MW's own load
+    // hitch, which is the same bargain the cell-epoch grace makes for door transitions.
+    RenderProcess::openCaptureGrace(60);
+    LOG::logline(">> [nearrefs] t=%llu sent %u refs (v%u)", (unsigned long long)GetTickCount64(), n, nearRefsVersion);
 }
 
 // setView - Called once per frame to setup view dependent data

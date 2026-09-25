@@ -959,6 +959,15 @@ namespace {
     // at all. A FRAME NUMBER and not a timer: frames only tick while the world is rendering, so it
     // counts gameplay rather than loading, which is the quantity a settle delay is actually about.
     float g_dumpAtFrame = 0.0f;
+    // Knob "dumpBurst": K > 0 dumps K CONSECUTIVE frames each time the near/far ownership key changes
+    // (MW's grid shifted, a cell finished loading, the held-reference list moved) — the one-frame
+    // handover blip is only attributable from the frames around that event. Each dump stalls its frame.
+    float    g_dumpBurst     = 0.0f;
+    uint32_t g_dumpBurstLeft = 0;
+    // ...or once, when the eye first comes within dumpBurstR of (dumpBurstX, dumpBurstY) — a burst
+    // aimed at the moment a known object crosses MW's reach on an unattended walk.
+    float    g_dumpBurstX = 0.0f, g_dumpBurstY = 0.0f, g_dumpBurstR = 0.0f;
+    bool     g_dumpBurstNearFired = false;
 
     // A UNIFORM multiplier on the medium's sea-level Mie coefficient, applied in packParams() — the
     // one site where a Params becomes coefficients. 1.0 is the shipped atmosphere. See the long note
@@ -22087,6 +22096,10 @@ namespace {
             { "upscaleSharpness",   &g_upscaleSharpness   },
             { "upscaleAntiRing",    &g_upscaleAntiRing    },
             { "dlOwnOff",           &g_dlOwnOff           },
+            { "dumpBurst",          &g_dumpBurst          },
+            { "dumpBurstX",         &g_dumpBurstX         },
+            { "dumpBurstY",         &g_dumpBurstY         },
+            { "dumpBurstR",         &g_dumpBurstR         },
             { "hizOff",             &g_hizOffKnob         },
             { "fogSkyKnee",         &g_fogSkyKnee         },
             { "fogHazeLiftDeg",     &g_fogHazeLiftDeg     },
@@ -28451,17 +28464,32 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
-    void setNearRefs(const NearRef* refs, unsigned count) {
-        g_nearRefs.assign(refs, refs + count);
-        ++g_nearRefsVersion;
-        g_nearRefsValid = true;
+    // A new held-reference list is PENDING until a frame whose draw list was built at or after it
+    // arrives (setNearCells). In park mode the list is sent at the start of the frame that FIRES the
+    // previous frame's payload — activating it at once would cut DL for references that payload's
+    // near set does not carry yet, a one-frame hole on every grid shift.
+    std::vector<ForgeRender::NearRef> g_nearRefsPending;
+    uint32_t g_nearRefsPendingVersion = 0;
+    bool     g_nearRefsPendingSet     = false;
+
+    void setNearRefs(const NearRef* refs, unsigned count, unsigned version) {
+        g_nearRefsPending.assign(refs, refs + count);
+        g_nearRefsPendingVersion = version;
+        g_nearRefsPendingSet = true;
     }
 
-    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach) {
+    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach, unsigned nearRefsVersion) {
         g_nearCellX     = (int32_t)centreX;
         g_nearCellY     = (int32_t)centreY;
         g_nearCellMask  = (uint32_t)loadedMask & 0x1FFu;
         g_nearCellReach = (reach > 0.0f) ? reach : 0.0f;
+        if (g_nearRefsPendingSet && (int32_t)(nearRefsVersion - g_nearRefsPendingVersion) >= 0) {
+            g_nearRefs.swap(g_nearRefsPending);
+            g_nearRefsPending.clear();
+            g_nearRefsPendingSet = false;
+            ++g_nearRefsVersion;
+            g_nearRefsValid = true;
+        }
     }
 
     void* sharedHandle() {
@@ -43654,6 +43682,22 @@ void destroyHostWindow(Renderer* R);
             g_dumpAtFrame = 0.0f;
             armHdrDump();
         }
+        if (g_dumpBurstR > 0.0f && g_dumpBurst > 0.0f && !g_dumpBurstNearFired) {
+            const float bx = g_eyeAbsShadow[0] - g_dumpBurstX, by = g_eyeAbsShadow[1] - g_dumpBurstY;
+            static bool s_seenOutside = false;   // fire on APPROACH, not at a load already inside
+            if (bx * bx + by * by >= g_dumpBurstR * g_dumpBurstR) {
+                s_seenOutside = true;
+            } else if (s_seenOutside) {
+                g_dumpBurstNearFired = true;
+                g_dumpBurstLeft = (uint32_t)g_dumpBurst;
+                LOG::logline(">> [forge] dump burst ARMED by proximity: %u frames from render frame %u, eye (%.0f,%.0f)",
+                             g_dumpBurstLeft, g_renderFrame, g_eyeAbsShadow[0], g_eyeAbsShadow[1]);
+            }
+        }
+        if (g_dumpBurstLeft > 0) {
+            --g_dumpBurstLeft;
+            armHdrDump();
+        }
         hdrDumpIfArmed(rzViewProj);
         // Tier 1: NO fence wait here — the wait moved to the top of the NEXT renderScene
         // (settleFrameFence). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
@@ -53182,6 +53226,14 @@ void destroyHostWindow(Renderer* R);
         const uint32_t key[4] = { g_nearRefsVersion, (uint32_t)g_nearCellX, (uint32_t)g_nearCellY,
                                   g_nearCellMask };
         if (std::memcmp(key, g_nearOwnApplied, sizeof(key)) == 0) { return; }
+        static uint32_t s_bursts = 0;
+        if (g_nearOwnApplied[0] != ~0u && g_dumpBurst > 0.0f && g_dumpBurstR <= 0.0f
+            && g_dumpBurstLeft == 0 && s_bursts < 3) {
+            ++s_bursts;
+            g_dumpBurstLeft = (uint32_t)g_dumpBurst;
+            LOG::logline(">> [forge][dl] dump burst ARMED: %u frames from render frame %u",
+                         g_dumpBurstLeft, g_renderFrame);
+        }
         std::memcpy(g_nearOwnApplied, key, sizeof(key));
 
         auto originKey = [](float x, float y) -> uint64_t {
@@ -53254,8 +53306,8 @@ void destroyHostWindow(Renderer* R);
             endUpdateResource(&u);
         }
         if (g_live.pCullInstBuf) { flushTextureUploads(R); }
-        LOG::logline(">> [forge][dl] near-own refresh: refs=%zu window=%u matched=%u orphans=%u adopted=%u "
-                     "wrote=%zu centre=(%d,%d) mask=0x%03X",
+        LOG::logline(">> [forge][dl] near-own refresh: t=%llu refs=%zu window=%u matched=%u orphans=%u adopted=%u "
+                     "wrote=%zu centre=(%d,%d) mask=0x%03X", (unsigned long long)GetTickCount64(),
                      g_nearRefs.size(), g_nearOwnWindow, g_nearOwnMatched, g_nearOwnOrphans,
                      g_nearOwnAdopted, dirty.size(), g_nearCellX, g_nearCellY, g_nearCellMask);
     }

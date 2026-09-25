@@ -152,6 +152,11 @@ namespace RenderProcess {
     // failed seam falls back to (g_initOk false), and it is the ONLY fallback.
     bool forgeOwnsFrame();
 
+    // Lift the first-sight capture budget for the next `frames` builds. Called when the references
+    // MW holds change (a grid shift): the host hands those references to the near path at once, so
+    // the near path must be able to draw every newly held shape in that same build.
+    void openCaptureGrace(unsigned frames);
+
     // The real IDirect3DTexture9* MW binds for the sun disc (tx_sun_05), recorded by the sky-list
     // build. MW's sky passthrough (inspectIndexedPrimitive) draws the sun AND the host draws it too;
     // where the host's semi-transparent lower dome band lets MW bleed through the composite, the two

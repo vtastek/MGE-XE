@@ -367,11 +367,12 @@ namespace IPC {
 		return beginRpc(Command::UpdateDynVis);
 	}
 
-	bool Client::updateNearRefs(VecId id, std::uint32_t count) {
+	bool Client::updateNearRefs(VecId id, std::uint32_t count, std::uint32_t version) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		m_ipcParameters->params.nearRefsParams.id = id;
 		m_ipcParameters->params.nearRefsParams.count = count;
+		m_ipcParameters->params.nearRefsParams.version = version;
 		return beginRpc(Command::UpdateNearRefs);
 	}
 
@@ -654,6 +655,7 @@ namespace IPC {
 		params.nearCellY = m_nearCellY;
 		params.nearCellMask = m_nearCellMask;
 		params.nearCellReach = m_nearCellReach;
+		params.nearRefsVersion = m_nearRefsVersion;
 		// Tier 1: whether the host may overlap frame N's GPU work past its reply (see bridge.h).
 		params.clientSyncsOnFence = m_clientSyncsOnFence;
 		// Mode-3 park: the delta the sky payload was pre-cancelled by, for the reflect mirror plane.

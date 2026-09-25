@@ -177,6 +177,7 @@ namespace IPC {
     struct NearRefsParameters {
         IN VecId id;
         IN std::uint32_t count;
+        IN std::uint32_t version;   // monotonic; matched by RenderFrameParameters::nearRefsVersion
     };
 
     struct AllocVecParameters {
@@ -626,6 +627,14 @@ namespace IPC {
         IN VecId fpMMList;
         IN std::uint32_t fpMMCount;
         IN std::uint32_t fpMMBytes;
+
+        // Statics near/far handover: the UpdateNearRefs version that was current when THIS frame's
+        // draw list was BUILT. In park mode the payload is built a frame before it is fired, so a
+        // held-reference list sent at the start of the firing frame describes references the fired
+        // draw list does not carry yet; the host activates a list only once a payload built after it
+        // arrives, so DL is never cut for a reference the near set cannot draw. Appended at the end
+        // of the IN block (same rule as above; rebuild and deploy both binaries together).
+        IN std::uint32_t nearRefsVersion;
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

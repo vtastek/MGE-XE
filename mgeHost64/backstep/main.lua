@@ -26,6 +26,17 @@ local kDist   = 1430.0   -- ~20 m (MW unit ~1.4 cm)
 local kSpeed  = 250.0    -- units/s, about a walk
 local kPause  = 3.0      -- seconds held at the far point
 
+-- FORWARD mode (a second marker file, FORWARD, beside ACTIVE): instead of out-and-back, walk straight
+-- ahead kFwdDist at kFwdSpeed and park. That is the approach the user reports a one-frame blip on —
+-- crossing a cell border toward the fort, where MW shifts its grid and loads a new row.
+local fwdMarker = io.open("Data Files/MWSE/mods/mgexe/backstep/FORWARD", "r")
+local forward = fwdMarker ~= nil
+if fwdMarker then fwdMarker:close() end
+local kFwdDist  = 12000.0
+local kFwdSettle = 10.0  -- seconds at the teleport target before walking
+local kFwdOver  = 4000.0 -- ...and how far PAST the save spot it keeps walking
+local kFwdSpeed = 400.0  -- about a run
+
 local phase = "idle"     -- idle -> out -> pause -> back -> parked
 local t, phaseT = 0.0, 0.0
 local sx, sy, sz, clear, facing
@@ -103,7 +114,15 @@ local function onSimulate(e)
     t = t + e.delta
     phaseT = phaseT + e.delta
 
-    if phase == "out" then
+    if phase == "fwd" then
+        local d = math.min(kFwdDist + kFwdOver, kFwdSpeed * phaseT)
+        place(mp, sx - bx * d, sy - by * d)
+        if d >= kFwdDist + kFwdOver then
+            setPhase("parked")
+            timer.start({ duration = 2.0, type = timer.real, iterations = 1,
+                          callback = function() dumpProbe("after") end })
+        end
+    elseif phase == "out" then
         local d = math.min(kDist, kSpeed * phaseT)
         place(mp, sx + bx * d, sy + by * d)
         if d >= kDist then setPhase("pause") end
@@ -137,7 +156,24 @@ local function onLoaded()
             mwse.log("[backstep] start=(%.1f,%.1f,%.1f) facing=%.3f clear=%.1f back=(%.3f,%.3f)",
                      sx, sy, sz, facing, clear, bx, by)
             dumpProbe("before")
-            setPhase("out")
+            if not forward then
+                setPhase("out")
+                return
+            end
+            -- FORWARD: teleport kFwdDist BEHIND the save spot (a cell change: the client purges and
+            -- re-captures there), settle, then walk forward back to the save spot, so the fort ENTERS
+            -- MW's range mid-walk — the case the user sees, which a load already inside range hides.
+            local fx, fy = sx + bx * kFwdDist, sy + by * kFwdDist
+            local g2 = landHeight(fx, fy)
+            local fz = g2 and (g2 + clear) or sz
+            tes3.positionCell({ reference = tes3.player, position = tes3vector3.new(fx, fy, fz),
+                                orientation = tes3vector3.new(0, 0, facing), suppressFader = true })
+            mwse.log("[backstep] FORWARD: teleported to (%.1f,%.1f,%.1f), settling %.0f s", fx, fy, fz, kFwdSettle)
+            timer.start({ duration = kFwdSettle, type = timer.real, iterations = 1, callback = function()
+                sx, sy = fx, fy
+                tes3.player.facing = facing
+                setPhase("fwd")
+            end })
         end,
     })
 end

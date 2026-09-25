@@ -70,6 +70,7 @@ IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 IPC::VecView<IPC::NearRefWire> DistantLand::nearRefsShared;
 IPC::VecId DistantLand::nearRefsSharedId = IPC::InvalidVector;
+std::uint32_t DistantLand::nearRefsVersion = 0;
 
 unsigned DistantLand::recordMWCount = 0;
 

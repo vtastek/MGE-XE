@@ -130,6 +130,9 @@ public:
     // the cell each is FILED under (scanNearRefs). Shipped to the host only when the set changes.
     static IPC::VecView<IPC::NearRefWire> nearRefsShared;
     static IPC::VecId nearRefsSharedId;
+    // Bumped on every send; stamped into each frame's params at BUILD so the host activates a list
+    // only with the first draw list that was built knowing it (RenderFrameParameters::nearRefsVersion).
+    static std::uint32_t nearRefsVersion;
 
     // Number of z-writing draws MW has issued in the current scene. Bumped in
     // inspectIndexedPrimitive, reset at scene 0 (renderStage0 / renderStage1). Its one
