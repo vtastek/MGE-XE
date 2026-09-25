@@ -311,6 +311,7 @@ float4 PS_MAIN( VSOutput In )
         // and the view showing that honestly rather than inventing one.
         RETURN(float4(aoAmbientTermProxy(aoSample.a, aoFlags), 1.0f));
     }
+    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN
     if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }                            // mode 5: albedo only (texture product)
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                           // mode 6: lit only (lighting, no texture)
     if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)

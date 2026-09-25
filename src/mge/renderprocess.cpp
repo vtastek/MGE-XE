@@ -5016,7 +5016,8 @@ namespace RenderProcess {
             // paragraph above asks for. Cycle is %28 — 27 (PBR specular only) lands with a name
             // here AND an entry in kDebugModeNames in the same commit, which is the whole of what
             // the paragraph above asks for and what nobody did the three times it drifted.
-            g_debugMode = (g_debugMode + 1) % 28;
+            // 28 (near/far producer: DL magenta, near green) lands with its host name — cycle %29.
+            g_debugMode = (g_debugMode + 1) % 29;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -5041,7 +5042,9 @@ namespace RenderProcess {
                              : (g_debugMode == 23) ? "TERRAIN TEXTURE SIZE"
                              : (g_debugMode == 24) ? "TERRAIN ANISOTROPY"
                              : (g_debugMode == 25) ? "PARALLAX UV DELTA"
-                             : (g_debugMode == 26) ? "TERRAIN HEIGHT BLEND" : "NORMAL";
+                             : (g_debugMode == 26) ? "TERRAIN HEIGHT BLEND"
+                             : (g_debugMode == 27) ? "PBR SPECULAR"
+                             : (g_debugMode == 28) ? "NEAR/FAR PRODUCER" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.

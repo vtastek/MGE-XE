@@ -4182,6 +4182,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
         return (float4(aoAmbientTermProxy(aoSample.a, aoFlags), 1.0f));
     }
+    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }
     if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
     if (dbg == 7u) {

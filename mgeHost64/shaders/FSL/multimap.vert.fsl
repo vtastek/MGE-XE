@@ -9,6 +9,7 @@
 // the multimap.frag fixed-function stage blend.
 
 #include "opaque.srt.h"
+#include "handover.h.fsl" // handoverNearClip() — the near/far plane, shared with statics.vert
 #include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
 #include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
@@ -156,6 +157,8 @@ VSOutput VS_MAIN( VSInput In )
     Out.Fog = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)
     // Below-water clip (reflect pass only) — see the VSOutput comment. worldPos is camera-relative,
     // matching the plane the host writes.
-    Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
+    // ...and, in the world camera, the near/far HANDOVER plane: MW's near set stops where DL starts.
+    Out.Clip = handoverNearClip(worldPos.xyz,
+                                dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w);
     RETURN(Out);
 }

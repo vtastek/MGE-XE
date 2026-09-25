@@ -4946,6 +4946,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
         return (float4(aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags), 1.0f));
     }
+    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }
     if (dbg == 27u) {
 
 

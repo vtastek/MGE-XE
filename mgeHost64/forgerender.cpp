@@ -17258,6 +17258,9 @@ namespace {
     uint32_t g_lastReflNearDrawn = 0;   // heartbeat: reflected near opaque draws (indirect + inline)
     uint32_t g_lastReflSkinDrawn = 0;   // heartbeat: reflected skinned draws
     uint32_t g_lastReflMMDrawn   = 0;   // heartbeat: reflected multi-map draws (heads, glow lamps, trim)
+    // The F12 view pinned from the HARNESS (knob debugForce): the client ships its own cycle every
+    // frame, and a minimized run has nobody to press F12. 0 = follow the client.
+    float     g_debugForce = 0.0f;
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
     // ---- Dev overlay (Forge IUI) state ----
@@ -21935,7 +21938,10 @@ namespace {
                                             // `% 28` in the same commit, which is the whole of what
                                             // the note above asks for and what nobody did three
                                             // times running.
-                                            "27 PBR specular only" };
+                                            "27 PBR specular only",
+                                            // 28: who drew the pixel — DL statics magenta, MW's
+                                            // near path green. Lands with the client's `% 29`.
+                                            "28 near/far producer" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -22096,6 +22102,8 @@ namespace {
             { "upscaleSharpness",   &g_upscaleSharpness   },
             { "upscaleAntiRing",    &g_upscaleAntiRing    },
             { "dlOwnOff",           &g_dlOwnOff           },
+            { "debugForce",         &g_debugForce         },
+            { "sunShadowStrength",  &g_sunShadowStrength  },
             { "dumpBurst",          &g_dumpBurst          },
             { "dumpBurstX",         &g_dumpBurstX         },
             { "dumpBurstY",         &g_dumpBurstY         },
@@ -22396,6 +22404,7 @@ namespace {
             // not a click.
             { "sunLightFollowsDisc", &g_sunLightFollowsDisc },
             { "pbrEnable", &g_pbrEnable },
+            { "drawDLStatics", &g_drawDLStatics },
             // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
             // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
             // cost has to be measured on a minimized harness run with nobody at the panel.
@@ -36626,6 +36635,7 @@ void destroyHostWindow(Renderer* R);
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
                     ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
                     ((float*)fc)[75] = (float)(s + 1);          // atlasDbg.w: SLOT being baked (+1) — the carve
+                    ((float*)fc)[50] = 0.0f;                    // lodParams.z: no handover plane in a light's view
                                                                // fires only on its owner's bake (MatEmissive.y)
                 }
                 sl.lastRenderFrame = frame;
@@ -36672,6 +36682,7 @@ void destroyHostWindow(Renderer* R);
                         std::memcpy(fc, faceVP, 16 * sizeof(float));
                         ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
                         ((float*)fc)[75] = (float)(s + 1);          // atlasDbg.w: SLOT being baked (+1)
+                        ((float*)fc)[50] = 0.0f;                    // lodParams.z: no handover plane in a light's view
                     }
                 }
                 g_shadowRendersDyn.push_back(s);
@@ -37212,6 +37223,9 @@ void destroyHostWindow(Renderer* R);
             // the same question as [125]: the arms are never in the world Z-prepass, so they have no
             // gAO of their own whether or not they are receiving shadows this frame.
             ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[126] = 1.0f;
+            // ...and no handover plane (lodParams.z): the arms are MW's near scene but not in MW's
+            // camera, so the world camera's reach plane means nothing in their projection.
+            ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[50] = 0.0f;
             std::memcpy(g_live.pFPLightCbv->pCpuMappedAddress,
                         g_live.pLightCbv->pCpuMappedAddress, kLightCbvBytes);
             float* flc = (float*)g_live.pFPLightCbv->pCpuMappedAddress;
@@ -43687,6 +43701,9 @@ void destroyHostWindow(Renderer* R);
         if (g_dumpAtFrame > 0.0f && g_renderFrame >= (uint32_t)g_dumpAtFrame) {
             g_dumpAtFrame = 0.0f;
             armHdrDump();
+            // ...and with dumpBurst set (no proximity radius) the frame starts a run of consecutive
+            // dumps instead: the only way to catch a flicker that exists BETWEEN frames.
+            if (g_dumpBurst > 1.0f && g_dumpBurstR <= 0.0f) { g_dumpBurstLeft = (uint32_t)g_dumpBurst - 1u; }
         }
         if (g_dumpBurstR > 0.0f && g_dumpBurst > 0.0f && !g_dumpBurstNearFired) {
             const float bx = g_eyeAbsShadow[0] - g_dumpBurstX, by = g_eyeAbsShadow[1] - g_dumpBurstY;
@@ -43758,6 +43775,7 @@ void destroyHostWindow(Renderer* R);
     // wild char* and an immediate AV inside ImGui. Clamping here means the host survives a client that
     // knows about a mode the host does not (it shows the last named mode instead of dying).
     void setDebugMode(unsigned m) {
+        if (g_debugForce > 0.0f) { m = (unsigned)g_debugForce; }   // harness: the client's key cycles it
         g_debugMode = (m < kDebugModeCount) ? m : (kDebugModeCount - 1u);
     }
 
@@ -52641,6 +52659,11 @@ void destroyHostWindow(Renderer* R);
         // the fidelity heartbeat line). This function has three early returns below; clearing here
         // means a frame that took one of them reports "no reflect cull ran" rather than last frame's.
         if (!T.primary) { g_reflCullValid = false; }
+        // ...and the handover plane (lodParams.z): an interior never reaches the block that writes
+        // it, and a stale armed value would cut the near scene at the last exterior's reach.
+        if (T.primary && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress) {
+            ((float*)g_live.pFrameCbv->pCpuMappedAddress)[50] = 0.0f;
+        }
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
 
@@ -52699,7 +52722,16 @@ void destroyHostWindow(Renderer* R);
             // at the DL stage), so zeroing the lane here — as it did while it was dead padding —
             // blacked the glow out in every exterior while leaving it correct in interiors, which
             // the DL path skips. One lane, one owner.
-            fd[48] = nearOwn; fd[50] = dlPackSlabRotation(viewProj); fd[51] = g_dlNearViewRange;
+            // lodParams.z/.w = THE HANDOVER PLANE, for both producers. Nonzero .z arms it: the build
+            // camera's packed rotation step (statics.vert clips DL in FRONT of it, opaque/skinned/
+            // multimap.vert clip MW's near set BEHIND it), and .w is the reach it sits at — MW's own
+            // cull reach, the same number the cull hands DL as the slab, so the two halves are one
+            // plane. Disarmed (0) wherever DL is not clipped: then there is no half for the near
+            // path to cede, and cutting it would open a hole.
+            const bool handover = !T.suppressNearCut && dlCellOwnActive();
+            fd[48] = nearOwn;
+            fd[50] = handover ? dlPackSlabRotation(viewProj) : 0.0f;
+            fd[51] = handover ? g_nearCellReach : g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             // lodEye — .w is the above-water hole-fill permission, same expression as the lighting
             // block's write (this runs after it and rewrites the whole float4). g_dlExterior is

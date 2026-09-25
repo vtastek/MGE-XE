@@ -1,0 +1,65 @@
+// mgeHost64 — THE NEAR/FAR HANDOVER PLANE, shared by both producers. SHADER-ONLY header: include
+// after opaque.srt.h (needs gFrameData).
+//
+// MW's near set and DL's statics partition the world at ONE plane: view-Z == reach, measured along
+// the camera MW CLASSIFIED with (the build camera — in park mode the payload is fired a frame later
+// with the current one). DL is clipped in front of it (statics.vert, per instance via InstParams.w)
+// and MW's near set behind it (opaque/skinned/multimap.vert). Both halves are needed:
+//
+//   MW's own far plane is pinned at the reach, so on the DX9 path MW never drew past it. The host
+//   re-projects MW's near set with the EXTENDED far plane DL needs, so a shape MW kept because part
+//   of it was inside the reach was drawn WHOLE — and past the plane DL draws the same surface from
+//   the same full-detail mesh. Two identical surfaces from two pipelines: a z-fight whose pattern
+//   reshuffles with every step and turn (Vivec's cantons, which straddle the plane end to end).
+//
+// ⚠ BUT THE TWO COPIES ARE NOT ALWAYS THE SAME SURFACE. The DL bake prefers an authored
+// `<model>_dist.nif` stand-in (terrain_bc_scum_01_dist sits 12 u above MW's scum), and at a lower
+// "Mesh detail" it simplifies. Cut both at one plane and wherever they differ the two cut edges
+// miss each other on screen: a line of whatever lies behind. DX9 never showed it because MW was
+// LAYERED over DL across that band, not depth-tested against it. So the partition overlaps:
+//   - MW's near set runs kHandoverOverlap PAST the plane (it fills under a stand-in's edge), and
+//   - every DL instance the slab clips is pushed back by kHandoverDepthBias (relative, reverse-Z),
+//     so in the overlap an IDENTICAL copy always loses to MW's and cannot z-fight it. A stand-in
+//     that really is in front (the raised scum) still wins, which is the authored look.
+
+// World units MW's near set is kept beyond the reach. Covers a stand-in's deviation at the seam;
+// the cost is fragments the depth test mostly rejects.
+#define kHandoverOverlap   256.0f
+// Relative depth push for slab-clipped DL (z *= 1 - k, reverse-Z): 4e-5 is ~0.3 u at 7168 — far
+// above the float noise between two pipelines' transforms of one mesh, far below anything visible.
+#define kHandoverDepthBias 4.0e-5f
+
+// lodParams.z = the host's packed yaw/pitch step from this frame's forward to the build forward
+// (dlPackSlabRotation), and NONZERO ARMS THE PLANE — the host writes 0 wherever DL is not clipped
+// (interiors, the viewer, dlOwnOff, MW's cell not committed) and in every view that is not the
+// world camera (FP arms, light faces). lodParams.w = the reach.
+
+// The build camera's forward. Translation needs no correction: both producers' positions are
+// relative to the build eye already, so dot(fwd, worldPos) IS view-Z from it.
+float3 handoverForward()
+{
+    float3 fwd = gFrameData.viewProj[3].xyz;
+    uint   rot = (uint)(gFrameData.lodParams.z + 0.5f);
+    if (rot != 0u) {
+        rot -= 1u;
+        float dyaw   = ((float)(rot >> 12u)  - 2048.0f) * (0.25f / 2047.0f);
+        float dpitch = ((float)(rot & 4095u) - 2048.0f) * (0.25f / 2047.0f);
+        float yaw    = atan2(fwd.x, fwd.y) + dyaw;
+        float pitch  = asin(clamp(fwd.z / length(fwd), -1.0f, 1.0f)) + dpitch;
+        fwd = float3(cos(pitch) * sin(yaw), cos(pitch) * cos(yaw), sin(pitch));
+    }
+    return fwd;
+}
+
+// MW's near set: keep the half in FRONT of the plane, plus the overlap. `passClip` is what the
+// stage emits otherwise (the mirror's below-water plane, 1 = pass-all), and wins outright in any view
+// the plane does not describe: disarmed, the mirror (gReflWaterClip.z != 0), or an orthographic view
+// (no forward row).
+float handoverNearClip(float3 worldPos, float passClip)
+{
+    float3 wRow = gFrameData.viewProj[3].xyz;
+    if (gFrameData.lodParams.z < 0.5f || gFrameData.lodParams.w <= 0.0f
+        || gFrameData.gReflWaterClip.z != 0.0f || dot(wRow, wRow) < 0.25f)
+        return passClip;
+    return gFrameData.lodParams.w + kHandoverOverlap - dot(handoverForward(), worldPos);
+}

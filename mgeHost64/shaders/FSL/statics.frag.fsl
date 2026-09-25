@@ -481,6 +481,9 @@ PSOut PS_MAIN( VSOutput In )
     // geometry and the ground that DO isolate, so leaving them out made mode 6 read as "everything
     // past the handover is still on MW's path" — the opposite of the truth, and unreadable exactly
     // where the near<->far handover is the thing being judged.
+    // mode 28: which PRODUCER drew the pixel — DL statics MAGENTA, MW's near path GREEN (opaque /
+    // multimap). Where both draw the same surface the view is a speckle of the two: the z-fight.
+    if (dbg == 28u) { Out.Color = float4(1.0f, 0.0f, 1.0f, 1.0f); RETURN(Out); }
     if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out); }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }

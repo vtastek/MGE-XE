@@ -13,6 +13,7 @@
 // viewProj keeps the column-major mul like opaque/distantland). Placeholder linear fog (1c = scatter).
 
 #include "opaque.srt.h"
+#include "handover.h.fsl" // handoverForward() — the near/far plane, shared with the near stages
 #include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 #include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
@@ -245,22 +246,15 @@ VSOutput VS_MAIN( VSInput In )
     // build eye, so clip.w minus the matrix's own eye offset (viewProj row 3's w) is the depth from
     // it. Rotation is the host's packed yaw/pitch step to the build forward (lodParams.z, see
     // dlPackSlabRotation; 0 = none, which is every non-park frame and makes this Out.Position.w).
+    // The near path clips at the SAME plane from the other side (handover.h.fsl).
     float slabDepth = 0.0f;
     if (In.InstParams.w > 0.0f) {
-        float4 wRow = gFrameData.viewProj[3];
-        float3 fwd  = wRow.xyz;
-        uint   rot  = (uint)(gFrameData.lodParams.z + 0.5f);
-        if (rot != 0u) {
-            rot -= 1u;
-            float dyaw   = ((float)(rot >> 12u)    - 2048.0f) * (0.25f / 2047.0f);
-            float dpitch = ((float)(rot & 4095u)   - 2048.0f) * (0.25f / 2047.0f);
-            float yaw    = atan2(fwd.x, fwd.y) + dyaw;
-            float pitch  = asin(clamp(fwd.z / length(fwd), -1.0f, 1.0f)) + dpitch;
-            fwd = float3(cos(pitch) * sin(yaw), cos(pitch) * cos(yaw), sin(pitch));
-        }
-        slabDepth = dot(fwd, worldPos.xyz);
+        slabDepth = dot(handoverForward(), worldPos.xyz);
     }
     Out.Clip = (In.InstParams.w > 0.0f) ? (slabDepth - In.InstParams.w) : waterClip;
+    // ...and yields the overlap band to MW's copy (handover.h.fsl): an identical surface loses by a
+    // hair instead of z-fighting, a stand-in that really is in front still wins.
+    if (In.InstParams.w > 0.0f) { Out.Position.z *= (1.0f - kHandoverDepthBias); }
 
     // Glow in the Dahrk distant windows. A GitD window mesh is a NiSwitchNode whose "off"/"on"
     // children share vertex POSITIONS but not UVs, so the bake exports both as separate subsets:
