@@ -31,11 +31,12 @@ local kPause  = 3.0      -- seconds held at the far point
 -- crossing a cell border toward the fort, where MW shifts its grid and loads a new row.
 local fwdMarker = io.open("Data Files/MWSE/mods/mgexe/backstep/FORWARD", "r")
 local forward = fwdMarker ~= nil
+local fwdSpeedText = fwdMarker and fwdMarker:read("*l") or nil   -- FORWARD's first line = speed
 if fwdMarker then fwdMarker:close() end
 local kFwdDist  = 12000.0
 local kFwdSettle = 10.0  -- seconds at the teleport target before walking
 local kFwdOver  = 4000.0 -- ...and how far PAST the save spot it keeps walking
-local kFwdSpeed = 400.0  -- about a run
+local kFwdSpeed = tonumber(fwdSpeedText or "") or 400.0  -- about a run unless FORWARD says otherwise
 
 local phase = "idle"     -- idle -> out -> pause -> back -> parked
 local t, phaseT = 0.0, 0.0

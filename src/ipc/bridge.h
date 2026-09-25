@@ -635,6 +635,11 @@ namespace IPC {
         // arrives, so DL is never cut for a reference the near set cannot draw. Appended at the end
         // of the IN block (same rule as above; rebuild and deploy both binaries together).
         IN std::uint32_t nearRefsVersion;
+        // ...and the FORWARD axis of the camera that draw list was classified with. MW culls against
+        // ITS far plane, so the host must cut DL at view-Z (along THIS axis, from the build eye) =
+        // reach, not at the fire camera's: in park mode the two differ by a frame of motion, which
+        // sliced the near side off small rocks and wall corners at speed.
+        IN float nearFwd[3];
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

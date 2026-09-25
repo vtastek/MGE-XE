@@ -2770,9 +2770,24 @@ VSOutput VS_MAIN( VSInput In )
 
 
     float waterClip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
-#line 239 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
-    Out.Clip = (In.InstParams.w > 0.0f) ? (Out.Position.w - In.InstParams.w) : waterClip;
-#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 248 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+    float slabDepth = 0.0f;
+    if (In.InstParams.w > 0.0f) {
+        float4 wRow = gFrameData.viewProj[3];
+        float3 fwd = wRow.xyz;
+        uint rot = (uint)(gFrameData.lodParams.z + 0.5f);
+        if (rot != 0u) {
+            rot -= 1u;
+            float dyaw = ((float)(rot >> 12u) - 2048.0f) * (0.25f / 2047.0f);
+            float dpitch = ((float)(rot & 4095u) - 2048.0f) * (0.25f / 2047.0f);
+            float yaw = atan2(fwd.x, fwd.y) + dyaw;
+            float pitch = asin(clamp(fwd.z / length(fwd), -1.0f, 1.0f)) + dpitch;
+            fwd = float3(cos(pitch) * sin(yaw), cos(pitch) * cos(yaw), sin(pitch));
+        }
+        slabDepth = dot(fwd, worldPos.xyz);
+    }
+    Out.Clip = (In.InstParams.w > 0.0f) ? (slabDepth - In.InstParams.w) : waterClip;
+#line 281 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     if ((Out.Flags & 0x18u) != 0u) {
         bool lit = (gFrameData.timeParams.z + In.InstParams.z) > 0.0f;
         bool want = lit ? ((Out.Flags & 0x8u) != 0u)
@@ -2800,11 +2815,11 @@ VSOutput VS_MAIN( VSInput In )
     if (!heroBlend) {
         Out.Position = float4(1e9f, 1e9f, 1e9f, 1.0f);
     } else {
-#line 296 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 320 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
         float distXY = length(In.W3.xy);
         if (distXY < gFrameData.lodParams.w) { Out.Position = float4(1e9f, 1e9f, 1e9f, 1.0f); }
     }
-#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 329 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     return (Out);
 }
 #line 243 "FSL/shaders.list"

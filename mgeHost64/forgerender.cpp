@@ -28478,7 +28478,12 @@ void destroyHostWindow(Renderer* R);
         g_nearRefsPendingSet = true;
     }
 
-    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach, unsigned nearRefsVersion) {
+    // Forward axis of the camera the fired draw list was CLASSIFIED with (see dlPackSlabRotation).
+    float g_nearBuildFwd[3] = { 0.0f, 0.0f, 0.0f };
+
+    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach, unsigned nearRefsVersion,
+                      const float buildFwd[3]) {
+        g_nearBuildFwd[0] = buildFwd[0]; g_nearBuildFwd[1] = buildFwd[1]; g_nearBuildFwd[2] = buildFwd[2];
         g_nearCellX     = (int32_t)centreX;
         g_nearCellY     = (int32_t)centreY;
         g_nearCellMask  = (uint32_t)loadedMask & 0x1FFu;
@@ -28681,6 +28686,7 @@ void destroyHostWindow(Renderer* R);
     // renderScene (earlier in the file) can drive them. dlSetFrameEye/dlLogHeartbeat wrap the DL
     // global state renderScene touches so those globals can stay next to their definitions.
     void dlSetFrameEye(float x, float y, float z, bool exterior);
+    float dlPackSlabRotation(const float* rzViewProj);   // defined with dlNearOwnRefresh
     // ...and the flag it latches. renderScene needs it well before the DL globals are declared: the
     // SH1 sky-ambient publish is gated on exterior-ness, and it happens up with the per-frame camera
     // write, not down in the DL cull.
@@ -52693,7 +52699,7 @@ void destroyHostWindow(Renderer* R);
             // at the DL stage), so zeroing the lane here — as it did while it was dead padding —
             // blacked the glow out in every exterior while leaving it correct in interiors, which
             // the DL path skips. One lane, one owner.
-            fd[48] = nearOwn; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
+            fd[48] = nearOwn; fd[50] = dlPackSlabRotation(viewProj); fd[51] = g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             // lodEye — .w is the above-water hole-fill permission, same expression as the lighting
             // block's write (this runs after it and rewrites the whole float4). g_dlExterior is
@@ -53221,6 +53227,39 @@ void destroyHostWindow(Renderer* R);
     // it), so DL keeps it whole; one that matches a reference filed in a loaded cell is OWNED even
     // if its position cell is not. Origins match by exact float bits: DL baked them from the same
     // ESM floats MW placed the node with.
+    // The handover slab lives in the CLASSIFY camera, not the fire camera. MW decided the near set by
+    // culling against its own far plane — view-Z along the build camera's forward, from the build
+    // eye — and in park mode the payload is fired a frame later with the current camera. Cutting DL
+    // at the fire camera's plane sliced the near side off anything MW had culled a frame earlier:
+    // small rocks halved, wall corners nicked, worse the faster you move.
+    //
+    // statics.vert gets the TRANSLATION half for free: statics sit relative to the build eye
+    // (g_dlEye = lighting[24..26] = bakeEye), so clip.w minus the matrix's own eye offset is the view
+    // depth from the build eye. The ROTATION half is the only input it needs from here: the yaw/pitch
+    // step from the fire camera's forward (the viewProj w column) to the build camera's, two small
+    // angles packed into lodParams.z as 12 bits each over ±kSlabRotMax (1 + qy*4096 + qp; 0 = none).
+    // 0.25 rad / 2047 = 1.2e-4 rad, i.e. under a unit at 7168. A bigger step (a flick, a teleport)
+    // clamps, leaving a one-frame residual — the same frame the park drop already hides.
+    constexpr float kSlabRotMax = 0.25f;
+    float dlPackSlabRotation(const float* rzViewProj) {
+        const float bx = g_nearBuildFwd[0], by = g_nearBuildFwd[1], bz = g_nearBuildFwd[2];
+        const float nx = rzViewProj[3], ny = rzViewProj[7], nz = rzViewProj[11];   // w column = forward
+        const float bl = std::sqrt(bx * bx + by * by + bz * bz);
+        const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (bl < 0.5f || nl < 0.5f) { return 0.0f; }
+        const float kPi = 3.14159265f;
+        float dyaw = std::atan2(bx, by) - std::atan2(nx, ny);
+        if (dyaw >  kPi) { dyaw -= 2.0f * kPi; }
+        if (dyaw < -kPi) { dyaw += 2.0f * kPi; }
+        const float dpitch = std::asin(std::max(-1.0f, std::min(1.0f, bz / bl)))
+                           - std::asin(std::max(-1.0f, std::min(1.0f, nz / nl)));
+        auto q = [](float a) -> uint32_t {
+            const float c = std::max(-1.0f, std::min(1.0f, a / kSlabRotMax));
+            return (uint32_t)std::lround(c * 2047.0f + 2048.0f) & 0xFFFu;
+        };
+        return (float)(1u + q(dyaw) * 4096u + q(dpitch));
+    }
+
     void dlNearOwnRefresh(Renderer* R) {
         if (!g_nearRefsValid || g_cullInst.empty() || g_liveGrid.empty()) { return; }
         const uint32_t key[4] = { g_nearRefsVersion, (uint32_t)g_nearCellX, (uint32_t)g_nearCellY,

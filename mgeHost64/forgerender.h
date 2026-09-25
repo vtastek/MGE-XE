@@ -66,7 +66,8 @@ namespace ForgeRender {
     // LOADED mask, bit (dy+1)*3 + (dx+1)) and how far MW's own cull reaches (its view distance).
     // The distant-statics cull drops the LOD proxies the near path is already drawing at full
     // detail. Centre bit clear / reach 0 ⇒ gate off, the fixed near-cut distance applies instead.
-    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach, unsigned nearRefsVersion);
+    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach, unsigned nearRefsVersion,
+                      const float buildFwd[3]);
 
     // ...and WHICH references MW actually holds in those cells: each reference root's placement
     // origin with the cell it is FILED under. A reference can stand outside its own cell, so the

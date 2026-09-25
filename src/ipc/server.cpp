@@ -684,7 +684,7 @@ namespace IPC {
 			// Statics near/far handover: MW's active exterior cell set + how far its own cull
 			// reaches. Mask 0 (no centre cell) ⇒ the host keeps its fixed near-cut distance.
 			ForgeRender::setNearCells(params.nearCellX, params.nearCellY,
-				params.nearCellMask, params.nearCellReach, params.nearRefsVersion);
+				params.nearCellMask, params.nearCellReach, params.nearRefsVersion, params.nearFwd);
 			// Tier 1: does the client hold the sync object that makes overlapping this frame's GPU
 			// work past our reply safe? Fail-safe — anything but an explicit 1 makes renderScene
 			// settle its own frame before returning, exactly as it did pre-Tier-1.

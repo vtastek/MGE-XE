@@ -656,6 +656,7 @@ namespace IPC {
 		params.nearCellMask = m_nearCellMask;
 		params.nearCellReach = m_nearCellReach;
 		params.nearRefsVersion = m_nearRefsVersion;
+		params.nearFwd[0] = m_nearFwd[0]; params.nearFwd[1] = m_nearFwd[1]; params.nearFwd[2] = m_nearFwd[2];
 		// Tier 1: whether the host may overlap frame N's GPU work past its reply (see bridge.h).
 		params.clientSyncsOnFence = m_clientSyncsOnFence;
 		// Mode-3 park: the delta the sky payload was pre-cancelled by, for the reflect mirror plane.

@@ -76,6 +76,7 @@ namespace IPC {
 		std::uint32_t m_nearCellMask = 0;
 		float m_nearCellReach = 0.0f;
 		std::uint32_t m_nearRefsVersion = 0;
+		float m_nearFwd[3] = { 0.0f, 1.0f, 0.0f };
 		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting.
 		std::uint32_t m_clientSyncsOnFence = 0;
 		// Mode-3 park sky re-anchor delta — see setSkyParkEyeDelta. 0 on the serial paths.
@@ -423,9 +424,10 @@ namespace IPC {
 		// a 9-bit LOADED mask, bit (dy+1)*3 + (dx+1)) and its cull reach into every subsequent
 		// render RPC. Refreshed per frame by the seam; mask 0 disables the host's ownership gate.
 		void setNextNearCells(std::int32_t cx, std::int32_t cy, std::uint32_t mask, float reach,
-		                      std::uint32_t nearRefsVersion) {
+		                      std::uint32_t nearRefsVersion, const float fwd[3]) {
 			m_nearCellX = cx; m_nearCellY = cy; m_nearCellMask = mask; m_nearCellReach = reach;
 			m_nearRefsVersion = nearRefsVersion;
+			m_nearFwd[0] = fwd[0]; m_nearFwd[1] = fwd[1]; m_nearFwd[2] = fwd[2];
 		}
 
 		// Tier 1: tell the host whether we hold an imported timeline semaphore for its shared frame

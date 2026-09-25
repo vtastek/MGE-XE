@@ -750,10 +750,12 @@ namespace {
         std::uint32_t mask = 0;
         float         reach = 0.0f;
         std::uint32_t refsVersion = 0;
+        float         fwd[3] = { 0.0f, 1.0f, 0.0f };   // the classify camera's forward (view-Z axis)
     };
     NearCellsSnap snapNearCells() {
         NearCellsSnap n;
         n.refsVersion = DistantLand::nearRefsVersion;
+        n.fwd[0] = DistantLand::eyeVec.x; n.fwd[1] = DistantLand::eyeVec.y; n.fwd[2] = DistantLand::eyeVec.z;
         if (MWBridge::get()->IsExterior()) {
             void* dh = MGE::SceneGraph::getDataHandler();
             if (dh) {
@@ -6973,7 +6975,7 @@ namespace RenderProcess {
         // Statics near/far handover (snapNearCells): the park's BUILD-time snapshot when this is a
         // parked fire, otherwise a fresh one — built and fired in the same frame, the two agree.
         const NearCellsSnap nc = parkFired ? g_park.nearCells : snapNearCells();
-        g_client->setNextNearCells(nc.x, nc.y, nc.mask, nc.reach, nc.refsVersion);
+        g_client->setNextNearCells(nc.x, nc.y, nc.mask, nc.reach, nc.refsVersion, nc.fwd);
 
         // Async kickoff: copy the frame params into shared memory and start the host, then
         // RETURN — the host renders while MW's frame-N work continues. All the pointer args
