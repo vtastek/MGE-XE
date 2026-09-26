@@ -57,6 +57,9 @@ namespace MGE::GeometryCache {
         // the host's settle window (kCasterSettleFrames), or the host still reads its last sighting
         // as "moving" and its mover expiry drops the shadow (the rope lantern on a pause menu).
         uint64_t lastMoveFrame;
+        // Parent is a NiBillboardNode. The shipped rotation is then built by the cache itself
+        // (applyBillboardFacing), not read off the scene graph — see that function.
+        bool     billboard;
         // True when the part's world/bone transform has negative determinant (a
         // mirrored left-side part). Clip-space winding is flipped, so the cache
         // depth/shadow draws must cull the opposite face for these.

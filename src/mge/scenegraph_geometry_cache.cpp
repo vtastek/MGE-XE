@@ -2383,10 +2383,40 @@ namespace MGE::GeometryCache {
             buildD3DFromTransform(out, geom->worldTransform);
         }
 
+        // GRAVITY BILLBOARD FACING, built here rather than read off the scene graph.
+        //
+        // MW turns a NiBillboardNode toward the camera when it DISPLAYS the node. The host owns
+        // these leaves, so MW never displays them, and turning the node ourselves (rotateToCamera
+        // in the classify traversal) did not survive to the capture: 293 of 420 CAP staircase
+        // flames shipped in the node's axis-aligned REST pose, a back face from the player's side,
+        // culled single-sided — the "missing flames" that all reappeared in menus.
+        //
+        // The r0 candle flame is a gravity billboard: an NiLookAtController keeps the quad's model
+        // Y on world up and the billboard yaws its model Z toward the eye (read off the flames that
+        // did draw: Y=(0,0,1), Z = horizontal flame->eye). That is a pure function of position and
+        // eye, so compute it: no controllers, no scene-graph writes, no ordering against MW. Tilted
+        // candles too — keeping Y on world up is the look-at's whole job. Applied only when the
+        // captured up row is already near vertical; any other billboard kind keeps the scene
+        // graph's rotation. Scale (row length) is preserved.
+        void applyBillboardFacing(float m[16]) {
+            const float s = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+            if (!(s > 1e-6f) || std::fabs(m[6]) < 0.9f * s) return;       // not a gravity billboard
+            float zx = DistantLand::eyePos.x - m[12], zy = DistantLand::eyePos.y - m[13];
+            const float zl = std::sqrt(zx * zx + zy * zy);
+            if (!(zl > 1e-3f)) return;                                      // eye straight above
+            zx /= zl; zy /= zl;
+            const float up = (m[6] > 0.0f) ? 1.0f : -1.0f;                 // keep the captured up sign
+            // Rows (D3DX row-major): X = Y x Z, Y = world up, Z = horizontal toward the eye.
+            m[0] = -up * zy * s; m[1] = up * zx * s; m[2]  = 0.0f;
+            m[4] = 0.0f;         m[5] = 0.0f;        m[6]  = up * s;
+            m[8] = zx * s;       m[9] = zy * s;      m[10] = 0.0f;
+        }
+
         // The one way an entry's pose is taken: the float D3D matrix AND its exact double
         // translation together, so the emitters can never pair a translation with a stale twin.
         void captureWorld(CachedGeometry& e, const NI::TriBasedGeometry* geom) {
             buildD3DTransform(e.worldTransformD3D, geom);
+            if (e.billboard) applyBillboardFacing(e.worldTransformD3D);
             ExactPos::worldT(geom, e.worldT);
         }
 
@@ -2901,6 +2931,35 @@ namespace MGE::GeometryCache {
             else               g_portalRoleKeys.erase(key);
         }
 
+        void refaceBillboardImpl(NI::BillboardNode* bb, NI::Camera* cam) {
+            const NI::Point3& wt = bb->worldTransform.translation;
+            // Guard the erect-mod up-∞ LookUpTarget (z≈3.4e38): never re-face or
+            // recompute a node whose world position is non-finite / astronomical.
+            if (!(std::isfinite(wt.x) && std::isfinite(wt.y) &&
+                  std::isfinite(wt.z) && std::fabs(wt.z) < 1.0e30f)) {
+                return;
+            }
+            // Match the engine's order: recompute the billboard's own world
+            // from its parent FIRST (the parent carries the erect-mod
+            // NiLookAtController "gravity" → a vertical world up), THEN
+            // rotateToCamera. RotateAboutUp mode preserves the world up, so
+            // feeding it the fresh parent-derived up is what keeps the flame
+            // vertical. Without this it yawed around a stale up (flame tilted
+            // until an F11 seam cycle let a real engine render re-seed it).
+            // bUpdateChildren=false — children are re-derived below.
+            bb->update(0.0f, false, false);
+            bb->rotateToCamera(cam);
+            // Re-derive children off the freshly-rotated billboard world
+            // (child.world = billboard.world * child.local). update() on the
+            // CHILDREN only — calling it on the billboard itself would rebuild
+            // its world from parent*local and clobber the facing just set.
+            const auto count = bb->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                if (NI::AVObject* child = bb->children.at(i).get())
+                    child->update(0.0f, false, true);
+            }
+        }
+
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
             auto* data = geom->getModelData().get();
             if (!data) return;
@@ -2944,6 +3003,8 @@ namespace MGE::GeometryCache {
                 g_geomRefs[key] = geom;
                 e.numBones = 0; e.skinnedUnsupported = false;
                 e.dataPtr = data;
+                e.billboard = geom->parentNode
+                           && geom->parentNode->isInstanceOfType(NI::RTTIStaticPtr::NiBillboardNode);
                 // Material first: uploadEntry reads the captured map UV sets (baseUV/
                 // darkUV/detailUV/glowUV, set here) to size the VB's UV-set count.
                 extractMaterial(e, geom);
@@ -3103,6 +3164,7 @@ namespace MGE::GeometryCache {
                     } else {
                         float newTransform[16];
                         buildD3DTransform(newTransform, geom);
+                        if (e.billboard) applyBillboardFacing(newTransform);
                         if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
                             e.dynamicHint = 4;
                             e.lastMoveFrame = g_frame;
@@ -3387,31 +3449,7 @@ namespace MGE::GeometryCache {
                     NI::Camera* faceCam = g_walkingFP ? MWBridge::get()->getArmCamera()
                                                       : MWBridge::get()->getWorldCamera();
                     if (NI::Camera* armCam = faceCam) {
-                        auto* bb = static_cast<NI::BillboardNode*>(node);
-                        const NI::Point3& wt = bb->worldTransform.translation;
-                        // Guard the erect-mod up-∞ LookUpTarget (z≈3.4e38): never re-face or
-                        // recompute a node whose world position is non-finite / astronomical.
-                        if (std::isfinite(wt.x) && std::isfinite(wt.y) &&
-                            std::isfinite(wt.z) && std::fabs(wt.z) < 1.0e30f) {
-                            // Match the engine's order: recompute the billboard's own world
-                            // from its parent FIRST (the parent carries the erect-mod
-                            // NiLookAtController "gravity" → a vertical world up), THEN
-                            // rotateToCamera. RotateAboutUp mode preserves the world up, so
-                            // feeding it the fresh parent-derived up is what keeps the flame
-                            // vertical. Without this it yawed around a stale up (flame tilted
-                            // until an F11 seam cycle let a real engine render re-seed it).
-                            // bUpdateChildren=false — children are re-derived below.
-                            bb->update(0.0f, false, false);
-                            bb->rotateToCamera(armCam);
-                            // Re-derive children off the freshly-rotated billboard world
-                            // (child.world = billboard.world * child.local). update() on the
-                            // CHILDREN only — calling it on the billboard itself would rebuild
-                            // its world from parent*local and clobber the facing just set.
-                            for (size_t i = 0; i < count; ++i) {
-                                if (NI::AVObject* child = node->children.at(i).get())
-                                    child->update(0.0f, false, true);
-                            }
-                        }
+                        refaceBillboardImpl(static_cast<NI::BillboardNode*>(node), armCam);
                     }
                 }
 
@@ -5755,6 +5793,7 @@ namespace MGE::GeometryCache {
             }
             float newTransform[16];
             buildD3DTransform(newTransform, geom);
+            if (e.billboard) applyBillboardFacing(newTransform);
             if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
                 memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
                 ExactPos::worldT(geom, e.worldT);   // captureWorld's twin, on change only
