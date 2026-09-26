@@ -73,6 +73,11 @@ namespace MGE::SceneGraph {
         // it participates in the change-detection memcmp, but a live light's pointer is stable,
         // so it never trips a spurious frameRevision bump.
         const void* source;
+        // G3 fixture gobo key (tasks/forge-light-gobo.md): FNV-1a of the owning reference's LIGH
+        // object id (0 = no LIGH reference) and that reference's model->world rotation, packed
+        // (IPC::packQuatSmallest3). Stable for a placed light, so the change memcmp stays quiet.
+        std::uint32_t goboIdHash;
+        std::uint32_t goboRot;
     };
     const std::vector<PointLight>& pointLights();
 

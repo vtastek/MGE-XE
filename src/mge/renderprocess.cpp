@@ -620,6 +620,7 @@ namespace {
     std::vector<std::uint8_t>                 g_fpMultiMapScratch;  // packed FP MultiMapDrawWire[] this frame (FP1e)
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
+    std::vector<IPC::LightGoboWire>           g_lightGoboScratch;   // G3: the parallel gobo side array
 
     // PARK-LAG CORRECTION for the player's own geometry.
     //
@@ -1835,7 +1836,7 @@ namespace {
             g_multiMapVec.emplace(std::move(*mm));
         }
 
-        // Point-light list (Tier 3a) rides its own 1-chunk vec — kMaxPointLights * 48B ≈ 6KB,
+        // Point-light list (Tier 3a) rides its own 1-chunk vec — kMaxPointLights * 56B ≈ 7KB (48B wire + the G3 gobo side entry),
         // far under 1MB. PointLightWire[] world-space, rebuilt each frame from the SceneGraph snapshot.
         auto lv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
         if (!lv) {
@@ -4024,6 +4025,7 @@ namespace {
         const ViewFrustum lightFrustum(&lightVP);
 
         g_lightScratch.clear();
+        g_lightGoboScratch.clear();
         std::uint32_t count = 0;
         std::uint32_t culled = 0;
         for (const auto& pl : lights) {
@@ -4134,7 +4136,16 @@ namespace {
             const std::size_t at = g_lightScratch.size();
             g_lightScratch.resize(at + sizeof(w));
             memcpy(g_lightScratch.data() + at, &w, sizeof(w));
+            g_lightGoboScratch.push_back({ pl.goboIdHash, pl.goboRot });
             ++count;
+        }
+        // G3: the gobo side array rides the SAME blob, after the PointLightWire[] (geomwire.h
+        // LightGoboWire): lightBytes = count * 56 tells the host it is there.
+        if (count > 0) {
+            const std::size_t at = g_lightScratch.size();
+            const std::size_t sz = g_lightGoboScratch.size() * sizeof(IPC::LightGoboWire);
+            g_lightScratch.resize(at + sz);
+            memcpy(g_lightScratch.data() + at, g_lightGoboScratch.data(), sz);
         }
 
         // Evict identity entries whose light hasn't been seen in a long time (cell changes drop
@@ -8154,6 +8165,8 @@ namespace RenderProcess {
         g_multiMapScratch.shrink_to_fit();
         g_lightScratch.clear();
         g_lightScratch.shrink_to_fit();
+        g_lightGoboScratch.clear();
+        g_lightGoboScratch.shrink_to_fit();
         g_skyScratch.clear();
         g_skyScratch.shrink_to_fit();
         g_alphaScratch.clear();

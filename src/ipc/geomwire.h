@@ -12,6 +12,7 @@
 // Per-frame draw lists (M1c) reference the same slots.
 
 #include <cstdint>
+#include <cmath>     // std::sqrt / std::floor — packQuatSmallest3 (G3 gobo side array)
 #include <cstring>   // std::memcpy — bit-copy for the packed light-identity lane
 
 namespace IPC {
@@ -489,6 +490,80 @@ namespace IPC {
         std::memcpy(&bits, &lane, sizeof(bits));
         id    = bits >> 8;
         flags = bits & 0xFFu;
+    }
+
+    // G3 fixture gobos (tasks/forge-light-gobo.md): a SIDE ARRAY appended to the light blob, one
+    // entry per PointLightWire in the same order — [PointLightWire x n][LightGoboWire x n], so
+    // lightBytes == n * 56 when it is present. PointLightWire has no free lane left (colour.w is the
+    // identity, falloff.w the shadow slot), and a side array keeps its 48-byte memcpy intact.
+    //   idHash    = fixtureIdHash(the owning reference's LIGH object id); 0 = not a LIGH reference
+    //               (a carried torch resolves to its actor, a spell light to nothing);
+    //   rotPacked = packQuatSmallest3(the reference's MODEL->WORLD rotation) — the frame the gobo
+    //               was baked in (NOT the NiLight's own: an AttachLight node may be rotated).
+    // The host maps idHash through fixtures.data to a gobo layer.
+    struct LightGoboWire {
+        std::uint32_t idHash;
+        std::uint32_t rotPacked;
+    };
+
+    // 32-bit FNV-1a over the LOWERCASE object id — MGEgui DistantLandForm.cs FixtureIdHash, the
+    // fixtures.data key. ASCII lowercase only (ids are ASCII in practice; the C# side lowercases
+    // with the culture, which agrees on ASCII).
+    inline std::uint32_t fixtureIdHash(const char* id) {
+        std::uint32_t h = 2166136261u;
+        for (; id && *id; ++id) {
+            std::uint8_t b = (std::uint8_t)*id;
+            if (b >= 'A' && b <= 'Z') { b = (std::uint8_t)(b + 32); }
+            h ^= b;
+            h *= 16777619u;
+        }
+        return h;
+    }
+
+    // Unit quaternion (x,y,z,w) -> 32 bits, smallest-three: 2 bits for the largest |component| (made
+    // positive; q and -q are one rotation), then the other three in x,y,z,w order at 10 bits over
+    // [-1/sqrt2, 1/sqrt2]. ~0.24 deg worst case. The shaders read it with asuint and gobo.h.fsl's
+    // goboQuatUnpack — MUST match that. Used by the host for baked lights too, so there is one packer.
+    inline std::uint32_t packQuatSmallest3(const float qIn[4]) {
+        float q[4] = { qIn[0], qIn[1], qIn[2], qIn[3] };
+        float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+        if (!(n > 1e-12f)) { q[0] = q[1] = q[2] = 0.0f; q[3] = 1.0f; n = 1.0f; }
+        n = 1.0f / std::sqrt(n);
+        int big = 0;
+        for (int k = 0; k < 4; ++k) { q[k] *= n; if (std::fabs(q[k]) > std::fabs(q[big])) { big = k; } }
+        const float sgn = (q[big] < 0.0f) ? -1.0f : 1.0f;
+        std::uint32_t p = (std::uint32_t)big << 30;
+        int shift = 20;
+        for (int k = 0; k < 4; ++k) {
+            if (k == big) { continue; }
+            const float t = (q[k] * sgn + 0.70710678f) * (1023.0f / 1.41421356f) + 0.5f;
+            const int   v = (int)std::floor(t);
+            p |= (std::uint32_t)(v < 0 ? 0 : (v > 1023 ? 1023 : v)) << shift;
+            shift -= 10;
+        }
+        return p;
+    }
+
+    // Rotation matrix in COLUMN-vector form (world = R * v; R[r][c]) -> unit quaternion (x,y,z,w).
+    inline void quatFromRotation(const float R[3][3], float q[4]) {
+        const float tr = R[0][0] + R[1][1] + R[2][2];
+        if (tr > 0.0f) {
+            const float s = std::sqrt(tr + 1.0f) * 2.0f;
+            q[3] = 0.25f * s;
+            q[0] = (R[2][1] - R[1][2]) / s; q[1] = (R[0][2] - R[2][0]) / s; q[2] = (R[1][0] - R[0][1]) / s;
+        } else if (R[0][0] > R[1][1] && R[0][0] > R[2][2]) {
+            const float s = std::sqrt(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f;
+            q[3] = (R[2][1] - R[1][2]) / s;
+            q[0] = 0.25f * s; q[1] = (R[0][1] + R[1][0]) / s; q[2] = (R[0][2] + R[2][0]) / s;
+        } else if (R[1][1] > R[2][2]) {
+            const float s = std::sqrt(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f;
+            q[3] = (R[0][2] - R[2][0]) / s;
+            q[0] = (R[0][1] + R[1][0]) / s; q[1] = 0.25f * s; q[2] = (R[1][2] + R[2][1]) / s;
+        } else {
+            const float s = std::sqrt(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f;
+            q[3] = (R[1][0] - R[0][1]) / s;
+            q[0] = (R[0][2] + R[2][0]) / s; q[1] = (R[1][2] + R[2][1]) / s; q[2] = 0.25f * s;
+        }
     }
 
     // Per-frame point-light cap. The frag loops a bounded working set (Tier 3a is the

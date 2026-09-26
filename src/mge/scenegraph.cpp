@@ -27,6 +27,7 @@
 #include "distantland.h"                 // DistantLand::mwWorldSuppress (MW-ONLY-UI root cull)
 #include "scenegraph_geometry_cache.h"   // kSuppress* bits
 #include "support/log.h"
+#include "ipc/geomwire.h"          // G3: fixtureIdHash / quatFromRotation / packQuatSmallest3
 #include "mge_tracy.h"
 
 namespace MGE::SceneGraph {
@@ -142,6 +143,34 @@ namespace MGE::SceneGraph {
             // P2: stable per-frame identity key. Downstream tracking recycles it when a freed
             // NiLight's address is reused (frame-gap + teleport guards in buildLightList).
             out.source = pl;
+
+            // G3 fixture gobo key. The OWNING REFERENCE, not the NiLight: its base object names the
+            // fixture (fixtures.data is keyed by LIGH id) and its scene node carries the model->world
+            // rotation the gobo was baked in — the light itself may hang off a rotated AttachLight.
+            // SharedSE keeps TES3::Reference opaque, so the fields are read at the MWSE-documented
+            // offsets, as referenceLiveKind does (MWSE TES3Object.h / TES3Reference.h):
+            //   Reference: sceneNode @ 0x10, baseObject @ 0x28; BaseObject: objectType @ 0x4;
+            //   PhysicalObject: objectID (char*) @ 0x2C.
+            // A carried torch resolves to its ACTOR and a spell light to no reference: no key, no gobo.
+            out.goboIdHash = 0; out.goboRot = 0;
+            if (const void* ref = pl->getTes3Reference(true)) {
+                const char* r = static_cast<const char*>(ref);
+                const char* base = *reinterpret_cast<const char* const*>(r + 0x28);
+                const auto* node = *reinterpret_cast<const NI::Node* const*>(r + 0x10);
+                if (base && node && *reinterpret_cast<const uint32_t*>(base + 0x4) == 'HGIL' /*LIGH*/) {
+                    const char* id = *reinterpret_cast<const char* const*>(base + 0x2C);
+                    if (id && id[0]) {
+                        const auto& M = node->worldTransform.rotation;   // world = M * v, rows m0..m2
+                        const float R[3][3] = { { M.m0.x, M.m0.y, M.m0.z },
+                                                { M.m1.x, M.m1.y, M.m1.z },
+                                                { M.m2.x, M.m2.y, M.m2.z } };
+                        float q[4];
+                        IPC::quatFromRotation(R, q);
+                        out.goboIdHash = IPC::fixtureIdHash(id);
+                        out.goboRot    = IPC::packQuatSmallest3(q);
+                    }
+                }
+            }
             return out;
         }
 
