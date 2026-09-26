@@ -3036,6 +3036,7 @@ namespace MGE::GeometryCache {
                         buildD3DTransform(newTransform, geom);
                         if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
                             e.dynamicHint = 4;
+                            e.lastMoveFrame = g_frame;
                             memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
                             ExactPos::worldT(geom, e.worldT);   // captureWorld's twin, on change only
                         } else {
@@ -5689,6 +5690,7 @@ namespace MGE::GeometryCache {
                 memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
                 ExactPos::worldT(geom, e.worldT);   // captureWorld's twin, on change only
                 e.dynamicHint = 4;
+                e.lastMoveFrame = g_frame;
                 e.mirrored = computeMirrored(e);
             } else if (e.dynamicHint > 0) {
                 --e.dynamicHint;

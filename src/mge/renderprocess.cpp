@@ -3759,6 +3759,19 @@ namespace {
             // its slot and stays skipped. The map is cleared on epoch change, matching the host wipe.
             static std::unordered_map<std::uint32_t, std::uint32_t> s_offscreenSeeded;  // cacheKey -> host slot
             static std::uint32_t s_offscreenSeededEpoch = 0xFFFFFFFFu;
+            // Moving plain statics collected by the two loops below (kind 0 opaque, 1 alpha),
+            // pose-refreshed and emitted after both, like the movers' s_reEmitRefresh.
+            static std::vector<ReEmitCand> s_animStaticRefresh;   s_animStaticRefresh.clear();
+            // "Moving" = moved within kSettleResend cache frames. MUST outlast the host's settle window
+            // (kCasterSettleFrames 10, forgerender.cpp): the host keeps a mover's record past its
+            // expiry only if its LAST sighting was >10 frames after its last move, so the re-send
+            // has to keep reporting the part at rest for that long. dynamicHint (4) alone stopped
+            // first, and a pause menu — the script stops turning the lantern — dropped its shadow.
+            constexpr std::uint64_t kSettleResend = 30;
+            auto movingStatic = [cacheFrame](const MGE::GeometryCache::CachedGeometry& ge) {
+                return ge.dynamicHint > 0
+                    || (ge.lastMoveFrame != 0 && cacheFrame - ge.lastMoveFrame <= kSettleResend);
+            };
             if (s_offscreenSeededEpoch != g_cellEpoch) {
                 s_offscreenSeededEpoch = g_cellEpoch;
                 s_offscreenSeeded.clear();
@@ -3784,6 +3797,17 @@ namespace {
                     if (dx * dx + dy * dy + dz * dz > r2) continue;           // precise near-eye cull
                     auto ks = g_keySlot.find(skey);
                     if (ks == g_keySlot.end()) continue;                      // never uploaded a host slot
+                    // A MOVING plain static is the exception to the seed rule: the host flags it
+                    // everMoved and its mover expiry forgets the record kMoverFresh frames after the
+                    // last sighting, so one seed per cell lost its shadow the moment it left view.
+                    // Tribunal's Light_MH_Rope_Lantern swings by SCRIPT — its NIF holds no controller
+                    // at all — so "moving" is read from MOTION (movingStatic: the transform changed
+                    // within kSettleResend frames), not from controllers. Frozen at its last value
+                    // off screen; the re-send's ensureLive keeps it current, so a part that comes to
+                    // rest drops back to the seed rule once the host has had time to call it settled
+                    // (C4b keeps a settled record). Deferred: ensureLive must not run while this loop
+                    // reads cacheMap.
+                    if (movingStatic(e)) { s_animStaticRefresh.push_back({ skey, 0 }); continue; }
                     auto seedIt = s_offscreenSeeded.find(skey);
                     if (seedIt != s_offscreenSeeded.end() && seedIt->second == ks->second.slot) continue;
                     s_offscreenSeeded[skey] = ks->second.slot;   // seed (or re-seed on a new slot)
@@ -3815,6 +3839,8 @@ namespace {
                     if (wx*wx + wy*wy + wz*wz > r2) continue;          // precise near-eye cull
                     auto ks = g_keySlot.find(akey);
                     if (ks == g_keySlot.end()) continue;               // never uploaded a host slot
+                    // Moving: every frame with a fresh pose, as in the opaque loop above.
+                    if (movingStatic(e)) { s_animStaticRefresh.push_back({ akey, 1 }); continue; }
                     // Once-per-cell seed gate (shares s_offscreenSeeded; alpha/static keys are disjoint).
                     // A blended static lantern's alpha caster record is likewise persistent (everMoved
                     // false), so it need only enter the alpha pass once per cell to register.
@@ -3822,6 +3848,47 @@ namespace {
                     if (aSeedIt != s_offscreenSeeded.end() && aSeedIt->second == ks->second.slot) continue;
                     s_offscreenSeeded[akey] = ks->second.slot;
                     alphaCands.push_back({ wx*fwdX + wy*fwdY + wz*fwdZ, &ks->second, &e, nullptr });
+                }
+            }
+            // The moving statics both loops deferred: refresh the pose from the live node (a script
+            // keeps turning an off-screen reference; only its draw is skipped), then emit. The cache pointer
+            // ensureLive returns is node-stable, so alphaCands may hold it like the loop's own.
+            // [anim-static] DIAG: is the moving-static re-emit reaching its parts? Kept on purpose
+            // (animated-light investigation) — one line per 120 frames.
+            static std::uint32_t s_asFrames = 0, s_asQueued = 0, s_asEmitted = 0, s_asNull = 0;
+            ++s_asFrames;
+            s_asQueued += (std::uint32_t)s_animStaticRefresh.size();
+            if (s_asFrames >= 120) {
+                std::uint32_t nAnimAll = 0;
+                for (std::uint32_t k : MGE::GeometryCache::nearStaticCasters()) {
+                    auto c2 = cacheMap.find(k);
+                    if (c2 != cacheMap.end() && movingStatic(c2->second)) { ++nAnimAll; }
+                }
+                for (std::uint32_t k : MGE::GeometryCache::nearAlphaCasters()) {
+                    auto c2 = cacheMap.find(k);
+                    if (c2 != cacheMap.end() && movingStatic(c2->second)) { ++nAnimAll; }
+                }
+                LOG::logline("[anim-static] 120f: queued=%u emitted=%u ensureNull=%u movingInNearSets=%u",
+                             s_asQueued, s_asEmitted, s_asNull, nAnimAll);
+                s_asFrames = s_asQueued = s_asEmitted = s_asNull = 0;
+            }
+            for (const auto& rc : s_animStaticRefresh) {
+                const double tpr0 = nowMs();
+                const auto* fr = MGE::GeometryCache::ensureLive(rc.key);
+                tailEnsureMs += nowMs() - tpr0;
+                if (!fr) { ++s_asNull; continue; }                     // key gone → skip, no stale pose
+                auto ks = g_keySlot.find(rc.key);
+                if (ks == g_keySlot.end()) continue;
+                ++s_asEmitted;
+                if (rc.kind == 0) {
+                    emitStaticDraw(ks->second, *fr, drawCount);
+                } else {
+                    const float* w = fr->worldTransformD3D;
+                    const float cx = fr->boundsCenter[0], cy = fr->boundsCenter[1], cz = fr->boundsCenter[2];
+                    const float wx = cx*w[0] + cy*w[4] + cz*w[8]  + w[12] - DistantLand::eyePos.x;
+                    const float wy = cx*w[1] + cy*w[5] + cz*w[9]  + w[13] - DistantLand::eyePos.y;
+                    const float wz = cx*w[2] + cy*w[6] + cz*w[10] + w[14] - DistantLand::eyePos.z;
+                    alphaCands.push_back({ wx*fwdX + wy*fwdY + wz*fwdZ, &ks->second, fr, nullptr });
                 }
             }
             // FP0 instrumentation: each skipped frame is a frame the body WOULD have

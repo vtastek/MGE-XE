@@ -52,6 +52,11 @@ namespace MGE::GeometryCache {
         uint32_t numBones;
         bool     skinnedUnsupported;
         uint8_t  dynamicHint;           // counts down from N when transform moves; 0 = static
+        // g_frame of the last transform CHANGE (0 = never moved since capture). The Forge feed's
+        // offscreen static re-emit keeps feeding a part for a while after it stops — longer than
+        // the host's settle window (kCasterSettleFrames), or the host still reads its last sighting
+        // as "moving" and its mover expiry drops the shadow (the rope lantern on a pause menu).
+        uint64_t lastMoveFrame;
         // True when the part's world/bone transform has negative determinant (a
         // mirrored left-side part). Clip-space winding is flipped, so the cache
         // depth/shadow draws must cull the opposite face for these.
