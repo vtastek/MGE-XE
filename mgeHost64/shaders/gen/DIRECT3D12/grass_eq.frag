@@ -1430,7 +1430,12 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 248
+
+
+
+
+    float4 goboNear[ 128  / 2];
+#line 253
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1440,7 +1445,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 284 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 289 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1555,13 +1560,13 @@ STRUCT(LightData)
 
 
         Tex2D(float) gSunOcc :  register(t53,space1);
-#line 416 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 421 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gSkyColor :  register(t54,space1);
-#line 429 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gReflectMips :  register(t55,space1);
-#line 452 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 457 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float) gWaterSlopeVar :  register(t56,space1);
-#line 469 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 474 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float) gReflectDepth :  register(t57,space1);
 
 
@@ -1580,13 +1585,13 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gWakeField :  register(t59,space1);
-#line 509 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 514 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gPortalGate :  register(t60,space1);
-#line 530 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 535 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float) gCausticField :  register(t61,space1);
-#line 544 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 549 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gGrassCrush :  register(t62,space1);
-#line 557 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 562 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gAtmosSkyView :  register(t63,space1);
 
 
@@ -1601,7 +1606,7 @@ STRUCT(LightData)
 
 
         CBUFFER(AtmosphereParams) gAtmosParams :  register(b65,space1);
-#line 589 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 594 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float2) gMotionVectors :  register(t66,space1);
 
 
@@ -1618,12 +1623,18 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAtmosSkyViewClear :  register(t68,space1);
-#line 631 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 636 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Buffer(uint) gTerrainParamTex :  register(t69,space1);
         Tex2DArray(float4) gTerrainParamArrays[ 32 ] :  register(t70,space1);
-#line 661 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 666 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Buffer(uint) gStaticsParamSlot :  register(t102,space1);
         Tex2DArray(float4) gStaticsParamArrays[ 48 ] :  register(t103,space1);
+
+
+
+
+
+        Tex2DArray(float) gGoboArray :  register(t151,space1);
 
 
 
@@ -1640,7 +1651,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 693 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 704 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1651,7 +1662,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 717 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 728 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
@@ -3488,7 +3499,136 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 }
 #line 49 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
-#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
+#line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
+#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobo.h.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobo.h.fsl"
+float2 goboOctEncode(float3 d)
+{
+    d /= max(abs(d.x) + abs(d.y) + abs(d.z), 1e-8f);
+    float2 p = d.xy;
+    if (d.z < 0.0f) {
+        float2 s = float2(p.x >= 0.0f ? 1.0f : -1.0f, p.y >= 0.0f ? 1.0f : -1.0f);
+        p = (1.0f - abs(p.yx)) * s;
+    }
+    return p * 0.5f + 0.5f;
+}
+
+
+float3 goboOctDecode(float2 uv)
+{
+    float2 p = uv * 2.0f - 1.0f;
+    float3 d = float3(p.x, p.y, 1.0f - abs(p.x) - abs(p.y));
+    float t = saturate(-d.z);
+    d.x += (d.x >= 0.0f) ? -t : t;
+    d.y += (d.y >= 0.0f) ? -t : t;
+    return normalize(d);
+}
+
+
+
+
+void goboFaceBasis(uint f, out float3 F, out float3 R, out float3 U)
+{
+    if (f == 0u) { F = float3( 1, 0, 0); R = float3( 0, 1, 0); U = float3(0, 0, 1); }
+    else if (f == 1u) { F = float3(-1, 0, 0); R = float3( 0,-1, 0); U = float3(0, 0, 1); }
+    else if (f == 2u) { F = float3( 0, 1, 0); R = float3(-1, 0, 0); U = float3(0, 0, 1); }
+    else if (f == 3u) { F = float3( 0,-1, 0); R = float3( 1, 0, 0); U = float3(0, 0, 1); }
+    else if (f == 4u) { F = float3( 0, 0, 1); R = float3( 1, 0, 0); U = float3(0, 1, 0); }
+    else { F = float3( 0, 0,-1); R = float3( 1, 0, 0); U = float3(0,-1, 0); }
+}
+
+
+uint goboCubeFace(float3 d, out float2 uv)
+{
+    float3 a = abs(d);
+    uint f;
+    if (a.x >= a.y && a.x >= a.z) { f = (d.x >= 0.0f) ? 0u : 1u; }
+    else if (a.y >= a.z) { f = (d.y >= 0.0f) ? 2u : 3u; }
+    else { f = (d.z >= 0.0f) ? 4u : 5u; }
+    float3 F, R, U;
+    goboFaceBasis(f, F, R, U);
+    float w = dot(d, F);
+    uv = float2(dot(d, R) / w * 0.5f + 0.5f, 0.5f - dot(d, U) / w * 0.5f);
+    return f;
+}
+
+
+
+float3 goboQuatRotateInv(float4 q, float3 v)
+{
+    float3 u = -q.xyz;
+    float3 t = 2.0f * cross(u, v);
+    return v + q.w * t + cross(u, t);
+}
+
+
+
+
+float4 goboQuatUnpack(uint p)
+{
+    uint big = p >> 30;
+    float3 s = float3((float)((p >> 20) & 1023u), (float)((p >> 10) & 1023u), (float)(p & 1023u))
+               * (1.41421356f / 1023.0f) - 0.70710678f;
+    float m = sqrt(saturate(1.0f - dot(s, s)));
+    if (big == 0u) { return float4(m, s.x, s.y, s.z); }
+    if (big == 1u) { return float4(s.x, m, s.y, s.z); }
+    if (big == 2u) { return float4(s.x, s.y, m, s.z); }
+    return float4(s.x, s.y, s.z, m);
+}
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
+
+
+
+
+
+
+float fixtureGoboVis(float3 toL, float layerP1, float quatBits)
+{
+    if (layerP1 < 0.5f) { return 1.0f; }
+    float4 q = goboQuatUnpack(asuint(quatBits));
+    float2 uv = goboOctEncode(goboQuatRotateInv(q, -toL));
+    float occ =  gGoboArray.SampleLevel(gSamplerBilinearClamp, float3(uv, layerP1 - 1.0f), 0.0f) .r;
+    return 1.0f - occ;
+}
+
+
+
+
+
+
+float fixtureGoboNear(float4 g, uint i, float3 toL)
+{
+    float2 e = ((i & 1u) != 0u) ? g.zw : g.xy;
+    return fixtureGoboVis(toL, (e.x < 0.0f) ? (-e.x - 1.0f) : e.x, e.y);
+}
+
+
+
+float nearHandoverT(float3 worldPosRel, float band)
+{
+    float hand = gFrameData.lodParams.x;
+    if (band <= 0.0f || hand <= band) { return 0.0f; }
+    return smoothstep(hand - band, hand, length(worldPosRel));
+}
+
+
+
+
+
+
+
+
+
+float goboSlotFade(float sv, float4 g, uint i, float3 toL, float3 worldPosRel, float band)
+{
+    float t = nearHandoverT(worldPosRel, band);
+    if (t <= 0.0f) { return sv; }
+    return lerp(sv, fixtureGoboNear(g, i, toL), t);
+}
+#line 5 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
+#line 34 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
 float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
 {
     uint nL = (uint)gLights.lightParams.x;
@@ -3524,8 +3664,9 @@ float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
             bits = bits & (bits - 1u);
             if (i >= nL) { continue; }
             float4 posR = gLights.lights[i * 3u + 0u];
-            float3 lcol = gLights.lights[i * 3u + 1u].rgb;
-            float3 fo = gLights.lights[i * 3u + 2u].xyz;
+            float4 lc4 = gLights.lights[i * 3u + 1u];
+            float3 lcol = lc4.rgb;
+            float4 fo = gLights.lights[i * 3u + 2u];
             float reach = posR.w * reachK;
             float3 toL = posR.xyz - worldPosRel;
             float d2 = dot(toL, toL);
@@ -3534,13 +3675,14 @@ float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
             float d = d2 * invD;
             float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
             att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
+            att *= fixtureGoboVis(toL, fo.w, lc4.w);
             float lambert = saturate(dot(N, toL) * invD);
             pointDiffuse += lambert * att * lcol;
         }
     }
     return pointDiffuse;
 }
-#line 110 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
+#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pointlights.h.fsl"
 float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY)
 {
     if (length(worldPosRel) >= gFrameData.lodParams.x)
@@ -3593,6 +3735,9 @@ float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY)
             float d = d2 * invD;
             float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
             att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
+
+
+            att *= fixtureGoboNear(gLightsNear.goboNear[i >> 1u], i, toL);
             float lambert = saturate(dot(N, toL) * invD);
             pointDiffuse += lambert * att * lcol;
         }

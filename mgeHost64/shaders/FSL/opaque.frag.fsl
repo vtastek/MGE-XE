@@ -8,6 +8,7 @@
 // The base map is the bindless gTextures[TexIndex] (slot 0 = white), MODULATE'd over the material.
 
 #include "opaque.srt.h"
+#include "gobosample.h.fsl" // fixtureGoboNear() — the near light's fixture self-shadow when it has no slot (G3)
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "pbrmaterial.h.fsl" // _paramh PBR: height-derived normals + GGX (tasks/forge-pbr-materials.md)
 #include "parallax.h.fsl"    // parallaxOffsetUVTex() + Drobot soft shadows (tasks/forge-parallax.md)
@@ -434,14 +435,19 @@ float4 PS_MAIN( VSOutput In )
                 // reflection tag above). Reflected near geometry is therefore UNSHADOWED by point
                 // lights — a deliberate IR3 limitation. Doing it properly means a mirror-view mask,
                 // which is a pass, not a branch.
-                if (slotP1 != 0u && !inReflect)
+                // G3: a slotless light (or the mirror, which has no slot mask, or the goboForceNear
+                // oracle) takes its FIXTURE GOBO instead — the cage without the world shadow.
+                const bool useSlot = slotP1 != 0u && !inReflect && gLights.lightParams.z < 0.5f;
+                if (!useSlot) { att *= fixtureGoboNear(gLights.goboNear[i >> 1u], i, toLight); }
+                if (useSlot)
                 {
                     // First-person arms (alphaShadowParams.y set): sample the cube atlas DIRECTLY
                     // from the true world pos + geometric vertex normal — the screen gShadowMask
                     // holds the WORLD behind the arm, not the arm. Everything else reads the mask.
                     if (gFrameData.alphaShadowParams.y > 0.5f)
                     {
-                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                        att *= goboSlotFade(fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u),
+                                        gLights.goboNear[i >> 1u], i, toLight, In.WorldPos, gLights.lightParams.w);   // G4
                     }
                     else
                     {
@@ -452,7 +458,8 @@ float4 PS_MAIN( VSOutput In )
                         uint  lane = s >> 3u;
                         uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
                         uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                        att *= float(nib) * (1.0f / 15.0f);
+                        att *= goboSlotFade(float(nib) * (1.0f / 15.0f), gLights.goboNear[i >> 1u], i, toLight, In.WorldPos,
+                                        gLights.lightParams.w);   // G4: fade to the gobo before the handover
                     }
                 }
 

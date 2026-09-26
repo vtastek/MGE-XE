@@ -1,6 +1,8 @@
 #ifndef POINT_LIGHTS_H
 #define POINT_LIGHTS_H
 
+#include "gobosample.h.fsl" // fixtureGoboVis() — distant arm only (G2)
+
 // Clustered forward POINT-LIGHT diffuse, factored out of statics.frag so a fourth surface does not
 // mean a fourth transcription of it.
 //
@@ -64,8 +66,9 @@ float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
             bits = bits & (bits - 1u);
             if (i >= nL) { continue; }
             float4 posR = gLights.lights[i * 3u + 0u];
-            float3 lcol = gLights.lights[i * 3u + 1u].rgb;
-            float3 fo   = gLights.lights[i * 3u + 2u].xyz;   // k0, k1, k2
+            float4 lc4  = gLights.lights[i * 3u + 1u];      // w = fixture rotation (G2)
+            float3 lcol = lc4.rgb;
+            float4 fo   = gLights.lights[i * 3u + 2u];      // k0, k1, k2 ; w = gobo layer+1 (G2)
             float  reach = posR.w * reachK;
             float3 toL  = posR.xyz - worldPosRel;
             float  d2   = dot(toL, toL);
@@ -74,6 +77,7 @@ float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
             float d    = d2 * invD;
             float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
             att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+            att *= fixtureGoboVis(toL, fo.w, lc4.w);   // the fixture's own cage (G2) — BAKED list only
             float lambert = saturate(dot(N, toL) * invD);
             pointDiffuse += lambert * att * lcol;
         }
@@ -159,6 +163,9 @@ float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY)
             float d    = d2 * invD;
             float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
             att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+            // G3: EVERY light's fixture gobo, slotted or not — this arm reads no shadow mask at all
+            // (see above), so the gobo is the only shadow grass can take from a near lamp.
+            att *= fixtureGoboNear(gLightsNear.goboNear[i >> 1u], i, toL);
             float lambert = saturate(dot(N, toL) * invD);
             pointDiffuse += lambert * att * lcol;
         }

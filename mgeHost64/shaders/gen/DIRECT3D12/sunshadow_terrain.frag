@@ -1430,7 +1430,12 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 248
+
+
+
+
+    float4 goboNear[ 128  / 2];
+#line 253
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1440,7 +1445,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 284 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 289 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1555,13 +1560,13 @@ STRUCT(LightData)
 
 
         Tex2D(float) gSunOcc :  register(t53,space1);
-#line 416 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 421 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gSkyColor :  register(t54,space1);
-#line 429 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gReflectMips :  register(t55,space1);
-#line 452 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 457 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float) gWaterSlopeVar :  register(t56,space1);
-#line 469 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 474 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float) gReflectDepth :  register(t57,space1);
 
 
@@ -1580,13 +1585,13 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gWakeField :  register(t59,space1);
-#line 509 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 514 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gPortalGate :  register(t60,space1);
-#line 530 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 535 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float) gCausticField :  register(t61,space1);
-#line 544 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 549 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gGrassCrush :  register(t62,space1);
-#line 557 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 562 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gAtmosSkyView :  register(t63,space1);
 
 
@@ -1601,7 +1606,7 @@ STRUCT(LightData)
 
 
         CBUFFER(AtmosphereParams) gAtmosParams :  register(b65,space1);
-#line 589 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 594 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float2) gMotionVectors :  register(t66,space1);
 
 
@@ -1618,12 +1623,18 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAtmosSkyViewClear :  register(t68,space1);
-#line 631 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 636 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Buffer(uint) gTerrainParamTex :  register(t69,space1);
         Tex2DArray(float4) gTerrainParamArrays[ 32 ] :  register(t70,space1);
-#line 661 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 666 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Buffer(uint) gStaticsParamSlot :  register(t102,space1);
         Tex2DArray(float4) gStaticsParamArrays[ 48 ] :  register(t103,space1);
+
+
+
+
+
+        Tex2DArray(float) gGoboArray :  register(t151,space1);
 
 
 
@@ -1640,7 +1651,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 693 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 704 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1651,7 +1662,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 717 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 728 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunshadow_terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmpack.h.fsl"

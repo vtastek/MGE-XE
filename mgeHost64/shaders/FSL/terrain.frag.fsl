@@ -39,6 +39,7 @@
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
+#include "gobosample.h.fsl" // fixtureGoboVis() — the baked light's fixture self-shadow (G2)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 #define TERRAIN_VERTS   65
@@ -1127,7 +1128,10 @@ float4 PS_MAIN( VSOutput In )
                 // the screen mask is only legal because terrain now writes the Z-prepass — before
                 // that these pixels sat at the far plane and the mask was meaningless here.
                 uint slotP1 = (uint)fo.w;
-                if (slotP1 != 0u && !inReflect)   // mirror: gShadowMask is main-view screen space
+                // G3: slotless / mirror / goboForceNear -> the fixture gobo (near list = gLightsNear).
+                const bool useSlot = slotP1 != 0u && !inReflect && gLightsNear.lightParams.z < 0.5f;
+                if (!useSlot) { att *= fixtureGoboNear(gLightsNear.goboNear[i >> 1u], i, toL); }
+                if (useSlot)   // mirror: gShadowMask is main-view screen space
                 {
                     // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
                     // belong to whatever is standing in front of us (see shadowreceive.h.fsl).
@@ -1136,7 +1140,8 @@ float4 PS_MAIN( VSOutput In )
                     uint  lane = s >> 3u;
                     uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
                     uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                    att *= float(nib) * (1.0f / 15.0f);
+                    att *= goboSlotFade(float(nib) * (1.0f / 15.0f), gLightsNear.goboNear[i >> 1u], i, toL, In.WorldPos,
+                                        gLightsNear.lightParams.w);   // G4: fade to the gobo before the handover
                 }
                 float lambert = saturate(dot(nShade, toL) * invD);
                 if (pbrLive) { lambert *= saturate(8.0f * dot(normal, toL) * invD + 1.0f); }   // geom_vis
@@ -1205,8 +1210,9 @@ float4 PS_MAIN( VSOutput In )
                 bits = bits & (bits - 1u);
                 if (i >= nL) { continue; }
                 float4 posR = gLights.lights[i * 3u + 0u];
-                float3 lcol = gLights.lights[i * 3u + 1u].rgb;
-                float3 fo   = gLights.lights[i * 3u + 2u].xyz;   // k0, k1, k2
+                float4 lc4  = gLights.lights[i * 3u + 1u];      // w = fixture rotation (G2)
+                float3 lcol = lc4.rgb;
+                float4 fo   = gLights.lights[i * 3u + 2u];      // k0, k1, k2 ; w = gobo layer+1 (G2)
                 float  reach = posR.w * reachK;
                 float3 toL  = posR.xyz - In.WorldPos;
                 float  d2   = dot(toL, toL);
@@ -1215,6 +1221,8 @@ float4 PS_MAIN( VSOutput In )
                 float d    = d2 * invD;
                 float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
                 att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+                // The fixture's own cage/bowl, from its gobo — in att, so diffuse AND specular see it.
+                att *= fixtureGoboVis(toL, fo.w, lc4.w);
                 float lambert = saturate(dot(nShade, toL) * invD);
                 if (pbrLive) { lambert *= saturate(8.0f * dot(normal, toL) * invD + 1.0f); }   // geom_vis
                 // W32 — the mirror gobo: a mean-1 multiplier on the direct term, not a second light.

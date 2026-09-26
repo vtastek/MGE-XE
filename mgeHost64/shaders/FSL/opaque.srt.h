@@ -245,6 +245,11 @@ STRUCT(LightData)
     // matching froxelassign.comp exactly (near lights are already camera-relative, like In.WorldPos).
     DATA(float4, froxelDimsNear, None);   // x=tilesX, y=tilesY, z=NZslices, w=tileSize(px); x<=0 => brute loop
     DATA(float4, froxelZNear,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); zw unused
+    // G3 fixture gobos for the NEAR list (tasks/forge-light-gobo.md): light 2k in .xy, 2k+1 in .zw,
+    // each (gobo layer+1, rotation bits as asfloat — gobosample.h.fsl). The near entries' own spare
+    // lanes are taken (colour.w identity, falloff.w shadow slot), hence a tail. Zero on the baked
+    // (distant) list, which carries its gobo in-entry instead. lightParams.z = goboForceNear.
+    DATA(float4, goboNear[MAX_POINT_LIGHTS / 2], None);
 };
 
 BEGIN_SRT_NO_AB(SrtData)
@@ -660,6 +665,12 @@ BEGIN_SRT_NO_AB(SrtData)
         // running counter and an insertion silently re-points every later binding.
         DECL_BUFFER(PerFrame, Buffer(uint), gStaticsParamSlot)
         DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gStaticsParamArrays, MAX_STATICS_PARAM_BUCKETS)
+        // Fixture GOBOS (tasks/forge-light-gobo.md G2): one octahedral 128^2 R8 layer per unique LIGH
+        // model, the fixture's self-shadow as seen from its light, stored as OCCLUSION so an unbound
+        // slot reads "open" (gobosample.h.fsl). Read only by the BAKED light loops (statics.frag,
+        // terrain.frag's distant arm, pointlights.h.fsl's distant arm), which draw under pPerFrameSet
+        // and pPerFrameSetReflectGeo — goboBake binds exactly those two. Appended last (one counter).
+        DECL_TEXTURE(PerFrame, Tex2DArray(float), gGoboArray)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

@@ -1,0 +1,49 @@
+// mgeHost64 — fixture GOBO bake, fragment stage (tasks/forge-light-gobo.md G1).
+//
+// Every fragment that survives is an OCCLUDER of the fixture's own light, so it writes 0 into the
+// R8 atlas that was cleared to 1 (open). No depth test: visibility is binary, so draw order is
+// irrelevant.
+//
+// The two discards are shadowcaster.frag's, because the gobo has to be the SAME thing the near
+// shadow shows for this fixture — that sameness is what lets a near shadow hand over to it. WHETHER
+// a part casts, how it is culled, its cutout ref and whether it is emissive-hot are all decided on
+// the host by the near caster's own rules (goboBake); this stage only applies the verdict:
+//   1. alpha cutout at the part's ref (flags bit1);
+//   2. emissive carve — always the "own light" case here, so a glowing texel (flame, lit paper) is
+//      see-through and only its dark texels cast.
+//
+// VSOutput MUST match gobobake.vert's byte for byte (project_forge_shared_frag_vsoutput).
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float2,       Uv,       TEXCOORD0);
+    DATA(FLAT(uint),   TexIndex, TEXCOORD1);
+    DATA(FLAT(uint),   Flags,    TEXCOORD2);
+    DATA(FLAT(float),  Thr,      TEXCOORD3);
+    DATA(FLAT(float),  Ref,      TEXCOORD4);
+};
+
+STRUCT(PsOut)
+{
+    DATA(float4, vis, SV_Target0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PsOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint   bucket = In.TexIndex >> 16;
+    uint   layer  = In.TexIndex & 0xFFFFu;
+    float4 tex    = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+    if ((In.Flags & 0x2u) != 0u && tex.a < In.Ref) { discard; }
+    // MatEmissive.x = 1 on an emissive-hot caster in the near path, so its carve is on the texel's
+    // own luminance; the host sends Thr = 0 for a part that is not hot.
+    float emitLum = dot(tex.rgb, float3(0.299f, 0.587f, 0.114f));
+    if (In.Thr > 0.0f && emitLum > In.Thr) { discard; }
+    PsOut Out;
+    Out.vis = f4(0.0f);
+    RETURN(Out);
+}

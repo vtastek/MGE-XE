@@ -415,6 +415,9 @@ static int forgeEcoQoSState()
 // gather off each of the two possible colour sources). One SRT for all three compute passes — DXC
 // strips whichever half a given pass never touches, exactly as bloom's does.
 #include "shaders/FSL/motionblur.srt.h"
+// Fixture gobos (tasks/forge-light-gobo.md G1): GoboResolveSrtData, PerBatch, one instance per bake
+// batch. Shares the merged ComputeRootSignature (1 CBV + 1 SRV + 1 UAV — no rootsig change).
+#include "shaders/FSL/goboresolve.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -4308,7 +4311,9 @@ namespace {
     // a float4 header (count). MUST match IPC::kMaxPointLights / MAX_POINT_LIGHTS (opaque.srt.h).
     // 16 + 128*3*16 = 6160 B, rounded up to a 256-byte CBV multiple.
     constexpr uint32_t kMaxPointLights = 128;
-    constexpr uint32_t kLightCbvBytes  = ((16 + kMaxPointLights * 3 * 16) + 255) & ~255u;  // 6400
+    // header + lights[] + froxelDimsNear/froxelZNear + the G3 goboNear[] tail (8 B a light).
+    constexpr uint32_t kLightCbvBytes  = ((16 + kMaxPointLights * 3 * 16 + 32 + kMaxPointLights * 8) + 255) & ~255u;  // 7424
+    constexpr uint32_t kLightGoboNearOff = 16 + kMaxPointLights * 3 * 16 + 32;   // byte offset of LightData::goboNear
 
     // --- Clustered forward lighting (froxel grid) -------------------------------------------------
     constexpr uint32_t kFroxelTile     = 32;    // DISTANT grid screen tile (px). Distant lights are small
@@ -21434,6 +21439,33 @@ namespace {
     constexpr float kMWLightConstant  = 0.36f;   // Morrowind.ini ConstantValue
     constexpr float kMWLightQuadratic = 3.25f;   // Morrowind.ini QuadraticValue (Method 2 → /R²)
     bool  g_drawDistLights  = true;              // A/B enable (dev panel checkbox; NOT a brightness knob)
+    // Fixture gobos (tasks/forge-light-gobo.md). goboBake = run the one-shot bake at DL live init (off
+    // = no gobo array at all, the pre-G1 host). goboDump = after the bake, write every layer as a
+    // contact sheet to hdrdump/gobo_sheet.tga (+ gobo_sheet.txt naming each cell's model) — G1's
+    // eyeball check. Env-only (MGE_HOST_KNOBS), because both act once, before the panel exists.
+    bool  g_goboBake        = true;
+    bool  g_goboDump        = false;
+    // G2: the baked (distant) light loops multiply in each light's fixture gobo. Live: off writes the
+    // layer lane 0, which the shaders read as "no fixture" (no fetch) — the pre-G2 image exactly.
+    bool  g_distGobo        = true;
+    // G3: NEAR lights. nearGobo = a near fixture light without a shadow slot (or in the water mirror,
+    // where the slot mask does not exist) multiplies in its gobo; off = the pre-G3 image exactly.
+    // goboForceNear = the ORACLE: slotted lights take the gobo INSTEAD of their real shadow, so the
+    // cage it draws can be laid against the one the atlas draws on the same light. Both live.
+    bool  g_nearGobo        = true;
+    bool  g_goboForceNear   = false;
+    // G4: world units over which a SLOTTED near shadow fades into its gobo, ending at the near/far
+    // light handover (lodParams.x) — so the baked light, which carries only the gobo, takes over with
+    // no step. 0 = off (the slot shadow runs to the handover and cuts, the pre-G4 image).
+    float g_goboFadeBand    = 1024.0f;
+    // The near/far LIGHT handover radius this frame (= lodParams.x, Phase E's nearOwn); 0 in an
+    // interior or with the dedup off. Host copy, so the light upload never reads the WC frame cbuffer.
+    float g_dlHandoverR     = 0.0f;
+    // G4b: this frame's near lights with NO baked twin (torch, spell, NPC lantern, spawned light), in
+    // ABSOLUTE world space with their RAW wire colour + falloff. The distant fill appends them to the
+    // baked list, so past the handover the far arm lights with them too and they never cut there.
+    struct DlDynLight { float x, y, z, radius; float col[3]; float fo[3]; };
+    std::vector<DlDynLight> g_dlDynLights;
     // Phase F distant-light glow billboards. All brightness/fade/min-pixel maths run host-side (the
     // instance record carries final colour+size+intensity), so these are plain live knobs — no shader
     // or FrameData change. See [[project_light_radius_mesh_independent]] / [[project_emissive_light_coupling]].
@@ -21891,7 +21923,10 @@ namespace {
     // rope is 47% transparent / 31% mid — cast their ≥-threshold weave. True translucents
     // (smoke ~all-low alpha) discard everything → still no shadow. 0 → strict mode: only
     // explicit-NIF-test or MASK-classified textures cast. Any change sweeps alpha records live.
-    float g_shadowBlendRef = 0.5f;
+    // 0.8 since the fixture audit (tasks/forge-light-gobo.md): at 0.5 the tinted glass of the
+    // Colovian streetlamp / small lantern (Tamriel_Data) cast as solid and sealed their own light.
+    // The fixture gobo bake reads this same knob, so both follow.
+    float g_shadowBlendRef = 0.8f;
 
     // F12 debug-view names; index = debugParams.x. The dropdown binds &g_debugMode DIRECTLY, so this
     // table is not just labels — it is the host's only bound on that index.
@@ -22075,6 +22110,7 @@ namespace {
             // (the `atmos=` cost dial), and the two night lanes, whose whole point is that they are
             // judged at midnight and the harness cannot click a checkbox at midnight either.
             { "dumpAtFrame",        &g_dumpAtFrame        },
+            { "goboFadeBand",       &g_goboFadeBand       },
             // M1 step 4b THE UPSCALER (tasks/forge-upscale.md). ⚠ THE ONLY WAY THE HARNESS CAN RUN
             // THE REAL 4b TEST. Scale 1.0 is an exact identity by construction, so it proves nothing
             // about the seam; the test that does — `[rect] in=840x525 out=1680x1050`, APL within ~1%
@@ -22532,6 +22568,11 @@ namespace {
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
+            { "goboBake",           &g_goboBake           },
+            { "goboDump",           &g_goboDump           },
+            { "distGobo",           &g_distGobo           },
+            { "nearGobo",           &g_nearGobo           },
+            { "goboForceNear",      &g_goboForceNear      },
             { "causticOn",          &g_causticOn          },
             // AO's two big levers. halfRes is here because it is a 4x PIXEL COUNT change hiding
             // behind a dev-panel checkbox, and the harness runs minimized — so the one A/B that
@@ -23595,6 +23636,10 @@ namespace {
         // -- Tab: Draw / A/B (the on/off subsystem toggles — the top-level measurement controls) --
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Draw / A/B"; t.defaultOpen = true;
           t.checkbox("Dist lights: enable (numpad- live A/B)", &g_drawDistLights);
+          t.checkbox("Dist lights: fixture gobos (cage shadow)", &g_distGobo);
+          t.checkbox("Near lights: fixture gobos when unslotted", &g_nearGobo);
+          t.checkbox("Near lights: FORCE gobo over the real shadow (oracle)", &g_goboForceNear);
+          t.sliderF("Near lights: shadow -> gobo fade band before handover (0 = off)", &g_goboFadeBand, 0.0f, 4096.0f, 64.0f);
           t.checkbox("Dist lights: clustered froxel (off = brute, same lights)", &g_useFroxel);
           t.checkbox("Near lights: clustered froxel (off = brute, same lights)", &g_useFroxelNear);
           t.checkbox("Dist lights: drop near-owned (handoff dedup)", &g_dlLightNearDedup);
@@ -33946,6 +33991,12 @@ void destroyHostWindow(Renderer* R);
 
     }  // namespace — promoted passes
 
+    void dlNearBakedPairDiag(const float* lw, const IPC::LightGoboWire* gw, uint32_t nL, const float eyeAbs[3],
+                             bool exterior);   // G0/G3 gobo oracle, below
+    void goboFillNear(const IPC::LightGoboWire* side, uint32_t nL, float* gn);   // G3, below
+    bool goboReady();                                                             // G4, below
+    bool dlHasBakedTwin(float x, float y, float z);                               // G4b, below
+
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
@@ -34753,7 +34804,60 @@ void destroyHostWindow(Renderer* R);
             // here. Slaved to the shadow test range and clamped strictly inside it, so the lit
             // region is always a subset of the shadow-tested region — see g_shadowRangeK.
             ((float*)lc)[1] = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
-            ((float*)lc)[2] = 0.0f; ((float*)lc)[3] = 0.0f;
+            // lightParams.z = goboForceNear (the frags' "take the gobo even with a slot").
+            // lightParams.w = the G4 shadow -> gobo fade band (gobosample.h.fsl goboSlotFade).
+            ((float*)lc)[2] = g_goboForceNear ? 1.0f : 0.0f;
+            // lightParams.w = the handover fade band: slotted shadows -> gobo (G4) AND lights with no
+            // baked twin -> off (G4b). Not gated on the gobo bake: a torch must fade either way.
+            ((float*)lc)[3] = std::max(g_goboFadeBand, 0.0f);
+            // G3: the gobo side array, when the client sent one (lightBytes == n * 56, geomwire.h).
+            const IPC::LightGoboWire* goboSide = nullptr;
+            if (lightBlob && lightCount > 0
+                && lightBytes >= lightCount * (uint32_t)(sizeof(IPC::PointLightWire) + sizeof(IPC::LightGoboWire))) {
+                goboSide = (const IPC::LightGoboWire*)((const uint8_t*)lightBlob
+                                                       + (size_t)lightCount * sizeof(IPC::PointLightWire));
+            }
+            uint8_t lone[kMaxPointLights] = {};   // G4b: near lights with no baked twin
+            bool    haveLone = false;
+            {
+                // goboNear[i/2] = (layer+1, rot bits) for light 2k in .xy, 2k+1 in .zw. Every entry
+                // the frags can index is written each frame (zeros = no gobo), so nothing goes stale.
+                float* gn = (float*)(lc + kLightGoboNearOff);
+                std::memset(gn, 0, (size_t)((nL + 1u) & ~1u) * 8u);
+                if (goboSide && g_nearGobo) { goboFillNear(goboSide, nL, gn); }
+                // G4b: mark every near light with NO baked twin (a torch, a spell, an NPC's lantern, a
+                // spawned light). Past the handover only the baked list lights a fragment, so such a
+                // light would stop on a hard line; marked, it fades out over the same band instead.
+                // A light WITH a twin keeps full strength — the twin takes over at the same level.
+                // Flag = the layer lane made negative: e.x = -(layer+1) - 1 (gobosample.h.fsl).
+                if (lightBlob && lighting[27] != 0.0f) {
+                    const float* lw = (const float*)lightBlob;
+                    uint32_t fixTwin = 0, fixLone = 0, dynLone = 0;   // log only
+                    haveLone = true;
+                    for (uint32_t i = 0; i < nL; ++i) {
+                        const float* e = lw + i * 12;
+                        uint32_t id = 0, flags = 0;
+                        IPC::unpackLightIdFlags(e[7], id, flags);
+                        const bool fixture = (flags & IPC::kLightFlagFixture) && !(flags & IPC::kLightFlagCarried);
+                        if (!dlHasBakedTwin(e[0] + lighting[24], e[1] + lighting[25], e[2] + lighting[26])) {
+                            gn[i * 2] = -gn[i * 2] - 1.0f;
+                            lone[i] = 1u;
+                            if (fixture) { ++fixLone; } else { ++dynLone; }
+                        } else if (fixture) { ++fixTwin; }
+                    }
+                    // A placed fixture with no twin is the case to watch: it fades on near geometry
+                    // while nothing replaces it (an interior-only light in an exterior cell, a light
+                    // the baker skipped, a moved lamp). Throttled, and on change.
+                    static uint32_t s_last = 0xFFFFFFFFu; static int s_tick = 0;
+                    const uint32_t sig = (fixTwin << 20) ^ (fixLone << 10) ^ dynLone;
+                    if (sig != s_last && (++s_tick % 120) == 0) {
+                        s_last = sig;
+                        LOG::logline(">> [gobo] G4b twins: fixtures with a baked twin=%u, WITHOUT=%u (fade out),"
+                                     " other lights (torch/spell/fill) fading=%u, band=%.0f handover=%.0f",
+                                     fixTwin, fixLone, dynLone, g_goboFadeBand, g_dlHandoverR);
+                    }
+                }
+            }
             if (nL && lightBlob) {
                 std::memcpy(lc + 16, lightBlob, (size_t)nL * sizeof(IPC::PointLightWire));
                 // STEP 5: each wire entry is 3 float4 and the MIDDLE one is the light's colour —
@@ -34766,8 +34870,31 @@ void destroyHostWindow(Renderer* R);
                     float* lf = (float*)(lc + 16);
                     for (uint32_t i = 0; i < nL; ++i) { decodeAuthoredRGB(lf + i * 12 + 4); }
                 }
+                // G4b: hand the twinless lights to the distant fill (dlLiveCullAndBuild runs later in
+                // this frame). Past the handover only the distant list lights a fragment, so a light
+                // that is not in it stops on a line there; with it, the torch continues at the same
+                // level. Two earlier tries both FADED instead: per fragment drew the fade circle across
+                // the pool, per light shut a torch off hundreds of units before its NPC stopped being
+                // drawn. RAW colour/falloff from the wire: the distant fill decodes like the near one.
+            }
+            g_dlDynLights.clear();
+            if (nL && lightBlob && haveLone) {
+                const float* lw = (const float*)lightBlob;
+                for (uint32_t i = 0; i < nL; ++i) {
+                    if (!lone[i]) { continue; }
+                    const float* e = lw + i * 12;
+                    DlDynLight d;
+                    d.x = e[0] + lighting[24]; d.y = e[1] + lighting[25]; d.z = e[2] + lighting[26];
+                    d.radius = e[3];
+                    d.col[0] = e[4]; d.col[1] = e[5]; d.col[2] = e[6];
+                    d.fo[0]  = e[8]; d.fo[1]  = e[9]; d.fo[2]  = e[10];
+                    g_dlDynLights.push_back(d);
+                }
+            }
+            {
             }
             g_lastLightCount = nL;
+            dlNearBakedPairDiag((const float*)lightBlob, goboSide, nL, lighting + 24, lighting[27] != 0.0f);
 
             // ─── B1: MW'S OWN POINT-LIGHT LEVEL, IN MW'S CODE SPACE ─────────────────────────────
             // ⚠ COMPUTED HERE, OFF `lightBlob`, AND NOT OFF THE CBUFFER. The mapped upload buffer is
@@ -45297,9 +45424,64 @@ void destroyHostWindow(Renderer* R);
         uint16_t visIndex;   // v2: dynamic-vis group (0 = ungated). A stronghold lantern must go dark
                              // with its building, or it lights bare ground — the statics' ghost-town
                              // bug one dataset over.
+        uint16_t fixture;    // v3: fixture_meshes record = gobo layer (kNoFixture = none; v1/v2 bakes)
+        int16_t  quat[4];    // v3: model->world rotation (world = q v q*), snorm16 x,y,z,w; identity pre-v3
+        uint32_t quatPacked; // G2: quat, smallest-three for the colour.w lane (goboPackQuat)
     };
+    constexpr uint16_t kNoFixture = 0xFFFFu;
     std::vector<DlBakedLight> g_dlBakedLights;
     bool  g_dlBakedLightsLoaded = false;
+    uint32_t g_dlBakedLightsVersion = 0;   // lights.data version (3 = AttachLight positions + fixtures)
+    // Fixture gobos (tasks/forge-light-gobo.md): one entry per unique LIGH model, index = gobo layer.
+    struct DlFixture { float attach[3]; float radius; std::string model; };
+    std::vector<DlFixture> g_dlFixtures;
+    std::unordered_map<uint32_t, uint16_t> g_dlFixtureById;   // FNV-1a(lowercase LIGH id) -> fixture
+    // The fixture MESH library (statics\fixture_meshes), CPU-side until goboBake uploads it.
+    // alpha: fixtures.data v2 carries fixture_meshes flags[1] bits 5-7 = test (ref > 0 only: the
+    // pc_colouredglass lanterns ship test ON with ref 0, which rejects nothing) / blend / not-alpha-over
+    // (kFixAlpha*); a v1 library has only hasAlpha, which is taken as a plain test. sphere = the
+    // subset's model-space bound (x,y,z,r) — the near cage rule's input. vAlpha = mean vertex alpha
+    // (material alpha when the mesh has no vertex colours: the near "fading part" gate). emissive =
+    // the material emissive the bake packed into Normal.w. texKind = classifyDdsAlpha of its texture.
+    struct DlFixtureSubset {
+        uint32_t vbBase, ibBase, indexCount, texSlot;
+        float    sphere[4];
+        float    vAlpha, emissive;
+        uint8_t  hasAlpha, alpha, texKind;
+    };
+    constexpr uint8_t kFixAlphaTest = 0x1, kFixAlphaBlend = 0x2, kFixAlphaNotOver = 0x4;
+    uint32_t g_dlFixturesVersion = 0;   // fixtures.data version (2 = alpha bits present)
+    struct DlFixtureMesh   { uint32_t firstSubset, numSubsets; float radius; };
+    std::vector<DlFixtureMesh>   g_fixMeshes;
+    std::vector<DlFixtureSubset> g_fixSubsets;
+    std::vector<std::string>     g_fixSubsetTex;   // parallel to g_fixSubsets; statics\textures-relative
+    std::vector<uint8_t>         g_fixVB, g_fixIB; // StaticElem (20 B) / uint16 staging
+    // The bake's products and machinery. pArray (R8 octahedral, layer = fixture) is the only thing
+    // that outlives goboBake; the atlas, instance rows and mesh buffers are released when it returns.
+    constexpr uint32_t kGoboOctRes  = 128;   // octahedral layer resolution
+    constexpr uint32_t kGoboFaceRes = 256;   // cube-face resolution in the bake atlas (2x oct)
+    constexpr uint32_t kGoboBatch   = 16;    // fixtures per atlas (1536 x 4096 R8 = 6 MB)
+    constexpr float    kGoboNear    = 0.25f; // bake near plane, model units (clips only the flame core)
+    struct GoboState {
+        Shader*        pBakeShader      = nullptr;
+        // Indexed by the near caster's own cull code (g_shadowCasterCull): 0 = CULL_BACK, 1 = NONE,
+        // 2 = CULL_FRONT, all FRONT_FACE_CCW — the near atlas PSOs' non-mirrored set, so a fixture
+        // part drawn into its gobo is culled exactly as it is drawn into its near shadow.
+        Pipeline*      pBakePso[3]      = {};
+        Texture*       pArray           = nullptr;
+        uint32_t       layers           = 0;
+        bool           attempted        = false;
+        bool           ready            = false;   // pArray holds a finished bake
+        // Per layer: mean openness (0 sealed .. 1 open), read back once after the bake. A layer under
+        // kGoboSealedOpen is NOT USED (usable = 0): a light its own mesh fully encloses is an asset
+        // whose light was never meant to be boxed in (light_de_streetlight_01 has no AttachLight, so
+        // its light sits at the mesh origin inside the lantern) — MW, which has no shadows, lights
+        // the street with it, and so must we.
+        std::vector<float>   open;
+        std::vector<uint8_t> usable;
+    };
+    GoboState g_gobo;
+    constexpr float kGoboSealedOpen = 0.02f;
     // Phase F: compact, MESHED-only glow source list (positions + precomputed luminance/chromaticity),
     // built once from g_dlBakedLights. The per-frame billboard walk streams THIS — cache-tight, no
     // meshless skips (6098/9504 were meshless), no per-frame colour math — not the full 20B×9504 set.
@@ -45810,12 +45992,173 @@ void destroyHostWindow(Renderer* R);
         return true;
     }
 
+    // A static_meshes subset's texture name -> its path RELATIVE to statics\textures\ (and to the
+    // source tree's textures\, the fallback): strip trailing NUL/space, normalise slashes, lowercase,
+    // drop a leading "data files\" then "textures\", force .dds. Shared by the statics library and
+    // the fixture library so a texture both use resolves to ONE slot.
+    std::string dlStaticsTexName(const char* np, uint16_t n) {
+        while (n > 0 && (np[n-1] == 0 || np[n-1] == ' ')) { --n; }
+        std::string full;
+        for (int i = 0; i < (int)n; ++i) {
+            char c = np[i];
+            if (c == '/') { c = '\\'; }
+            if (c >= 'A' && c <= 'Z') { c = (char)(c - 'A' + 'a'); }
+            full.push_back(c);
+        }
+        if (full.rfind("data files\\", 0) == 0) { full.erase(0, 11); }
+        if (full.rfind("textures\\", 0) == 0)    { full.erase(0, 9); }
+        size_t dot = full.find_last_of('.');
+        if (dot != std::string::npos) { full.erase(dot); }
+        return full + ".dds";
+    }
+
+    // Parse statics\fixture_meshes (static_meshes format, record N = fixture N) into CPU staging:
+    // one packed VB/IB + per-subset draw records. Uploaded and freed by goboBake. The positional
+    // format has no count, so the record count must equal the fixture table's or the two files are
+    // from different bakes and nothing may be keyed across them.
+    bool dlLoadFixtureMeshes() {
+        g_fixMeshes.clear(); g_fixSubsets.clear(); g_fixSubsetTex.clear();
+        g_fixVB.clear(); g_fixIB.clear();
+        std::vector<uint8_t> file;
+        if (!dlReadWholeFile("Data Files\\distantland\\statics\\fixture_meshes", file)) {
+            LOG::logline(">> [gobo] fixture_meshes missing — no gobos (regen distant land)");
+            return false;
+        }
+        const uint8_t* p = file.data();
+        const uint8_t* end = p + file.size();
+        while (p + 21 <= end) {
+            uint32_t numSubsets = 0; std::memcpy(&numSubsets, p, 4);
+            DlFixtureMesh m; m.firstSubset = (uint32_t)g_fixSubsets.size(); m.numSubsets = 0;
+            std::memcpy(&m.radius, p + 4, 4);
+            p += 21;                                   // numSubsets + radius + centre + type
+            for (uint32_t s = 0; s < numSubsets; ++s) {
+                if (p + 52 > end) { p = end; break; }
+                DlFixtureSubset fs = {};
+                std::memcpy(&fs.sphere[3], p, 4);      // radius, then centre
+                std::memcpy(fs.sphere, p + 4, 12);
+                p += 40;                               // sphere + aabbMin + aabbMax
+                int verts = 0, faces = 0;
+                std::memcpy(&verts, p, 4); std::memcpy(&faces, p + 4, 4); p += 8;
+                const size_t vb = (size_t)verts * 20, ib = (size_t)faces * 6;
+                if (verts < 0 || faces < 0 || p + vb + ib + 4 > end) { p = end; break; }
+                fs.vbBase = (uint32_t)(g_fixVB.size() / 20);
+                fs.ibBase = (uint32_t)(g_fixIB.size() / 2);
+                fs.indexCount = (uint32_t)faces * 3;
+                // StaticElem: pos half4 @0, normal ubyte4 @8 (.w = emissive), colour bgra @12, uv @16.
+                double aSum = 0.0; uint8_t emMax = 0;
+                for (int v = 0; v < verts; ++v) {
+                    aSum += p[v * 20 + 15];
+                    emMax = std::max(emMax, p[v * 20 + 11]);
+                }
+                fs.vAlpha   = verts ? (float)(aSum / (255.0 * verts)) : 1.0f;
+                fs.emissive = emMax / 255.0f;
+                g_fixVB.insert(g_fixVB.end(), p, p + vb); p += vb;
+                g_fixIB.insert(g_fixIB.end(), p, p + ib); p += ib;
+                fs.hasAlpha = p[0] ? 1u : 0u;
+                fs.alpha = (g_dlFixturesVersion >= 2)
+                         ? (uint8_t)(((p[1] & 0x20) ? kFixAlphaTest : 0) | ((p[1] & 0x40) ? kFixAlphaBlend : 0)
+                                   | ((p[1] & 0x80) ? kFixAlphaNotOver : 0))
+                         : (uint8_t)(fs.hasAlpha ? kFixAlphaTest : 0);   // v1: no split, treat as test
+                fs.texKind = kTexAlphaOpaque;          // classified by buildStaticsTextureArrays
+                p += 2;
+                uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
+                if (p + pathsize > end) { p = end; break; }
+                fs.texSlot = 0;                        // resolved by buildStaticsTextureArrays
+                g_fixSubsetTex.push_back(dlStaticsTexName((const char*)p, pathsize));
+                p += pathsize;
+                if (fs.indexCount) { g_fixSubsets.push_back(fs); ++m.numSubsets; }
+                else               { g_fixSubsetTex.pop_back(); }
+            }
+            g_fixMeshes.push_back(m);
+        }
+        if (g_fixMeshes.size() != g_dlFixtures.size()) {
+            LOG::logline("!! [gobo] fixture_meshes has %zu records but fixtures.data %zu — mismatched bakes,"
+                         " gobos disabled", g_fixMeshes.size(), g_dlFixtures.size());
+            g_fixMeshes.clear(); g_fixSubsets.clear(); g_fixSubsetTex.clear();
+            g_fixVB.clear(); g_fixIB.clear();
+            return false;
+        }
+        LOG::logline(">> [gobo] fixture meshes: %zu fixtures, %zu subsets, %.1f KB verts",
+                     g_fixMeshes.size(), g_fixSubsets.size(), g_fixVB.size() / 1024.0);
+        return true;
+    }
+
+    // Fixture gobos: distantland\statics\fixtures.data (MGEgui BuildFixtureLibrary). Fixture N is
+    // record N of statics\fixture_meshes (static_meshes format) and gobo layer N. Layout: "MGFX",
+    // int32 version 1, int32 fixtureCount, int32 idCount; per fixture float attach[3], float
+    // boundRadius, uint16 len + model path; per LIGH id uint32 FNV-1a(lowercase id), uint16 fixture,
+    // uint16 0. The id map is G3's (near lights); G0 only needs the names for its oracle.
+    void dlLoadFixtureTable() {
+        g_dlFixtures.clear();
+        g_dlFixtureById.clear();
+        std::vector<uint8_t> f;
+        if (!dlReadWholeFile("Data Files\\distantland\\statics\\fixtures.data", f) || f.size() < 16
+            || std::memcmp(f.data(), "MGFX", 4) != 0) {
+            LOG::logline(">> [gobo] fixtures.data missing or bad — no fixture table (regen distant land)");
+            return;
+        }
+        const uint8_t* p = f.data() + 4;
+        const uint8_t* end = f.data() + f.size();
+        uint32_t version = 0, nFix = 0, nIds = 0;
+        std::memcpy(&version, p, 4); std::memcpy(&nFix, p + 4, 4); std::memcpy(&nIds, p + 8, 4); p += 12;
+        if (version < 1 || version > 2) { LOG::logline(">> [gobo] fixtures.data: unsupported version %u", version); return; }
+        g_dlFixturesVersion = version;
+        if (version < 2) {
+            LOG::logline(">> [gobo] fixtures.data v1 — no alpha test/blend split: glass and paper shells bake"
+                         " as cutouts (regen distant land)");
+        }
+        g_dlFixtures.reserve(nFix);
+        for (uint32_t i = 0; i < nFix; ++i) {
+            if (p + 18 > end) { LOG::logline(">> [gobo] fixtures.data truncated at fixture %u/%u", i, nFix); return; }
+            DlFixture F;
+            std::memcpy(F.attach, p, 12); std::memcpy(&F.radius, p + 12, 4);
+            uint16_t len = 0; std::memcpy(&len, p + 16, 2); p += 18;
+            if (p + len > end) { LOG::logline(">> [gobo] fixtures.data truncated at name %u", i); return; }
+            F.model.assign((const char*)p, len); p += len;
+            g_dlFixtures.push_back(std::move(F));
+        }
+        for (uint32_t i = 0; i < nIds && p + 8 <= end; ++i, p += 8) {
+            uint32_t h = 0; uint16_t fx = 0;
+            std::memcpy(&h, p, 4); std::memcpy(&fx, p + 4, 2);
+            if (fx < g_dlFixtures.size()) { g_dlFixtureById[h] = fx; }
+        }
+        uint32_t attached = 0;
+        for (const DlFixture& F : g_dlFixtures) {
+            if (F.attach[0] != 0.0f || F.attach[1] != 0.0f || F.attach[2] != 0.0f) { ++attached; }
+        }
+        LOG::logline(">> [gobo] fixture table: %zu fixtures (%u with an off-origin AttachLight), %zu LIGH ids",
+                     g_dlFixtures.size(), attached, g_dlFixtureById.size());
+        dlLoadFixtureMeshes();
+    }
+
     // Phase B: load the DL-gen baked static lights (distantland\lights.data) into the resident set.
     // One-shot (missing file is fine — pre-Phase-A DL gens have none). Format v1: int32 version;
     // int32 count; then count * { float x,y,z; float radius; byte r,g,b; byte flags(bit0=hasMesh) }.
     // v2 appends a `ushort visIndex` per record (20 B -> 22 B) — the dynamic-vis group that gates the
     // light, resolved by the baker from the LIGH's own script / object id exactly as statics are.
     // v1 still loads (every light ungated), so an old bake keeps working — it just keeps the ghosts.
+    // v3 (fixture gobos, tasks/forge-light-gobo.md) appends `ushort fixtureIndex; int16 quat[4]`
+    // (22 B -> 32 B) AND moves the position from the reference origin to the mesh's AttachLight
+    // node, which is where the near light sits. v1/v2 load with no fixture (no gobo, old position).
+    // The fixture rotation for a baked light's colour.w lane (G2): smallest-three — 2 bits for the
+    // largest |component| (made positive; q and -q are the same rotation), then the other three in
+    // x,y,z,w order at 10 bits over [-1/sqrt2, 1/sqrt2]. ~0.08 deg a step. MUST match gobo.h.fsl
+    // goboQuatUnpack. The shader reads the lane with asuint, so the bits never pass through float maths.
+    static uint32_t goboPackQuat(const int16_t q16[4]) {
+        float q[4];
+        for (int k = 0; k < 4; ++k) { q[k] = (float)q16[k] * (1.0f / 32767.0f); }
+        return IPC::packQuatSmallest3(q);   // the ONE packer, shared with the client's near side array
+    }
+    // ...and its inverse, for the G3 oracle only (the shaders have their own: goboQuatUnpack).
+    static void goboUnpackQuat(uint32_t p, float q[4]) {
+        const uint32_t big = p >> 30;
+        float s3[3] = { (float)((p >> 20) & 1023u), (float)((p >> 10) & 1023u), (float)(p & 1023u) };
+        float ss = 0.0f;
+        for (float& v : s3) { v = v * (1.41421356f / 1023.0f) - 0.70710678f; ss += v * v; }
+        const float m = std::sqrt(std::max(0.0f, 1.0f - ss));
+        for (uint32_t k = 0, j = 0; k < 4; ++k) { q[k] = (k == big) ? m : s3[j++]; }
+    }
+
     void dlLoadBakedLights() {
         if (g_dlBakedLightsLoaded) { return; }
         g_dlBakedLightsLoaded = true;   // one-shot regardless of outcome
@@ -45831,14 +46174,14 @@ void destroyHostWindow(Renderer* R);
         uint32_t version = 0, count = 0;
         std::memcpy(&version, p, 4); p += 4;
         std::memcpy(&count,   p, 4); p += 4;
-        if (version != 1 && version != 2) {
+        if (version < 1 || version > 3) {
             LOG::logline(">> [forge][dl] baked lights: unsupported version %u", version);
             return;
         }
-        const uint32_t recSize = (version >= 2) ? 22u : 20u;
+        const uint32_t recSize = (version >= 3) ? 32u : (version >= 2) ? 22u : 20u;
 
         g_dlBakedLights.reserve(count);
-        uint32_t meshless = 0, gated = 0;
+        uint32_t meshless = 0, gated = 0, withFixture = 0;
         float rmin = 1e30f, rmax = 0.0f;
         for (uint32_t i = 0; i < count; ++i) {
             if (p + recSize > end) { LOG::logline(">> [forge][dl] baked lights: truncated at %u/%u", i, count); break; }
@@ -45851,19 +46194,189 @@ void destroyHostWindow(Renderer* R);
             L.hasMesh = (p[19] & 0x1) != 0;
             L.visIndex = 0;
             if (version >= 2) { std::memcpy(&L.visIndex, p + 20, 2); }
+            L.fixture = kNoFixture;
+            L.quat[0] = L.quat[1] = L.quat[2] = 0; L.quat[3] = 32767;
+            if (version >= 3) {
+                std::memcpy(&L.fixture, p + 22, 2);
+                std::memcpy(L.quat,     p + 24, 8);
+            }
+            L.quatPacked = goboPackQuat(L.quat);
             p += recSize;
             if (!L.hasMesh) { ++meshless; }
             if (L.visIndex != 0) { ++gated; }
+            if (L.fixture != kNoFixture) { ++withFixture; }
             rmin = std::min(rmin, L.radius);
             rmax = std::max(rmax, L.radius);
             g_dlBakedLights.push_back(L);
         }
-        LOG::logline(">> [forge][dl] baked lights: %zu loaded v%u (%u meshless, %u gated), radius %.0f..%.0f",
-                     g_dlBakedLights.size(), version, meshless, gated,
+        LOG::logline(">> [forge][dl] baked lights: %zu loaded v%u (%u meshless, %u gated, %u with a fixture),"
+                     " radius %.0f..%.0f",
+                     g_dlBakedLights.size(), version, meshless, gated, withFixture,
                      g_dlBakedLights.empty() ? 0.0f : rmin, rmax);
         if (version < 2) {
             LOG::logline(">> [forge][dl] baked lights: v1 bake — NO vis gating (regen distant land to gate them)");
         }
+        if (version < 3) {
+            LOG::logline(">> [forge][dl] baked lights: pre-v3 bake — ref-origin positions, no fixture gobos"
+                         " (regen distant land)");
+        }
+        g_dlBakedLightsVersion = version;
+        if (version >= 3) { dlLoadFixtureTable(); }
+    }
+
+    // G0 oracle (tasks/forge-light-gobo.md): pair every near FIXTURE light with the nearest baked
+    // light and log |delta|. MEASURED on the v2 bake (2026-09-26, Balmora-ish, 31 pairs): median 0.0,
+    // p90 20, max 49 — MOST fixtures already have their light at the reference origin and only a
+    // minority carry an AttachLight offset, so the median cannot show the fix. The statistic is the
+    // SPLIT: `at0` = pairs within 1 u, and the spread of the rest. v3 passes when the offset tail
+    // collapses into at0 and nothing that was at 0 moves out of it. The worst pairs are itemised so a
+    // survivor can be traced to its mesh. Cross-pairing (two lanterns a pace apart) is possible, so a
+    // lone outlier is not a failure. Fires once >= 4 pairs exist, re-arms after the eye moves a cell,
+    // and stops after 12 lines. `lw` = the RAW light wire (camera-relative to eyeAbs, the same
+    // lighting[24..26] the client subtracted).
+    // G3: goboNear[] (camera cbuffer tail) from the client's side array — layer+1 and the rotation
+    // bits for every near light whose LIGH id names a USABLE fixture (sealed layers stay plain).
+    bool goboReady() { return g_gobo.ready; }
+
+    // G4b: is there a baked light at this ABSOLUTE position (within 2 u)? Near fixture lights sit
+    // exactly on their twins since lights.data v3 (the G0 oracle: 31/31 at 0.0 u). A 64 u grid over
+    // g_dlBakedLights, built on first use; 27 cells probed so a twin across a cell edge is found.
+    bool dlHasBakedTwin(float x, float y, float z) {
+        static std::unordered_map<uint64_t, std::vector<uint32_t>> s_grid;
+        static size_t s_built = (size_t)-1;
+        constexpr float kCell = 64.0f, kTol2 = 2.0f * 2.0f;
+        auto key = [](int64_t cx, int64_t cy, int64_t cz) -> uint64_t {
+            return ((uint64_t)(cx & 0x1FFFFF) << 42) | ((uint64_t)(cy & 0x1FFFFF) << 21) | (uint64_t)(cz & 0x1FFFFF);
+        };
+        if (s_built != g_dlBakedLights.size()) {
+            s_grid.clear();
+            for (uint32_t k = 0; k < (uint32_t)g_dlBakedLights.size(); ++k) {
+                const DlBakedLight& L = g_dlBakedLights[k];
+                s_grid[key((int64_t)std::floor(L.x / kCell), (int64_t)std::floor(L.y / kCell),
+                           (int64_t)std::floor(L.z / kCell))].push_back(k);
+            }
+            s_built = g_dlBakedLights.size();
+        }
+        if (s_grid.empty()) { return false; }
+        const int64_t cx = (int64_t)std::floor(x / kCell), cy = (int64_t)std::floor(y / kCell),
+                      cz = (int64_t)std::floor(z / kCell);
+        for (int64_t dx = -1; dx <= 1; ++dx)
+        for (int64_t dy = -1; dy <= 1; ++dy)
+        for (int64_t dz = -1; dz <= 1; ++dz) {
+            auto it = s_grid.find(key(cx + dx, cy + dy, cz + dz));
+            if (it == s_grid.end()) { continue; }
+            for (uint32_t k : it->second) {
+                const DlBakedLight& L = g_dlBakedLights[k];
+                const float ex = L.x - x, ey = L.y - y, ez = L.z - z;
+                if (ex * ex + ey * ey + ez * ez <= kTol2) { return true; }
+            }
+        }
+        return false;
+    }
+
+    void goboFillNear(const IPC::LightGoboWire* side, uint32_t nL, float* gn) {
+        if (!g_gobo.ready) { return; }
+        for (uint32_t i = 0; i < nL; ++i) {
+            const IPC::LightGoboWire& g = side[i];
+            if (g.idHash == 0u) { continue; }
+            auto it = g_dlFixtureById.find(g.idHash);
+            if (it == g_dlFixtureById.end()) { continue; }
+            const uint16_t fx = it->second;
+            if (fx >= g_gobo.usable.size() || !g_gobo.usable[fx]) { continue; }
+            gn[i * 2 + 0] = (float)(fx + 1u);
+            std::memcpy(&gn[i * 2 + 1], &g.rotPacked, 4);
+        }
+    }
+
+    void dlNearBakedPairDiag(const float* lw, const IPC::LightGoboWire* gw, uint32_t nL, const float eyeAbs[3],
+                             bool exterior) {
+        static int   s_fired = 0;
+        static float s_last[2] = { 1e30f, 1e30f };
+        if (!exterior || !lw || nL == 0 || g_dlBakedLights.empty() || s_fired >= 12) { return; }
+        const float mx = eyeAbs[0] - s_last[0], my = eyeAbs[1] - s_last[1];
+        if (mx * mx + my * my < 8192.0f * 8192.0f) { return; }
+
+        const float kPairR2 = 96.0f * 96.0f;
+        uint32_t fixtures = 0;
+        std::vector<float> d, dz;
+        struct Pair { float d, nx, ny, nz, bx, by, bz; uint16_t fixture; };
+        std::vector<Pair> pairs;
+        // G3: the near light's OWN key (client side array) against its baked twin's, per at0 pair.
+        // Layer: the id hash through fixtures.data must name the SAME fixture the baker gave the twin.
+        // Rotation: the reference's scene-node rotation must be the baker's RefRotation, to within
+        // the two packings (~0.24 deg each) — a conjugated or transposed convention shows as a large,
+        // systematic angle, not scatter.
+        uint32_t keyMatch = 0, keyMismatch = 0, keyNone = 0, keyRotated = 0;   // rotated = twin > 5 deg off identity
+        std::vector<float> rotDeg;
+        for (uint32_t i = 0; i < nL; ++i) {
+            const float* e = lw + i * 12;
+            uint32_t id = 0, flags = 0;
+            IPC::unpackLightIdFlags(e[7], id, flags);
+            if (!(flags & IPC::kLightFlagFixture) || (flags & IPC::kLightFlagCarried)) { continue; }
+            ++fixtures;
+            const float ax = e[0] + eyeAbs[0], ay = e[1] + eyeAbs[1], az = e[2] + eyeAbs[2];
+            float best = kPairR2;
+            const DlBakedLight* hit = nullptr;
+            for (const DlBakedLight& L : g_dlBakedLights) {
+                const float dx = L.x - ax, dy = L.y - ay, dzz = L.z - az;
+                const float q = dx * dx + dy * dy + dzz * dzz;
+                if (q < best) { best = q; hit = &L; }
+            }
+            if (hit) {
+                const float dd = std::sqrt(best);
+                pairs.push_back({ dd, ax, ay, az, hit->x, hit->y, hit->z, hit->fixture });
+                if (gw && dd < 1.0f && hit->fixture != kNoFixture) {
+                    auto it = gw[i].idHash ? g_dlFixtureById.find(gw[i].idHash) : g_dlFixtureById.end();
+                    if (it == g_dlFixtureById.end()) { ++keyNone; }
+                    else if (it->second != hit->fixture) { ++keyMismatch; }
+                    else {
+                        ++keyMatch;
+                        float qa[4], qb[4];
+                        goboUnpackQuat(gw[i].rotPacked, qa);
+                        goboUnpackQuat(hit->quatPacked, qb);
+                        const float dot = std::fabs(qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3]);
+                        rotDeg.push_back(2.0f * std::acos(std::min(dot, 1.0f)) * 57.2957795f);
+                        // A match between two IDENTITIES proves nothing about the convention, so
+                        // count how many of the matched pairs were actually rotated.
+                        if (2.0f * std::acos(std::min(std::fabs(qb[3]), 1.0f)) * 57.2957795f > 5.0f) { ++keyRotated; }
+                    }
+                }
+                if (dd >= 1.0f) { d.push_back(dd); dz.push_back(az - hit->z); }
+            }
+        }
+        if (pairs.size() < 4) { return; }
+        std::sort(d.begin(), d.end());
+        std::sort(dz.begin(), dz.end());
+        const size_t n = d.size();
+        LOG::logline(">> [gobo] near<->baked pairs=%zu (of %u near fixtures): at0(<1u)=%zu, offset=%zu"
+                     " |d| median=%.1f p90=%.1f max=%.1f dz(near-baked) median=%+.1f  lights.data v%u eye=(%.0f,%.0f)",
+                     pairs.size(), fixtures, pairs.size() - n, n,
+                     n ? d[n / 2] : 0.0f, n ? d[(n * 9) / 10] : 0.0f, n ? d[n - 1] : 0.0f, n ? dz[n / 2] : 0.0f,
+                     g_dlBakedLightsVersion, eyeAbs[0], eyeAbs[1]);
+        if (gw) {
+            std::sort(rotDeg.begin(), rotDeg.end());
+            const size_t r = rotDeg.size();
+            LOG::logline(">> [gobo] G3 near key vs baked twin (at0 pairs): fixture match=%u (%u rotated >5 deg) mismatch=%u"
+                         " no-key=%u | rotation delta median=%.2f p90=%.2f max=%.2f deg (packing floor ~0.5)",
+                         keyMatch, keyRotated, keyMismatch, keyNone,
+                         r ? rotDeg[r / 2] : 0.0f, r ? rotDeg[(r * 9) / 10] : 0.0f, r ? rotDeg[r - 1] : 0.0f);
+        } else {
+            LOG::logline(">> [gobo] G3 near key: the client sent NO gobo side array (old mgecore?)");
+        }
+        std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.d > b.d; });
+        for (size_t k = 0; k < pairs.size() && k < 4 && pairs[k].d >= 1.0f; ++k) {
+            const Pair& q = pairs[k];
+            const bool known = q.fixture != kNoFixture && q.fixture < g_dlFixtures.size();
+            LOG::logline(">> [gobo]   worst: |d|=%.1f near=(%.1f,%.1f,%.1f) baked=(%.1f,%.1f,%.1f) fixture=%d %s"
+                         " attach=(%.1f,%.1f,%.1f)",
+                         q.d, q.nx, q.ny, q.nz, q.bx, q.by, q.bz,
+                         known ? (int)q.fixture : -1, known ? g_dlFixtures[q.fixture].model.c_str() : "-",
+                         known ? g_dlFixtures[q.fixture].attach[0] : 0.0f,
+                         known ? g_dlFixtures[q.fixture].attach[1] : 0.0f,
+                         known ? g_dlFixtures[q.fixture].attach[2] : 0.0f);
+        }
+        ++s_fired;
+        s_last[0] = eyeAbs[0]; s_last[1] = eyeAbs[1];
     }
 
     void dlMul(const float a[16], const float b[16], float out[16]);   // defined with the camera helpers below
@@ -47739,6 +48252,47 @@ void destroyHostWindow(Renderer* R);
             }
         }
 
+        // Fixture gobo bake (tasks/forge-light-gobo.md G1): the statics vertex layout, an R8 target and
+        // no depth at all (visibility is binary — any occluder writes 0, so order is irrelevant). Three
+        // cull variants, because the NEAR caster's rule picks per part (two-sided for the light's own
+        // small cage, g_shadowCasterCull for everything else) and the gobo must be the same shadow.
+        // The face cameras share the near's winding: both build R x U = F (buildShadowFaceVP).
+        // Non-fatal: without them goboBake declines and the distant lights stay plain spheres.
+        {
+            ShaderLoadDesc gsd = {};
+            gsd.mVert.pFileName = "gobobake.vert";
+            gsd.mFrag.pFileName = "gobobake.frag";
+            addShader(R, &gsd, &g_gobo.pBakeShader);
+            if (g_gobo.pBakeShader) {
+                TinyImageFormat goboFmt = TinyImageFormat_R8_UNORM;
+                DepthStateDesc goboDepth = {};
+                goboDepth.mDepthTest = false; goboDepth.mDepthWrite = false;
+                RasterizerStateDesc goboRaster = {};
+                goboRaster.mFrontFace = FRONT_FACE_CCW;
+                PipelineDesc gpd = {};
+                gpd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& gg = gpd.mGraphicsDesc;
+                gg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                gg.mRenderTargetCount  = 1;
+                gg.pColorFormats       = &goboFmt;
+                gg.mSampleCount        = SAMPLE_COUNT_1;
+                gg.mSampleQuality      = 0;
+                gg.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+                gg.pDepthState         = &goboDepth;
+                gg.pVertexLayout       = &vl;
+                gg.pRasterizerState    = &goboRaster;
+                gg.pShaderProgram      = g_gobo.pBakeShader;
+                const CullMode kCull[3] = { CULL_MODE_BACK, CULL_MODE_NONE, CULL_MODE_FRONT };
+                for (int c = 0; c < 3; ++c) {
+                    goboRaster.mCullMode = kCull[c];
+                    addPipeline(R, &gpd, &g_gobo.pBakePso[c]);
+                }
+            }
+            if (!g_gobo.pBakePso[0] || !g_gobo.pBakePso[1] || !g_gobo.pBakePso[2]) {
+                LOG::logline("!! [gobo] bake pipelines FAILED — no gobos");
+            }
+        }
+
         // G1 GRASS: grass.vert + grass.frag. Same vertex layout, same reverse-Z GEQUAL depth-write,
         // same colour target and sample count as the statics pipeline — grass IS opaque geometry
         // (its cutout is resolved by SV_Coverage, not by blending), so it belongs in the depth-
@@ -48152,23 +48706,7 @@ void destroyHostWindow(Renderer* R);
                 // ~250 statics go white. Keep the subpath: strip trailing NUL/space, normalize slashes
                 // + lowercase, drop a leading "data files\" then "textures\" prefix, force .dds (the
                 // library is all .dds; static_meshes stores the original, often .tga, source name).
-                std::string name;
-                {
-                    const char* np = (const char*)p; uint16_t n = pathsize;
-                    while (n > 0 && (np[n-1] == 0 || np[n-1] == ' ')) { --n; }
-                    std::string full;
-                    for (int i = 0; i < (int)n; ++i) {
-                        char c = np[i];
-                        if (c == '/') { c = '\\'; }
-                        if (c >= 'A' && c <= 'Z') { c = (char)(c - 'A' + 'a'); }
-                        full.push_back(c);
-                    }
-                    if (full.rfind("data files\\", 0) == 0) { full.erase(0, 11); }
-                    if (full.rfind("textures\\", 0) == 0)    { full.erase(0, 9); }
-                    size_t dot = full.find_last_of('.');
-                    if (dot != std::string::npos) { full.erase(dot); }
-                    name = full + ".dds";
-                }
+                std::string name = dlStaticsTexName((const char*)p, pathsize);
                 p += pathsize;
 
                 StaticsSubsetGPU sub = {};
@@ -49129,10 +49667,17 @@ void destroyHostWindow(Renderer* R);
             }
         }
 
-        // Pass 1: header scan -> bucket plan (dedup by name).
+        // Pass 1: header scan -> bucket plan (dedup by name). The fixture-gobo library's textures ride
+        // along (tasks/forge-light-gobo.md): the bake cuts out their alpha through these same arrays,
+        // and a candle too small for distant land has no other route into them.
         uint32_t missing = 0, overflow = 0, grassKept = 0;
         uint64_t grassBytes = 0;
-        for (const std::string& nm : g_staticsSubsetTex) {
+        std::vector<const std::string*> planNames;
+        planNames.reserve(g_staticsSubsetTex.size() + g_fixSubsetTex.size());
+        for (const std::string& n : g_staticsSubsetTex) { planNames.push_back(&n); }
+        for (const std::string& n : g_fixSubsetTex)     { planNames.push_back(&n); }
+        for (const std::string* pnm : planNames) {
+            const std::string& nm = *pnm;
             if (nm.empty() || plan.find(nm) != plan.end()) { continue; }
             std::vector<uint8_t> hdr;
             const bool inLib = dlReadWholeFile((texDir + nm).c_str(), hdr);
@@ -49263,6 +49808,38 @@ void destroyHostWindow(Renderer* R);
             auto it = plan.find(g_staticsSubsetTex[sid]);
             g_staticsSubsets[sid].texSlot = (it != plan.end())
                                           ? ((it->second.bucket << 16) | (it->second.layer & 0xFFFF)) : 0u;
+        }
+        // ...and each BLENDED fixture subset's texture gets the near caster's alpha classification
+        // (classifyDdsAlpha — the same histogram g_texAlphaKind holds for near textures), because the
+        // near blend-caster gate turns on it: a sheet of glass with no transparent texel (SOFT) never
+        // casts, a real cutout does. Read from the same file the array slice came from.
+        uint32_t fixWhite = 0, fixKind[4] = {};
+        std::unordered_map<std::string, uint8_t> kindCache;
+        for (size_t fs = 0; fs < g_fixSubsets.size(); ++fs) {
+            DlFixtureSubset& sub = g_fixSubsets[fs];
+            auto it = plan.find(g_fixSubsetTex[fs]);
+            sub.texSlot = (it != plan.end()) ? ((it->second.bucket << 16) | (it->second.layer & 0xFFFF)) : 0u;
+            if (sub.texSlot == 0u) { ++fixWhite; }
+            if (!(sub.alpha & kFixAlphaBlend)) { continue; }
+            auto kc = kindCache.find(g_fixSubsetTex[fs]);
+            if (kc == kindCache.end()) {
+                uint8_t kind = kTexAlphaOpaque;
+                std::vector<uint8_t> dds;
+                if (readStaticsTex(g_fixSubsetTex[fs], dds)) {
+                    DdsInfo info = parseDds(dds.data(), (uint32_t)dds.size());
+                    if (info.ok) { kind = classifyDdsAlpha(dds.data(), (uint32_t)dds.size(), info); }
+                }
+                kc = kindCache.emplace(g_fixSubsetTex[fs], kind).first;
+            }
+            sub.texKind = kc->second;
+            ++fixKind[sub.texKind & 3u];
+        }
+        if (!g_fixSubsets.empty()) {
+            // White = no texture = no cutout: a cage whose bars are alpha would bake as a solid box.
+            LOG::logline(">> [gobo] fixture textures: %zu subsets, %u resolved WHITE (no alpha cutout);"
+                         " blended: opaque=%u mask=%u translucent=%u soft=%u",
+                         g_fixSubsets.size(), fixWhite, fixKind[kTexAlphaOpaque], fixKind[kTexAlphaMask],
+                         fixKind[kTexAlphaTranslucent], fixKind[kTexAlphaSoft]);
         }
 
         // ─── THE PBR COMPANIONS: `_paramh` at LOD resolution ─────────────────────────────────────
@@ -49592,6 +50169,427 @@ void destroyHostWindow(Renderer* R);
         LOG::flush();
         g_staticsTexReady = true;
         return true;
+    }
+
+    // ─── FIXTURE GOBO BAKE (tasks/forge-light-gobo.md G1) ──────────────────────────────────────────
+    // For every fixture (unique LIGH model): rasterise its own mesh into six cube faces around its
+    // AttachLight (gobobake.vert/.frag — shadowcaster.frag's cutout + own-light emissive carve, so it
+    // is the same thing the near shadow shows), then fold the faces into one octahedral R8 layer
+    // (goboresolve.comp, 4x4 box = soft edges). Fixtures go through in batches of kGoboBatch rows of
+    // one R8 atlas. ONE-SHOT at DL live init, on its own command list + fence (hdrDumpIfArmed's
+    // idiom), so it neither waits for nor lands inside a frame; everything but the array is released
+    // before it returns.
+
+    // Face basis (F, R, U) per face, atlas order +X -X +Y -Y +Z -Z. MUST match gobo.h.fsl goboFaceBasis.
+    static const float kGoboFace[6][3][3] = {
+        { {  1, 0, 0 }, {  0, 1, 0 }, { 0, 0, 1 } },
+        { { -1, 0, 0 }, {  0,-1, 0 }, { 0, 0, 1 } },
+        { {  0, 1, 0 }, { -1, 0, 0 }, { 0, 0, 1 } },
+        { {  0,-1, 0 }, {  1, 0, 0 }, { 0, 0, 1 } },
+        { {  0, 0, 1 }, {  1, 0, 0 }, { 0, 1, 0 } },
+        { {  0, 0,-1 }, {  1, 0, 0 }, { 0,-1, 0 } },
+    };
+
+    // The four instance rows for a fixture with attach A seen through face f: row-vector
+    // [p,1] * W = clip = (q.R, q.U, q.F - near, q.F), q = p - A. ndc.z = 1 - near/w, inside [0,1)
+    // for every w >= near, so the near plane is the only depth clip and no far plane is needed.
+    static void goboFaceRows(const float A[3], uint32_t f, float W[16]) {
+        const float* F = kGoboFace[f][0];
+        const float* Rt = kGoboFace[f][1];
+        const float* U = kGoboFace[f][2];
+        for (int r = 0; r < 3; ++r) {
+            W[r * 4 + 0] = Rt[r]; W[r * 4 + 1] = U[r]; W[r * 4 + 2] = F[r]; W[r * 4 + 3] = F[r];
+        }
+        const float aR = A[0] * Rt[0] + A[1] * Rt[1] + A[2] * Rt[2];
+        const float aU = A[0] * U[0]  + A[1] * U[1]  + A[2] * U[2];
+        const float aF = A[0] * F[0]  + A[1] * F[1]  + A[2] * F[2];
+        W[12] = -aR; W[13] = -aU; W[14] = -aF - kGoboNear; W[15] = -aF;
+    }
+
+    // goboDump: every layer as one contact sheet, 16 per row, a 1 px magenta border round each cell,
+    // plus a text index (cell -> layer -> model -> mean openness). The mean is the sanity number: a
+    // sconce should sit well below 1, and 0 means the light is sealed in (near plane inside a mesh,
+    // or an alpha texture that resolved white).
+    void goboReadLayers(Renderer* R, bool writeSheet) {
+        const uint32_t N = g_gobo.layers, O = kGoboOctRes;
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u)
+                                      ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u)
+                                      ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t pitch = roundUp(O, rowAlign);
+        const uint64_t slice = roundUp64((uint64_t)pitch * O, texAlign);
+        Buffer* rb = nullptr;
+        {
+            BufferLoadDesc bd = {};
+            bd.mDesc.mSize = slice * N;
+            bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+            bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+            bd.ppBuffer = &rb;
+            addResource(&bd, nullptr);
+            waitForAllResourceLoads();
+        }
+        if (!rb || !rb->pCpuMappedAddress) {
+            // No readback = no openness: keep every layer (the pre-check behaviour), say so.
+            g_gobo.open.assign(N, 1.0f); g_gobo.usable.assign(N, 1u);
+            LOG::logline("!! [gobo] layer readback alloc FAILED — sealed layers are NOT filtered");
+            return;
+        }
+        SyncToken tk = {};
+        for (uint32_t L = 0; L < N; ++L) {
+            TextureCopyDesc c = {};
+            c.pTexture = g_gobo.pArray; c.pBuffer = rb;
+            c.mTextureArrayLayer = L; c.mBufferOffset = (uint64_t)L * slice;
+            c.mTextureState = RESOURCE_STATE_SHADER_RESOURCE; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+            copyResource(&c, &tk);
+        }
+        waitForToken(&tk);
+
+        const uint32_t cols = 16, cell = O + 2, rows = (N + cols - 1) / cols;
+        const uint32_t SW = cols * cell, SH = rows * cell;
+        std::vector<uint8_t> sheet((size_t)SW * SH * 4);
+        for (size_t k = 0; k < sheet.size(); k += 4) { sheet[k] = 255; sheet[k + 1] = 0; sheet[k + 2] = 255; sheet[k + 3] = 255; }
+        g_gobo.open.assign(N, 1.0f); g_gobo.usable.assign(N, 1u);
+        if (writeSheet) { CreateDirectoryA("hdrdump", nullptr); }
+        std::FILE* txt = writeSheet ? std::fopen("hdrdump\\gobo_sheet.txt", "w") : nullptr;
+        const uint8_t* src = (const uint8_t*)rb->pCpuMappedAddress;
+        uint32_t sealed = 0, open = 0;
+        for (uint32_t L = 0; L < N; ++L) {
+            const uint32_t cx = (L % cols) * cell + 1, cy = (L / cols) * cell + 1;
+            uint64_t sum = 0;
+            for (uint32_t y = 0; y < O; ++y) {
+                const uint8_t* row = src + (uint64_t)L * slice + (uint64_t)y * pitch;
+                for (uint32_t x = 0; x < O; ++x) {
+                    uint8_t* d = &sheet[((size_t)(cy + y) * SW + (cx + x)) * 4];
+                    const uint8_t openB = (uint8_t)(255u - row[x]);   // the array stores OCCLUSION (G2)
+                    d[0] = d[1] = d[2] = openB; d[3] = 255;
+                    sum += openB;
+                }
+            }
+            const double mean = (double)sum / (255.0 * O * O);
+            g_gobo.open[L]   = (float)mean;
+            g_gobo.usable[L] = (mean >= kGoboSealedOpen) ? 1u : 0u;
+            if (mean < kGoboSealedOpen) { ++sealed; }
+            if (mean > 0.98) { ++open; }
+            if (txt) {
+                std::fprintf(txt, "cell %2u,%2u  layer %3u  open %.3f  %s\n", L % cols, L / cols, L, mean,
+                             L < g_dlFixtures.size() ? g_dlFixtures[L].model.c_str() : "?");
+            }
+        }
+        if (txt) { std::fclose(txt); }
+        removeResource(rb);
+        std::string sealedNames;
+        for (uint32_t L = 0; L < N; ++L) {
+            if (g_gobo.usable[L] || L >= g_dlFixtures.size()) { continue; }
+            if (!sealedNames.empty()) { sealedNames += ", "; }
+            sealedNames += g_dlFixtures[L].model;
+        }
+        LOG::logline(">> [gobo] %u of %u layers SEALED (<%.0f%% open) -> not used, their lights stay plain spheres: %s",
+                     sealed, N, kGoboSealedOpen * 100.0f, sealedNames.empty() ? "none" : sealedNames.c_str());
+        if (!writeSheet) { return; }
+        const bool ok = writeTga32("hdrdump\\gobo_sheet.tga", SW, SH, sheet.data(), SW * 4);
+        LOG::logline(">> [gobo] dump %s: hdrdump\\gobo_sheet.tga (%ux%u, %u layers, %u sealed <2%%, %u fully open >98%%)"
+                     " + gobo_sheet.txt", ok ? "written" : "FAILED", SW, SH, N, sealed, open);
+    }
+
+    void goboBake(Renderer* R) {
+        if (g_gobo.attempted) { return; }
+        g_gobo.attempted = true;
+        if (!g_goboBake) { LOG::logline(">> [gobo] bake OFF (goboBake=0)"); return; }
+        const uint32_t N = (uint32_t)g_fixMeshes.size();
+        const bool psoOk = g_gobo.pBakePso[0] && g_gobo.pBakePso[1] && g_gobo.pBakePso[2];
+        if (N == 0 || g_fixSubsets.empty() || !psoOk || !g_staticsTexReady || !g_live.pPersistentSet) {
+            LOG::logline(">> [gobo] bake skipped: fixtures=%u subsets=%zu pipelines=%d statics-tex=%d",
+                         N, g_fixSubsets.size(), psoOk ? 1 : 0, g_staticsTexReady ? 1 : 0);
+            return;
+        }
+        const double t0 = hostNowMs();
+        const uint32_t batches   = (N + kGoboBatch - 1) / kGoboBatch;
+        const uint32_t atlasRows = std::min(N, kGoboBatch);
+
+        // ── Per PART, the NEAR caster's decision, so the gobo is the shadow the near light casts ──
+        // Each rule below names the near site it copies; the knobs are the near's own, read at bake
+        // time (the bake is one-shot, so moving one afterwards does not re-bake).
+        //  * cull — the fixture-cage override (the light's OWN small holder: wr <= g_shadowCageRadius
+        //    and its bound encloses the light -> two-sided), else g_shadowCasterCull. Model units
+        //    stand in for world units: a gobo is per model, so the ref's scale is not known here.
+        //  * emissive-hot — material emissive >= g_shadowEmissiveSkip carves texels brighter than
+        //    g_shadowEmissiveTexel (shadowcaster.frag, always the owner here); g_shadowEmissiveCast
+        //    off drops the part (the old whole-mesh skip). The near reads the emissive AS SHIPPED
+        //    (gain-scaled); this is the authored value — the one known divergence.
+        //  * alpha — an opaque part casts solid; an alpha-TEST part cuts out at 133/255 (the DL
+        //    statics constant — the NIF's own ref is not in the bake); an alpha BLEND part follows the
+        //    C3a gate: not alpha-over -> no cast (a glow is light), vertex/material alpha <= 0.5 -> no
+        //    cast (fading), no test and a SOFT texture -> no cast (glass: nothing to carve), else cut
+        //    at max(test ? 133/255 : 0, g_shadowBlendRef), 0.5 if that is 0; g_shadowBlendCasters off
+        //    drops every blended part.
+        enum { kSkipNotOver, kSkipFading, kSkipSoft, kSkipHotOff, kSkipBlendOff, kSkipCount };
+        uint32_t nSkip[kSkipCount] = {}, nTwoSided = 0, nCulled = 0, nCutout = 0, nHot = 0;
+        struct GoboPart { int8_t pso; float ref, thr; };   // pso < 0 = does not cast
+        std::vector<GoboPart> part(g_fixSubsets.size());
+        const uint32_t liveCull = std::min(g_shadowCasterCull, 2u);
+        for (uint32_t i = 0; i < N; ++i) {
+            const DlFixtureMesh& m = g_fixMeshes[i];
+            const float* A = g_dlFixtures[i].attach;
+            for (uint32_t s = 0; s < m.numSubsets; ++s) {
+                const DlFixtureSubset& fs = g_fixSubsets[m.firstSubset + s];
+                GoboPart& gp = part[m.firstSubset + s];
+                gp.pso = -1; gp.ref = 0.0f; gp.thr = 0.0f;
+                const bool hot = fs.emissive >= g_shadowEmissiveSkip;
+                if (hot && !g_shadowEmissiveCast) { ++nSkip[kSkipHotOff]; continue; }
+                if (fs.alpha & kFixAlphaBlend) {
+                    if (!g_shadowBlendCasters)       { ++nSkip[kSkipBlendOff]; continue; }
+                    if (fs.alpha & kFixAlphaNotOver) { ++nSkip[kSkipNotOver];  continue; }
+                    if (fs.vAlpha <= 0.5f)           { ++nSkip[kSkipFading];   continue; }
+                    const bool test = (fs.alpha & kFixAlphaTest) != 0;
+                    if (!test && fs.texKind == kTexAlphaSoft) { ++nSkip[kSkipSoft]; continue; }
+                    gp.ref = std::max(test ? 133.0f / 255.0f : 0.0f, g_shadowBlendRef);
+                    if (gp.ref <= 0.0f) { gp.ref = 0.5f; }
+                } else if (fs.alpha & kFixAlphaTest) {
+                    gp.ref = 133.0f / 255.0f;
+                }
+                if (gp.ref > 0.0f) { ++nCutout; }
+                if (hot) { gp.thr = g_shadowEmissiveTexel; ++nHot; }
+                const float dx = fs.sphere[0] - A[0], dy = fs.sphere[1] - A[1], dz = fs.sphere[2] - A[2];
+                const float wr = fs.sphere[3];
+                const bool twoSided = g_shadowCageRadius > 0.0f && wr <= g_shadowCageRadius
+                                   && (dx * dx + dy * dy + dz * dz) < wr * wr;
+                gp.pso = twoSided ? 1 : (int8_t)liveCull;
+                if (twoSided) { ++nTwoSided; } else { ++nCulled; }
+            }
+        }
+
+        // Instance rows + draw list, [fixture][face][casting part]. Params: x texSlot, y flags (bit1 =
+        // cutout), z carve threshold (0 = not hot), w cutout ref (gobobake.vert).
+        struct GoboDraw { uint32_t sub, inst; int8_t pso; };
+        std::vector<float>    inst;
+        std::vector<GoboDraw> drawList;
+        std::vector<uint32_t> drawBase((size_t)N * 6 + 1);   // drawList range per (fixture, face)
+        inst.reserve(g_fixSubsets.size() * 6 * 20);
+        for (uint32_t i = 0; i < N; ++i) {
+            const DlFixtureMesh& m = g_fixMeshes[i];
+            for (uint32_t f = 0; f < 6; ++f) {
+                drawBase[(size_t)i * 6 + f] = (uint32_t)drawList.size();
+                float W[16];
+                goboFaceRows(g_dlFixtures[i].attach, f, W);
+                for (uint32_t s = 0; s < m.numSubsets; ++s) {
+                    const uint32_t sid = m.firstSubset + s;
+                    const GoboPart& gp = part[sid];
+                    if (gp.pso < 0) { continue; }
+                    drawList.push_back({ sid, (uint32_t)(inst.size() / 20), gp.pso });
+                    inst.insert(inst.end(), W, W + 16);
+                    inst.push_back((float)g_fixSubsets[sid].texSlot);
+                    inst.push_back(gp.ref > 0.0f ? 2.0f : 0.0f);
+                    inst.push_back(gp.thr);
+                    inst.push_back(gp.ref);
+                }
+            }
+        }
+        drawBase[(size_t)N * 6] = (uint32_t)drawList.size();
+        const float thr = g_shadowEmissiveTexel;
+        if (inst.empty()) { inst.assign(20, 0.0f); }   // a zero-size buffer is not creatable; nothing draws it
+
+        Buffer *pVB = nullptr, *pIB = nullptr, *pInst = nullptr;
+        auto uploadGpu = [&](const void* data, size_t size, DescriptorType dt, const char* name, Buffer** out) {
+            BufferLoadDesc d = {};
+            d.mDesc.mDescriptors = dt;
+            d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            d.mDesc.mSize = size;
+            d.mDesc.pName = name;
+            d.pData = data;
+            d.ppBuffer = out;
+            addResource(&d, nullptr);
+        };
+        uploadGpu(g_fixVB.data(), g_fixVB.size(), DESCRIPTOR_TYPE_VERTEX_BUFFER, "goboVB", &pVB);
+        uploadGpu(g_fixIB.data(), g_fixIB.size(), DESCRIPTOR_TYPE_INDEX_BUFFER, "goboIB", &pIB);
+        uploadGpu(inst.data(), inst.size() * sizeof(float), DESCRIPTOR_TYPE_VERTEX_BUFFER, "goboInst", &pInst);
+
+        {
+            TextureDesc td = {};
+            td.mWidth = kGoboOctRes; td.mHeight = kGoboOctRes; td.mDepth = 1;
+            td.mArraySize = N; td.mMipLevels = 1;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R8_UNORM;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "goboArray";
+            TextureLoadDesc tl = {}; tl.ppTexture = &g_gobo.pArray; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+        }
+        RenderTarget* pAtlas = nullptr;
+        {
+            RenderTargetDesc rd = {};
+            rd.mWidth = 6 * kGoboFaceRes; rd.mHeight = atlasRows * kGoboFaceRes;
+            rd.mDepth = 1; rd.mArraySize = 1; rd.mMipLevels = 1;
+            rd.mSampleCount = SAMPLE_COUNT_1;
+            rd.mFormat = TinyImageFormat_R8_UNORM;
+            rd.mStartState = RESOURCE_STATE_RENDER_TARGET;
+            rd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            rd.mClearValue.r = rd.mClearValue.g = rd.mClearValue.b = rd.mClearValue.a = 1.0f;   // open
+            rd.pName = "goboAtlas";
+            addRenderTarget(R, &rd, &pAtlas);
+        }
+        Shader* pRS = nullptr; Pipeline* pRP = nullptr; DescriptorSet* pSet = nullptr;
+        {
+            ShaderLoadDesc cs = {}; cs.mComp.pFileName = "goboresolve.comp";
+            addShader(R, &cs, &pRS);
+            if (pRS) {
+                PipelineDesc cp = {}; cp.mType = PIPELINE_TYPE_COMPUTE; cp.mComputeDesc.pShaderProgram = pRS;
+                addPipeline(R, &cp, &pRP);
+            }
+            if (pRP) {
+                DescriptorSetDesc sd = SRT_SET_DESC(GoboResolveSrtData, PerBatch, batches, 0);
+                addDescriptorSet(R, &sd, &pSet);
+            }
+        }
+        std::vector<Buffer*> cbs(batches, nullptr);
+        for (uint32_t b = 0; b < batches; ++b) {
+            BufferLoadDesc cb = {};
+            cb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            cb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            cb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            cb.mDesc.mSize = 256;
+            cb.mDesc.pName = "goboResolveParams";
+            cb.ppBuffer = &cbs[b];
+            addResource(&cb, nullptr);
+        }
+        waitForAllResourceLoads();
+
+        bool ok = pVB && pIB && pInst && g_gobo.pArray && pAtlas && pRP && pSet;
+        for (Buffer* cb : cbs) { ok = ok && cb && cb->pCpuMappedAddress; }
+        uint32_t draws = 0;
+        if (ok) {
+            for (uint32_t b = 0; b < batches; ++b) {
+                const uint32_t first = b * kGoboBatch, count = std::min(kGoboBatch, N - first);
+                const uint32_t dims[4] = { first, count, kGoboFaceRes, kGoboOctRes };
+                std::memcpy(cbs[b]->pCpuMappedAddress, dims, sizeof(dims));
+                DescriptorData d[3] = {};
+                d[0].mIndex = SRT_RES_IDX(GoboResolveSrtData, PerBatch, gGoboResolveParams);
+                d[0].ppBuffers = &cbs[b];
+                d[1].mIndex = SRT_RES_IDX(GoboResolveSrtData, PerBatch, gGoboCube);
+                d[1].ppTextures = &pAtlas->pTexture;
+                d[2].mIndex = SRT_RES_IDX(GoboResolveSrtData, PerBatch, gGoboOut);
+                d[2].ppTextures = &g_gobo.pArray;
+                updateDescriptorSet(R, b, pSet, 3, d);
+            }
+
+            CmdPool* pPool = nullptr; Cmd* pCmd = nullptr; Fence* pFence = nullptr;
+            CmdPoolDesc pd = {}; pd.pQueue = g_live.pQueue;
+            initCmdPool(R, &pd, &pPool);
+            CmdDesc cd = {}; cd.pPool = pPool;
+            initCmd(R, &cd, &pCmd);
+            initFence(R, &pFence);
+            ok = pPool && pCmd && pFence;
+            if (ok) {
+                resetCmdPool(R, pPool);
+                beginCmd(pCmd);
+                Buffer*  vbs[2]     = { pVB, pInst };
+                uint32_t strides[2] = { 20, kStaticsInstStride };
+                for (uint32_t b = 0; b < batches; ++b) {
+                    const uint32_t first = b * kGoboBatch, count = std::min(kGoboBatch, N - first);
+                    if (b > 0) {
+                        RenderTargetBarrier rb = {};
+                        rb.pRenderTarget = pAtlas;
+                        rb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                        rb.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+                        cmdResourceBarrier(pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+                    }
+                    BindRenderTargetsDesc bind = {};
+                    bind.mRenderTargetCount = 1;
+                    bind.mRenderTargets[0] = { pAtlas, LOAD_ACTION_CLEAR };
+                    cmdBindRenderTargets(pCmd, &bind);
+                    int boundPso = -1;
+                    for (uint32_t i = first; i < first + count; ++i) {
+                        const uint32_t row = i - first;
+                        for (uint32_t f = 0; f < 6; ++f) {
+                            cmdSetViewport(pCmd, (float)(f * kGoboFaceRes), (float)(row * kGoboFaceRes),
+                                           (float)kGoboFaceRes, (float)kGoboFaceRes, 0.0f, 1.0f);
+                            cmdSetScissor(pCmd, f * kGoboFaceRes, row * kGoboFaceRes, kGoboFaceRes, kGoboFaceRes);
+                            for (uint32_t d = drawBase[(size_t)i * 6 + f]; d < drawBase[(size_t)i * 6 + f + 1]; ++d) {
+                                const GoboDraw& gd = drawList[d];
+                                if (gd.pso != boundPso) {
+                                    // Every resource bind follows the PSO: a pipeline change may not
+                                    // keep root bindings, so nothing is left to chance.
+                                    cmdBindPipeline(pCmd, g_gobo.pBakePso[gd.pso]);
+                                    cmdBindDescriptorSet(pCmd, 0, g_live.pPersistentSet);   // gStaticsArrays
+                                    cmdBindVertexBuffer(pCmd, 2, vbs, strides, nullptr);
+                                    cmdBindIndexBuffer(pCmd, pIB, INDEX_TYPE_UINT16, 0);
+                                    boundPso = gd.pso;
+                                }
+                                const DlFixtureSubset& fs = g_fixSubsets[gd.sub];
+                                cmdDrawIndexedInstanced(pCmd, fs.indexCount, fs.ibBase, 1, fs.vbBase, gd.inst);
+                                ++draws;
+                            }
+                        }
+                    }
+                    cmdBindRenderTargets(pCmd, nullptr);
+                    RenderTargetBarrier rb = {};
+                    rb.pRenderTarget = pAtlas;
+                    rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                    rb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+                    cmdBindPipeline(pCmd, pRP);
+                    cmdBindDescriptorSet(pCmd, b, pSet);
+                    cmdDispatch(pCmd, kGoboOctRes / 8, kGoboOctRes / 8, count);
+                }
+                TextureBarrier tb = {};
+                tb.pTexture = g_gobo.pArray;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                endCmd(pCmd);
+                QueueSubmitDesc sd = {};
+                sd.mCmdCount = 1; sd.ppCmds = &pCmd; sd.pSignalFence = pFence; sd.mSubmitDone = true;
+                queueSubmit(g_live.pQueue, &sd);
+                waitForFences(R, 1, &pFence);
+            }
+            if (pFence) { exitFence(R, pFence); }
+            if (pCmd)   { exitCmd(R, pCmd); }
+            if (pPool)  { exitCmdPool(R, pPool); }
+        }
+
+        for (Buffer* cb : cbs) { if (cb) { removeResource(cb); } }
+        if (pSet)   { removeDescriptorSet(R, pSet); }
+        if (pRP)    { removePipeline(R, pRP); }
+        if (pRS)    { removeShader(R, pRS); }
+        if (pAtlas) { removeRenderTarget(R, pAtlas); }
+        if (pInst)  { removeResource(pInst); }
+        if (pIB)    { removeResource(pIB); }
+        if (pVB)    { removeResource(pVB); }
+        std::vector<uint8_t>().swap(g_fixVB);
+        std::vector<uint8_t>().swap(g_fixIB);
+
+        if (!ok) {
+            if (g_gobo.pArray) { removeResource(g_gobo.pArray); g_gobo.pArray = nullptr; }
+            LOG::logline("!! [gobo] bake FAILED (resource/pipeline creation) — no gobos");
+            return;
+        }
+        g_gobo.layers = N;
+        g_gobo.ready  = true;
+        // G2: into the two PerFrame sets the baked light loops draw under (main, water mirror). An
+        // unbound set would read zero = OCCLUSION 0 = open, so a miss shows no cage, never a black light.
+        {
+            DescriptorData gd = {};
+            gd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gGoboArray);
+            gd.mCount = 1; gd.ppTextures = &g_gobo.pArray;
+            if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &gd); }
+            if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &gd); }
+            // G3: the NEAR frags too — main, the near-scene mirror, and first person (the FP light
+            // cbuffer is a byte copy of the near one, goboNear included).
+            if (g_live.pPerFrameSetReflect)    { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, 1, &gd); }
+            if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &gd); }
+        }
+        LOG::logline(">> [gobo] fixtures=%u baked=%u draws=%u batches=%u ms=%.1f (oct %u², face %u², carve thr %.3f)",
+                     N, N, draws, batches, hostNowMs() - t0, kGoboOctRes, kGoboFaceRes, thr);
+        LOG::logline(">> [gobo] near-caster rule census over %zu parts: cast two-sided(cage)=%u culled(mode %u)=%u"
+                     " [cutout %u, emissive-hot %u] | no cast: blend-not-over=%u fading=%u soft-glass=%u"
+                     " hot-off=%u blend-off=%u  (fixtures.data v%u)",
+                     g_fixSubsets.size(), nTwoSided, liveCull, nCulled, nCutout, nHot,
+                     nSkip[kSkipNotOver], nSkip[kSkipFading], nSkip[kSkipSoft], nSkip[kSkipHotOff],
+                     nSkip[kSkipBlendOff], g_dlFixturesVersion);
+        goboReadLayers(R, g_goboDump);   // always: the sealed-layer filter needs every layer's openness
+        LOG::flush();
     }
 
     // Build the per-scope instance + indirect-arg buffers: collect exterior placements within
@@ -52663,6 +53661,11 @@ void destroyHostWindow(Renderer* R);
         // it, and a stale armed value would cut the near scene at the last exterior's reach.
         if (T.primary && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress) {
             ((float*)g_live.pFrameCbv->pCpuMappedAddress)[50] = 0.0f;
+            // ...and the LIGHT handover (lodParams.x) for the same reason: a stale exterior radius
+            // would run the G4 shadow->gobo fade and the twinless-light fade inside an interior.
+            // An exterior frame rewrites both below.
+            ((float*)g_live.pFrameCbv->pCpuMappedAddress)[48] = 0.0f;
+            g_dlHandoverR = 0.0f;
         }
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
@@ -52696,6 +53699,10 @@ void destroyHostWindow(Renderer* R);
             // Phase F: build the glow-billboard path now that dlLoadBakedLights has populated
             // g_dlBakedLights (the instance buffer is sized from it). Non-fatal (glowReady gates the pass).
             buildGlowPath(R);
+            // Fixture gobos (tasks/forge-light-gobo.md G1): one-shot, own command list. Needs the
+            // statics texture arrays (fixture textures ride in them) and the fixture library that
+            // dlLoadBakedLights loaded. Non-fatal: without it distant lights stay plain spheres.
+            if (g_staticsLiveOk) { goboBake(R); }
             g_dlLiveInit = true;
             std::printf("[forge][dl] live init done (terrain cells=%u, statics=%d)\n",
                         Terrain::cellCount(), (int)g_staticsLiveOk);
@@ -52730,6 +53737,7 @@ void destroyHostWindow(Renderer* R);
             // path to cede, and cutting it would open a hole.
             const bool handover = !T.suppressNearCut && dlCellOwnActive();
             fd[48] = nearOwn;
+            g_dlHandoverR = nearOwn;
             fd[50] = handover ? dlPackSlabRotation(viewProj) : 0.0f;
             fd[51] = handover ? g_nearCellReach : g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
@@ -52783,7 +53791,9 @@ void destroyHostWindow(Renderer* R);
             //
             // nearOwn is deliberately the SMALLER of the two cuts (conservative).
             static std::vector<std::pair<float, uint32_t>> s_cand;   // (dist2, index), reused
+            static std::vector<const DlDynLight*> s_dyn;              // G4b: twinless near lights uploaded
             s_cand.clear();
+            s_dyn.clear();
             uint32_t inRadius  = 0;  // diagnostics: within stream radius, pre-dedup/frustum
             uint32_t nearOwned = 0;  // diagnostics: dropped as near-path-owned
             float    nearestD2 = 3.4e38f;  // closest streamed light — read against nearOwn, it says at a
@@ -52828,7 +53838,32 @@ void destroyHostWindow(Renderer* R);
                 if (g_drawDistLights) {
                     // reachK (hoisted above) matches the near path so baked + live lights fade
                     // identically at the handoff.
-                    lc[0] = (float)nUp; lc[1] = reachK; lc[2] = 0.0f; lc[3] = 0.0f;
+                    // G4b: the near lights with no baked twin ride along (g_dlDynLights), same near-own
+                    // and frustum tests as a baked light; they take their slots FIRST, the nearest
+                    // baked lights fill the rest.
+                    s_dyn.clear();
+                    for (const DlDynLight& D : g_dlDynLights) {
+                        const float dx = D.x - eye[0], dy = D.y - eye[1], dz = D.z - eye[2];
+                        const float reach = D.radius * reachK;
+                        if (nearOwn > 0.0f && reach < nearOwn) {
+                            const float lim = nearOwn - reach;
+                            if (dx * dx + dy * dy + dz * dz <= lim * lim) { continue; }   // never reaches past
+                        }
+                        if (!dlSphereInFrustum(planes, dx, dy, dz, reach)) { continue; }
+                        if (s_dyn.size() >= kMaxPointLights / 4) { break; }
+                        s_dyn.push_back(&D);
+                    }
+                    const uint32_t nDyn = (uint32_t)s_dyn.size();
+                    if (nUp > kMaxPointLights - nDyn) { nUp = kMaxPointLights - nDyn; }
+                    lc[0] = (float)(nUp + nDyn); lc[1] = reachK; lc[2] = 0.0f; lc[3] = 0.0f;
+                    for (uint32_t k = 0; k < nDyn; ++k) {
+                        const DlDynLight& D = *s_dyn[k];
+                        float* e = lc + 4 + (nUp + k) * 12;
+                        e[0] = D.x - eye[0]; e[1] = D.y - eye[1]; e[2] = D.z - eye[2]; e[3] = D.radius;
+                        e[4] = D.col[0]; e[5] = D.col[1]; e[6] = D.col[2]; e[7] = 0.0f;
+                        decodeAuthoredRGB(e + 4);                 // as the near upload does
+                        e[8] = D.fo[0]; e[9] = D.fo[1]; e[10] = D.fo[2]; e[11] = 0.0f;   // its own falloff, no gobo
+                    }
                     for (uint32_t k = 0; k < nUp; ++k) {
                         const DlBakedLight& L = g_dlBakedLights[s_cand[k].second];
                         const float R = L.radius;
@@ -52848,10 +53883,19 @@ void destroyHostWindow(Renderer* R);
                         // MW ini-baked attenuation: c=0.36, l=0, q=3.25/R². Same coefficients the engine
                         // gives the near lights → distant is byte-identical, no shader change.
                         e[8] = kMWLightConstant; e[9] = 0.0f; e[10] = q; e[11] = 0.0f;   // k0,k1,k2 ; w=0
+                        // G2: the two lanes a baked entry never used carry its FIXTURE GOBO —
+                        // falloff.w = layer+1 (0 = none), colour.w = the packed rotation (raw bits;
+                        // the shader asuint's it back). gobosample.h.fsl reads them.
+                        if (g_distGobo && g_gobo.ready && L.fixture < g_gobo.usable.size()
+                            && g_gobo.usable[L.fixture]) {
+                            e[11] = (float)(L.fixture + 1u);
+                            std::memcpy(&e[7], &L.quatPacked, 4);
+                        }
                     }
                 } else {
                     lc[0] = 0.0f;   // count 0 -> distant frag light loop is a no-op
                     nUp = 0u;
+                    s_dyn.clear();
                 }
             }
 
@@ -52862,8 +53906,8 @@ void destroyHostWindow(Renderer* R);
                                                                : s_lastStreamed - streamed);
             if (delta >= 16u || (++s_throttle % 300) == 0) {
                 LOG::logline(">> [forge][dl] baked lights: %u in-radius -> %u near-owned dropped -> %u in-frustum"
-                             " -> %u uploaded (/ %zu, r=%.0f, nearOwn=%.0f, nearest=%.0f)",
-                             inRadius, nearOwned, streamed, nUp, g_dlBakedLights.size(),
+                             " -> %u uploaded + %zu twinless near (G4b) (/ %zu, r=%.0f, nearOwn=%.0f, nearest=%.0f)",
+                             inRadius, nearOwned, streamed, nUp, s_dyn.size(), g_dlBakedLights.size(),
                              g_dlBakedLightStreamR, nearOwn,
                              (inRadius ? std::sqrt(nearestD2) : -1.0f));
                 s_lastStreamed = streamed;
@@ -52876,7 +53920,8 @@ void destroyHostWindow(Renderer* R);
             // -> froxelDims.x=0 -> frags brute-loop. Slice metric = radial distance, matching the frag.
             float* mfd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             g_live.froxelActive = false;
-            if (g_live.froxelReady && g_useFroxel && g_drawDistLights && nUp > 0u && g_live.pFroxelParamsCbv) {
+            const uint32_t nAll = nUp + (uint32_t)s_dyn.size();   // baked + G4b twinless, as uploaded
+            if (g_live.froxelReady && g_useFroxel && g_drawDistLights && nAll > 0u && g_live.pFroxelParamsCbv) {
                 const float d0 = std::max(mfd[51], 256.0f);                        // nearViewRange (handoff) = slice near
                 const float d1 = std::max(g_dlBakedLightStreamR, d0 * 1.01f);      // stream radius = slice far
                 const uint32_t tile   = kFroxelTile;
@@ -52891,7 +53936,7 @@ void destroyHostWindow(Renderer* R);
                 std::memcpy(fp, mfd, 16 * sizeof(float));                          // [0..15] = gFrameData.viewProj
                 // ^ use the FRAME cbuffer's viewProj (what the DL vertex shader uses to make SV_Position),
                 //   NOT the `viewProj` param — guarantees the froxel projection matches the rasterized tile.
-                fp[16] = (float)tilesX;      fp[17] = (float)tilesY;      fp[18] = (float)kFroxelZSlices; fp[19] = (float)nUp;
+                fp[16] = (float)tilesX;      fp[17] = (float)tilesY;      fp[18] = (float)kFroxelZSlices; fp[19] = (float)nAll;
                 fp[20] = (float)g_live.width; fp[21] = (float)g_live.height; fp[22] = (float)tile;          fp[23] = (float)numWords;
                 fp[24] = d0; fp[25] = d1; fp[26] = logd0; fp[27] = invLog;
                 float* sph = fp + 28;
@@ -52901,6 +53946,11 @@ void destroyHostWindow(Renderer* R);
                     sph[k * 4 + 1] = L.y - eye[1];
                     sph[k * 4 + 2] = L.z - eye[2];
                     sph[k * 4 + 3] = L.radius * reachK;                            // reach = shader's posR.w * reachK
+                }
+                for (uint32_t k = 0; k < (uint32_t)s_dyn.size(); ++k) {         // G4b: after the baked, as uploaded
+                    const DlDynLight& D = *s_dyn[k];
+                    float* q = sph + (nUp + k) * 4;
+                    q[0] = D.x - eye[0]; q[1] = D.y - eye[1]; q[2] = D.z - eye[2]; q[3] = D.radius * reachK;
                 }
                 // gFrameData froxel fields: froxelDims @ float 116 (464B), froxelZ @ 120 (480B).
                 mfd[116] = (float)tilesX; mfd[117] = (float)tilesY; mfd[118] = (float)kFroxelZSlices; mfd[119] = (float)tile;
@@ -52913,7 +53963,7 @@ void destroyHostWindow(Renderer* R);
 
                 g_live.froxelActive     = true;
                 g_live.froxelNumWords   = numWords;
-                g_live.froxelLightCount = nUp;
+                g_live.froxelLightCount = nAll;
             } else {
                 mfd[116] = 0.0f;   // clustering off -> brute loop
             }
@@ -57482,6 +58532,10 @@ void destroyHostWindow(Renderer* R);
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsPipeline) { removePipeline(R, g_pSunShadowStaticsPipeline); g_pSunShadowStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsShader)   { removeShader(R, g_pSunShadowStaticsShader); g_pSunShadowStaticsShader = nullptr; }
+        for (Pipeline*& gp : g_gobo.pBakePso) { if (gp) { removePipeline(R, gp); gp = nullptr; } }
+        if (g_gobo.pBakeShader)   { removeShader(R, g_gobo.pBakeShader);     g_gobo.pBakeShader = nullptr; }
+        if (g_gobo.pArray)        { removeResource(g_gobo.pArray);           g_gobo.pArray = nullptr; }
+        g_gobo.ready = false;
         if (g_pGrassPipeline)          { removePipeline(R, g_pGrassPipeline);          g_pGrassPipeline = nullptr; }
         if (g_pGrassSunShadowPipeline) { removePipeline(R, g_pGrassSunShadowPipeline); g_pGrassSunShadowPipeline = nullptr; }
         if (g_pGrassSunShadowShader)   { removeShader(R, g_pGrassSunShadowShader);     g_pGrassSunShadowShader = nullptr; }

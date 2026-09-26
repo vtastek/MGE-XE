@@ -13,6 +13,7 @@
 // lockstep with multimap.frag / opaque.frag (Tier 1/2b/3a). Only the last RETURN differs.
 
 #include "opaque.srt.h"
+#include "gobosample.h.fsl" // fixtureGoboNear() — the near light's fixture self-shadow when it has no slot (G3)
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
@@ -119,7 +120,10 @@ float4 PS_MAIN( VSOutput In )
                 att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
 
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-                if (slotP1 != 0u)
+                // G3: slotless / goboForceNear -> the fixture gobo (lockstep with multimap.frag).
+                const bool useSlot = slotP1 != 0u && gLights.lightParams.z < 0.5f;
+                if (!useSlot) { att *= fixtureGoboNear(gLights.goboNear[i >> 1u], i, toLight); }
+                if (useSlot)
                 {
                     // FP1e: first-person parts (alphaShadowParams.y) sample the cube atlas DIRECTLY
                     // from the true world pos + geometric vertex normal — lockstep with
@@ -141,7 +145,8 @@ float4 PS_MAIN( VSOutput In )
                     // fully LIT (see alpha.frag, where the same fix removed bright MSAA edge lines in
                     // a shadowed cave). Route C draws bind only the main and FP PerFrame sets, both
                     // of which carry gShadowAtlas, so the direct test is always legal here.
-                    att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                    att *= goboSlotFade(fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u),
+                                        gLights.goboNear[i >> 1u], i, toLight, In.WorldPos, gLights.lightParams.w);   // G4
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);

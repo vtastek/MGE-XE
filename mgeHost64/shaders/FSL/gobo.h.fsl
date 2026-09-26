@@ -1,0 +1,88 @@
+// mgeHost64 — fixture GOBOS: the shared direction <-> texel mappings (tasks/forge-light-gobo.md).
+//
+// A gobo is the direction-only visibility of a light fixture's OWN geometry as seen from its light
+// (the AttachLight node): 1 = open, 0 = the cage/bowl/rim is in the way. One octahedral layer per
+// unique LIGH model, in MODEL space, so a placed light rotates the query into model space and one
+// layer serves every instance and every scale (the light and the mesh scale together).
+//
+// Two mappings live here because BOTH ends must agree bit for bit:
+//   * the OCTAHEDRAL map (goboresolve.comp writes it, the light loops read it),
+//   * the six CUBE FACES the bake rasterises (gobobake draws them, goboresolve.comp reads them).
+// The face basis is ALSO spelled out on the host (forgerender.cpp kGoboFace) — it builds the
+// per-face projection rows. Change one, change both.
+#pragma once
+
+// Octahedral encode: unit direction -> [0,1]^2. +Z (model up) is the centre, -Z the four corners.
+float2 goboOctEncode(float3 d)
+{
+    d /= max(abs(d.x) + abs(d.y) + abs(d.z), 1e-8f);
+    float2 p = d.xy;
+    if (d.z < 0.0f) {
+        float2 s = float2(p.x >= 0.0f ? 1.0f : -1.0f, p.y >= 0.0f ? 1.0f : -1.0f);
+        p = (1.0f - abs(p.yx)) * s;
+    }
+    return p * 0.5f + 0.5f;
+}
+
+// ...and back: [0,1]^2 -> unit direction.
+float3 goboOctDecode(float2 uv)
+{
+    float2 p = uv * 2.0f - 1.0f;
+    float3 d = float3(p.x, p.y, 1.0f - abs(p.x) - abs(p.y));
+    float  t = saturate(-d.z);
+    d.x += (d.x >= 0.0f) ? -t : t;
+    d.y += (d.y >= 0.0f) ? -t : t;
+    return normalize(d);
+}
+
+// Cube face basis. Face f looks along F with screen-right R and screen-up U; clip = (q.R, q.U, *, q.F)
+// for q = p - attach, so ndc = (dot(d,R), dot(d,U)) / dot(d,F). Faces sit left to right in the bake
+// atlas row: +X -X +Y -Y +Z -Z. MUST match forgerender.cpp kGoboFace.
+void goboFaceBasis(uint f, out float3 F, out float3 R, out float3 U)
+{
+    if      (f == 0u) { F = float3( 1, 0, 0); R = float3( 0, 1, 0); U = float3(0, 0, 1); }
+    else if (f == 1u) { F = float3(-1, 0, 0); R = float3( 0,-1, 0); U = float3(0, 0, 1); }
+    else if (f == 2u) { F = float3( 0, 1, 0); R = float3(-1, 0, 0); U = float3(0, 0, 1); }
+    else if (f == 3u) { F = float3( 0,-1, 0); R = float3( 1, 0, 0); U = float3(0, 0, 1); }
+    else if (f == 4u) { F = float3( 0, 0, 1); R = float3( 1, 0, 0); U = float3(0, 1, 0); }
+    else              { F = float3( 0, 0,-1); R = float3( 1, 0, 0); U = float3(0,-1, 0); }
+}
+
+// Unit direction -> (face, uv in [0,1]^2 with v DOWN, the viewport's texel order).
+uint goboCubeFace(float3 d, out float2 uv)
+{
+    float3 a = abs(d);
+    uint f;
+    if (a.x >= a.y && a.x >= a.z) { f = (d.x >= 0.0f) ? 0u : 1u; }
+    else if (a.y >= a.z)          { f = (d.y >= 0.0f) ? 2u : 3u; }
+    else                          { f = (d.z >= 0.0f) ? 4u : 5u; }
+    float3 F, R, U;
+    goboFaceBasis(f, F, R, U);
+    float w = dot(d, F);
+    uv = float2(dot(d, R) / w * 0.5f + 0.5f, 0.5f - dot(d, U) / w * 0.5f);
+    return f;
+}
+
+// Rotate v by the conjugate of unit quaternion q = (x,y,z,w). q maps MODEL -> WORLD (lights.data v3:
+// world = q v q*), so this maps a WORLD direction into the fixture's model space.
+float3 goboQuatRotateInv(float4 q, float3 v)
+{
+    float3 u = -q.xyz;
+    float3 t = 2.0f * cross(u, v);
+    return v + q.w * t + cross(u, t);
+}
+
+// Unpack the fixture's MODEL->WORLD rotation from its light's colour.w lane (G2): smallest-three,
+// 2 bits = index of the largest component (which the host made positive), then the other three in
+// x,y,z,w order at 10 bits each over [-1/sqrt2, 1/sqrt2]. MUST match forgerender.cpp goboPackQuat.
+float4 goboQuatUnpack(uint p)
+{
+    uint   big = p >> 30;
+    float3 s   = float3((float)((p >> 20) & 1023u), (float)((p >> 10) & 1023u), (float)(p & 1023u))
+               * (1.41421356f / 1023.0f) - 0.70710678f;
+    float  m   = sqrt(saturate(1.0f - dot(s, s)));
+    if (big == 0u) { return float4(m, s.x, s.y, s.z); }
+    if (big == 1u) { return float4(s.x, m, s.y, s.z); }
+    if (big == 2u) { return float4(s.x, s.y, m, s.z); }
+    return float4(s.x, s.y, s.z, m);
+}

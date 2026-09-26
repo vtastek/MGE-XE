@@ -14,6 +14,7 @@
 // (see [[project_forge_shared_frag_vsoutput]] — a mismatched vert hangs the GPU).
 
 #include "opaque.srt.h"
+#include "gobosample.h.fsl" // fixtureGoboNear() — the near light's fixture self-shadow when it has no slot (G3)
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
@@ -194,9 +195,13 @@ float4 PS_MAIN( VSOutput In )
             // ours to step to. The direct test answers from this fragment's own world position,
             // exactly what the ghost/FP branch already relied on. Verified in play: lines gone.
             // (Its filter is the atlas's own bilinear compare, not the mask's PCF grid.)
-            if (receiveShadows && slotP1 != 0u && !inReflect)
+            // G3: slotless / mirror / goboForceNear -> the fixture gobo, for receivers only.
+            const bool useSlot = slotP1 != 0u && !inReflect && gLights.lightParams.z < 0.5f;
+            if (receiveShadows && !useSlot) { att *= fixtureGoboNear(gLights.goboNear[i >> 1u], i, toLight); }
+            if (receiveShadows && useSlot)
             {
-                att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                att *= goboSlotFade(fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u),
+                                        gLights.goboNear[i >> 1u], i, toLight, In.WorldPos, gLights.lightParams.w);   // G4
             }
             else if (receiveShadows && slotP1 != 0u && !inReflect)   // screen-space mask — see inReflect
             {
@@ -205,7 +210,8 @@ float4 PS_MAIN( VSOutput In )
                 uint  lane = s >> 3u;
                 uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
                 uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                att *= float(nib) * (1.0f / 15.0f);
+                att *= goboSlotFade(float(nib) * (1.0f / 15.0f), gLights.goboNear[i >> 1u], i, toLight, In.WorldPos,
+                                        gLights.lightParams.w);   // G4: fade to the gobo before the handover
             }
 
             float  ndlp    = dot(N, toLight) * invDist;

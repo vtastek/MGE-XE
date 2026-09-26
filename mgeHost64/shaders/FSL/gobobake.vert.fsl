@@ -1,0 +1,53 @@
+// mgeHost64 — fixture GOBO bake, vertex stage (tasks/forge-light-gobo.md G1).
+//
+// Draws a fixture mesh (fixture_meshes, the static_meshes StaticElem layout) into one cube face of
+// the bake atlas. Same two vertex bindings as statics.vert so the bake PSO reuses its vertex layout,
+// but the per-instance "world" rows carry the WHOLE model->clip transform for that face: the host
+// folds the attach offset, the face basis and the projection into them (forgerender.cpp
+// goboFaceRows). So there is no frame cbuffer, no lighting and no fog here — nothing but the clip
+// position and what the frag's cutout + carve need.
+//
+// Params — the host has already run the NEAR caster's per-part decision (goboBake), so these are its
+// verdict, not raw material data: x = packed texSlot (bucket<<16|layer), y = flags (bit1 = cut out),
+// z = the emissive carve threshold (g_shadowEmissiveTexel for an emissive-hot part, 0 = no carve),
+// w = the cutout ref.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float4, Position, POSITION);    // FLOAT16_4 model pos (w = 1)
+    DATA(float4, Normal,   NORMAL);      // UBYTE4N: xyz normal, w = emissive
+    DATA(float4, Color,    COLOR);
+    DATA(float2, Uv,       TEXCOORD0);
+    DATA(float4, W0, TEXCOORD1);
+    DATA(float4, W1, TEXCOORD2);
+    DATA(float4, W2, TEXCOORD3);
+    DATA(float4, W3, TEXCOORD4);
+    DATA(float4, InstParams, TEXCOORD5);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float2,       Uv,       TEXCOORD0);
+    DATA(FLAT(uint),   TexIndex, TEXCOORD1);
+    DATA(FLAT(uint),   Flags,    TEXCOORD2);
+    DATA(FLAT(float),  Thr,      TEXCOORD3);
+    DATA(FLAT(float),  Ref,      TEXCOORD4);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+    Out.Position = In.Position.x * In.W0 + In.Position.y * In.W1
+                 + In.Position.z * In.W2 + In.Position.w * In.W3;
+    Out.Uv       = In.Uv;
+    Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
+    Out.Flags    = (uint)(In.InstParams.y + 0.5f);
+    Out.Thr      = In.InstParams.z;
+    Out.Ref      = In.InstParams.w;
+    RETURN(Out);
+}

@@ -846,3 +846,19 @@
 #comp mbgather.comp
 #include "mbgather.comp.fsl"
 #end
+
+// FIXTURE GOBOS (tasks/forge-light-gobo.md G1). gobobake draws each light fixture's own mesh into six
+// cube faces from its AttachLight (statics vertex layout, the whole model->clip transform in the
+// instance rows, so no frame cbuffer); goboresolve folds each fixture's faces into one octahedral
+// R8 layer of the gobo array. One-shot at DL live init.
+#vert gobobake.vert
+#include "gobobake.vert.fsl"
+#end
+
+#frag gobobake.frag
+#include "gobobake.frag.fsl"
+#end
+
+#comp goboresolve.comp
+#include "goboresolve.comp.fsl"
+#end

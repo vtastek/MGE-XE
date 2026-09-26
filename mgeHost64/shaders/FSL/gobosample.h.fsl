@@ -1,0 +1,67 @@
+// mgeHost64 — fixture GOBO lookup for the BAKED (distant) light loops (tasks/forge-light-gobo.md G2).
+//
+// Needs opaque.srt.h first (gGoboArray). Not in gobo.h.fsl because goboresolve.comp includes that
+// under its own SRT, where gGoboArray does not exist.
+//
+// Named "fixture" gobo to keep it apart from W32's caustic "mirror gobo" (causticProjector), which
+// sits in the same loops and is an unrelated thing.
+//
+// The two lanes are the ones a baked entry never used (forgerender.cpp, the Phase C fill):
+//   falloff.w = gobo layer + 1 (0 = this light has no fixture, or distGobo is off -> 1.0, no fetch);
+//   colour.w  = the fixture's MODEL->WORLD rotation, smallest-three packed (gobo.h.fsl goboQuatUnpack).
+// ⚠ NEVER call this on the NEAR list: there colour.w is the id/flags lane and falloff.w the shadow slot.
+//
+// The array stores OCCLUSION (0 = open), not visibility. An unbound PerFrame slot reads zero
+// (project_forge_perframe_set_instances), so a set that missed the bind shows the pre-gobo image —
+// every fixture open — rather than every fixture light gone black.
+#pragma once
+#include "gobo.h.fsl"
+
+// Forge's SampleLvlTex2DArray is typed Texture3D (project_forge_fsl_lvl_array_sampler_typed_3d);
+// local macro, named per file like the other three.
+#define SampleLvlGoboArray(N, S, C, L)  N.SampleLevel(S, C, L)
+
+// toL = light - fragment (any common origin); layerP1 = falloff.w; quatBits = colour.w.
+float fixtureGoboVis(float3 toL, float layerP1, float quatBits)
+{
+    if (layerP1 < 0.5f) { return 1.0f; }
+    float4 q  = goboQuatUnpack(asuint(quatBits));
+    float2 uv = goboOctEncode(goboQuatRotateInv(q, -toL));   // light -> fragment, in model space
+    float  occ = SampleLvlGoboArray(gGoboArray, gSamplerBilinearClamp, float3(uv, layerP1 - 1.0f), 0.0f).r;
+    return 1.0f - occ;
+}
+
+// NEAR list (G3): light i's gobo from the goboNear tail. `g` = <list>.goboNear[i >> 1] — the caller
+// names the list (gLights on near geometry, gLightsNear on terrain/grass).
+// Entry .x = layer+1 (0 = no gobo), NEGATED as -(layer+1) - 1 when the light has NO baked twin (G4b:
+// the host's dlHasBakedTwin) — so a torch reads e.x <= -1 and still decodes to its layer. The host
+// fades such a light's COLOUR as a whole before the handover; nothing here reads the flag.
+float fixtureGoboNear(float4 g, uint i, float3 toL)
+{
+    float2 e = ((i & 1u) != 0u) ? g.zw : g.xy;
+    return fixtureGoboVis(toL, (e.x < 0.0f) ? (-e.x - 1.0f) : e.x, e.y);
+}
+
+// 0 -> 1 over the last `band` units before the near/far light handover (gFrameData.lodParams.x, 0 in
+// an interior = never). The one ramp G4 and G4b share, so the shadow and the light fade together.
+float nearHandoverT(float3 worldPosRel, float band)
+{
+    float hand = gFrameData.lodParams.x;
+    if (band <= 0.0f || hand <= band) { return 0.0f; }
+    return smoothstep(hand - band, hand, length(worldPosRel));
+}
+
+// G4: a SLOTTED near light's shadow, faded into its gobo before the near/far handover. Past
+// gFrameData.lodParams.x a fragment is lit by the BAKED list (terrain's pick; DL statics beyond MW's
+// reach), and a baked light carries only its gobo — so the full shadow (walls, NPCs, the cage) fades
+// out over the last `band` units and the gobo alone arrives at the handover, where the baked light
+// takes over with the same gobo: the cage runs straight through and only the world shadow fades.
+//   sv = the slot's own visibility; band = <near list>.lightParams.w (0 = off); lodParams.x = 0 in an
+//   interior (no handover) and far past an arm, so both leave sv untouched. A light with no usable
+//   gobo fades to 1 (open) — the plain sphere the baked arm will draw.
+float goboSlotFade(float sv, float4 g, uint i, float3 toL, float3 worldPosRel, float band)
+{
+    float t = nearHandoverT(worldPosRel, band);
+    if (t <= 0.0f) { return sv; }
+    return lerp(sv, fixtureGoboNear(g, i, toL), t);
+}

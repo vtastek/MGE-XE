@@ -1,0 +1,44 @@
+// mgeHost64 — fixture GOBO resolve: cube-face atlas -> octahedral layer (tasks/forge-light-gobo.md G1).
+//
+// One thread per octahedral texel. A 4x4 grid of sub-texel directions, each looked up in the cube
+// face it falls in (point load), averaged: a box filter of the binary visibility over the texel's
+// footprint, so a bar edge comes out as a soft ramp the way the near PCF softens it — not as a
+// stair-step that would crawl across the ground as the light's rotation quantises.
+//
+// The face faceRes is 2x the oct resolution, so each oct texel spans ~2x2 face texels at the
+// equator; the 16 sub-samples over-sample that comfortably.
+
+#include "goboresolve.srt.h"
+#include "gobo.h.fsl"
+
+#define GOBO_RESOLVE_THREADS 8
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(GOBO_RESOLVE_THREADS, GOBO_RESOLVE_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+    uint4 dims = gGoboResolveParams.dims;
+    uint  oct  = dims.w;
+    uint  face = dims.z;
+    // NB: RETURN() must start its own line — fsl.py only rewrites a line-leading RETURN.
+    if (did.x >= oct || did.y >= oct || did.z >= dims.y) {
+        RETURN();
+    }
+
+    float sum = 0.0f;
+    for (uint j = 0u; j < 4u; ++j) {
+        for (uint i = 0u; i < 4u; ++i) {
+            float2 uv = (float2((float)did.x, (float)did.y) + (float2((float)i, (float)j) + 0.5f) * 0.25f)
+                      / (float)oct;
+            float2 fuv;
+            uint   f  = goboCubeFace(goboOctDecode(uv), fuv);
+            int2   px = int2(clamp(fuv * (float)face, 0.0f, (float)face - 1.0f));
+            px += int2((int)(f * face), (int)(did.z * face));
+            sum += LoadTex2D(gGoboCube, NO_SAMPLER, px, 0).r;
+        }
+    }
+    // Stored as OCCLUSION (1 - open): an unbound read of the array is then "open" (gobosample.h.fsl).
+    Write3D(gGoboOut, int3((int)did.x, (int)did.y, (int)(dims.x + did.z)), 1.0f - sum * (1.0f / 16.0f));
+    RETURN();
+}
