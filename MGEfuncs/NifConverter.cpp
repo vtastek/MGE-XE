@@ -62,6 +62,13 @@ static uint32_t g_heroRecordCount = 0; // backpatched into the hero_anim.data he
 // instead of dropping them. Toggled by the SetAllowTexturelessShapes export around a sky bake.
 static bool g_allowTextureless = false;
 
+// Fixture-gobo library export (tasks/forge-light-gobo.md): set by SetFixtureMode around the fixture
+// pass. It (1) writes the alpha test/blend/not-over bits into flags[1] bits 5-7, (2) skips the
+// merge-by-texture, so each subset is one source shape like the near shadow casters it must match,
+// and (3) takes a NiLODNode's nearest level instead of the one-cell one — a fixture is baked at
+// full detail. Default off = distant statics generation is byte-for-byte unchanged.
+static bool g_fixtureMode = false;
+
 // --- Glow in the Dahrk day/night window variants ---
 // GitD ships each window mesh as a NiSwitchNode with children named "off" / "on" / "int-day" and
 // bakes indexActive = 0 = OFF into the file. SearchShapes used to resolve that switch with
@@ -162,6 +169,8 @@ struct ExportedNode {
     float emissive;
     bool alphaTestEnabled;
     bool alphaBlendEnabled;
+    bool alphaNotOver;       // blend enabled but NOT alpha-over (dst != 1-srcA): additive glow etc.
+    bool alphaTestLive;      // alpha test enabled WITH a threshold > 0 (a 0 ref passes every texel)
     bool hasUVController;
     unsigned char variant;   // SubsetVariant — GitD day/night window pair member, or kVariantAll
     // Fixed-function stage op for a multi-map layer above the base: 0 = not a layer (the base, or
@@ -174,13 +183,13 @@ struct ExportedNode {
 
     ExportedNode() :
         center(0,0,0), radius(0), verts(0), faces(0), emissive(0),
-        alphaTestEnabled(false), alphaBlendEnabled(false), hasUVController(false),
+        alphaTestEnabled(false), alphaBlendEnabled(false), alphaNotOver(false), alphaTestLive(false), hasUVController(false),
         variant(kVariantAll), layerOp(0) {
     }
 
     ExportedNode(const ExportedNode& src) :
         center(0,0,0), radius(0), verts(0), faces(0), emissive(0),
-        alphaTestEnabled(false), alphaBlendEnabled(false), hasUVController(false),
+        alphaTestEnabled(false), alphaBlendEnabled(false), alphaNotOver(false), alphaTestLive(false), hasUVController(false),
         variant(kVariantAll), layerOp(0) {
 
         *this = src;
@@ -196,6 +205,8 @@ struct ExportedNode {
         emissive = src.emissive;
         alphaTestEnabled = src.alphaTestEnabled;
         alphaBlendEnabled = src.alphaBlendEnabled;
+        alphaNotOver = src.alphaNotOver;
+        alphaTestLive = src.alphaTestLive;
         hasUVController = src.hasUVController;
         variant = src.variant;
         layerOp = src.layerOp;
@@ -380,6 +391,15 @@ struct ExportedNode {
                                  | (variant == kVariantNight ? 0x2 : 0)    // bit1: night-only variant
                                  | (variant == kVariantDay   ? 0x4 : 0)    // bit2: day-only variant
                                  | ((layerOp & 0x3)         << 3));      // bits3-4: layer op (1 MOD, 2 MOD2X, 3 ADD)
+        // Fixture library only (g_fixtureMode): the alpha state the gobo bake needs to reproduce the
+        // near shadow caster's rules, which flags[0] collapses into one bool. static_meshes never
+        // gets these bits, so it stays byte-identical. bit5 = alpha TEST with a ref > 0, bit6 = alpha BLEND,
+        // bit7 = the blend is not alpha-over (additive glow: light, not an occluder).
+        if (g_fixtureMode) {
+            flags[1] |= (unsigned char)((alphaTestLive     ? 0x20 : 0)
+                                      | (alphaBlendEnabled ? 0x40 : 0)
+                                      | (alphaNotOver      ? 0x80 : 0));
+        }
         WriteFile(file, &flags, 2, &unused, 0);
 
         // Write texture name
@@ -522,8 +542,9 @@ private:
             RootCollisionNodeRef collision = DynamicCast<RootCollisionNode>(rootObj);
 
             if (lod) {
-                // Pick LOD level with 1 cell equivalent distance, which may result in no node selected
-                const float lodDist = 8192.0f;
+                // Pick LOD level with 1 cell equivalent distance, which may result in no node selected.
+                // A fixture bakes its nearest level (g_fixtureMode).
+                const float lodDist = g_fixtureMode ? 0.0f : 8192.0f;
                 const auto levels = lod->GetLODLevels();
                 int index = -1;
 
@@ -718,6 +739,11 @@ private:
         if (niAlphaProp) {
             node->alphaTestEnabled = niAlphaProp->GetTestState();
             node->alphaBlendEnabled = niAlphaProp->GetBlendState();
+            node->alphaNotOver = node->alphaBlendEnabled
+                              && niAlphaProp->GetDestBlendFunc() != NiAlphaProperty::BF_ONE_MINUS_SRC_ALPHA;
+            // pc_colouredglass lanterns ship test ON with ref 0: that test rejects nothing, and the
+            // near caster (which reads the real ref) treats the part as an untested blend.
+            node->alphaTestLive = node->alphaTestEnabled && niAlphaProp->GetTestThreshold() > 0;
             // Hero mode captures the full blend/test state per subset (the legacy bake collapses both
             // to one bool; the host would then draw a translucent fence as an opaque cutout).
             if (g_heroMode) {
@@ -904,7 +930,7 @@ public:
         // NiTriShape over the SAME tx_gg_fence_01 texture, and the interference between them at 2:1
         // scroll speeds IS the effect. Merging would collapse them to one subset (one UV offset) and
         // kill it. Keep every subset distinct so each carries its own controller + alpha state.
-        if (!g_heroMode) {
+        if (!g_heroMode && !g_fixtureMode) {
         for (size_t i = 0; i < nodes.size(); ++i) {
             // GitD day/night window variants are ALTERNATIVES, not layers, and they can share a
             // texture (the "on" child often just indexes a glow region of the same atlas). Merging
@@ -1250,4 +1276,46 @@ extern "C" void __stdcall EndStaticCreation() {
 // Default off, so ordinary distant-land statics generation is completely unaffected.
 extern "C" void __stdcall SetAllowTexturelessShapes(int on) {
     g_allowTextureless = (on != 0);
+}
+
+// Fixture-gobo library export toggle (see g_fixtureMode). The C# driver brackets the fixture pass.
+extern "C" void __stdcall SetFixtureMode(int on) {
+    g_fixtureMode = (on != 0);
+}
+
+// Depth-first search for the node MW hangs a LIGH's NiPointLight under.
+static NiAVObjectRef FindNamedNode(NiAVObjectRef obj, const char* name) {
+    if (!obj) { return nullptr; }
+    if (_stricmp(obj->GetName().c_str(), name) == 0) { return obj; }
+    NiNodeRef node = DynamicCast<NiNode>(obj);
+    if (node) {
+        for (auto child : node->GetChildren()) {
+            NiAVObjectRef hit = FindNamedNode(child, name);
+            if (hit) { return hit; }
+        }
+    }
+    return nullptr;
+}
+
+// Model-space position of a light mesh's "AttachLight" node (fixture gobos, tasks/forge-light-gobo.md).
+// The near light sits THERE, not at the reference origin (light_sconce00: +17.6 u), so a baked
+// distant light placed at the ref origin jumps at the near/far handover. Same frame as the vertices
+// ProcessNif exports: root transform reset to identity, then the node's world transform applied to
+// the origin exactly as ExportShape applies it to each vertex. Returns 1 if found, else 0 and out = 0.
+extern "C" int __stdcall GetNifAttachLight(char* data, int datasize, float* out) {
+    out[0] = out[1] = out[2] = 0.0f;
+    NiAVObjectRef rootObj;
+    try {
+        istrstream s(data, datasize);
+        rootObj = DynamicCast<NiAVObject>(ReadNifTree(s, 0));
+    } catch (std::runtime_error&) {
+        return 0;
+    }
+    if (!rootObj) { return 0; }
+    rootObj->SetLocalTransform(Matrix44::IDENTITY);
+    NiAVObjectRef attach = FindNamedNode(rootObj, "AttachLight");
+    if (!attach) { return 0; }
+    const Vector3 p = attach->GetWorldTransform() * Vector3(0.0f, 0.0f, 0.0f);
+    out[0] = p.x; out[1] = p.y; out[2] = p.z;
+    return 1;
 }

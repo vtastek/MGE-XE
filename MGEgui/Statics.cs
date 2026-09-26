@@ -221,6 +221,11 @@ namespace MGEgui {
         public const string fn_grassbin = fn_dl + @"\statics\grass.bin";
         public const string fn_heroanim = fn_dl + @"\statics\hero_anim.data";
         public const string fn_lightsdata = fn_dl + @"\lights.data";
+        // Fixture gobos (tasks/forge-light-gobo.md): every LIGH model a baked light uses, exported at
+        // full detail (no MinSize cut) in the static_meshes format, record N = fixture index N; and
+        // the table that goes with it (attach offsets, radii, LIGH object id -> fixture index).
+        public const string fn_fixturemesh = fn_dl + @"\statics\fixture_meshes";
+        public const string fn_fixturedata = fn_dl + @"\statics\fixtures.data";
         public const string fn_stattex = fn_dl + @"\statics\textures";
         public const string fn_postShaders = fn_dataFiles + @"\shaders\XEshaders";
         public const string fn_testImagePath = "MGE3";

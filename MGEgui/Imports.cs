@@ -34,6 +34,15 @@ namespace MGEgui {
         internal static extern float ProcessNif(
             [MarshalAs(UnmanagedType.LPArray)] byte[] data, int datasize, float simplify, float cutoff, byte static_type);
 
+        // Fixture-gobo library export: alpha bits in flags[1], no texture merge, nearest LOD. Bracket the fixture pass.
+        [DllImport("MGE3/MGEfuncs.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi, EntryPoint = "SetFixtureMode")]
+        internal static extern void SetFixtureMode(int on);
+
+        // Model-space position of a light mesh's AttachLight node (fixture gobos). 1 = found, 0 = absent.
+        [DllImport("MGE3/MGEfuncs.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi, EntryPoint = "GetNifAttachLight")]
+        internal static extern int GetNifAttachLight(
+            [MarshalAs(UnmanagedType.LPArray)] byte[] data, int datasize, [Out, MarshalAs(UnmanagedType.LPArray, SizeConst = 3)] float[] outPos);
+
         [DllImport("MGE3/MGEfuncs.dll", CallingConvention = CallingConvention.StdCall,
             CharSet = CharSet.Ansi, EntryPoint = "TessellateLandscapeAtlased")]
         internal static extern void TessellateLandscapeAtlased([MarshalAs(UnmanagedType.LPStr)] string file_path,

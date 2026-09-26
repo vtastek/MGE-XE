@@ -1062,21 +1062,28 @@ namespace MGEgui.DistantLand {
             // ("") only -- distant lighting is an exterior concern. Record layout per light:
             //   float posX,posY,posZ; float radius; byte r,g,b; byte flags(bit0=hasMesh);
             //   ushort visIndex   (v2; 0 = ungated, else the dynamic-vis group that gates it)
+            //   ushort fixtureIndex; short quat[4]   (v3; fixture gobos -- see BuildFixtureLibrary.
+            //   v3 also moves the position from the reference origin to the AttachLight node.)
             // Negative + OffByDefault lights were already dropped at parse (never enter LightDefs).
             // Radius is the base LHDT radius (vanilla does not scale light range by ref XSCL).
             Dictionary<string, LightReference> mainLights;
             if (!UsedLightsList.TryGetValue("", out mainLights)) {
                 mainLights = new Dictionary<string, LightReference>();
             }
-            int lightsMeshless = 0;
+            int lightsMeshless = 0, lightsAttached = 0, lightsFixture = 0;
+            dlFixtures = BuildFixtureLibrary(mainLights, staticsWarnings);
             using (var lbw = new BinaryWriter(File.Create(Statics.fn_lightsdata), Statics.ESPEncoding)) {
-                lbw.Write((int)2);              // version (v2 = + ushort visIndex per record)
+                lbw.Write((int)3);              // version (v3 = + fixtureIndex + quat, AttachLight position)
                 lbw.Write(mainLights.Count);
                 foreach (var lp in mainLights) {
                     if (!lp.Value.HasMesh) { lightsMeshless++; }
+                    if (lp.Value.Attached) { lightsAttached++; }
+                    if (lp.Value.FixtureIndex != 0xFFFF) { lightsFixture++; }
                     lp.Value.Write(lbw);
                 }
             }
+            dlLightsAttached = lightsAttached;
+            dlLightsFixture = lightsFixture;
             dlLightsBaked = mainLights.Count;
             dlLightsMeshless = lightsMeshless;
             dlLightsSkipped = lightsSkippedFlagged;
@@ -1158,6 +1165,33 @@ namespace MGEgui.DistantLand {
                     }
                 }
 
+                // Fixture gobo meshes cut out their alpha on the host as well, and most light
+                // textures live in BSAs the host cannot read, so they need LOD copies here too. Sized
+                // by the fixture's own bound; a texture a real static already uses keeps its size.
+                if (File.Exists(Statics.fn_fixturemesh)) {
+                    using (var br = new BinaryReader(File.OpenRead(Statics.fn_fixturemesh), Statics.ESPEncoding)) {
+                        while (br.BaseStream.Position < br.BaseStream.Length) {
+                            int nodes = br.ReadInt32();
+                            br.BaseStream.Position += 17; // Byte count: 4 - radius, 12 - center, 1 - type
+                            for (int j = 0; j < nodes; j++) {
+                                float radius = br.ReadSingle();
+                                br.BaseStream.Position += 36;
+                                int verts = br.ReadInt32();
+                                int faces = br.ReadInt32();
+                                br.BaseStream.Position += verts * vert_size + faces * face_size;
+                                br.BaseStream.Position += 2;
+                                short chars = br.ReadInt16();
+                                string path = new string(br.ReadChars(chars - 1));
+                                br.BaseStream.Position += 1;
+                                if (path.Length > 0 && !texMaxExtent.ContainsKey(path)) {
+                                    texMaxExtent[path] = 2.0f * radius;
+                                    texFirstName[path] = "light fixture";
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Phase 2: create one LOD texture per unique path, sized by its largest user.
                 var texStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 foreach (var kv in texMaxExtent) {
@@ -1200,6 +1234,7 @@ namespace MGEgui.DistantLand {
         private List<string> dlMipFixedPaths;
         private List<string> dlBsaSkippedPaths;
         private int dlLightsBaked, dlLightsMeshless, dlLightsSkipped;
+        private int dlFixtures, dlLightsAttached, dlLightsFixture;
         private long dlGrassDiverted; private int dlGrassModels; private bool dlProcGrass;
         private int dlLtbdModded; private bool dlLtbdActive; private float dlLtbdScale;
 
@@ -1279,6 +1314,7 @@ namespace MGEgui.DistantLand {
                      + "\r\n  of those, " + dlParamMaps + " PBR companion maps (_paramh)"
                      + "\r\nDistant textures stage: " + dlStaticsTexMs + " ms";
             summary += "\r\nBaked distant lights: " + dlLightsBaked + " (" + dlLightsMeshless + " meshless, " + dlLightsSkipped + " skipped negative/off-by-default)";
+            summary += "\r\nLight fixtures: " + dlFixtures + " meshes, " + dlLightsAttached + " lights moved to AttachLight, " + dlLightsFixture + " with a gobo";
             if (dlProcGrass) {
                 // This count must equal mgeBake64 --grass's blade total for the same plugin list;
                 // if it does not, the two halves disagree about what grass is and the field will
@@ -2118,15 +2154,22 @@ namespace MGEgui.DistantLand {
             public int Flags;
             public bool HasMesh;
             public int VisIndex;
+            public string Model;    // null when meshless; the fixture-gobo key
         }
 
         private class LightReference {
             public float X, Y, Z;
+            public float Yaw, Pitch, Roll;
             public float Scale;
             public float Radius;
             public byte R, G, B;
             public bool HasMesh;
             public int VisIndex;
+            public string Model;                        // null when meshless
+            // v3 (fixture gobos), filled by BuildFixtureLibrary:
+            public bool Attached;                       // position moved to the AttachLight node
+            public ushort FixtureIndex = 0xFFFF;        // fixture_meshes record, 0xFFFF = none
+            public short[] Quat = { 0, 0, 0, 32767 };   // model->world rotation, int16 snorm x,y,z,w
 
             public void Write(BinaryWriter bw) {
                 bw.Write(X);
@@ -2138,7 +2181,188 @@ namespace MGEgui.DistantLand {
                 bw.Write(B);
                 bw.Write((byte)(HasMesh ? 1 : 0));
                 bw.Write((ushort)VisIndex);
+                bw.Write(FixtureIndex);
+                bw.Write(Quat[0]);
+                bw.Write(Quat[1]);
+                bw.Write(Quat[2]);
+                bw.Write(Quat[3]);
             }
+        }
+
+        // The host's DL-statics placement rotation, transcribed element for element from
+        // forgerender.cpp buildStaticsScope: Scale * RotZ(-roll) * RotY(-pitch) * RotX(-yaw) *
+        // Translate, D3DX row vectors. 3x3 row-major; world_row = model_row * M. Keep the two in
+        // lockstep: a baked light and the mesh it hangs on must agree on which way the mesh faces.
+        private static float[] RefRotationRowMajor(float yaw, float pitch, float roll) {
+            double cz = Math.Cos(-roll),  sz = Math.Sin(-roll);
+            double cy = Math.Cos(-pitch), sy = Math.Sin(-pitch);
+            double cx = Math.Cos(-yaw),   sx = Math.Sin(-yaw);
+            double[] rz = { cz, sz, 0, -sz, cz, 0, 0, 0, 1 };
+            double[] ry = { cy, 0, -sy, 0, 1, 0, sy, 0, cy };
+            double[] rx = { 1, 0, 0, 0, cx, sx, 0, -sx, cx };
+            double[] m = Mul3(Mul3(rz, ry), rx);
+            var f = new float[9];
+            for (int i = 0; i < 9; ++i) { f[i] = (float)m[i]; }
+            return f;
+        }
+
+        private static double[] Mul3(double[] a, double[] b) {
+            var r = new double[9];
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    r[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+                }
+            }
+            return r;
+        }
+
+        // Unit quaternion (x,y,z,w) rotating a MODEL-space vector into world, world = q v q*, i.e.
+        // the same rotation as world_row = model_row * M. Canonical w >= 0, stored int16 snorm.
+        private static short[] RowMatrixToQuatSnorm(float[] M) {
+            // Column-vector form C = M^T (C[r][c] = M[c*3+r]), then the standard trace branch.
+            double c00 = M[0], c01 = M[3], c02 = M[6];
+            double c10 = M[1], c11 = M[4], c12 = M[7];
+            double c20 = M[2], c21 = M[5], c22 = M[8];
+            double x, y, z, w, s;
+            double tr = c00 + c11 + c22;
+            if (tr > 0.0) {
+                s = Math.Sqrt(tr + 1.0) * 2.0;
+                w = 0.25 * s; x = (c21 - c12) / s; y = (c02 - c20) / s; z = (c10 - c01) / s;
+            } else if (c00 > c11 && c00 > c22) {
+                s = Math.Sqrt(1.0 + c00 - c11 - c22) * 2.0;
+                w = (c21 - c12) / s; x = 0.25 * s; y = (c01 + c10) / s; z = (c02 + c20) / s;
+            } else if (c11 > c22) {
+                s = Math.Sqrt(1.0 + c11 - c00 - c22) * 2.0;
+                w = (c02 - c20) / s; x = (c01 + c10) / s; y = 0.25 * s; z = (c12 + c21) / s;
+            } else {
+                s = Math.Sqrt(1.0 + c22 - c00 - c11) * 2.0;
+                w = (c10 - c01) / s; x = (c02 + c20) / s; y = (c12 + c21) / s; z = 0.25 * s;
+            }
+            double n = Math.Sqrt(x * x + y * y + z * z + w * w);
+            if (w < 0.0) { n = -n; }
+            return new short[] { Snorm16(x / n), Snorm16(y / n), Snorm16(z / n), Snorm16(w / n) };
+        }
+
+        private static short Snorm16(double v) {
+            return (short)Math.Round(Math.Max(-1.0, Math.Min(1.0, v)) * 32767.0);
+        }
+
+        // 32-bit FNV-1a over the lowercase object id -- the fixtures.data key for near lights (G3).
+        private static uint FixtureIdHash(string id) {
+            uint h = 2166136261u;
+            foreach (byte b in Statics.ESPEncoding.GetBytes(id)) {
+                h ^= b;
+                h *= 16777619u;
+            }
+            return h;
+        }
+
+        // Fixture gobos (tasks/forge-light-gobo.md). For every LIGH model a baked light uses:
+        //  1. read its AttachLight offset and move each light there, ref + R*(S*attach) with R from
+        //     RefRotationRowMajor -- the near light sits at that node, not at the reference origin;
+        //  2. export the model ONCE at full detail (MinSize 0, no simplify) into fixture_meshes, in the
+        //     static_meshes format so the host reuses its loader; record N there = fixture index N;
+        //  3. write fixtures.data: magic MGFX, int version 2, int fixtureCount, int idCount; per
+        //     fixture float attach[3], float boundRadius, ushort len + model path bytes; then per LIGH
+        //     object id: uint FNV-1a(lowercase id), ushort fixtureIndex, ushort 0.
+        // Returns the number of fixtures exported.
+        private int BuildFixtureLibrary(Dictionary<string, LightReference> lights, List<string> warnings) {
+            var models = new List<string>();
+            var seen = new HashSet<string>();
+            foreach (var lp in lights) {
+                string m = lp.Value.Model;
+                if (m != null && seen.Add(m)) { models.Add(m); }
+            }
+            models.Sort(StringComparer.Ordinal);
+
+            var attach = new Dictionary<string, float[]>();
+            var fixtureIndex = new Dictionary<string, int>();
+            var fixtureModels = new List<string>();
+            var fixtureRadius = new List<float>();
+            unsafe {
+                NativeMethods.BeginStaticCreation((IntPtr)DXMain.device.ComPointer, Statics.fn_fixturemesh);
+            }
+            try {
+                NativeMethods.SetHeroMode(0);
+                NativeMethods.SetFixtureMode(1);   // alpha bits, no texture merge, nearest LOD
+                foreach (string model in models) {
+                    if (fixtureModels.Count >= 0xFFFF) { break; }
+                    byte[] data;
+                    try { data = BSA.GetNif(model); } catch { data = null; }
+                    if (data == null) {
+                        warnings.Add("Light fixture mesh not found: " + model);
+                        continue;
+                    }
+                    var a = new float[3];
+                    try {
+                        if (NativeMethods.GetNifAttachLight(data, data.Length, a) != 0) { attach[model] = a; }
+                    } catch (Exception ex) {
+                        warnings.Add("AttachLight read failed on " + model + "\n    " + ex.Message);
+                    }
+                    float radius = -1.0f;
+                    try {
+                        radius = NativeMethods.ProcessNif(data, data.Length, 1.0f, 0.0f, (byte)StaticType.Auto);
+                    } catch (Exception ex) {
+                        warnings.Add("Light fixture export failed on " + model + "\n    " + ex.Message);
+                    }
+                    if (radius >= 0.0f) {
+                        fixtureIndex[model] = fixtureModels.Count;
+                        fixtureModels.Add(model);
+                        fixtureRadius.Add(radius);
+                    }
+                }
+            } finally {
+                NativeMethods.SetFixtureMode(0);
+                NativeMethods.EndStaticCreation();
+            }
+
+            foreach (var lp in lights) {
+                LightReference lr = lp.Value;
+                float[] M = RefRotationRowMajor(lr.Yaw, lr.Pitch, lr.Roll);
+                float[] a;
+                if (lr.Model != null && attach.TryGetValue(lr.Model, out a)) {
+                    float sc = lr.Scale > 0.0f ? lr.Scale : 1.0f;
+                    float ax = a[0] * sc, ay = a[1] * sc, az = a[2] * sc;
+                    lr.X += ax * M[0] + ay * M[3] + az * M[6];
+                    lr.Y += ax * M[1] + ay * M[4] + az * M[7];
+                    lr.Z += ax * M[2] + ay * M[5] + az * M[8];
+                    lr.Attached = true;
+                }
+                int fi;
+                lr.FixtureIndex = (lr.Model != null && fixtureIndex.TryGetValue(lr.Model, out fi)) ? (ushort)fi : (ushort)0xFFFF;
+                lr.Quat = RowMatrixToQuatSnorm(M);
+            }
+
+            // Every LIGH definition whose model made it in, not only the ones placed in the exterior:
+            // a near light indoors or a carried lantern is keyed the same way.
+            var ids = new List<KeyValuePair<uint, int>>();
+            foreach (var kv in LightDefs) {
+                int fi;
+                if (kv.Value.Model != null && fixtureIndex.TryGetValue(kv.Value.Model, out fi)) {
+                    ids.Add(new KeyValuePair<uint, int>(FixtureIdHash(kv.Key), fi));
+                }
+            }
+            using (var fw = new BinaryWriter(File.Create(Statics.fn_fixturedata), Statics.ESPEncoding)) {
+                fw.Write(new byte[] { (byte)'M', (byte)'G', (byte)'F', (byte)'X' });
+                fw.Write((int)2);   // v2: fixture_meshes carries flags[1] alpha bits 5-7 (SetFixtureMode)
+                fw.Write(fixtureModels.Count);
+                fw.Write(ids.Count);
+                for (int i = 0; i < fixtureModels.Count; ++i) {
+                    float[] a;
+                    if (!attach.TryGetValue(fixtureModels[i], out a)) { a = new float[3]; }
+                    fw.Write(a[0]); fw.Write(a[1]); fw.Write(a[2]);
+                    fw.Write(fixtureRadius[i]);
+                    byte[] nm = Statics.ESPEncoding.GetBytes(fixtureModels[i]);
+                    fw.Write((ushort)nm.Length);
+                    fw.Write(nm);
+                }
+                foreach (var id in ids) {
+                    fw.Write(id.Key);
+                    fw.Write((ushort)id.Value);
+                    fw.Write((ushort)0);
+                }
+            }
+            return fixtureModels.Count;
         }
 
         // --- LetThereBeDarkness (RFD) light-mod bake ---------------------------------------------
@@ -2658,6 +2882,7 @@ namespace MGEgui.DistantLand {
                             ld.R = lightR; ld.G = lightG; ld.B = lightB;
                             ld.Flags = lightFlags;
                             ld.HasMesh = (model != null && model.Trim() != string.Empty);
+                            ld.Model = ld.HasMesh ? model : null;
                             // Dynamic vis, matched on script or object ID -- the same two lookups
                             // the statics block runs just below. Repeated here (not shared) because
                             // that block requires a model, so a MESHLESS light never reaches it,
@@ -2780,7 +3005,9 @@ namespace MGEgui.DistantLand {
             }
             LightReference lr = new LightReference();
             lr.X = sr.X; lr.Y = sr.Y; lr.Z = sr.Z;
+            lr.Yaw = sr.Yaw; lr.Pitch = sr.Pitch; lr.Roll = sr.Roll;
             lr.Scale = sr.Scale;
+            lr.Model = ld.Model;
             lr.Radius = ld.Radius;
             lr.R = ld.R; lr.G = ld.G; lr.B = ld.B;
             lr.HasMesh = ld.HasMesh;

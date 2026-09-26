@@ -8,6 +8,8 @@ BeginHeroAnim=BeginHeroAnim
 EndHeroAnim=EndHeroAnim
 SetHeroMode=SetHeroMode
 ProcessNif=ProcessNif
+GetNifAttachLight=GetNifAttachLight
+SetFixtureMode=SetFixtureMode
 TessellateLandscapeAtlased=TessellateLandscapeAtlased
 
 GetVertSize=GetVertSize
