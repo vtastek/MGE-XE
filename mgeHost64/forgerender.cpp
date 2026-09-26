@@ -7012,6 +7012,10 @@ namespace {
                                             // eps re-bakes it whenever it accumulates past one texel-ish.
         float    bakedRadius     = 0.0f;    // light radius the cached tile was baked with (same accumulate-blind fix
                                             // for a slowly ramping darkening-mod radius)
+        uint32_t liveMoveFrame   = 0;       // last frame the light moved at ALL since the previous frame (a
+                                            // scripted swinging lantern). While recent, the slot re-bakes every
+                                            // frame like a carried light: the kShadowMovedEps drift test alone
+                                            // re-baked a slow swing only when 1u accumulated — ~5 steps a second.
         float    radius          = 0.0f;
         float    importance      = 0.0f;    // this frame's score (challenger comparison)
         uint32_t assignedFrame   = 0;       // frame the light took this slot (hysteresis hold)
@@ -36194,7 +36198,27 @@ void destroyHostWindow(Renderer* R);
                 // periodic re-bake it DID get on faster motion flickered. So it never caches: force it
                 // dirty every frame → re-rendered fresh, fully dynamic, always agreeing with the mask.
                 const bool carried = (L.flags & IPC::kLightFlagCarried) != 0;
+                // LIVE motion: drift SINCE THE BAKE past a float-noise floor, on a frame-contiguous sighting (a
+                // gap or a teleport is not motion). The prison ship's swinging lanterns move LESS THAN ONE UNIT
+                // in all (heartbeat maxSpd~100 u/s against the bake pos, yet no re-bake in 18k frames): under
+                // kShadowMovedEps they never re-baked — or did, in ~5 Hz steps, for a wider swing — while the
+                // mask projected the stale tile from the light's current position. A per-frame step test missed
+                // them too (a slow swing steps ~0.02u/frame). The floor scales with the absolute coordinate so a
+                // still light far from the origin cannot read eye-rebase rounding as motion. Held kLiveMoveHold
+                // frames so the tile also re-bakes at the rest pose.
+                {
+                    constexpr uint32_t kLiveMoveHold = 10;
+                    const float mag = std::max(std::fabs(ax), std::max(std::fabs(ay), std::fabs(az)));
+                    const float eps = 0.01f + 2.0e-6f * mag;
+                    if (sl.lastSeenFrame + 1 == frame && dx*dx + dy*dy + dz*dz > eps * eps) {
+                        sl.liveMoveFrame = frame;
+                    }
+                    if (sl.liveMoveFrame != 0 && frame - sl.liveMoveFrame > kLiveMoveHold) {
+                        sl.liveMoveFrame = 0;
+                    }
+                }
                 const bool moved = carried
+                                   || (sl.liveMoveFrame != 0)
                                    || (L.flags & IPC::kLightFlagMoved)
                                    || (dx*dx + dy*dy + dz*dz > kShadowMovedEps * kShadowMovedEps)
                                    || (std::fabs(L.radius - sl.bakedRadius) > 1.0f);
@@ -36228,7 +36252,16 @@ void destroyHostWindow(Renderer* R);
                 const float rateGain = 1.0f + g_flickMotionRate * motionDrive(sl)
                                             + g_flickWindRate   * windDrive;
                 sl.fPhase += (double)(flickDt * g_flickShadowSpeed * rateGain);
-                if (moved) { sl.lastRenderFrame = 0; }   // 0 = dirty (also the never-rendered sentinel)
+                // A CARRIED light keeps the must-path (0 = never-rendered sentinel: the mask skips the slot
+                // until it bakes). Any other mover only goes DIRTY and keeps showing its last tile until its
+                // re-bake gets the pool: six swinging lanterns re-baking every frame overflow the caster
+                // pool, and the must-path blanked every slot that missed its turn — the shadows flickered
+                // off and on (and the flicker exposed the deck leak). Dirty slots re-bake oldest-first, so
+                // they round-robin through the pool.
+                if (moved) {
+                    if (carried) { sl.lastRenderFrame = 0; }
+                    else         { sl.dirty = true; }
+                }
             }
 
             // Live-tuning aid: when a ranking knob (vertical weight or fixture boost) changes, drop
@@ -36299,6 +36332,7 @@ void destroyHostWindow(Renderer* R);
                 // delta (the must-render below bakes and re-anchors it properly next).
                 sl.bakedPos[0] = sl.absPos[0]; sl.bakedPos[1] = sl.absPos[1]; sl.bakedPos[2] = sl.absPos[2];
                 sl.bakedRadius = L.radius;
+                sl.liveMoveFrame = 0;   // the jump from the previous tenant is not motion
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.assignedFrame = frame; sl.lastSeenFrame = frame;
                 sl.lastRenderFrame = 0;   // must render once
@@ -36604,7 +36638,12 @@ void destroyHostWindow(Renderer* R);
                 // over-subscribes the per-light cap drops its FARTHEST (weakest) casters, never
                 // arbitrary slot-index ones — a static near the light can no longer be starved out
                 // by distant furniture that happens to sit at a lower slot index.
-                struct GatherC { float d2; uint32_t slot; uint8_t mirror; uint8_t twoSided; };
+                // "Closest" is the bound SURFACE (centre distance - radius), not the centre: a ship's hull
+                // piece (radius ~1200) has its centre 400-950u from a lantern it nearly touches, and by
+                // centre distance it lost the 256 cut to the clutter around the light — six swinging
+                // lanterns in the prison ship gathered 300-640 casters each and leaked through the walls
+                // and the deck (the cap only bites on a crowded re-bake, which is why a save fixed it).
+                struct GatherC { float d2; float surf; uint32_t slot; uint8_t mirror; uint8_t twoSided; };
                 static std::vector<GatherC> gc; gc.clear();
                 float minEncl = 2.0f;   // deepest enclosure by a small caster (dist/radius); 2 = none
                 const double tGather0 = hostNowMs();
@@ -36660,10 +36699,56 @@ void destroyHostWindow(Renderer* R);
                     if (tiny && wr > 1e-3f) {
                         minEncl = std::min(minEncl, std::sqrt(d2) / wr);
                     }
-                    gc.push_back({ d2, slot, hm.lastMirror, twoSided });
+                    gc.push_back({ d2, std::sqrt(d2) - wr, slot, hm.lastMirror, twoSided });
                 }
                 g_lastSetupGatherMs += hostNowMs() - tGather0;
                 g_lastSetupGatherKept += (uint32_t)gc.size();
+                // [movelight] DIAG (prison-ship swinging lantern ignores the hull): for a LIVE-moving light,
+                // the six BIGGEST meshes in reach and the filter each one met, once a second per slot. The
+                // hull is by far the largest thing near it, so this names the rule that drops it.
+                if (sl.liveMoveFrame != 0) {
+                    static uint32_t s_mlLast[kMaxShadowLights] = {};
+                    if (frame - s_mlLast[s] >= 60) {
+                        s_mlLast[s] = frame;
+                        struct MlC { float wr, d; uint32_t slot; const char* why; };
+                        static std::vector<MlC> ml; ml.clear();
+                        for (uint32_t slot : g_casterSlots) {
+                            const HostMesh& hm = g_meshes[slot];
+                            if (!hm.valid) { continue; }
+                            const float* w = hm.lastWorld;
+                            const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+                            const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+                            const float cz = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+                            const float s0 = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+                            const float s1 = w[4]*w[4] + w[5]*w[5] + w[6]*w[6];
+                            const float s2 = w[8]*w[8] + w[9]*w[9] + w[10]*w[10];
+                            float smax = s0 > s1 ? s0 : s1; if (s2 > smax) { smax = s2; }
+                            const float wr = hm.localRadius * std::sqrt(smax);
+                            const float dx = cx - lax, dy = cy - lay, dz = cz - laz;
+                            const float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+                            if (d > reach + wr) { continue; }
+                            const char* why = "kept";
+                            if (hm.skinned)                                        { why = "skinned"; }
+                            else if (hm.multimap)                                  { why = "multimap(dyn-only)"; }
+                            else if (hm.lastWorldFrame == 0)                       { why = "no-record"; }
+                            else if (hm.emissiveHot && !g_shadowEmissiveCast)      { why = "emissive-drop"; }
+                            else if (g_shadowRigidMovers && isRigidMover(hm))      { why = "rigid-mover(dyn)"; }
+                            else if (hm.everMoved)                                 { why = "kept(everMoved)"; }
+                            ml.push_back({ wr, d, slot, why });
+                        }
+                        std::sort(ml.begin(), ml.end(), [](const MlC& a, const MlC& b) { return a.wr > b.wr; });
+                        char buf[900]; int o = 0;
+                        o += std::snprintf(buf + o, sizeof(buf) - o,
+                                           "[movelight] slot=%u id=%u r=%.0f pos=(%.0f,%.0f,%.0f) inReach=%u gathered=%u mm=%zu dynMovers=%zu:",
+                                           s, sl.lightId, sl.radius, lax, lay, laz, (unsigned)ml.size(),
+                                           (unsigned)gc.size(), g_mmCasters.size(), g_dynMoverCasters.size());
+                        for (size_t k = 0; k < ml.size() && k < 6 && o < (int)sizeof(buf) - 80; ++k) {
+                            o += std::snprintf(buf + o, sizeof(buf) - o, " [mesh%u wr=%.0f d=%.0f %s]",
+                                               ml[k].slot, ml[k].wr, ml[k].d, ml[k].why);
+                        }
+                        LOG::logline(">> %s", buf);
+                    }
+                }
                 // LANTERN category: the light hangs DEEP inside one of its own casters — a shade around
                 // the flame. Diffused = soft shadows + a low-res tile. A candle/torch sits at the RIM of
                 // its own mesh's bound (its flame is on top of the wax/haft), so it stays crisp.
@@ -36676,7 +36761,7 @@ void destroyHostWindow(Renderer* R);
                 const double tPkCap0 = hostNowMs();
                 if (gc.size() > kShadowMaxCasters) {
                     std::nth_element(gc.begin(), gc.begin() + kShadowMaxCasters, gc.end(),
-                                     [](const GatherC& a, const GatherC& b) { return a.d2 < b.d2; });
+                                     [](const GatherC& a, const GatherC& b) { return a.surf < b.surf; });
                     gc.resize(kShadowMaxCasters);
                 }
                 g_setupBlkMs[kSetupBlkPackCap] += hostNowMs() - tPkCap0;
