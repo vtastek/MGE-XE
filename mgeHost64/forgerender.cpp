@@ -22102,6 +22102,7 @@ namespace {
             // step and smooths the enlarged grain. blurPx is the blur's SPATIAL sigma in PIXELS,
             // and note it saturates — past ~1.5 over a +-3 kernel it is a box filter and buys
             // nothing more ([[project_forge_ao_blur_extent]]).
+            { "alphaDepthRef",      &g_alphaDepthRef      },
             { "aoUpSigma",          &g_aoUpSigma          },
             { "aoBlurPx",           &g_aoBlurPx           },
             // SHADOW MASK: the test range (the pass's area dial — covered area ~ rangeK², and the
@@ -22464,6 +22465,10 @@ namespace {
             // MW's own light arc — and the A/B for it is a walk at a fixed hour, which is a run,
             // not a click.
             { "sunLightFollowsDisc", &g_sunLightFollowsDisc },
+            // The alpha fold fix (near-opaque depth prepass), so a dense-alpha scene (the CAP candle
+            // staircase: 420 flame billboards in view) can be A/B'd from a minimized harness run.
+            { "alphaDepthWrite", &g_alphaDepthWrite },
+            { "alphaHighlight", &g_alphaHighlight },   // flat per-class colour on every alpha draw
             { "pbrEnable", &g_pbrEnable },
             { "drawDLStatics", &g_drawDLStatics },
             // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as

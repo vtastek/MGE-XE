@@ -5066,8 +5066,14 @@ namespace RenderProcess {
             return;     // already polled this display frame
         }
         g_lastPollSerial = g_frameSerial;
-        // F11: live composite toggle.
-        if (GetAsyncKeyState(VK_F11) & 0x0001) {
+        // F11: live composite toggle. Also fired by a one-shot `mge_seam_toggle` file in the game
+        // folder (deleted on use), so an unattended MWSE fixture can take the MW-vs-host A/B —
+        // GetAsyncKeyState cannot be reached from tes3.tapKey. Checked twice a second.
+        bool seamFile = false;
+        if ((g_frameSerial & 31u) == 0u && GetFileAttributesA("mge_seam_toggle") != INVALID_FILE_ATTRIBUTES) {
+            seamFile = DeleteFileA("mge_seam_toggle") != 0;
+        }
+        if ((GetAsyncKeyState(VK_F11) & 0x0001) || seamFile) {
             g_enabled = !g_enabled;
             LOG::logline(">> [seam] composite %s", g_enabled ? "ON" : "OFF");
         }
@@ -7791,16 +7797,39 @@ namespace RenderProcess {
         }
     }
 
+    void noteScene0Blend(const RenderedState* rs) {
+        static std::unordered_set<const void*> s_seen;
+        if (!rs || s_seen.size() >= 256 || !s_seen.insert(rs->texture).second) return;
+        const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
+        LOG::logline("!! [scene0-blend] tex=%s prim=%d fvf=0x%X vc=%u tri=%u blend=%u/%u zw=%d",
+                     nm ? nm : "(unnamed)", (int)rs->primType, (unsigned)rs->fvf,
+                     rs->vertCount, rs->primCount, (unsigned)rs->srcBlend, (unsigned)rs->destBlend,
+                     (int)rs->zWrite);
+    }
+
     void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs) {
         if (!g_initOk || !g_enabled || !g_capturedVec) return;
         if (!rs || !frs) return;
+        // [cap-reject] flame/particle triage: one line per (texture, reason) the guards below
+        // refuse, so a blended DIP that silently never reaches the host has a name in the log.
+        auto rejectOnce = [&](const char* why) {
+            static std::unordered_set<std::uint64_t> s_seen;
+            const std::uint64_t key = ((std::uint64_t)(std::uintptr_t)rs->texture << 8) ^ (std::uint64_t)(std::uintptr_t)why;
+            if (s_seen.size() < 256 && s_seen.insert(key).second) {
+                const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
+                LOG::logline("!! [cap-reject] %s tex=%s prim=%d fvf=0x%X vbs=%u vc=%u tri=%u blend=%u/%u",
+                             why, nm ? nm : "(unnamed)", (int)rs->primType, (unsigned)rs->fvf,
+                             (unsigned)rs->vertexBlendState, rs->vertCount, rs->primCount,
+                             (unsigned)rs->srcBlend, (unsigned)rs->destBlend);
+            }
+        };
         // HW-skinned blends (ghosts) excluded — the bind-pose VB here is the wrong pose (a
         // separate follow-up). Need an indexed TRIANGLELIST with a real stride (TRISTRIP/FAN and
         // non-indexed particle DIPs are dropped; a counter would reveal if MW emits any).
-        if (rs->vertexBlendState != 0) return;
-        if (rs->primType != D3DPT_TRIANGLELIST) return;
-        if (!rs->vb || !rs->ib || rs->vbStride == 0) return;
-        if ((rs->fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZ) return;   // untransformed XYZ only
+        if (rs->vertexBlendState != 0) { rejectOnce("skinned"); return; }
+        if (rs->primType != D3DPT_TRIANGLELIST) { rejectOnce("primtype"); return; }
+        if (!rs->vb || !rs->ib || rs->vbStride == 0) { rejectOnce("no-vb-ib"); return; }
+        if ((rs->fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZ) { rejectOnce("fvf-pos"); return; }   // untransformed XYZ only
         if (rs->vertCount == 0 || rs->primCount == 0) return;
 
         // Texture slot: rs->texture is the proxy realTexture pointer, identical to the GPU texture
@@ -7837,7 +7866,7 @@ namespace RenderProcess {
                 // cached-blend duplicate from an aliased particle draw (a particle's vertCount moves
                 // frame to frame; a cached blend's does not).
                 static std::uint32_t s_logged = 0;
-                if (s_logged < 12) {
+                if (s_logged < 48) {
                     ++s_logged;
                     const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
                     LOG::logline("!! [alpha-dedup] dropped DIP tex=%s vc=%u tri=%u (key collision)",
@@ -7938,15 +7967,20 @@ namespace RenderProcess {
             static std::unordered_set<const void*> s_capDiagSeen;
             const char* dname = MGE::GeometryCache::resolveTextureName(rs->texture);
             const void* dkey = dname ? (const void*)dname : (const void*)rs->texture;
-            if (s_capDiagSeen.insert(dkey).second && s_capDiagSeen.size() <= 64) {
+            if (s_capDiagSeen.insert(dkey).second && s_capDiagSeen.size() <= 256) {
                 const int st1 = (int)frs->stage[1].colorOp, st2 = (int)frs->stage[2].colorOp, st3 = (int)frs->stage[3].colorOp;
                 LOG::logline(">> [cap-diag] %s fvf=0x%X stride=%u norm=%d@%u col=%d@%u uv=%d@%u "
-                             "vcs=%u lit=%u matD=(%.2f,%.2f,%.2f) matA=%.2f stageOps=[%d,%d,%d,%d]",
+                             "vcs=%u lit=%u matD=(%.2f,%.2f,%.2f) matA=%.2f matE=(%.2f,%.2f,%.2f) "
+                             "srcD=%u srcE=%u blend=%u/%u slot=%u stageOps=[%d,%d,%d,%d]",
                              dname ? dname : "(null)", (unsigned)rs->fvf, (unsigned)stride,
                              (int)hasNorm, (unsigned)normOff, (int)hasCol, (unsigned)colOff, (int)hasUV, (unsigned)uvOff,
                              vColSource, (unsigned)rs->useLighting,
                              frs->material.diffuse.r, frs->material.diffuse.g, frs->material.diffuse.b,
-                             frs->material.diffuse.a, (int)frs->stage[0].colorOp, st1, st2, st3);
+                             frs->material.diffuse.a,
+                             frs->material.emissive.r, frs->material.emissive.g, frs->material.emissive.b,
+                             (unsigned)rs->matSrcDiffuse, (unsigned)rs->matSrcEmissive,
+                             (unsigned)rs->srcBlend, (unsigned)rs->destBlend, texIndex,
+                             (int)frs->stage[0].colorOp, st1, st2, st3);
             }
         }
 

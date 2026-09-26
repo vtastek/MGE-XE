@@ -258,6 +258,9 @@ namespace RenderProcess {
     // cache pass doesn't own. Silent no-op on any guard miss (flag off, HW-skinned, non-tri-list,
     // caps, dedup); reject at the gate is unchanged whether or not this captures.
     void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs);
+    // [scene0-blend] triage: a blended DIP MW issued in scene 0 (outside the sorter), which
+    // nothing captures and the composite covers. Logs once per texture.
+    void noteScene0Blend(const RenderedState* rs);
 
     // Upload cost accounting (Part A, upload-debug). The geometry cache calls noteUpload()
     // once per host geom reship, tagged by cause so the [uploads] heartbeat line can break the

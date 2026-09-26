@@ -1456,6 +1456,9 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
             && (isCoveredOpaque(rs, frs) || isLandSplat)) {
             return false;
         }
+        if (RenderProcess::forgeOwnsFrame() && sceneCount == 0 && rs->blendEnable) {
+            RenderProcess::noteScene0Blend(rs);
+        }
         // PPL reactive colour path: render non-covered opaque (and, in plain PPL mode,
         // all opaque) with the replacement FFE shader. Only when the PPL renderer is
         // active; in fixed-function mode the engine draws its own colour.
