@@ -1080,6 +1080,7 @@ namespace MGE::GeometryCache {
             const bool  ownByRef  = shapeBase && *reinterpret_cast<const uint32_t*>(
                                                    static_cast<const char*>(shapeBase) + 0x4) == 'HGIL' /*LIGH*/;
             const MGE::SceneGraph::PointLight* own = nullptr;
+            const MGE::SceneGraph::PointLight* nearest = nullptr;   // regardless of tol
             float bestD2 = tol * tol;   // doubles as the inside-the-fixture threshold
             float nearD2 = 3.0e30f;     // nearest light REGARDLESS of tol — for the reject line only
             for (const auto& pl : g_lightSnapshot) {
@@ -1088,14 +1089,51 @@ namespace MGE::GeometryCache {
                 const float dy = pl.worldPos[1] - geom->worldBoundOrigin.y;
                 const float dz = pl.worldPos[2] - geom->worldBoundOrigin.z;
                 const float d2 = dx * dx + dy * dy + dz * dz;
-                if (d2 < nearD2) { nearD2 = d2; }
+                if (d2 < nearD2) { nearD2 = d2; nearest = &pl; }
                 if (d2 <= bestD2) { bestD2 = d2; own = &pl; }
+            }
+            // ⚠ ONE LIGHT, MANY EMITTERS. A LIGH model can carry many small emitters that MW stands in
+            // for with a single light: the CAP staircase (ah\ex_Candleredux.nif) is ONE reference with
+            // ONE light and 226 candles whose 654 flames the r0 mod turns into billboards. Only the
+            // few flames within tol of that light found it; the other 417 fell to gain 1 and read as
+            // unlit next to their boosted neighbours (the "missing flames"). Such a piece is its own
+            // emitter — a candle, not a facet of one lamp — so it takes its OWN light's colour and one
+            // fixture's flux over ITS OWN area, in a group of one. Pooling them would divide one
+            // candle's flux across the whole field. Sliver-sized pieces only (r < kMinFixtureTol): a
+            // lantern's facets sit well inside tol of its light and keep the shared-group rule.
+            bool soloEmitter = false;
+            if (!own && ownByRef && nearest && r < kMinFixtureTol) {
+                own = nearest;
+                bestD2 = nearD2;
+                soloEmitter = true;
+            }
+            // ⚠ THE HELD CANDLE (first person). The arm scene lives in its own space, nowhere near
+            // the carried light's world position, so no light is ever within tol and the held
+            // flame stayed at gain 1 — no bloom, while every placed candle bloomed. Its reference
+            // does not name its light either: the shape resolves to the PLAYER, the light to the
+            // equipped item's own reference (measured: 275A7598 vs 27496988). What does identify
+            // it is the light walk's `carried` tag (scenegraph.cpp runWalk: every point light under
+            // the player's body root in first person). That light is this piece's own light, and
+            // the whole held candle — wax and flames — shares its group exactly as a placed
+            // candle's pieces share the light inside them.
+            const bool fpShape = g_walkingFP || e.isFP;
+            if (!own && fpShape) {
+                for (const auto& pl : g_lightSnapshot) {
+                    if (pl.carried) { own = &pl; break; }
+                }
+                if (own) {
+                    const float dx = own->worldPos[0] - geom->worldBoundOrigin.x;
+                    const float dy = own->worldPos[1] - geom->worldBoundOrigin.y;
+                    const float dz = own->worldPos[2] - geom->worldBoundOrigin.z;
+                    bestD2 = dx * dx + dy * dy + dz * dz;
+                }
             }
             // The own light may simply not be in the snapshot YET — it joins a frame after the
             // mesh. Stay unboosted and let the walk ask again (emisOwnRetry, walk cache-hit path)
             // instead of latching "no light" for the life of the entry. A lantern that is off has
-            // no light at all and just spends its retries.
-            if (!own && ownByRef && retriesLeft > 0) {
+            // no light at all and just spends its retries. A first-person piece waits the same way
+            // for the carried light (an equip lands the mesh before the light walk sees it).
+            if (!own && (ownByRef || fpShape) && retriesLeft > 0) {
                 e.emisOwnRetry = (std::uint8_t)(retriesLeft - 1);
                 return;
             }
@@ -1144,7 +1182,11 @@ namespace MGE::GeometryCache {
                 e.emissiveFlux[i] = kEmissiveFlux * own->diffuse[i];
             }
             e.emissiveArea  = area;
-            e.emissiveGroup = emisGroupKey(own->source, e.textureName ? e.textureName : "");
+            // A solo emitter's group is keyed by the piece itself, so it can never pool with siblings.
+            e.emissiveGroup = soloEmitter
+                ? emisGroupKey(reinterpret_cast<const void*>((std::uintptr_t)own->source ^ ((std::uintptr_t)emisKey << 1)),
+                               e.textureName ? e.textureName : "")
+                : emisGroupKey(own->source, e.textureName ? e.textureName : "");
             EmisGroup& grp = g_emisGroups[e.emissiveGroup];
             grp.area += (double)area;
             grp.members.push_back(emisKey);
