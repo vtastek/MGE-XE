@@ -78,6 +78,14 @@ namespace MGE::SceneGraph {
         // (IPC::packQuatSmallest3). Stable for a placed light, so the change memcmp stays quiet.
         std::uint32_t goboIdHash;
         std::uint32_t goboRot;
+        // The owning TES3 reference and its base object (opaque, identity only — never
+        // dereferenced downstream), for any reference type: a carried torch names its ACTOR, a
+        // spell light names nothing. The emissive coupling pairs a LIGH fixture's glowing shapes
+        // with the light of the SAME reference (computeEmissiveGain) — nearest-light alone read
+        // last frame's snapshot and took a just-deleted neighbour's colour. The base is kept too so
+        // a freed reference's recycled address cannot pass for a different fixture.
+        const void* ownerRef;
+        const void* ownerBase;
     };
     const std::vector<PointLight>& pointLights();
 

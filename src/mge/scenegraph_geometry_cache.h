@@ -309,6 +309,10 @@ namespace MGE::GeometryCache {
         std::uint64_t emissiveGroup;
         float         emissiveArea;
         float         emissiveFlux[3];
+        //   emisOwnRetry  : walks left to find the own light of a LIGH fixture's glowing shape. Its
+        //                   light joins the snapshot a frame after the mesh (last frame's lights on
+        //                   the async path), and the pairing otherwise ran only at capture.
+        std::uint8_t  emisOwnRetry;
         // Vertex colour usage. hasVertexColor: the mesh carries per-vertex colours
         // (filled into the non-skinned VB's DIFFUSE slot). vColSource: NI
         // VertexColorProperty::source — 0 ignore (vcol unused, constant material),

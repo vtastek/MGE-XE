@@ -153,10 +153,12 @@ namespace MGE::SceneGraph {
             //   PhysicalObject: objectID (char*) @ 0x2C.
             // A carried torch resolves to its ACTOR and a spell light to no reference: no key, no gobo.
             out.goboIdHash = 0; out.goboRot = 0;
+            out.ownerRef = nullptr; out.ownerBase = nullptr;
             if (const void* ref = pl->getTes3Reference(true)) {
                 const char* r = static_cast<const char*>(ref);
                 const char* base = *reinterpret_cast<const char* const*>(r + 0x28);
                 const auto* node = *reinterpret_cast<const NI::Node* const*>(r + 0x10);
+                out.ownerRef = ref; out.ownerBase = base;
                 if (base && node && *reinterpret_cast<const uint32_t*>(base + 0x4) == 'HGIL' /*LIGH*/) {
                     const char* id = *reinterpret_cast<const char* const*>(base + 0x2C);
                     if (id && id[0]) {

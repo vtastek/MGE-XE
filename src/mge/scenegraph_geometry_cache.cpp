@@ -983,6 +983,10 @@ namespace MGE::GeometryCache {
             // plumbing to hold keys rather than pointers.
             const std::uint32_t emisKey = (std::uint32_t)(std::uintptr_t)geom;
             emisUngroup(emisKey, e);
+            // Retry budget: taken here so that EVERY return below leaves it at 0 (no retry) except the
+            // one "own light not in the snapshot yet" return, which hands back the rest.
+            const std::uint8_t retriesLeft = e.emisOwnRetry;
+            e.emisOwnRetry = 0;
             // Hoisted so the gate-1 diagnostic below can use the same thresholds the real gates do.
             constexpr float kMaxFixtureBoundRadius = 64.0f;   // ~1.4m across: brazier/chandelier still fit
             constexpr float kMaxOwnLightDistance   = 32.0f;   // the emitter sits in the fixture body
@@ -1062,16 +1066,38 @@ namespace MGE::GeometryCache {
             const float tolRaw = (r < kMaxOwnLightDistance) ? r : kMaxOwnLightDistance;
             const float tol    = (tolRaw > kMinFixtureTol) ? tolRaw : kMinFixtureTol;
 
+            // ⚠ NEAREST IS NOT OWN when the shape belongs to a LIGH reference. The snapshot is last
+            // frame's on the async path, so a lantern spawned where another was just deleted (the
+            // GoboInspect audit steps through fixtures on one spot) found the DELETED lantern's
+            // light inside its paper and latched that colour: Green05 glowed purple, Purple05's.
+            // A LIGH fixture's own light is the one its own reference carries, so only that light
+            // qualifies (reference AND base, so a recycled reference address cannot pass). A shape
+            // on any other reference keeps nearest-wins: a STAT lantern with a separate LIGH placed
+            // inside it is a common mod layout, and its light is a different reference by design.
+            const void* shapeRef  = geom->getTes3Reference(/*searchParents=*/true);
+            const void* shapeBase = shapeRef ? *reinterpret_cast<void* const*>(
+                                                   static_cast<const char*>(shapeRef) + 0x28) : nullptr;
+            const bool  ownByRef  = shapeBase && *reinterpret_cast<const uint32_t*>(
+                                                   static_cast<const char*>(shapeBase) + 0x4) == 'HGIL' /*LIGH*/;
             const MGE::SceneGraph::PointLight* own = nullptr;
             float bestD2 = tol * tol;   // doubles as the inside-the-fixture threshold
             float nearD2 = 3.0e30f;     // nearest light REGARDLESS of tol — for the reject line only
             for (const auto& pl : g_lightSnapshot) {
+                if (ownByRef && (pl.ownerRef != shapeRef || pl.ownerBase != shapeBase)) { continue; }
                 const float dx = pl.worldPos[0] - geom->worldBoundOrigin.x;
                 const float dy = pl.worldPos[1] - geom->worldBoundOrigin.y;
                 const float dz = pl.worldPos[2] - geom->worldBoundOrigin.z;
                 const float d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 < nearD2) { nearD2 = d2; }
                 if (d2 <= bestD2) { bestD2 = d2; own = &pl; }
+            }
+            // The own light may simply not be in the snapshot YET — it joins a frame after the
+            // mesh. Stay unboosted and let the walk ask again (emisOwnRetry, walk cache-hit path)
+            // instead of latching "no light" for the life of the entry. A lantern that is off has
+            // no light at all and just spends its retries.
+            if (!own && ownByRef && retriesLeft > 0) {
+                e.emisOwnRetry = (std::uint8_t)(retriesLeft - 1);
+                return;
             }
             if (!own) {
                 // ⚠ THE LIKELIEST REJECTION FOR A FLAME, and the one worth reading the numbers on.
@@ -1230,6 +1256,7 @@ namespace MGE::GeometryCache {
             // without touching the map would orphan this entry's area inside its old group and every
             // sibling would go permanently dim.
             e.emissiveFlux[0] = e.emissiveFlux[1] = e.emissiveFlux[2] = 0.0f;
+            e.emisOwnRetry = 60;   // ~1 s of walks to find a LIGH fixture's own light (computeEmissiveGain)
             // Vertex-colour routing. MGE's rule is PROPERTY-driven: vertex colours are used only
             // when a NiVertexColorProperty says so. A shape carrying a colour ARRAY but no such
             // property falls through as SOURCE_IGNORE, so the material drives diffuse — and with it
@@ -2992,6 +3019,13 @@ namespace MGE::GeometryCache {
                         // texture lands, so the steady-state cost is zero. Material only — the VB is
                         // unaffected by texture residency, so no re-upload and no wire traffic.
                         extractMaterial(e, geom);
+                    }
+                    // OWN-LIGHT RETRY: a LIGH fixture's glowing shape captured before its light
+                    // reached the snapshot (see computeEmissiveGain). Gain only — the material and
+                    // VB are already right; emissiveForDraw reads the new gain on the next list.
+                    // Self-limiting: the budget runs out, or the light is found and zeroes it.
+                    if (e.emisOwnRetry > 0) {
+                        computeEmissiveGain(e, geom);
                     }
                     // Transform (orbit for sky) + dynamic hint, shared by sky and opaque.
                     if (inCharacter) {
