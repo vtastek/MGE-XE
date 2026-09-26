@@ -2657,21 +2657,26 @@ VSOutput VS_MAIN( VSInput In )
     Out.Uv = In.Uv;
 
 
+
+
     if (uvAnimId != 0u) {
-        Out.Uv += gUVAnim[uvAnimId].xy;
+        float4 anim = gUVAnim[uvAnimId];
+        uint tp = asuint(anim.w);
+        float2 tile = float2(1.0f, 1.0f) + f16tof32(uint2(tp & 0xFFFFu, tp >> 16u));
+        Out.Uv = (Out.Uv - 0.5f) * tile + 0.5f + anim.xy;
     }
 
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
-#line 110 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
     Out.ClampMode = (In.TexAlpha >> 26u) & 0xFu;
-#line 127 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
+#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
     Out.Color = float4(decodeAuthored(In.Color.rgb), In.Color.a);
     Out.MatDiffuse = decodeAuthored(In.MatDiffuse);
     Out.MatAmbient = decodeAuthored(In.MatAmbient);
     Out.MatEmissive = decodeAuthored(In.MatEmissive);
-#line 161 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
+#line 166 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
     float3 emisGain = max(In.EmisGain, float3(0.0f, 0.0f, 0.0f));
     if (Out.VColSource == 1u) { Out.Color.rgb *= emisGain; }
     else { Out.MatEmissive *= emisGain; }

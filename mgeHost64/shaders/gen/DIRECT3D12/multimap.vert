@@ -2660,10 +2660,12 @@ VSOutput VS_MAIN( VSInput In )
     if (uvAnimId != 0u) {
         float4 anim = gUVAnim[uvAnimId];
         uint setIdx = uint(anim.z);
-        if (setIdx == 0u) { Out.Uv0 += anim.xy; }
-        else if (setIdx == 1u) { Out.Uv1 += anim.xy; }
-        else if (setIdx == 2u) { Out.Uv2 += anim.xy; }
-        else { Out.Uv3 += anim.xy; }
+        uint tp = asuint(anim.w);
+        float2 tile = float2(1.0f, 1.0f) + f16tof32(uint2(tp & 0xFFFFu, tp >> 16u));
+        if (setIdx == 0u) { Out.Uv0 = (Out.Uv0 - 0.5f) * tile + 0.5f + anim.xy; }
+        else if (setIdx == 1u) { Out.Uv1 = (Out.Uv1 - 0.5f) * tile + 0.5f + anim.xy; }
+        else if (setIdx == 2u) { Out.Uv2 = (Out.Uv2 - 0.5f) * tile + 0.5f + anim.xy; }
+        else { Out.Uv3 = (Out.Uv3 - 0.5f) * tile + 0.5f + anim.xy; }
     }
 
 
@@ -2677,7 +2679,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.MatDiffuse = decodeAuthored(In.MatDiffuse);
     Out.MatAmbient = decodeAuthored(In.MatAmbient);
     Out.MatEmissive = decodeAuthored(In.MatEmissive);
-#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.vert.fsl"
+#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.vert.fsl"
     float3 emisGain = max(In.MatAlphaGain.yzw, float3(0.0f, 0.0f, 0.0f));
     if (vColSource == 1u) { Out.Color.rgb *= emisGain; }
     else { Out.MatEmissive *= emisGain; }

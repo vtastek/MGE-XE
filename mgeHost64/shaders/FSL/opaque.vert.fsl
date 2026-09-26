@@ -86,10 +86,15 @@ VSOutput VS_MAIN( VSInput In )
     Out.Normal = mul((float3x3)world, In.Normal);
     Out.WorldPos = worldPos.xyz;   // Tier 3a: point lights evaluate in world space
     Out.Uv = In.Uv;
-    // NiUVController takeover: host-evaluated scroll delta for this draw (opaque wire carries
-    // one UV set, so setIndex is ignored here). Wrap handled by the sampler's address mode.
+    // NiUVController takeover: host-evaluated tiling + scroll for this draw (opaque wire carries
+    // one UV set, so setIndex is ignored here). MW's rewrite from the original UVs is
+    // uv' = (uv - 0.5) * tile + 0.5 + delta; .w holds half2(tile - 1), so a zero lane is tile 1.
+    // Wrap handled by the sampler's address mode.
     if (uvAnimId != 0u) {
-        Out.Uv += gUVAnim[uvAnimId].xy;
+        float4 anim = gUVAnim[uvAnimId];
+        uint tp = asuint(anim.w);
+        float2 tile = float2(1.0f, 1.0f) + f16tof32(uint2(tp & 0xFFFFu, tp >> 16u));
+        Out.Uv = (Out.Uv - 0.5f) * tile + 0.5f + anim.xy;
     }
     // Unpack the per-instance texIndex (low 16) + alpha-test ref (bits 16-23, /255) + vColSource (bits 24-25).
     Out.TexIndex = In.TexAlpha & 0xFFFFu;

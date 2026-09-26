@@ -90,15 +90,17 @@ VSOutput VS_MAIN( VSInput In )
     Out.Uv1 = In.Uv1;
     Out.Uv2 = In.Uv2;
     Out.Uv3 = In.Uv3;
-    // NiUVController takeover: host-evaluated scroll delta, applied to the controller's
-    // textureSet only (gUVAnim[id].z carries the set index).
+    // NiUVController takeover: host-evaluated tiling + scroll, applied to the controller's
+    // textureSet only (gUVAnim[id].z carries the set index; .w half2(tile - 1), see opaque.vert).
     if (uvAnimId != 0u) {
         float4 anim = gUVAnim[uvAnimId];
         uint setIdx = uint(anim.z);
-        if      (setIdx == 0u) { Out.Uv0 += anim.xy; }
-        else if (setIdx == 1u) { Out.Uv1 += anim.xy; }
-        else if (setIdx == 2u) { Out.Uv2 += anim.xy; }
-        else                   { Out.Uv3 += anim.xy; }
+        uint tp = asuint(anim.w);
+        float2 tile = float2(1.0f, 1.0f) + f16tof32(uint2(tp & 0xFFFFu, tp >> 16u));
+        if      (setIdx == 0u) { Out.Uv0 = (Out.Uv0 - 0.5f) * tile + 0.5f + anim.xy; }
+        else if (setIdx == 1u) { Out.Uv1 = (Out.Uv1 - 0.5f) * tile + 0.5f + anim.xy; }
+        else if (setIdx == 2u) { Out.Uv2 = (Out.Uv2 - 0.5f) * tile + 0.5f + anim.xy; }
+        else                   { Out.Uv3 = (Out.Uv3 - 0.5f) * tile + 0.5f + anim.xy; }
     }
     // MaterialProperty::alpha rides the interpolated vertex alpha rather than its own interpolator:
     // Out.Color.a is read ONLY by multimap_alpha.frag (multimap.frag and depthonly_mm.frag take

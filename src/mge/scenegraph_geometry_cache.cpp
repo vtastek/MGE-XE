@@ -1531,8 +1531,8 @@ namespace MGE::GeometryCache {
         // of this shape. The engine applies such a controller by rewriting the mesh's vertex UV
         // array every update tick (revisionID bump -> D3D9 VB rebuild + blocking geom-RPC
         // reship — the GitD night-collapse class). Instead the key track ships ONCE and the
-        // Forge host scrolls the UVs in-shader from sim time. Returns nullptr when absent or
-        // unsupported (animated TILING — rare; those shapes keep the engine reship path).
+        // Forge host scrolls (and, for animated TILING, scales) the UVs in-shader from sim time.
+        // Returns nullptr when absent or when nothing animates.
         NI::UVController* findUVAnimController(NI::TriBasedGeometry* geom) {
             for (NI::TimeController* c = geom->controllers; c; c = c->nextController) {
                 if ((c->flags & NI::TimeControllerFlags::Active) == 0) { continue; }
@@ -1540,18 +1540,9 @@ namespace MGE::GeometryCache {
                 auto* uvc = static_cast<NI::UVController*>(c);
                 NI::UVData* d = uvc->uvData.get();
                 if (!d) { return nullptr; }
-                if (d->UTilingData.numKeys > 1 || d->VTilingData.numKeys > 1) {
-                    static bool warnedTiling = false;
-                    if (!warnedTiling) {
-                        warnedTiling = true;
-                        const char* nm = geom->getName();
-                        LOG::logline("!! [uvanim] animated UV TILING unsupported (shape '%s') — engine reship path kept",
-                                     (nm && *nm) ? nm : "?");
-                    }
-                    return nullptr;
-                }
-                if (d->UOffsetData.numKeys < 2 && d->VOffsetData.numKeys < 2) {
-                    return nullptr;   // constant offsets — nothing animates
+                if (d->UOffsetData.numKeys < 2 && d->VOffsetData.numKeys < 2
+                    && d->UTilingData.numKeys < 2 && d->VTilingData.numKeys < 2) {
+                    return nullptr;   // constant offsets and tiling — nothing animates
                 }
                 return uvc;
             }
@@ -1624,19 +1615,24 @@ namespace MGE::GeometryCache {
         // Returns false (empty out) when nothing usable — the caller then keeps the engine
         // reship path (and must NOT exclude the UV component from the content gate).
         //
-        // `undoU`/`undoV` come back as the controller's CURRENT offsets, for the caller to remove
-        // from the vertex UVs it uploads (see the ORIGINAL-UV rule below). The wire's baseU/baseV
-        // ship as ZERO, because after that removal there is no capture-time offset left to cancel.
+        // `undoU`/`undoV` come back as the controller's CURRENT offsets and `undoSU`/`undoSV` as
+        // its CURRENT tiling (1 when that axis has no tiling track), for the caller to remove from
+        // the vertex UVs it uploads (see the ORIGINAL-UV rule below). The wire's baseU/baseV ship
+        // as ZERO, because after that removal there is no capture-time offset left to cancel.
         bool buildUVAnimPayload(NI::UVController* uvc, uint8_t uvSetCount,
-                                std::vector<uint8_t>& out, float& undoU, float& undoV) {
+                                std::vector<uint8_t>& out, float& undoU, float& undoV,
+                                float& undoSU, float& undoSV) {
             out.clear();
             NI::UVData* d = uvc->uvData.get();
             if (!d) { return false; }
-            static std::vector<std::pair<float, float>> uKeys, vKeys;  // single-threaded walk
+            static std::vector<std::pair<float, float>> uKeys, vKeys, suKeys, svKeys;  // single-threaded walk
             extractUVTrack(d->UOffsetData, uKeys);
             extractUVTrack(d->VOffsetData, vKeys);
-            if (uKeys.size() < 2 && vKeys.size() < 2) { return false; }
-            const size_t bytes = sizeof(IPC::GeomUVAnimWire) + 8u * (uKeys.size() + vKeys.size());
+            extractUVTrack(d->UTilingData, suKeys);
+            extractUVTrack(d->VTilingData, svKeys);
+            if (uKeys.size() < 2 && vKeys.size() < 2 && suKeys.size() < 2 && svKeys.size() < 2) { return false; }
+            const size_t bytes = sizeof(IPC::GeomUVAnimWire)
+                               + 8u * (uKeys.size() + vKeys.size() + suKeys.size() + svKeys.size());
             if (bytes > 0xFFFFu) { return false; }   // uvAnimBytes is uint16 (never hit in practice)
 
             IPC::GeomUVAnimWire w = {};
@@ -1668,10 +1664,17 @@ namespace MGE::GeometryCache {
                     const float net = k.back().second - k.front().second;
                     return std::fabs(net - std::round(net)) < 1e-3f;
                 };
-                if (seamless(uKeys) && seamless(vKeys)) { w.cycleType = 0; }
+                // Tiling tracks must come back to their start value too (a scale that jumps at
+                // the restart is a visible pop) — net 0, not a whole number of wraps.
+                auto returns = [](const std::vector<std::pair<float, float>>& k) {
+                    return k.size() < 2 || std::fabs(k.back().second - k.front().second) < 1e-3f;
+                };
+                if (seamless(uKeys) && seamless(vKeys) && returns(suKeys) && returns(svKeys)) { w.cycleType = 0; }
             }
-            w.keyCountU = (uint16_t)uKeys.size();
-            w.keyCountV = (uint16_t)vKeys.size();
+            w.keyCountU  = (uint16_t)uKeys.size();
+            w.keyCountV  = (uint16_t)vKeys.size();
+            w.keyCountSU = (uint16_t)suKeys.size();
+            w.keyCountSV = (uint16_t)svKeys.size();
             w.frequency = uvc->frequency;
             w.phase     = uvc->phase;
             w.keyMin    = uvc->lowKeyFrame;
@@ -1690,6 +1693,9 @@ namespace MGE::GeometryCache {
             // for an hour and return in phase.
             undoU = uvc->currentUOffset;
             undoV = uvc->currentVOffset;
+            // An axis with no tiling track is untouched by MW (tile 1), whatever the field holds.
+            undoSU = (!suKeys.empty() && uvc->currentUTiling > 1e-4f) ? uvc->currentUTiling : 1.0f;
+            undoSV = (!svKeys.empty() && uvc->currentVTiling > 1e-4f) ? uvc->currentVTiling : 1.0f;
             w.baseU     = 0.0f;
             w.baseV     = 0.0f;
 
@@ -1700,7 +1706,13 @@ namespace MGE::GeometryCache {
                 std::memcpy(dst, uKeys.data(), uKeys.size() * 8);  dst += uKeys.size() * 8;
             }
             if (!vKeys.empty()) {
-                std::memcpy(dst, vKeys.data(), vKeys.size() * 8);
+                std::memcpy(dst, vKeys.data(), vKeys.size() * 8);  dst += vKeys.size() * 8;
+            }
+            if (!suKeys.empty()) {
+                std::memcpy(dst, suKeys.data(), suKeys.size() * 8); dst += suKeys.size() * 8;
+            }
+            if (!svKeys.empty()) {
+                std::memcpy(dst, svKeys.data(), svKeys.size() * 8);
             }
             return true;
         }
@@ -1775,11 +1787,11 @@ namespace MGE::GeometryCache {
             // buildUVAnimPayload). MW writes u' = u - offU but v' = v + offV, so undoing them is
             // `u + undoU` and `v - undoV` — the asymmetry is MW's, matching the negated U delta in
             // the host's uvAnimIdFor.
-            float uvUndoU = 0.0f, uvUndoV = 0.0f;
+            float uvUndoU = 0.0f, uvUndoV = 0.0f, uvUndoSU = 1.0f, uvUndoSV = 1.0f;
             uint8_t uvAnimSet = 0;
             if (!g_walkingSky && !g_walkingFP && !g_walkingLandscape && data->textureCoords) {
                 if (NI::UVController* uvc = findUVAnimController(geom)) {
-                    if (buildUVAnimPayload(uvc, uvSetCount, uvAnimPayload, uvUndoU, uvUndoV)) {
+                    if (buildUVAnimPayload(uvc, uvSetCount, uvAnimPayload, uvUndoU, uvUndoV, uvUndoSU, uvUndoSV)) {
                         uvAnimSet = ((const IPC::GeomUVAnimWire*)uvAnimPayload.data())->setIndex;
                     }
                 }
@@ -2001,17 +2013,18 @@ namespace MGE::GeometryCache {
                     // rotated 90 degrees from each other — so keying on geometry alone handed the
                     // blended overlay the opaque base's UVs, and it rendered rotated.
                     //
-                    // The UVs are contaminated by the controller, but only by a TRANSLATION, so
-                    // vertex-relative UVs (uv[i] - uv[0]) are invariant to it and identical across
-                    // clones. Quantised before hashing because the contamination is subtracted in
-                    // float: (a-c)-(b-c) need not be bit-identical to a-b across different c.
+                    // The UVs are contaminated by the controller: a TRANSLATION, plus a SCALE when
+                    // tiling animates. Vertex-relative UVs (uv[i] - uv[0]) divided by the current
+                    // tile are invariant to both and identical across clones. Quantised before
+                    // hashing because the contamination is removed in float: (a-c)-(b-c) need not
+                    // be bit-identical to a-b across different c.
                     if (capUvs) {
                         const uint32_t ab = (uint32_t)uvAnimSet * storedVerts;
                         const float u0 = capUvs[ab].x, v0 = capUvs[ab].y;
                         for (uint32_t i = 0; i < vertexCount; ++i) {
                             const int32_t q[2] = {
-                                (int32_t)std::lround((capUvs[ab + i].x - u0) * 4096.0f),
-                                (int32_t)std::lround((capUvs[ab + i].y - v0) * 4096.0f) };
+                                (int32_t)std::lround((capUvs[ab + i].x - u0) / uvUndoSU * 4096.0f),
+                                (int32_t)std::lround((capUvs[ab + i].y - v0) / uvUndoSV * 4096.0f) };
                             uvShareKey = fnv(q, sizeof(q), uvShareKey);
                         }
                     }
@@ -2028,9 +2041,23 @@ namespace MGE::GeometryCache {
                         auto& v = s_uvShare[uvShareKey];
                         v.resize((size_t)vertexCount * 2);
                         const uint32_t animBase = (uint32_t)uvAnimSet * storedVerts;
+                        // Invert MW's rewrite u' = (u-0.5)*tileU + 0.5 - offU,
+                        //                    v' = (v-0.5)*tileV + 0.5 + offV (see GeomUVAnimWire).
                         for (uint32_t i = 0; i < vertexCount; ++i) {
-                            v[i * 2 + 0] = capUvs[animBase + i].x + uvUndoU;
-                            v[i * 2 + 1] = capUvs[animBase + i].y - uvUndoV;
+                            v[i * 2 + 0] = (capUvs[animBase + i].x - 0.5f + uvUndoU) / uvUndoSU + 0.5f;
+                            v[i * 2 + 1] = (capUvs[animBase + i].y - 0.5f - uvUndoV) / uvUndoSV + 0.5f;
+                        }
+                        // [uvanim] oracle: the r0 flame quad's authored UVs are the unit square, so
+                        // a correct inversion prints corners at 0/1 whatever the capture-time phase.
+                        if (uvUndoSU != 1.0f || uvUndoSV != 1.0f) {
+                            static uint32_t s_tileLogged = 0;
+                            if (s_tileLogged < 4) {
+                                ++s_tileLogged;
+                                LOG::logline(">> [uvanim] tiling undo: tile=(%.4f,%.4f) off=(%.4f,%.4f) v0 cap=(%.4f,%.4f) -> orig=(%.4f,%.4f) vLast orig=(%.4f,%.4f)",
+                                             uvUndoSU, uvUndoSV, uvUndoU, uvUndoV,
+                                             capUvs[animBase].x, capUvs[animBase].y, v[0], v[1],
+                                             v[(vertexCount - 1) * 2], v[(vertexCount - 1) * 2 + 1]);
+                            }
                         }
                         uvShare = &v;
                         if (s_uvShare.size() > 4096) { s_uvShare.clear(); uvShare = nullptr; }

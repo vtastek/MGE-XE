@@ -91,25 +91,30 @@ namespace IPC {
     };
 
     // NiUVController key track, shipped ONCE with the mesh (appended after the part's indices;
-    // size in GeomPartWire::uvAnimBytes). Followed inline by (keyCountU + keyCountV) x
-    // {float time, float value} linear keys — U-offset track first, then V-offset. Bezier/TBC
-    // source keys are resampled to linear CLIENT-side at capture; animated TILING tracks are
-    // out of scope (no payload is shipped — those rare parts stay on the engine reship path).
-    // The host evaluates offset(t) at t = MW sim time cycled into [keyMin, keyMax] per
-    // cycleType, and applies delta = offset(t) - base (the captured verts already embed the
-    // controller's offset AT CAPTURE, carried here as baseU/baseV).
+    // size in GeomPartWire::uvAnimBytes). Followed inline by (keyCountU + keyCountV +
+    // keyCountSU + keyCountSV) x {float time, float value} linear keys, in that track order:
+    // U-offset, V-offset, U-tiling, V-tiling. Bezier/TBC source keys are resampled to linear
+    // CLIENT-side at capture. The host evaluates each track at t = MW sim time cycled into
+    // [keyMin, keyMax] per cycleType and rebuilds MW's rewrite from the ORIGINAL UVs the client
+    // uploads: u' = (u-0.5)*tileU + 0.5 - offU, v' = (v-0.5)*tileV + 0.5 + offV (scale about the
+    // texture centre, then offset — OpenMW's NiUVController matrix, in D3D's V-down space). An
+    // absent tiling track means tile 1. The r0 candle flames animate tiling (a breathing flame),
+    // which is why tiling is carried at all: rejecting it left every flame on the per-frame engine
+    // reship path, hundreds of reships a frame, and the flames blinked while the game ran.
     struct GeomUVAnimWire {
         std::uint8_t  setIndex;      // UVController::textureSet, clamped to the captured uvSetCount-1
         std::uint8_t  cycleType;     // 0 loop / 1 reverse (ping-pong) / 2 clamp
         std::uint16_t keyCountU;     // U-offset linear keys following this header
         std::uint16_t keyCountV;     // V-offset linear keys (after the U keys)
-        std::uint16_t pad;
+        std::uint16_t keyCountSU;    // U-tiling linear keys (after the V keys); 0 = tile 1
         float         frequency;     // TimeController frequency/phase: keyTime = t*frequency + phase
         float         phase;
         float         keyMin, keyMax;// TimeController low/highKeyFrame (the cycle window)
         float         baseU, baseV;  // controller currentU/VOffset AT CAPTURE (embedded in the verts)
+        std::uint16_t keyCountSV;    // V-tiling linear keys (after the U-tiling keys); 0 = tile 1
+        std::uint16_t pad;
     };
-    static_assert(sizeof(GeomUVAnimWire) == 32, "GeomUVAnimWire wire size");
+    static_assert(sizeof(GeomUVAnimWire) == 36, "GeomUVAnimWire wire size");
 
     // DrawItemWire::casterFlags bits (C4d categorical shadow casters).
     // LIVE = the game says this part moves: geometry under a character subtree (NPC/creature

@@ -4223,7 +4223,11 @@ namespace {
     // NiUVController takeover: per-frame UV-animation table capacity (gUVAnim = float4[kMaxUVAnim];
     // MUST match MAX_UV_ANIM in opaque.srt.h). Id 0 is reserved = "no animation", so up to
     // kMaxUVAnim-1 animated draws per frame; extras draw with base UVs (frozen) + a 1/s log.
-    constexpr uint32_t kMaxUVAnim = 256;
+    constexpr uint32_t kMaxUVAnim = 4096;
+    // Ids 1..kUVAnimNarrowMax are the MULTIMAP pool: multimap.vert packs its id in 8 bits
+    // (Meta 24-31). Everything else (16-bit id, DrawIndex >> 16) allocates above it, so a
+    // staircase of r0 candle flames cannot starve — or alias — the multimap windows.
+    constexpr uint32_t kUVAnimNarrowMax = 255;
 
     // SK1 sky: per-frame sky draw cap (must match IPC::kMaxSkyDraws). SK1 draws only the dome;
     // the full sky subtree is ~15 shapes (SK2). One 64KB world window (< 1024 matrices) holds them.
@@ -15906,7 +15910,8 @@ namespace {
     // next gUVAnim slot (persistent-mapped, write-only — WC trap), and returns the 1-based id
     // the loop stamps into its instance stream. Id 0 = no animation (table entry 0 stays 0).
     inline double hostNowMs();               // defined below (rate-limits the table-full log)
-    uint32_t g_uvAnimCount = 0;      // ids handed out this frame (reset with g_renderFrame)
+    uint32_t g_uvAnimCount = 0;      // WIDE ids handed out this frame, above kUVAnimNarrowMax (reset per frame)
+    uint32_t g_uvAnimNarrowCount = 0;// NARROW (multimap, 8-bit) ids handed out this frame
     double   g_uvAnimSimT  = 0.0;    // MW sim time (lighting[32]) — frozen in menus, like MW
     // MB-2c: THIS FRAME'S SIM DELTA, AND THE ONE ANSWER TO "IS THE GAME PAUSED". Derived once per
     // frame from g_uvAnimSimT (see the MB-2c block in renderScene), clamped to [0, 0.1]. Read by
@@ -15960,12 +15965,17 @@ namespace {
         if (m.uvAnimFrame == g_renderFrame) { return m.uvAnimId; }   // memoized this frame
         m.uvAnimFrame = g_renderFrame;
         m.uvAnimId    = 0;
-        if (g_uvAnimCount + 1 >= kMaxUVAnim) {
+        // Pool pick by the mesh's own kind: multimap meshes are drawn only by the multimap loops,
+        // which pack 8-bit ids; every other mesh by the 16-bit loops.
+        const bool narrow = m.multimap;
+        const bool full = narrow ? (g_uvAnimNarrowCount + 1 > kUVAnimNarrowMax)
+                                 : (kUVAnimNarrowMax + g_uvAnimCount + 1 >= kMaxUVAnim);
+        if (full) {
             static double s_lastFullLogMs = 0.0;
             if (hostNowMs() - s_lastFullLogMs >= 1000.0) {
                 s_lastFullLogMs = hostNowMs();
-                LOG::logline("!! [forge] gUVAnim table full (%u) — extra animated draws frozen at base UVs",
-                             kMaxUVAnim);
+                LOG::logline("!! [forge] gUVAnim %s pool full (%u) — extra animated draws frozen at base UVs",
+                             narrow ? "multimap" : "wide", narrow ? kUVAnimNarrowMax : kMaxUVAnim - kUVAnimNarrowMax - 1);
             }
             return 0;
         }
@@ -16010,12 +16020,23 @@ namespace {
         // we compute. The disagreement is purely in the sign with which it is applied to the UVs.
         const float du = w.keyCountU ? -(uvEvalKeys(uk, w.keyCountU, tt) - w.baseU) : 0.0f;
         const float dv = w.keyCountV ?  (uvEvalKeys(vk, w.keyCountV, tt) - w.baseV) : 0.0f;
-        const uint32_t id = ++g_uvAnimCount;                 // first id = 1
+        // Animated TILING (the r0 candle flame's breathing): scale about the texture centre BEFORE
+        // the offset, u' = (u-0.5)*tileU + 0.5 + du (GeomUVAnimWire). An absent track is tile 1.
+        // Shipped as half2 of (tile - 1) in .w so the zero-filled lane every other id carries
+        // decodes to tile 1 — offset-only animations stay bit-identical.
+        const float* suk = vk + (size_t)w.keyCountV * 2;
+        const float* svk = suk + (size_t)w.keyCountSU * 2;
+        const float su = w.keyCountSU ? uvEvalKeys(suk, w.keyCountSU, tt) : 1.0f;
+        const float sv = w.keyCountSV ? uvEvalKeys(svk, w.keyCountSV, tt) : 1.0f;
+        const uint32_t tilePacked = (uint32_t)TinyImageFormat_FloatToHalfAsUint(su - 1.0f)
+                                  | ((uint32_t)TinyImageFormat_FloatToHalfAsUint(sv - 1.0f) << 16);
+        const uint32_t id = narrow ? ++g_uvAnimNarrowCount                  // 1..255
+                                   : kUVAnimNarrowMax + (++g_uvAnimCount);  // 256..
         float* tbl = (float*)g_live.pUVAnimBuf->pCpuMappedAddress;
         tbl[(size_t)id * 4 + 0] = du;
         tbl[(size_t)id * 4 + 1] = dv;
         tbl[(size_t)id * 4 + 2] = (float)w.setIndex;
-        tbl[(size_t)id * 4 + 3] = 0.0f;
+        std::memcpy(&tbl[(size_t)id * 4 + 3], &tilePacked, sizeof(tilePacked));
         m.uvAnimId = id;
         return id;
     }
@@ -34092,6 +34113,7 @@ void destroyHostWindow(Renderer* R);
             g_lastFrameStampMs = nowMs;
         }
         g_uvAnimCount = 0; // fresh gUVAnim table this frame (memoized ids re-assign on demand)
+        g_uvAnimNarrowCount = 0;
         // M1: draw this frame's sub-pixel jitter (tasks/forge-upscale.md). HERE, beside
         // ++g_renderFrame, because the sequence must advance once per RENDERED frame — park mode and
         // frame-ahead both re-render a parked payload at a new camera, and a sequence keyed to
@@ -58276,7 +58298,8 @@ void destroyHostWindow(Renderer* R);
             if (uvAnimP && (hdr.flags & IPC::kGeomFlagUVAnim)
                 && hdr.uvAnimBytes >= sizeof(IPC::GeomUVAnimWire)) {
                 std::memcpy(&m.uvMeta, uvAnimP, sizeof(IPC::GeomUVAnimWire));
-                const uint32_t nk = (uint32_t)m.uvMeta.keyCountU + m.uvMeta.keyCountV;
+                const uint32_t nk = (uint32_t)m.uvMeta.keyCountU + m.uvMeta.keyCountV
+                                  + m.uvMeta.keyCountSU + m.uvMeta.keyCountSV;
                 const uint64_t keyBytes = (uint64_t)nk * 8;
                 if (nk && sizeof(IPC::GeomUVAnimWire) + keyBytes <= hdr.uvAnimBytes) {
                     m.uvKeys = (float*)tf_malloc((size_t)keyBytes);
