@@ -1725,11 +1725,34 @@ namespace MGEgui {
         // per-vertex lighting; MGE XE lights per pixel, and the per-pixel set below is what the
         // renderer is balanced against. Written to Morrowind.ini at once, so a player who launches
         // the game without pressing Save still gets it. The lighting group can change it after.
+        //
+        // ASKED, never silent: the player may have tuned these by hand (or another tool did), and
+        // Morrowind.ini is theirs. Nothing is asked when they already match.
         private void ApplyPPLLightingCoefficients() {
+            // The EFFECTIVE values, read from the file: a term whose Use flag is 0 contributes nothing,
+            // whatever the value beside it says (the controls would show the linear box's initial 3).
+            var mwini = new INIFile(Statics.fn_mwini, mwSettings, System.Text.Encoding.Default, true);
+            double c = mwini.getKeyValue("UseConstant") == 1 ? mwini.getKeyValue("ConstantValue") : 0;
+            double l = mwini.getKeyValue("UseLinear") == 1 ? mwini.getKeyValue("LinearValue") : 0;
+            double q = mwini.getKeyValue("UseQuadratic") == 1 ? mwini.getKeyValue("QuadraticValue") : 0;
+            if (Math.Abs(c - 0.36) < 1e-3 && Math.Abs(l) < 1e-3 && Math.Abs(q - 3.25) < 1e-3) {
+                return;
+            }
+            string fmt;
+            if (!strings.TryGetValue("LightPPLApply", out fmt)) {
+                fmt = "MGE XE lights per pixel and is balanced for these dynamic lighting coefficients:\n"
+                    + "    constant 0.36, linear 0, quadratic 3.25\n\nYour Morrowind.ini currently has:\n"
+                    + "    constant {0}, linear {1}, quadratic {2}\n\nApply the MGE XE values now? Choose No to keep "
+                    + "yours, for example if you tuned them yourself. They can be changed later on the In-game tab.";
+            }
+            string msg = string.Format(fmt, c.ToString("0.###"), l.ToString("0.###"), q.ToString("0.###"));
+            if (MessageBox.Show(msg, Statics.strings["Warning"], MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                                MessageBoxDefaultButton.Button1) != DialogResult.Yes) {
+                return;
+            }
             udLightingConst.Value = 0.36M;
             udLightingLinear.Value = 0;
             udLightingQuad.Value = 3.25M;
-            var mwini = new INIFile(Statics.fn_mwini, mwSettings, System.Text.Encoding.Default, true);
             mwini.setKey("UseConstant", true);
             mwini.setKey("ConstantValue", Decimal.ToSingle(udLightingConst.Value));
             mwini.setKey("UseLinear", true);
