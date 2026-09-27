@@ -36,6 +36,11 @@ namespace LOG {
     static bool quiet = true;
     static volatile LONG tagCount[1024];
     static volatile LONG noticeWritten = 0;
+    // Warnings trickle twice as often: a frame spike or a stall is what a bug report needs, while
+    // the routine heartbeats would otherwise be most of the file.
+    static const DWORD kQuietTrickleWarnMs = 30000;
+    static const DWORD kQuietTrickleInfoMs = 60000;
+    static volatile LONG tagLastMs[1024];   // GetTickCount of the tag's last admitted line
 
     // The tag: from the first '[' to its ']' if both fall within the first 48 characters, plus
     // whatever precedes it (so "!! [x]" and ">> [x]" are separate).
@@ -67,15 +72,31 @@ namespace LOG {
         if (!quiet) { return true; }
         const char* tagEnd = nullptr;
         const unsigned h = tagHash(line, &tagEnd);
-        const LONG budget = (line[0] == '!' && line[1] == '!') ? kQuietBudgetWarn : kQuietBudgetInfo;
+        const bool warn = (line[0] == '!' && line[1] == '!');
+        const LONG budget = warn ? kQuietBudgetWarn : kQuietBudgetInfo;
+        const DWORD trickleMs = warn ? kQuietTrickleWarnMs : kQuietTrickleInfoMs;
         const LONG n = InterlockedIncrement(&tagCount[h & 1023u]);
-        if (n <= budget) { return true; }
+        if (n <= budget) {
+            tagLastMs[h & 1023u] = (LONG)GetTickCount();
+            return true;
+        }
         if (InterlockedExchange(&noticeWritten, 1) == 0) {
-            char note[200];
+            char note[220];
             std::snprintf(note, sizeof(note),
-                          "   (quiet log: repeating lines are capped from here on; put %s beside Morrowind.exe for the full log)\r\n",
+                          "   (quiet log: repeating lines are capped from here on, then one per kind every %lu s "
+                          "(warnings every %lu s); put %s beside Morrowind.exe for the full log)\r\n",
+                          (unsigned long)(kQuietTrickleInfoMs / 1000), (unsigned long)(kQuietTrickleWarnMs / 1000),
                           kVerboseMarker);
             write(note);
+        }
+        // THE TRICKLE: past its budget a tag still gets one line per trickleMs. A count-only cap
+        // spent the frame-spike budget on the load's first frames, so a dip minutes into play left no
+        // trace at all in a player's log. The unsigned difference survives GetTickCount's wrap.
+        const DWORD now  = GetTickCount();
+        const LONG  last = tagLastMs[h & 1023u];
+        if (now - (DWORD)last >= trickleMs
+            && InterlockedCompareExchange(&tagLastMs[h & 1023u], (LONG)now, last) == last) {
+            return true;
         }
         return false;
     }
@@ -88,6 +109,7 @@ namespace LOG {
         quiet = (GetFileAttributesA(kVerboseMarker) == INVALID_FILE_ATTRIBUTES);
         for (auto& c : tagCount) { c = 0; }
         noticeWritten = 0;
+        for (auto& t : tagLastMs) { t = 0; }
         handle = CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
         if (handle == INVALID_HANDLE_VALUE) {
