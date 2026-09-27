@@ -125,6 +125,9 @@ jobs:
           Copy-Item "$tp\DirectXShaderCompiler\bin\x64\dxil.dll"         $pkg -Force
           Copy-Item "$tp\ags\ags_lib\lib\amd_ags_x64.dll"                $pkg -Force
           Copy-Item "$tp\winpixeventruntime\bin\WinPixEventRuntime.dll"  $pkg -Force
+          # DLSS/DLAA runtime (vendored, 3rdparty/DLSS/VENDORED.md). The upscaler ships OFF; without
+          # this beside the exe, turning it on in the panel is declined.
+          Copy-Item '3rdparty\DLSS\lib\Windows_x86_64\rel\nvngx_dlss.dll' $pkg -Force
           # The Forge GPU config (same files deployed beside the exe today)
           Copy-Item '3rdparty\The-Forge\Examples_3\Unit_Tests\src\01_Transformations\GPUCfg\gpu.cfg' $pkg -Force
           Copy-Item '3rdparty\The-Forge\Common_3\OS\Windows\pc_gpu.data' "$pkg\gpu.data" -Force
@@ -146,7 +149,7 @@ jobs:
             "$pkg\MGEXEgui.exe", "$pkg\SlimDX.dll", "$pkg\mgeHost64.exe",
             "$pkg\mge3\MGEfuncs.dll",
             "$pkg\D3D12Core.dll", "$pkg\dxcompiler.dll", "$pkg\dxil.dll",
-            "$pkg\amd_ags_x64.dll", "$pkg\WinPixEventRuntime.dll",
+            "$pkg\amd_ags_x64.dll", "$pkg\WinPixEventRuntime.dll", "$pkg\nvngx_dlss.dll",
             "$pkg\gpu.cfg", "$pkg\gpu.data",
             "$pkg\DIRECT3D12\opaque.frag", "$pkg\DIRECT3D12\opaque.vert",
             "$pkg\fonts\ComicRelief.ttf",
@@ -157,6 +160,13 @@ jobs:
           )
           $missing = $required | Where-Object { -not (Test-Path $_) }
           if ($missing) { $missing | ForEach-Object { Write-Error "MISSING: $_" }; throw "package incomplete" }
+          # Dev-only files must never ship: probe mods live in tools\mwse-dev-mods, and the verbose-log
+          # marker would turn a player's log back into the multi-MB dev log.
+          $devOnly = @("$pkg\mgeXE_verbose_log.txt", "$pkg\mgeHostPanel.ini", "$pkg\mgeXE_fslwatch.txt",
+                       "$pkg\Data Files\MWSE\mods\ToggleWorldOnStart", "$pkg\Data Files\MWSE\mods\WeatherProbe",
+                       "$pkg\Data Files\MWSE\mods\ControllerProbe")
+          $leaked = $devOnly | Where-Object { Test-Path $_ }
+          if ($leaked) { $leaked | ForEach-Object { Write-Error "DEV-ONLY FILE IN PACKAGE: $_" }; throw "package carries dev files" }
           $shim = Get-Item "$pkg\d3d8.dll"
           if ($shim.Length -gt 100KB) { throw "d3d8.dll is $($shim.Length) bytes - expected the small shim, got the full DLL?" }
           Write-Host "package OK - $((Get-ChildItem $pkg -Recurse -File).Count) files"

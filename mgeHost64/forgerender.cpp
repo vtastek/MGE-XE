@@ -2055,7 +2055,9 @@ namespace {
     // frame, which is free to change per frame. Off restores the un-upscaled frame exactly: the
     // rect goes back to in == out, evaluate is never called, the resolve binds set instance 0, and
     // the jitter and motion-vector passes disarm with it.
-    uint32_t g_upscaleMode = kUpscaleModeDLAA;
+    // OFF by default (2026-09-27, release): DLAA is a per-frame GPU cost on top of the MSAA base and
+    // NVIDIA-only; the panel's mode list turns it on. nvngx_dlss.dll still ships beside the exe.
+    uint32_t g_upscaleMode = kUpscaleModeOff;
     // The published per-mode rect table (upscale.h::queryModeRects). ⚠ WRITTEN ON THE RENDER THREAD,
     // READ BY setRenderSize ON THE IPC THREAD, which is why it is a published table and not a call:
     // NGX is not thread-safe, so the rect authority cannot ask the SDK at the moment it needs the

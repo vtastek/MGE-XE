@@ -12,9 +12,63 @@ namespace LOG {
 
     static HANDLE handle = INVALID_HANDLE_VALUE;
 
+    // ── QUIET BY DEFAULT: a per-TAG line budget ──────────────────────────────────────────────────
+    // Both mgecore (mgeXE.log) and mgeHost64 (mgeHost64.log) log through here, and both carry
+    // thousands of diagnostic sites — heartbeats, per-frame traces, per-event dumps — written for
+    // the dev machine. A player's session wrote 8 MB + 3.6 MB of them. Auditing every site would be
+    // endless and the next one added would leak again, so the gate sits at the choke point instead:
+    // every line's TAG (the "[name]" in its first few dozen characters, with its ">> "/"!! "
+    // prefix) gets kQuietBudget lines per session, then one notice, then silence. Startup lines and
+    // the first heartbeats survive for bug reports; anything that repeats stops.
+    //
+    // The full log is a per-INSTALL choice, the same shape as mgeXE_fslwatch.txt: a file named
+    // kVerboseMarker beside Morrowind.exe (the host's cwd is that same directory). A release install
+    // never has it; the dev install and its harness do.
+    //
+    // Budgets are hashed buckets, not a keyed table: lock-free (several threads log), and a
+    // collision only makes two tags share one budget.
+    static const char* const kVerboseMarker = "mgeXE_verbose_log.txt";
+    static const LONG kQuietBudget = 32;
+    static bool quiet = true;
+    static volatile LONG tagCount[1024];
+
+    // The tag: from the first '[' to its ']' if both fall within the first 48 characters, plus
+    // whatever precedes it (so "!! [x]" and ">> [x]" are separate). Untagged lines share one bucket.
+    static unsigned tagHash(const char* s, const char** tagEnd) {
+        unsigned h = 2166136261u;
+        const char* open = nullptr;
+        for (int i = 0; i < 48 && s[i]; ++i) {
+            if (s[i] == '[' && !open) { open = s + i; }
+            if (s[i] == ']' && open) { *tagEnd = s + i + 1; break; }
+        }
+        if (!*tagEnd) { return 0u; }
+        for (const char* p = s; p < *tagEnd; ++p) { h = (h ^ (unsigned char)*p) * 16777619u; }
+        return h;
+    }
+
+    // true = write this line.
+    static bool admit(const char* line) {
+        if (!quiet) { return true; }
+        const char* tagEnd = nullptr;
+        const unsigned h = tagHash(line, &tagEnd);
+        const LONG n = InterlockedIncrement(&tagCount[h & 1023u]);
+        if (n <= kQuietBudget) { return true; }
+        if (n == kQuietBudget + 1) {
+            char note[160];
+            const int len = tagEnd ? (int)(tagEnd - line) : 0;
+            std::snprintf(note, sizeof(note),
+                          "   (quiet log: further '%.*s' lines suppressed; put %s beside Morrowind.exe for the full log)\r\n",
+                          len, line, kVerboseMarker);
+            write(note);
+        }
+        return false;
+    }
+
 
     bool open(const char* filename) {
         close();
+        quiet = (GetFileAttributesA(kVerboseMarker) == INVALID_FILE_ATTRIBUTES);
+        for (auto& c : tagCount) { c = 0; }
         handle = CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
         if (handle == INVALID_HANDLE_VALUE) {
@@ -82,7 +136,7 @@ namespace LOG {
             std::strcpy(buf, "LOG::log(null)\r\n");
         }
 
-        write(buf);
+        if (admit(buf)) { write(buf); }
 
         va_end(args);
         return result;
