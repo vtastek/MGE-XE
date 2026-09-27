@@ -19813,6 +19813,9 @@ namespace {
     // authority and there is no step at the handover; and gated on g_skyPhys.active, so interiors
     // (which have their own 40-50 row and genuinely need the authority) are untouched.
     float  g_expMaxNight = 8.0f;
+    // At full night the ceiling above is also the floor (see the servo's expMinNow): a dark exterior
+    // is exposed wide open, and adaptation can no longer stop it down. Off = the old free floor.
+    bool   g_expNightFloor = true;
     // The ceiling actually applied on the last servo step, for the heartbeat. `rail=MAX` is
     // meaningless without it now that the limit moves with the sun.
     float  g_expMaxNow   = 1.0e3f;
@@ -24706,6 +24709,8 @@ namespace {
           // Ramps up to the MAX above as the sun rises; exterior + physical sky only.
           t.sliderF("E clamp MAX at NIGHT (pins what the star/cloud lanes are tuned against)",
                     &g_expMaxNight, 1.0f, 64.0f, 0.5f, "%.1f");
+          t.checkbox("  ...and it is the night's FLOOR too (wide open; adaptation cannot stop down)",
+                     &g_expNightFloor);
           // ⚠ THE SETPOINT RULE ITSELF, and the top-level A/B for this change. ON = the exterior
           // setpoint tracks MW's own authored lighting at every hour (mwRefLevel), which reproduces
           // the signed-off 60-80 row exactly at a clear noon and halves it at dawn and dusk. OFF =
@@ -30384,6 +30389,18 @@ void destroyHostWindow(Renderer* R);
             ? (expMaxNightNow + ((double)g_expMax - expMaxNightNow)
                                      * std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp)))
             : (double)g_expMax;
+        // THE NIGHT FLOOR (g_expNightFloor): at full night the ceiling is also the BASE — a camera
+        // wide open on a dark exterior, which the moon, a lantern or a lit window must not stop
+        // down (user: "adaptation bringing it down too much. max out should be the base"). It opens
+        // toward g_expMin along the same night ramp, interpolated in STOPS so dusk is not pinned
+        // bright: half-way through the ramp the floor is half-way in log, not half the ceiling.
+        double expMinNow = (double)g_expMin;
+        if (g_expNightFloor && g_skyPhys.active) {
+            const double r = std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp));
+            const double Lf = std::log2(std::max(expMaxNightNow, 1.0e-12)) * (1.0 - r)
+                            + std::log2(std::max((double)g_expMin, 1.0e-12)) * r;
+            expMinNow = std::min(expMaxNow, std::max((double)g_expMin, std::exp2(Lf)));
+        }
         const double gm = calGainDomain(lvl);
         // The E the measured frame was rendered with (see g_expPublished).
         const double eMeas = (g_expPublished > 0.0) ? g_expPublished : g_exposure;
@@ -30397,7 +30414,7 @@ void destroyHostWindow(Renderer* R);
         // Rail contact, measured on the DESTINATION rather than on the state: `want` is what the
         // loop asked for, so a clamp here is the servo being refused, while g_exposure hitting a
         // limit could just be the lag passing through. Recorded before the clamp overwrites it.
-        const int railNow = (want < (double)g_expMin) ? -1 : ((want > expMaxNow) ? 1 : 0);
+        const int railNow = (want < expMinNow) ? -1 : ((want > expMaxNow) ? 1 : 0);
         if (railNow != 0 && railNow == g_expRail) {
             g_expRailMs += dt * 1000.0;
             g_expRailWorstMs = std::max(g_expRailWorstMs, g_expRailMs);
@@ -30405,7 +30422,7 @@ void destroyHostWindow(Renderer* R);
             g_expRail   = railNow;
             g_expRailMs = (railNow != 0) ? (dt * 1000.0) : 0.0;
         }
-        want = std::max((double)g_expMin, std::min(expMaxNow, want));
+        want = std::max(expMinNow, std::min(expMaxNow, want));
         // The door prediction's memory of this side — SETTLED values only. Storing every step's `want` let a
         // fade-out (the frames before a door go dark and ask for 2-3 stops more) write the memory,
         // and the next door out predicted from 5.4 where the sky wanted 1.9: two blinding frames.
@@ -30481,7 +30498,7 @@ void destroyHostWindow(Renderer* R);
         }
         // The state itself, not just the destination — dragging the clamp sliders inward has to bite
         // NOW rather than over a tau, or the guard is advisory while the frame is out of authority.
-        g_exposure = std::max((double)g_expMin, std::min(expMaxNow, g_exposure));
+        g_exposure = std::max(expMinNow, std::min(expMaxNow, g_exposure));
         g_expMaxNow = (float)expMaxNow;   // heartbeat: WHICH ceiling `rail=` is reporting against
     }
 
