@@ -1023,4 +1023,24 @@ STRUCT(ShadowMaskParams)
     //       pixel, would be told it is a mirror-flat surface made of noise.
     //   zw = spare.
     DATA(float4,   pbrShade2,        None);
+    // SUNNY 16 — THE TWO UNIT FAMILIES (tasks/forge-sunny16.md P1). The host has already folded both
+    // scales into every lane it owns (sun, ambient, fog, light colours, glow sprites, the emissive
+    // gain calParams.x); these reach only the few terms that enter IN a shader with no host lane:
+    //   x = R, the PHYSICAL family's rebase (sun, sky, atmosphere). Read by the sun disc's
+    //       exposed-emitter anchor, whose "1" is a physical level.
+    //   y = m = R * s_art, the MW-AUTHORED family (lights, emissive, glow maps, interior, night).
+    //       Read by the material emitters' anchor, the distant glow maps and the ADD glow stage.
+    //   zw = spare (z is reserved for a magic-VFX family once the client can flag those draws).
+    // 1.0 in both = today's image bit for bit, and the host writes 1.0 whenever the feature is off.
+    // ⚠ WRITTEN EVERY FRAME from the unconditional calParams block: a 0 here would black every
+    // self-lit surface, the same reason calParams.x is written from there.
+    DATA(float4,   sunny16,          None);
+    // SKY-VISIBILITY MAPS (Twister-style; tasks/forge-skyao-oracle.md "TWISTER"). K depth maps of the
+    // static world, one per fixed sky direction, averaged per pixel by skyvis.comp into gSkyVisScreen
+    // (opaque.srt.h), which skyamb.h.fsl skyAOTermPx reads:
+    //   x = K, the map count; 0 = NOT ARMED (maps absent, not all drawn, or the screen pass did not
+    //       run this frame), and every lit path takes the height-map march exactly as before.
+    //   y, z = the distance match: a screen texel serves a fragment iff |its distance - the
+    //       fragment's| <= y * distance + z (relative, world units).   w = spare
+    DATA(float4,   skyVis,           None);
 };

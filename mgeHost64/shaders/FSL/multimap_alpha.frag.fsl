@@ -200,7 +200,7 @@ float4 PS_MAIN( VSOutput In )
         if (op == 0u)      { float3 b = t.rgb * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, t.a * In.Color.a)); baseA = t.a; alb = b; }
         else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }
         else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; }
-        else               { c += t.rgb;        alb += t.rgb; }
+        else               { c += t.rgb * gShadowParams.sunny16.y; alb += t.rgb; }   // ADD glow: MW family (SUNNY 16)
     }
 
     // Alpha test on the BASE stage (kept for parity; these windows carry no test → alphaRef 0).

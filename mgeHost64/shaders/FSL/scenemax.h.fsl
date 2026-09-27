@@ -1,0 +1,30 @@
+// mgeHost64 — THE SCENE TARGET'S HEADROOM (tasks/forge-sunny16.md P2).
+//
+// The scene is R16G16B16A16_FLOAT: 65504 is the largest finite value, and a term past it writes +inf,
+// which the bloom pyramid, the resolve's filters and every later blend spread into NaN. Nothing in the
+// renderer clamped a GENERATED term before this (the bloom prefilter's min(..., 60000) guards its own
+// input only), and two things made that stop being safe:
+//   - SUNNY 16's physical rebase R multiplies every sun-driven term. At R = 64 the water glint's GGX
+//     core alone is ~140k.
+//   - pbrSpecTerms has no roughness floor (alpha^2 = rough^4), so D = 1/alpha^2 already overflows on
+//     a mirror-smooth texel at R = 1.
+//
+// So each GENERATED high-dynamic-range term — the sun's specular peaks, the sun disc, the volumetric
+// shafts — is clamped to half the format's range BEFORE it is summed, leaving room for the terms it
+// lands on (a glint over a reflected sky still fits). Half, not the max, because a clamp at 65504
+// followed by one addition is an overflow again.
+//
+// ⚠ At R = 1 no term that was finite comes near this, so the image is unchanged except on pixels that
+// were ALREADY above 32768 (and anything over 65504 was +inf already). min() in HLSL also returns the
+// non-NaN operand, so a NaN arriving here leaves as SCENE_MAX instead of spreading.
+#ifndef SCENE_MAX_H
+#define SCENE_MAX_H
+
+#define SCENE_MAX 32768.0f
+
+float3 clampSceneTerm(float3 c)
+{
+    return min(c, float3(SCENE_MAX, SCENE_MAX, SCENE_MAX));
+}
+
+#endif // SCENE_MAX_H

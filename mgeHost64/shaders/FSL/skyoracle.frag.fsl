@@ -1,0 +1,122 @@
+// mgeHost64 — SKY-AO GROUND TRUTH (tasks/forge-skyao-oracle.md O1). DEV TOOL, harness-driven.
+//
+// skyAOVisibility (skyamb.h.fsl) ESTIMATES how much of the sky a point sees from a 2.5D max-height map.
+// This measures it. For K frames the host swings the published sun direction through a cosine-weighted
+// stratified set over the UPPER hemisphere, the existing sun caster renders the real 3D scene (statics +
+// terrain) into its cascades for that direction, and this pass tests every on-screen pixel against them
+// and ADDS the answer. After K frames:  V_true = sum(vis) / count, which IS the cosine-weighted sky
+// visibility about +Z — the same quantity skyAOVisibility's cos^2(horizon) models, so the two compare
+// directly. A tunnel is correct here by construction: only the directions out through its mouth see sky.
+//
+// ⚠ THE CASCADES ONLY, NEVER sunShadowVisibility(). That receiver fades into and falls back on the
+// long-range sun map, which is built from the SAME height map skyAOVisibility marches — an oracle that
+// consults the model under test is not an oracle. A pixel outside every cascade for this direction adds
+// nothing and does not count (A.y), so its V_true is the average over the directions that DID see it.
+// No strength lane either: this wants the raw geometric answer, not the look.
+//
+// Directions below the pixel's own tangent plane count as blocked (the surface itself is the occluder),
+// which is what "sky visibility of a point on a surface" means. The calibrator compares floors
+// (N.z > 0.7) separately, where every sampled direction is above the plane.
+//
+// Outputs, both ADDITIVE (ONE/ONE) into R32G32B32A32 targets the host clears on the first frame:
+//   A = (vis, inCascade, N.z, 1)                     — vis only where inCascade
+//   B = (worldAbs.xyz, skyAOTerm(N, P))              — the GPU MODEL with the live knobs, so the
+//        calibrator can prove its numpy port reproduces the shader before it fits anything with it.
+//   C = (GTAO visibility, AO armed, 0, 1)            — the screen-space term the ambient ALSO multiplies
+//        by (opaque.frag: a *= aoAmbientTerm(gAO.a)). The oracle measures TOTAL visibility, so the
+//        honest target for sky AO is oracle / GTAO, not the oracle alone — fitting sky AO to the
+//        whole answer would count the near field twice. Raw gAO.a, before the multi-bounce lift.
+// Sky pixels (no depth) write zeros everywhere and read back as "no data".
+
+#include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // sunCascadeShadowMode(), MSM_CASCADE_INSET — the cascades alone
+#include "skyamb.h.fsl"    // skyAOVisibility() — the model under test
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+STRUCT(PSOut)
+{
+    DATA(float4, A, SV_Target0);
+    DATA(float4, B, SV_Target1);
+    DATA(float4, C, SV_Target2);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PSOut PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    PSOut Out;
+    Out.A = f4(0.0f);
+    Out.B = f4(0.0f);
+    Out.C = f4(0.0f);
+
+    // Same two normalisations as volfog.frag (read its note): texture address by the ALLOC size, NDC by
+    // the RENDER size.
+    float2 pix   = In.Position.xy;
+    float2 texUv = pix * gShadowParams.screenAlloc.zw;
+    float2 vpUv  = pix * gShadowParams.screenParams.zw;
+    float deviceZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, texUv, 0).r;
+
+    float2 ndc = float2(vpUv.x * 2.0f - 1.0f, 1.0f - vpUv.y * 2.0f);
+    float4 hp  = mul(gShadowParams.invViewProj, float4(ndc, max(deviceZ, 1.0e-6f), 1.0f));
+    float3 P   = hp.xyz / hp.w;   // camera-relative world position
+
+    // The normal from the reconstructed surface itself — the pass has no G-buffer, and the quad's own
+    // derivatives of P are exactly the surface it sampled. Wrong across a depth edge (it spans two
+    // surfaces), which is one pixel wide and is why the calibrator buckets on N.z rather than trusting
+    // every pixel. Oriented to face the camera. Taken BEFORE the sky early-out: derivatives need all
+    // four lanes of the quad alive.
+    float3 dPdx = ddx(P);
+    float3 dPdy = ddy(P);
+    float3 N = cross(dPdy, dPdx);
+    float  nl = length(N);
+    N = (nl > 1.0e-12f) ? N / nl : float3(0.0f, 0.0f, 1.0f);
+    if (dot(N, -P) < 0.0f) { N = -N; }
+
+    if (deviceZ <= 0.0f) { RETURN(Out); }   // sky: nothing to measure
+
+    // --- the cascades for THIS frame's direction ---------------------------------------------------
+    int   sel = -1;
+    UNROLL for (int i = 0; i < SUN_CASCADES; ++i)
+    {
+        if (sel < 0)
+        {
+            float4 q  = mul(gShadowParams.sunViewProj[i], float4(P, 1.0f));
+            float  mm = max(abs(q.x), abs(q.y));
+            if (mm < 1.0f - MSM_CASCADE_INSET && q.z > 0.0f && q.z < 1.0f) { sel = i; }
+        }
+    }
+
+    float3 L    = -gFrameData.sunDir.xyz;   // to the sampled sky direction
+    float  NdotL = dot(N, L);
+    float  vis  = 0.0f;
+    if (sel >= 0 && NdotL > 0.0f)
+    {
+        float  bias  = gShadowParams.sunParams.y;
+        float  noff  = gShadowParams.sunParams.w;
+        float4 texel = gShadowParams.sunCascadeTexel;
+        float  nls   = saturate(NdotL);
+        float  slopeBias = gShadowParams.sunPcf1.y * min(sqrt(1.0f - nls * nls) / max(nls, 0.1f), 10.0f);
+        float  occ = sunCascadeShadowMode(sel, P + N * (noff * texel[sel]), P, bias, slopeBias, 0);
+        // The same bleed reduction the receiver applies, because it corrects the moment QUADRATURE
+        // (an under-reported core), not the look.
+        occ = saturate(occ / max(1.0f - gShadowParams.sunParams.z, 1.0e-4f));
+        vis = 1.0f - occ;
+    }
+
+    float3 worldAbs = P + gFrameData.lodEye.xyz;
+    Out.A = float4((sel >= 0) ? vis : 0.0f, (sel >= 0) ? 1.0f : 0.0f, N.z, 1.0f);
+    // The SHIPPED term, whichever arm is live (the maps when gShadowParams.skyVis is armed, else the
+    // march) — so a run scores what the frame actually uses.
+    Out.B = float4(worldAbs, skyAOTermPx(N, P, In.Position.xy));
+    // gAO is allocation-sized and read 1:1 (opaque.frag's LOAD note); aoFlags bit 0 = AO applied.
+    uint  aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+    bool  aoOn    = (aoFlags & 1u) != 0u;
+    float gtao    = aoOn ? LoadTex2D(gAO, NO_SAMPLER, int2(pix), 0).a : 1.0f;
+    Out.C = float4(gtao, aoOn ? 1.0f : 0.0f, 0.0f, 1.0f);
+    RETURN(Out);
+}

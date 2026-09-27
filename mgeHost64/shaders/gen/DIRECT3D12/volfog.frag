@@ -1245,7 +1245,17 @@ STRUCT(ShadowMaskParams)
 
 
     float4 pbrShade2;
-#line 1026
+#line 1037 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunny16;
+
+
+
+
+
+
+
+    float4 skyVis;
+#line 1046
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1639,6 +1649,13 @@ STRUCT(LightData)
 
 
 
+
+
+        Tex2D(float4) gSkyVisScreen :  register(t152,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1651,7 +1668,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 704 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 711 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1662,7 +1679,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 728 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 735 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
@@ -1973,6 +1990,13 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 }
 #line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
+float3 clampSceneTerm(float3 c)
+{
+    return min(c, float3( 32768.0f ,  32768.0f ,  32768.0f ));
+}
+#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
@@ -3298,13 +3322,13 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 
     return lerp(fogSkyTarget(s, fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir)), behind, fogAir);
 }
-#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 37 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float2, Uv, TEXCOORD0);
-#line 41
+#line 42
 };
 
 
@@ -3348,7 +3372,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float maxDist = gShadowParams.volFog0.w;
     float3 dir = normalize(P);
     float dist = (deviceZ > 0.0f) ? min(length(P), maxDist) : maxDist;
-#line 95 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 96 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     if (gShadowParams.volFog4.w > 0.5f && dir.z < -1.0e-5f)
     {
         float waterRelZ = gShadowParams.volFog4.z - gFrameData.lodEye.z;
@@ -3394,7 +3418,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
     float phaseCeil = gShadowParams.volFog4.y;
     if (phaseCeil > 0.0f) { lobes = lobes / (1.0f + lobes / phaseCeil); }
-#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 155 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float3 hazeCol = fogSkyColor(pix);
     float3 shaftCol = gFrameData.sunCol.rgb;
 
@@ -3431,10 +3455,10 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
         }
         if (transmittance < 0.003f) { break; }
     }
-#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 220 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float coverage = 1.0f - transmittance;
     float occlude = saturate(gShadowParams.volFog3.x);
     float3 grade = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    return (float4(inscatter * grade, saturate(occlude * coverage)));
+    return (float4(clampSceneTerm(inscatter * grade), saturate(occlude * coverage)));
 }
 #line 94 "FSL/shaders.list"

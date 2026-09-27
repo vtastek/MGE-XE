@@ -93,6 +93,13 @@
 #include "volfog.frag.fsl"
 #end
 
+// SKY-AO GROUND TRUTH (tasks/forge-skyao-oracle.md). Dev tool: same fullscreen tri + PerFrame set as
+// volfog; ADDS per-pixel sun-cascade visibility for the host's swept sky directions into two
+// R32G32B32A32 targets (MRT). Built only when MGE_HOST_KNOBS arms skyOracleAt.
+#frag skyoracle.frag
+#include "skyoracle.frag.fsl"
+#end
+
 // UNDERWATER BACKSTOP (W8). Same fullscreen tri + PerFrame set as volfog, but a FILL-HOLES blend
 // (INV_DEST_ALPHA / ONE) so it writes only where nothing was drawn — the horizon band, past the
 // shelf, wherever terrain ends. Reads no depth at all: "no depth" is precisely the state it exists
@@ -611,6 +618,24 @@
 
 #comp skyheightmin.comp
 #include "skyheightmin.comp.fsl"
+#end
+
+// SKY AO's smoothed copy of the height map (skyheightblur.srt.h): the Gaussian and the verbatim
+// copy (the skyAOBlur=0 arm). Once per rebuild, at the tail of rebuildSkyHeightMap.
+#comp skyheightblur.comp
+#define SKYBLUR_RADIUS 4
+#define SKYBLUR_SIGMA 1.5f
+#include "skyheightblur.comp.fsl"
+#end
+
+#comp skyheightcopy.comp
+#include "skyheightblur.comp.fsl"
+#end
+
+// SKY-VISIBILITY screen pass (skyvis.srt.h): the K direction maps averaged once per half-res pixel,
+// after the linearize, for skyamb.h.fsl skyAOTermPx.
+#comp skyvis.comp
+#include "skyvis.comp.fsl"
 #end
 
 // Planar-reflection mip pyramid (WT4d / PBR water, P2). Same two-variant shape as the Hi-Z above,

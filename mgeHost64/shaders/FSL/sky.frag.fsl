@@ -210,7 +210,9 @@ float4 PS_MAIN( VSOutput In )
         // BLACK DISC over the sky, which is worse than every failure it could report; falling
         // through to liftInPass draws MW's own sun instead, which is merely un-physical.
         float3 emis = c.rgb * gSkyView.sunDisc.xyz;
-        c.rgb = expandExposedEmissiveP(emis, tex.rgb, c.a, gSkyView.sunDisc.w);
+        // SUNNY 16: the disc is PHYSICAL family, so its "exposed look" is R scene units.
+        // ...and clamped to the target's headroom (scenemax.h.fsl): the disc is ~18 x R scene units.
+        c.rgb = clampSceneTerm(expandExposedEmissiveP(emis, tex.rgb, c.a, gSkyView.sunDisc.w, gShadowParams.sunny16.x));
     } else if (cls == SKY_CLASS_STARS && gShadowParams.toneParams.y > 0.5f) {
         // ─── THE STARS, EXPOSED UP ───────────────────────────────────────────────────────────────
         // *"as long as nebulas and stars keep their look, space between them can go dark. stars can
@@ -280,7 +282,9 @@ float4 PS_MAIN( VSOutput In )
         // premultiply itself, and lifting a premultiplied value would put the curve on the wrong
         // side of the coverage multiply (the same trap resolve.srt.h documents three times over).
         // Inert under AgX by design; see scenecolor.h.fsl's amended class-2 note.
-        c.rgb = liftInPass(c.rgb);
+        // SUNNY 16: whatever lands here is MW's AUTHORED sky (the physical sky is off, or this is a
+        // class it does not own), so it is MW family: m. Exactly 1 with the feature off.
+        c.rgb = liftInPass(c.rgb) * gShadowParams.sunny16.y;
     }
     // ⚠ P1'S PHOTOMETRIC ANCHOR STOOD HERE AND IS GONE (tasks/forge-physical-sky.md P2).
     // It multiplied this pass by a host-derived scale that put MW's authored sky at the physical

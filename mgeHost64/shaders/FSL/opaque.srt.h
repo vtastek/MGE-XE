@@ -671,6 +671,13 @@ BEGIN_SRT_NO_AB(SrtData)
         // terrain.frag's distant arm, pointlights.h.fsl's distant arm), which draw under pPerFrameSet
         // and pPerFrameSetReflectGeo — goboBake binds exactly those two. Appended last (one counter).
         DECL_TEXTURE(PerFrame, Tex2DArray(float), gGoboArray)
+        // ─── SKY-VISIBILITY MAPS (skyamb.h.fsl skyVisMaps; gShadowParams.skyVis) ───────────────────
+        // skyvis.comp's half-res (vis, distance, coverage, 0) over the MAIN camera's prepass depth.
+        // ⚠ Bound ONLY into the main pPerFrameSet: it describes that camera's pixels and no other's.
+        // Unbound reads 0, and distance 0 matches no fragment, so every other set takes the march.
+        // Appended AFTER gGoboArray — append only, FSL assigns descriptor offsets from one running
+        // counter and an insertion silently re-points every later binding.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyVisScreen)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

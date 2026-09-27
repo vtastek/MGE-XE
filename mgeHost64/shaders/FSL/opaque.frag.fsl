@@ -299,7 +299,7 @@ float4 PS_MAIN( VSOutput In )
     // the lower hemisphere with fogColNear, which is usually brighter than the zenith. See
     // tasks/lighting.md SH1 before tuning.
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactor(pbrOn ? pbrNb : In.Normal, In.WorldPos);
+                                      : gFrameData.ambCol.rgb * skyAmbFactorPx(pbrOn ? pbrNb : In.Normal, In.WorldPos, In.Position.xy);
     // (PBR draws take the height-derived normal here — a relief that only the sun can see flattens
     // the moment the surface is in shadow. It is the UNBENT one, so the bend's double-count argument
     // above still holds.)
@@ -330,8 +330,10 @@ float4 PS_MAIN( VSOutput In )
     {
         const float2 st = pbrSpecTerms(pbrNb, -gFrameData.sunDir.xyz, pbrV, ndl, pbrNoV, pbrAlpha2);
         const float3 w  = gFrameData.sunCol.rgb * (ndl * sunVis) * pbrTSun;
-        pbrSpecA += w * st.x;
-        pbrSpecB += w * st.y;
+        // Clamped per term (scenemax.h.fsl): D = 1/alpha^2 has no roughness floor, and the sun's R
+        // multiplies it. Both halves, since spec = F0*A + B and F0 <= 1.
+        pbrSpecA += clampSceneTerm(w * st.x);
+        pbrSpecB += clampSceneTerm(w * st.y);
     }
     // W32 — a submerged lamp is a caustic PROJECTOR (waterfog.h.fsl). Hoisted out of the loop: above
     // water this is ONE cbuffer compare for the whole fragment instead of one call per light, and
@@ -640,7 +642,7 @@ float4 PS_MAIN( VSOutput In )
         // so the two cannot drift apart. L1 is blurry by nature — right for rough surfaces, soft for
         // polished ones — which is the honest limit of reflecting a probe that has no sharper term.
         const float3 R = reflect(-pbrV, pbrNb);
-        float3 env = gFrameData.ambCol.rgb * skyAmbFactor(R, In.WorldPos) * pbrTAmb * gFrameData.dbgScales.x;
+        float3 env = gFrameData.ambCol.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
         if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
                              + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);

@@ -1,0 +1,54 @@
+// mgeHost64 — sky AO's smoothed height map (see skyheightblur.srt.h for why a COPY).
+//
+// SKYBLUR_RADIUS 0 = a verbatim copy (the A/B arm, knob skyAOBlur off); otherwise a (2R+1)^2
+// Gaussian with sigma SKYBLUR_SIGMA texels. One pass, not separable: it runs once per rebuild, and
+// the valid-only normalisation below does not separate cleanly anyway.
+//
+// ⚠ EMPTY TEXELS (the -30000 sentinel) ARE EXCLUDED FROM THE WEIGHTS and an empty texel stays empty.
+// Averaging the sentinel in would drag every coastline and the window's rim thousands of units
+// down — a sloped cliff where there is none. tools/skyao_fit.py reproduces this kernel exactly, so
+// the oracle's port check covers it.
+#include "skyheightblur.srt.h"
+
+#ifndef SKYBLUR_RADIUS
+#define SKYBLUR_RADIUS 0
+#endif
+#ifndef SKYBLUR_SIGMA
+#define SKYBLUR_SIGMA 1.5f
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p  = int2(DispatchThreadID.xy);
+    int2 sd = GetDimensions(gSkyBlurSrc, NO_SAMPLER);
+    // RETURN() on its own line: fsl.py rewrites it line by line (see skyheight.comp.fsl).
+    if (p.x >= sd.x || p.y >= sd.y)
+    {
+        RETURN();
+    }
+    float c = LoadTex2D(gSkyBlurSrc, NO_SAMPLER, p, 0).r;
+#if SKYBLUR_RADIUS > 0
+    if (c > -20000.0f)
+    {
+        float sum = 0.0f, wsum = 0.0f;
+        const float k = -0.5f / (SKYBLUR_SIGMA * SKYBLUR_SIGMA);
+        int2 mx = sd - int2(1, 1);
+        for (int dy = -SKYBLUR_RADIUS; dy <= SKYBLUR_RADIUS; ++dy)
+        {
+            for (int dx = -SKYBLUR_RADIUS; dx <= SKYBLUR_RADIUS; ++dx)
+            {
+                int2  q = clamp(p + int2(dx, dy), int2(0, 0), mx);
+                float h = LoadTex2D(gSkyBlurSrc, NO_SAMPLER, q, 0).r;
+                float w = exp(k * (float)(dx * dx + dy * dy));
+                if (h > -20000.0f) { sum += w * h; wsum += w; }
+            }
+        }
+        c = sum / wsum;   // wsum > 0: the centre itself is valid
+    }
+#endif
+    Write2D(gSkyBlurDst, p, c);
+    RETURN();
+}

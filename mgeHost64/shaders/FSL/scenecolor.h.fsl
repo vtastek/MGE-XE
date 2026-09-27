@@ -109,6 +109,8 @@
 #ifndef SCENE_COLOR_H
 #define SCENE_COLOR_H
 
+#include "scenemax.h.fsl"   // clampSceneTerm() — fp16 headroom for generated HDR terms (SUNNY 16 P2)
+
 // Class 1. The curve, still in the pass, until the scene goes scene-referred.
 float3 tonemapInPass(float3 c)
 {
@@ -279,7 +281,11 @@ float3 mod2xStage(float3 t)
 // a radial profile that runs a=1.00 in the core to a=0.001 at r=0.8 — so it needs this operator.
 // But it is a GLARE SPRITE, not a lamp: it wants a falloff chosen from ITS profile, and sharing the
 // material path's lane would make one slider move two unrelated things. Same code, two exponents.
-float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
+// ⚠ SUNNY 16: `unit` IS WHAT "1" MEANT (tasks/forge-sunny16.md). The floor lands the skirt at "unit
+// emissive", and that unit belongs to the emitter's FAMILY: an MW lamp's exposed look is 1 MW unit,
+// i.e. m scene units once the families are split, and the sun sprite's is R. Written as
+// unit / max(lumaE, unit), which at unit = 1 is the pre-feature expression token for token.
+float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p, float unit)
 {
     if (!(p > 0.0f)) { return emis; }
     // The measure is the EXPOSED value — albedo x coverage — because that product is what MW put on
@@ -290,7 +296,7 @@ float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
     float3 a = max(albedoRgb, float3(0.0f, 0.0f, 0.0f));
     float  w = saturate(max(max(a.r, a.g), a.b) * max(cov, 0.0f));
     float  lumaE = dot(max(emis, float3(0.0f, 0.0f, 0.0f)), float3(0.2126f, 0.7152f, 0.0722f));
-    float  fMin  = 1.0f / max(lumaE, 1.0f);
+    float  fMin  = unit / max(lumaE, unit);
     float  f = fMin + (1.0f - fMin) * pow(w, p);
     return emis * f;
 }
@@ -299,7 +305,7 @@ float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
 // frag already reads. Unchanged behaviour for every existing caller.
 float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
 {
-    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w);
+    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w, gShadowParams.sunny16.y);
 }
 
 // The same operator as the DELTA to add to an ALREADY-ASSEMBLED `lit`. Every colour frag folds emis

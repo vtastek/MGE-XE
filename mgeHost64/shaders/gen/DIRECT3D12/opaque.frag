@@ -1245,7 +1245,17 @@ STRUCT(ShadowMaskParams)
 
 
     float4 pbrShade2;
-#line 1026
+#line 1037 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunny16;
+
+
+
+
+
+
+
+    float4 skyVis;
+#line 1046
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1639,6 +1649,13 @@ STRUCT(LightData)
 
 
 
+
+
+        Tex2D(float4) gSkyVisScreen :  register(t152,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1651,7 +1668,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 704 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 711 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1662,7 +1679,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 728 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 735 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
@@ -2933,20 +2950,56 @@ float skyAOVisibility(float3 worldAbs)
 
     return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
 }
+#line 208 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float skyAOTerm(float3 N, float3 worldPosRel)
+{
+    return (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
+                                              : 1.0f;
+}
+
+
+float skyAOTermPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    float strength = gShadowParams.skyParams.y;
+    if (strength <= 0.0f) { return 1.0f; }
+    if (gShadowParams.skyVis.x <= 0.0f) { return skyAOTerm(N, worldPosRel); }
+
+    float myD = length(worldPosRel);
+    float tol = myD * gShadowParams.skyVis.y + gShadowParams.skyVis.z;
+
+
+    float2 hc = (svPos - 0.5f) * 0.5f;
+    int2 i0 = int2(floor(hc));
+    float2 fr = hc - float2(i0);
+    int2 mx = int2(GetDimensions(gSkyVisScreen, NO_SAMPLER)) - int2(1, 1);
+    float wSum = 0.0f, vSum = 0.0f, cSum = 0.0f;
+    UNROLL for (int k = 0; k < 4; ++k)
+    {
+        int2 o = int2(k & 1, k >> 1);
+        float4 s = LoadTex2D(gSkyVisScreen, NO_SAMPLER, clamp(i0 + o, int2(0, 0), mx), 0);
+        float wb = ((o.x == 1) ? fr.x : 1.0f - fr.x) * ((o.y == 1) ? fr.y : 1.0f - fr.y) + 1.0e-3f;
+        float w = (abs(s.y - myD) <= tol) ? wb : 0.0f;
+        wSum += w; vSum += w * s.x; cSum += w * s.z;
+    }
+    if (wSum <= 0.0f) { return skyAOTerm(N, worldPosRel); }
+    float vis = vSum / wSum, cov = cSum / wSum;
+    float v = lerp(1.0f, vis, strength);
+    if (cov >= 0.999f) { return v; }
+    return lerp(skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz), v, cov);
+}
 
 
 
 
 
-float3 skyAmbFactor(float3 N, float3 worldPosRel)
+float3 skyAmbFactorAO(float3 N, float ao)
 {
 
 
 
 
 
-    float ao = (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
-                                                  : 1.0f;
+
 
 
     float s = gShadowParams.skyParams.x;
@@ -2965,6 +3018,18 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
 
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
+}
+
+
+float3 skyAmbFactor(float3 N, float3 worldPosRel)
+{
+    return skyAmbFactorAO(N, skyAOTerm(N, worldPosRel));
+}
+
+
+float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbFactorAO(N, skyAOTermPx(N, worldPosRel, svPos));
 }
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -3060,7 +3125,16 @@ float3 aoAmbientTermProxy(float visibility, uint aoFlags)
 }
 #line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+#line 112 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
+float3 clampSceneTerm(float3 c)
+{
+    return min(c, float3( 32768.0f ,  32768.0f ,  32768.0f ));
+}
 #line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+
+
 float3 tonemapInPass(float3 c)
 {
     return (gShadowParams.toneParams.x > 0.5f) ? c : tonemap(c);
@@ -3129,8 +3203,8 @@ float3 mod2xStage(float3 t)
 {
     return (gShadowParams.toneParams.y > 0.5f) ? mod2xLinear(t) : (t * 2.0f);
 }
-#line 282 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
-float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
+#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p, float unit)
 {
     if (!(p > 0.0f)) { return emis; }
 
@@ -3141,7 +3215,7 @@ float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
     float3 a = max(albedoRgb, float3(0.0f, 0.0f, 0.0f));
     float w = saturate(max(max(a.r, a.g), a.b) * max(cov, 0.0f));
     float lumaE = dot(max(emis, float3(0.0f, 0.0f, 0.0f)), float3(0.2126f, 0.7152f, 0.0722f));
-    float fMin = 1.0f / max(lumaE, 1.0f);
+    float fMin = unit / max(lumaE, unit);
     float f = fMin + (1.0f - fMin) * pow(w, p);
     return emis * f;
 }
@@ -3150,7 +3224,7 @@ float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
 
 float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
 {
-    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w);
+    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w, gShadowParams.sunny16.y);
 }
 
 
@@ -4755,7 +4829,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactor(pbrOn ? pbrNb : In.Normal, In.WorldPos);
+                                      : gFrameData.ambCol.rgb * skyAmbFactorPx(pbrOn ? pbrNb : In.Normal, In.WorldPos, In.Position.xy);
 
 
 
@@ -4786,8 +4860,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     {
         const float2 st = pbrSpecTerms(pbrNb, -gFrameData.sunDir.xyz, pbrV, ndl, pbrNoV, pbrAlpha2);
         const float3 w = gFrameData.sunCol.rgb * (ndl * sunVis) * pbrTSun;
-        pbrSpecA += w * st.x;
-        pbrSpecB += w * st.y;
+
+
+        pbrSpecA += clampSceneTerm(w * st.x);
+        pbrSpecB += clampSceneTerm(w * st.y);
     }
 
 
@@ -4957,10 +5033,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         }
     }
     d *= gFrameData.dbgScales.y;
-#line 518 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 520 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
                 * gShadowParams.calParams.x;
-#line 544 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 546 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float4 albedo;
     if (paraLive) {
         albedo = sampleBaseGrad(In.TexIndex, In.ClampMode, pbrUv, pbrDUVdx, pbrDUVdy,
@@ -4968,7 +5044,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     } else {
         albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
     }
-#line 562 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 564 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (In.OverlayIndex != 0u) {
         float3 ov;
         if (paraLive) {
@@ -5015,7 +5091,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 622 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 624 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
@@ -5037,7 +5113,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
         const float3 R = reflect(-pbrV, pbrNb);
-        float3 env = gFrameData.ambCol.rgb * skyAmbFactor(R, In.WorldPos) * pbrTAmb * gFrameData.dbgScales.x;
+        float3 env = gFrameData.ambCol.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
         if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }
         const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
                              + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);

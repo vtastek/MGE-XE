@@ -964,7 +964,7 @@ float4 PS_MAIN( VSOutput In )
     // SH1: distant ambient gets the same sky direction the near paths do. Landed together with them
     // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
     // a visible seam across the near/far handover on the same building.
-    float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos);
+    float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(normal, In.WorldPos, In.Position.xy);
     // "AO enable" tick (debugParams.w bit0), through the shared multi-bounce term.
     // ⚠ TERRAIN IS THE SURFACE THIS MATTERS MOST ON, and it is the one that prompted it. G1f made
     // grass a GTAO occluder, so the ground under a clump carries occlusion it never carried before —
@@ -1039,8 +1039,8 @@ float4 PS_MAIN( VSOutput In )
     {
         const float2 st = pbrSpecTerms(nShade, -gFrameData.sunDir.xyz, pbrV, sunNdl, pbrNoV, pbrAlpha2);
         const float3 w  = gFrameData.sunCol.rgb * (sunNdl * sunVis) * tSunW;
-        pbrSpecA += w * st.x;
-        pbrSpecB += w * st.y;
+        pbrSpecA += clampSceneTerm(w * st.x);   // headroom (scenemax.h.fsl) — see opaque.frag
+        pbrSpecB += clampSceneTerm(w * st.y);
     }
 
     // Point lights. Terrain is the ONE surface that spans the whole near↔far handoff — the ground
@@ -1289,7 +1289,7 @@ float4 PS_MAIN( VSOutput In )
         // mirror direction — so what lights the ground and what it reflects cannot drift apart.
         // lodSunAmb, not ambCol: that is terrain's own ambient source (see `amb` above).
         const float3 R = reflect(-pbrV, nShade);
-        float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactor(R, In.WorldPos) * tAmbW;
+        float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * tAmbW;
         if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         env *= pbrHeightVis;                              // ...and so does a pocket in the TEXTURE
         // Scaled by COVERAGE: where only part of the blend carries a _paramh, only that part is a

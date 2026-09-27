@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 312 "FSL/shaders.list"
+#line 319 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 60 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1245,7 +1245,17 @@ STRUCT(ShadowMaskParams)
 
 
     float4 pbrShade2;
-#line 1026
+#line 1037 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunny16;
+
+
+
+
+
+
+
+    float4 skyVis;
+#line 1046
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1639,6 +1649,13 @@ STRUCT(LightData)
 
 
 
+
+
+        Tex2D(float4) gSkyVisScreen :  register(t152,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1651,7 +1668,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 704 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 711 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1662,7 +1679,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 728 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 735 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 61 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -1714,7 +1731,16 @@ float3 mod2xLinear(float3 tLinear)
 }
 #line 63 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+#line 112 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
+float3 clampSceneTerm(float3 c)
+{
+    return min(c, float3( 32768.0f ,  32768.0f ,  32768.0f ));
+}
 #line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+
+
 float3 tonemapInPass(float3 c)
 {
     return (gShadowParams.toneParams.x > 0.5f) ? c : tonemap(c);
@@ -1783,8 +1809,8 @@ float3 mod2xStage(float3 t)
 {
     return (gShadowParams.toneParams.y > 0.5f) ? mod2xLinear(t) : (t * 2.0f);
 }
-#line 282 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
-float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
+#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p, float unit)
 {
     if (!(p > 0.0f)) { return emis; }
 
@@ -1795,7 +1821,7 @@ float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
     float3 a = max(albedoRgb, float3(0.0f, 0.0f, 0.0f));
     float w = saturate(max(max(a.r, a.g), a.b) * max(cov, 0.0f));
     float lumaE = dot(max(emis, float3(0.0f, 0.0f, 0.0f)), float3(0.2126f, 0.7152f, 0.0722f));
-    float fMin = 1.0f / max(lumaE, 1.0f);
+    float fMin = unit / max(lumaE, unit);
     float f = fMin + (1.0f - fMin) * pow(w, p);
     return emis * f;
 }
@@ -1804,7 +1830,7 @@ float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
 
 float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
 {
-    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w);
+    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w, gShadowParams.sunny16.y);
 }
 
 
@@ -4261,7 +4287,7 @@ rg - 1.0f;
         if (!physFresnel) {
             float3 sunPosU = -gFrameData.sunDir.xyz;
             float refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
-            resultU += gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog;
+            resultU += clampSceneTerm(gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog);
         }
 
         return (float4(resultU, 1.0f));
@@ -4446,8 +4472,8 @@ rg - 1.0f;
 
     float sphereNorm = (aSpec * aSpec) / max(a2, 1e-8f);
     float3 spec = gFrameData.sunCol.rgb * (D * Vis * F * NoL * min(sphereNorm, 1.0f));
-#line 2511 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
-    if (!noReflect) { result += tonemapInPass(spec); }
+#line 2513 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+    if (!noReflect) { result += tonemapInPass(clampSceneTerm(spec)); }
 
 
 
@@ -4462,10 +4488,10 @@ rg - 1.0f;
     float wcutDim = 1.0f - 0.9f * wcutdark;
     result = result * wcutDim;
     kDst = kDst * wcutDim;
-#line 2545 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2547 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     result = result * (1.0f - shorefactor);
     kDst = kDst * (1.0f - shorefactor) + shorefactor;
-#line 2615 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2617 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	if (!noFogMelt) {
 	    float E = fogExtinction(fog, 1.0f);
 	    result *= E;
@@ -4473,15 +4499,15 @@ rg - 1.0f;
 	    result = result * fog
 	            + fogSkyColorAt(In.Position.xy, fog, In.WorldPos) * ((1.0f - fog) * (1.0f - kDst));
 	}
-#line 2675 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2677 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	float2 offPx = (1.0f - refrOccl) * reffactorR;
 	float wOwn = saturate(gShadowParams.waterDistort.z)
 	              * smoothstep(0.5f, 2.0f, length(offPx));
 	float kDstBl = kDst * (1.0f - wOwn);
 	result += kDst * (refrDist - (1.0f - wOwn) * refrFlat);
-#line 2698 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2700 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	if (destProbe) { RETURN(float4(-kDst * refrFlat, 1.0f - kDst)); }
-#line 2710 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2712 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	if (flatProbe) { RETURN(float4(refrFlat, 1.0f)); }
 
 
@@ -4490,4 +4516,4 @@ rg - 1.0f;
 
 	return (float4(result, 1.0f - kDstBl));
 }
-#line 313 "FSL/shaders.list"
+#line 320 "FSL/shaders.list"

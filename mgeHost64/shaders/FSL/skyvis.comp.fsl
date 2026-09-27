@@ -1,0 +1,95 @@
+// mgeHost64 — sky visibility from the K direction maps, once per half-res pixel (see skyvis.srt.h).
+//
+// The ORACLE-SCORED LOOK (hdrdump skyoracle_0011_svm32.png, floor error 0.034 vs the old march's
+// 0.129): a point's visibility is the PLAIN average over the maps that cover it of a wide filtered
+// compare — (2R+1)^2 bilinear compare taps, R = 2 — at the point itself, no normal offset. It is a
+// function of world position only, which is what lets it live in a screen pass.
+//
+// The wide compare costs (R+1)^2 gathers per map, not (2R+1)^2 x 4 loads: the taps' bilinear
+// weights summed per texel are separable — 1-f, then 1 for every inner texel, then f — over a
+// (2R+2)^2 block, which (R+1)^2 2x2 gathers cover exactly.
+//
+// Output (vis, distance, coverage, 0). distance is the reconstructed point's distance from the
+// camera: a lit fragment reads this texture only where ITS distance matches, so a surface that was
+// not in the prepass (alpha, water, another camera) never borrows the value of what is behind it.
+// coverage = the fraction of the maps whose box holds the point; the fragment hands the rest to the
+// height-map march.
+#include "skyvis.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   h    = int2(DispatchThreadID.xy);
+    float4 dims = gSkyVisParams.dims;
+    // RETURN() on its own line: fsl.py rewrites it line by line (see skyheight.comp.fsl).
+    if (h.x >= (int)dims.z || h.y >= (int)dims.w)
+    {
+        RETURN();
+    }
+    // This half-res texel stands for full-res pixel 2h (the fragment side maps back the same way).
+    int2  f  = min(h * 2, int2(dims.xy) - int2(1, 1));
+    float dz = LoadTex2D(gSvDepth, NO_SAMPLER, f, 0).r;
+    float4 o = float4(1.0f, -1.0f, 0.0f, 0.0f);   // no surface: distance -1 matches nothing
+    if (dz > 0.0f)
+    {
+        float2 uv = (float2(f) + 0.5f) / dims.xy;
+        float4 p4 = mul(gSkyVisParams.invViewProj, float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
+        float3 p  = p4.xyz / p4.w;
+        float  dist = length(p);
+        o.y = dist;
+        if (dist < gSkyVisParams.params2.x)
+        {
+            int   K    = (int)gSkyVisParams.params.x;
+            float res  = gSkyVisParams.params.y;
+            float bias = gSkyVisParams.params.z;
+            int   R    = (int)gSkyVisParams.params.w;
+            float n    = float(2 * R + 1);
+            float norm = 1.0f / (n * n);
+            float sumL = 0.0f, cov = 0.0f;
+            for (int i = 0; i < K; ++i)
+            {
+                float4 c0 = gSkyVisParams.tiles[i * 4 + 0];
+                float4 c1 = gSkyVisParams.tiles[i * 4 + 1];
+                float4 c2 = gSkyVisParams.tiles[i * 4 + 2];
+                float3 r  = p - gSkyVisParams.tiles[i * 4 + 3].xyz;
+                float3 clip = float3(dot(r, c0.xyz) + c0.w, dot(r, c1.xyz) + c1.w, dot(r, c2.xyz) + c2.w);
+                // Fade a map out over its outer sixteenth rather than stepping at the box edge.
+                float2 ae = abs(clip.xy);
+                float  inside = saturate((1.0f - max(ae.x, ae.y)) * 16.0f);
+                if (inside <= 0.0f) { continue; }
+                float  ref = clip.z + bias;
+                float2 tc  = (clip.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f)) * res - 0.5f;
+                float2 b   = floor(tc);
+                float2 fr  = tc - b;
+                float  acc = 0.0f;
+                for (int gy = 0; gy <= R; ++gy)
+                {
+                    for (int gx = 0; gx <= R; ++gx)
+                    {
+                        // The 2x2 block whose top-left texel is t0; gathered at its shared corner.
+                        float2 t0 = b - float(R) + float2(float(2 * gx), float(2 * gy));
+                        float4 g  = GatherRedTex2D(gSvMaps, gSamplerPointClamp, float3((t0 + 1.0f) / res, float(i)));
+                        // Reverse-Z: a stored depth GREATER than the reference is nearer the sky.
+                        float4 lit = step(g, f4(ref));
+                        // Summed tap weights per texel: 1-f on the first, f on the last, 1 between.
+                        int    jx = 2 * gx, jy = 2 * gy;
+                        float  wx0 = (jx == 0) ? 1.0f - fr.x : 1.0f;
+                        float  wx1 = (jx + 1 == 2 * R + 1) ? fr.x : 1.0f;
+                        float  wy0 = (jy == 0) ? 1.0f - fr.y : 1.0f;
+                        float  wy1 = (jy + 1 == 2 * R + 1) ? fr.y : 1.0f;
+                        // Gather order: w (0,0), z (1,0), x (0,1), y (1,1).
+                        acc += lit.w * wx0 * wy0 + lit.z * wx1 * wy0 + lit.x * wx0 * wy1 + lit.y * wx1 * wy1;
+                    }
+                }
+                sumL += acc * norm * inside;
+                cov  += inside;
+            }
+            o.x = (cov > 1.0e-4f) ? sumL / cov : 1.0f;
+            o.z = cov / max(float(K), 1.0f);
+        }
+    }
+    Write2D(gSvOut, h, o);
+    RETURN();
+}

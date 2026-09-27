@@ -60,8 +60,8 @@
 // The taps START at an inner radius (default ~256 u) so this does NOT restate what GTAO already
 // multiplied into the same ambient — the two are complementary bands, not stacked copies.
 //
-// Requires (include AFTER opaque.srt.h): gShadowParams.shAr/shAg/shAb + skyParams + skyAOMap,
-// and gSkyHeight + gFrameData.lodEye.
+// Requires (include AFTER opaque.srt.h): gShadowParams.shAr/shAg/shAb + skyParams + skyAOMap + skyVis,
+// and gSkyHeight + gSkyVisScreen + gFrameData.lodEye.
 
 #ifndef SKY_AMB_H
 #define SKY_AMB_H
@@ -192,19 +192,68 @@ float skyAOVisibility(float3 worldAbs)
     return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
 }
 
+// ---------------------------------------------------------------------------------------------
+// SKY-VISIBILITY MAPS — the Twister method (tasks/forge-skyao-oracle.md "TWISTER").
+//
+// The march above reads a 2.5D map, and a 2.5D map cannot say "the space under that root is open"
+// or "this tube is closed": it over-lights tunnels and blotches underhangs, and no knob fixes either
+// (the oracle fit proved it). The host keeps K depth maps of the static world instead, one per fixed
+// sky direction, and skyvis.comp averages them ONCE PER HALF-RES PIXEL after the depth prepass into
+// gSkyVisScreen = (vis, distance, coverage). Oracle floor error 0.034 vs the march's 0.129.
+//
+// This side reads it: the four half-res texels around the fragment, bilinear, each kept only where
+// ITS distance matches this fragment's — so a fragment that was not in the prepass (alpha, water,
+// another camera) finds no match and takes the march, rather than borrowing what is behind it.
+// Bound only into the MAIN PerFrame set; elsewhere it reads 0, whose distance matches nothing.
+float skyAOTerm(float3 N, float3 worldPosRel)
+{
+    return (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
+                                              : 1.0f;
+}
+
+// svPos = SV_Position.xy of a MAIN-camera fragment (pixel centres, render rect at 0,0).
+float skyAOTermPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    float strength = gShadowParams.skyParams.y;
+    if (strength <= 0.0f) { return 1.0f; }
+    if (gShadowParams.skyVis.x <= 0.0f) { return skyAOTerm(N, worldPosRel); }
+
+    float  myD = length(worldPosRel);
+    float  tol = myD * gShadowParams.skyVis.y + gShadowParams.skyVis.z;
+    // Half-res texel h stands for full pixel 2h, whose centre is 2h + 0.5: a fragment centred at
+    // x + 0.5 sits at half coordinate x / 2.
+    float2 hc = (svPos - 0.5f) * 0.5f;
+    int2   i0 = int2(floor(hc));
+    float2 fr = hc - float2(i0);
+    int2   mx = int2(GetDimensions(gSkyVisScreen, NO_SAMPLER)) - int2(1, 1);
+    float  wSum = 0.0f, vSum = 0.0f, cSum = 0.0f;
+    UNROLL for (int k = 0; k < 4; ++k)
+    {
+        int2   o  = int2(k & 1, k >> 1);
+        float4 s  = LoadTex2D(gSkyVisScreen, NO_SAMPLER, clamp(i0 + o, int2(0, 0), mx), 0);
+        float  wb = ((o.x == 1) ? fr.x : 1.0f - fr.x) * ((o.y == 1) ? fr.y : 1.0f - fr.y) + 1.0e-3f;
+        float  w  = (abs(s.y - myD) <= tol) ? wb : 0.0f;
+        wSum += w; vSum += w * s.x; cSum += w * s.z;
+    }
+    if (wSum <= 0.0f) { return skyAOTerm(N, worldPosRel); }
+    float vis = vSum / wSum, cov = cSum / wSum;
+    float v = lerp(1.0f, vis, strength);
+    if (cov >= 0.999f) { return v; }
+    return lerp(skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz), v, cov);
+}
+
 // worldPosRel = the CAMERA-RELATIVE world position every one of the six lit paths already carries
 // (near geometry is pre-shifted by -eye, distant statics are host-shifted, terrain subtracts
 // lodEye in its VS). gFrameData.lodEye is the absolute eye and is written EVERY frame, interiors
 // included, so this reconstruction is the same one water.frag uses for its world-anchored normals.
-float3 skyAmbFactor(float3 N, float3 worldPosRel)
+float3 skyAmbFactorAO(float3 N, float ao)
 {
-    // SH2 occlusion, on its OWN strength lane so the two halves A/B independently — SH off with AO
+    // `ao` = the SH2 occlusion, computed by the caller (skyAOTerm / skyAOTermPx), on its OWN strength
+    // lane so the two halves A/B independently — SH off with AO
     // on is a legitimate thing to want to look at, and it would be unreachable if AO hung off the
     // SH's early-out. At AO strength 0 not one tap is taken and this whole block folds away, which
     // is the zero-change proof the feature ships behind. Interiors publish 0 in BOTH lanes (there
     // is no sky to project and no map to march), so neither needs a shader branch on interior-ness.
-    float ao = (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
-                                                  : 1.0f;
 
     // SH strength 0 = the directional half is off. AO still applies — it is a separate measurement.
     float s = gShadowParams.skyParams.x;
@@ -223,6 +272,18 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
     // what an occlusion term is for. Keeping them as separate multiplies is what lets the panel
     // A/B either one against the other.
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
+}
+
+
+float3 skyAmbFactor(float3 N, float3 worldPosRel)
+{
+    return skyAmbFactorAO(N, skyAOTerm(N, worldPosRel));
+}
+
+// The MAIN camera's lit fragments: the same factor with the sky-visibility screen term.
+float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbFactorAO(N, skyAOTermPx(N, worldPosRel, svPos));
 }
 
 #endif // SKY_AMB_H

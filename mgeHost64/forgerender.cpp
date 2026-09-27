@@ -345,6 +345,8 @@ static int forgeEcoQoSState()
 // field an occlusion march has to read, since pSkyHeight is a max raster. Built inline at the tail
 // of rebuildSkyHeightMap, so it can never describe a different window than its source.
 #include "shaders/FSL/skyheightmin.srt.h"
+#include "shaders/FSL/skyheightblur.srt.h"
+#include "shaders/FSL/skyvis.srt.h"
 // Stage B (M1) GPU statics cull SRT (CullSrtData: gCullParams + gCullInst + gCullCount). Also shares
 // the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
 // redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
@@ -2927,6 +2929,12 @@ namespace {
         // the terrain layer is compute (the heightfield is already resident; one thread per texel
         // beats building an instance stream and drawing it) and runs LAST, folding max() over them.
         RenderTarget*  pSkyHeight = nullptr;         // kSkyHeightRes² R16_FLOAT (SRV + UAV + RTV)
+        // SKY-AO two-layer map (tasks/forge-skyao-oracle.md): MINUS the LOWEST static surface per texel,
+        // written by the same statics raster as a second target with the same BM_MAX (max(-z) = -min z).
+        // With pSkyHeight's top it gives each column a static INTERVAL, so a roof, a bridge deck or a
+        // mushroom cap can float above a point instead of reading as a wall down to its feet. Statics
+        // only — terrain never enters it. Cleared to the same sentinel: -(-30000) = "no static here".
+        RenderTarget*  pSkyHeightLow = nullptr;      // kSkyHeightRes² R16_FLOAT (SRV + RTV)
         Shader*        pSkyHeightShader = nullptr;
         Pipeline*      pSkyHeightPipeline = nullptr;
         Buffer*        pSkyHeightParamsCbv = nullptr; // gSkyHeightParams (origin + LAND grid extent)
@@ -2969,6 +2977,15 @@ namespace {
         Pipeline*      pSkyHeightMinPipelineFirst = nullptr;
         Pipeline*      pSkyHeightMinPipeline = nullptr;
         DescriptorSet* pSkyHeightMinSet = nullptr;    // SkyHeightMinSrtData PerBatch, maxSets = mips
+        // SKY AO's SMOOTHED copy of pSkyHeight (skyheightblur.srt.h). Every PerFrame gSkyHeight bind
+        // points here; H1, the long-range sun map and culling keep reading the raw max.
+        Texture*       pSkyHeightAO = nullptr;       // kSkyHeightRes² R16F (SRV + UAV)
+        Shader*        pSkyBlurShader = nullptr;     // skyheightblur.comp (Gaussian)
+        Shader*        pSkyCopyShader = nullptr;     // skyheightcopy.comp (verbatim: the skyAOBlur=0 arm)
+        Pipeline*      pSkyBlurPipeline = nullptr;
+        Pipeline*      pSkyCopyPipeline = nullptr;
+        DescriptorSet* pSkyBlurSet = nullptr;         // SkyHeightBlurSrtData PerBatch, one instance
+        bool           skyBlurReady = false;
         uint32_t       skyHeightMinMips = 0;          // 1 + log2(kSkyHeightRes) = 12
         bool           skyHeightMinReady = false;
 
@@ -3604,6 +3621,16 @@ namespace {
         // every receiver's single gSunMoments binding, so adding cascades touched no PerFrame set.
         RenderTarget*  pSunMoments = nullptr;               // (kSunShadowRes*kSunCascades) x kSunShadowRes RGBA16_UNORM
         RenderTarget*  pSunMomentsDepth = nullptr;          // same dims, D32 reverse-Z (sun pass z-test)
+        RenderTarget*  pSvmDepth = nullptr;   // sky-visibility maps: D16 array, kSvmMaxDirs x svmRes²
+        // ...and the SCREEN pass that averages them once per half-res pixel (skyvis.comp):
+        // (vis, distance, coverage, 0), read by the main camera's lit frags as gSkyVisScreen.
+        Texture*       pSvmScreen = nullptr;
+        Shader*        pSkyVisShader = nullptr;
+        Pipeline*      pSkyVisPipeline = nullptr;
+        Buffer*        pSkyVisParamsCbv = nullptr;   // gSkyVisParams (matrix, dims, knobs, tiles)
+        DescriptorSet* pSkyVisSet = nullptr;         // SkyVisSrtData PerBatch
+        bool           skyVisReady = false;
+        bool           svmScreenInSR = false;        // resting state after the first dispatch
         Texture*       pSunMomentsScratch = nullptr;        // separable-blur ping-pong, ONE TILE (kSunShadowRes²)
         Buffer*        pSunBlurParamsCbv[2 * kSunCascades] = {};   // [2c] horizontal, [2c+1] vertical
         DescriptorSet* pSunBlurSet = nullptr;               // 2*kSunCascades instances, same order
@@ -3618,6 +3645,11 @@ namespace {
         Pipeline*      pSkyHeightViewPipeline = nullptr;
         Shader*        pVolFogShader = nullptr;             // shadowatlasview.vert + volfog.frag (height fog / shafts)
         Pipeline*      pVolFogPipeline = nullptr;           // blended ONE / SRC_ALPHA
+        Shader*        pSkyOracleShader = nullptr;          // shadowatlasview.vert + skyoracle.frag (dev tool)
+        Pipeline*      pSkyOraclePipeline = nullptr;        // MRT, ADDITIVE into the two targets below
+        RenderTarget*  pSkyOracleA = nullptr;               // R32G32B32A32: (vis, inCascade, N.z, frames)
+        RenderTarget*  pSkyOracleB = nullptr;               // R32G32B32A32: (worldAbs.xyz, GPU model)
+        RenderTarget*  pSkyOracleC = nullptr;               // R32G32B32A32: (GTAO vis, AO armed, 0, frames)
         Shader*        pWaterFillShader = nullptr;          // shadowatlasview.vert + waterfill.frag
         Pipeline*      pWaterFillPipeline = nullptr;        // FILL-HOLES blend: INV_DEST_ALPHA / ONE
         bool           sunShadowReady = false;
@@ -4188,6 +4220,8 @@ namespace {
            // "did it pay for itself" is exactly `grassdep + grass` against the old `grass` alone.
            kGpuPhaseGrassDepth,
            kGpuPhaseGrassColor,
+           kGpuPhaseSkyVis,     // one sky-visibility map redraw (renderSkyVisMaps), top of the frame
+           kGpuPhaseSkyVisScreen, // ...and the half-res screen pass that reads them (skyvis.comp)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -5833,9 +5867,17 @@ namespace {
     // Where the march STARTS. Below this GTAO already owns the answer and multiplied it into the
     // SAME ambient, so overlapping the two would count one occlusion twice. Above it, GTAO has
     // nothing to say (it can only see what is on screen).
-    float              g_skyAOInner     = 256.0f;
-    float              g_skyAOOuter     = 8192.0f;   // how far a cliff can still shade you
-    float              g_skyAOTaps      = 4.0f;      // steps per direction; 5 directions => 20 samples
+    // ⚠ FIT TO THE GROUND-TRUTH ORACLE (tasks/forge-skyao-oracle.md, 2026-09-27), not tuned by eye:
+    // floor MAE vs true sky visibility 0.298 -> 0.119 (Tel Mutthada) and 0.130 -> 0.099 (Ascadian
+    // Isles) against the old 256 / 8192 / 4, with the Tel Mutthada tunnel +0.68 -> +0.05. The inner
+    // radius has to sit INSIDE a tunnel's walls for the march to see them; 8 taps are what keep a
+    // 4096 reach from skipping over them.
+    float              g_skyAOInner     = 128.0f;
+    float              g_skyAOOuter     = 4096.0f;   // how far a cliff can still shade you
+    float              g_skyAOTaps      = 8.0f;      // steps per direction; 5 directions => 40 samples
+    // Sky AO marches a Gaussian-smoothed COPY of the map (skyheightblur.srt.h): the 32 u raster
+    // staircase was the "square artifacts". Off = a verbatim copy, the A/B.
+    bool               g_skyAOBlur      = true;
     // The OVERHANG correction — the one place a height map is provably lying. Every column reads as
     // solid from -inf to its stored top, so anywhere with open air above the receiver and geometry
     // above THAT (Baar Dau over Vivec, a tower shaft under a wider top, an arch, a canton walkway)
@@ -5877,7 +5919,79 @@ namespace {
     float              g_skyAOOverhangFade  = 1024.0f;
     // Never 0: a blocker the size of the meteor genuinely does remove sky, so the correction may only
     // lighten toward the truth and not past it. The residue in that band is GTAO's to own.
-    float              g_skyAOOverhangFloor = 0.25f;
+    // 1.0 = THE CORRECTION IS OFF, and the oracle is why: at every one of 160 swept settings on two
+    // saves the best error had it off. It lightened every receiver with anything overhead toward open
+    // sky — right under a bridge, badly wrong in a tunnel or under Tel Mutthada's roots, and the
+    // oracle weighs the second kind heavily. The two-layer map is the honest fix for bridges.
+    float              g_skyAOOverhangFloor = 1.0f;
+    // --- SKY-AO GROUND TRUTH (skyoracle.frag.fsl, tasks/forge-skyao-oracle.md) ------------------
+    // A DEV TOOL, armed only from MGE_HOST_KNOBS: skyOracleAt = the host frame to start at (0 = off,
+    // and then not even the pipeline is built), skyOracleDirs = K. For K frames the published sun
+    // direction is swung through K cosine-weighted stratified directions over the upper hemisphere,
+    // the real sun caster renders each, and skyoracle.frag ADDS every pixel's cascade visibility.
+    // After the K-th the targets and the height map are read back to hdrdump/skyoracle_NNNN.*.
+    float              g_skyOracleAt    = 0.0f;
+    float              g_skyOracleDirs  = 128.0f;
+    float              g_skyOracleBand  = 0.0f;         // 0 full, 1 high half, 2 low half (diagnostic)
+    uint32_t           g_skyOracleStart = 0;        // g_renderFrame of direction 0 (0 = not started)
+    uint32_t           g_skyOracleDrawn = 0;        // frames whose pass actually ran (sun map ready)
+    bool               g_skyOracleDone  = false;    // written; the tool never re-arms in a session
+    bool               g_skyOracleGrassWas = false; // grass casters are paused for the run (see the override)
+    // The oracle's direction set, shared with the sky-visibility maps below so the two integrate
+    // over the SAME directions. Hammersley: u stratified over [uLo, uHi), v the base-2 radical
+    // inverse — low-discrepancy, no RNG, bit-identical between runs. Cosine-weighted about +Z
+    // (z = sqrt(1-u)), so the PLAIN average of visibility is the cos-weighted integral. Writes the
+    // TRAVEL direction (sky -> ground), the convention of fd[16..18] and sunLightBasis.
+    inline void skyHemiDir(uint32_t k, uint32_t K, double uLo, double uHi, float travel[3]) {
+        uint32_t b = k;
+        b = (b << 16) | (b >> 16);
+        b = ((b & 0x55555555u) << 1) | ((b & 0xAAAAAAAAu) >> 1);
+        b = ((b & 0x33333333u) << 2) | ((b & 0xCCCCCCCCu) >> 2);
+        b = ((b & 0x0F0F0F0Fu) << 4) | ((b & 0xF0F0F0F0u) >> 4);
+        b = ((b & 0x00FF00FFu) << 8) | ((b & 0xFF00FF00u) >> 8);
+        const double u   = uLo + (uHi - uLo) * ((double)k + 0.5) / (double)K;
+        const double v   = (double)b * 2.3283064365386963e-10;
+        const double r   = std::sqrt(u), z = std::sqrt(1.0 - u);
+        const double phi = 2.0 * SceneCal::kPi * v;
+        travel[0] = (float)(-r * std::cos(phi));
+        travel[1] = (float)(-r * std::sin(phi));
+        travel[2] = (float)(-z);
+    }
+    // --- SKY-VISIBILITY MAPS (Twister-style; tasks/forge-skyao-oracle.md "TWISTER") -------------
+    // K depth maps of the STATIC world (statics + terrain), each an ortho view down one fixed sky
+    // direction from the set above, redrawn round-robin ONE PER FRAME — the world does not move, so
+    // a full refresh every K frames is enough. A receiver's sky visibility is the fraction of maps
+    // that see it: the oracle's integral at K samples and map resolution instead of 128 samples and
+    // cascade resolution. S1 (now): built, and dumped beside the oracle for scoring in
+    // tools/skyao_fit.py. Nothing samples them yet.
+    constexpr uint32_t kSvmMaxDirs = 32;
+    // DEFAULT ON (2026-09-27, the user's call after the oracle and the look). Allocation happens at
+    // startup only when this is true, so svm=0 in MGE_HOST_KNOBS is the no-VRAM arm; the panel
+    // checkbox is a live A/B against the march on top of the allocated maps.
+    bool     g_svm          = true;          // knob svm; allocates kSvmMaxDirs D16 slices of svmRes²
+    float    g_svmDirs      = 32.0f;
+    // Read ONCE, at allocation (32 x 512² D16 = 16 MB). The oracle scored 256..1024 alike: the
+    // direction count limits this technique, not the texel.
+    float    g_svmRes       = 512.0f;
+    uint32_t g_svmAllocRes  = 0;             // the slice size actually allocated (0 = none)
+    float    g_svmExtent    = 4096.0f;       // ortho HALF-width, world units (16 u texels at 512)
+    // Receiver: the compare's bias along the direction, world units. No normal offset and no
+    // per-normal weighting: the screen pass evaluates the point itself, plain average — the look the
+    // oracle scored best (0.034) and the one chosen (skyoracle_0011_svm32.png). Both refinements
+    // were tried per fragment and each cost accuracy (tasks/forge-skyao-oracle.md S2).
+    float    g_svmBias      = 16.0f;
+    // Screen pass: the compare's filter half-width in map texels, (2R+1)^2 bilinear taps, (R+1)^2
+    // gathers per map. 2 = the oracle-scored look (skyoracle_0011_svm32.png).
+    float    g_svmPcf       = 2.0f;
+    float    g_svmDepthHalf = 16384.0f;      // half the depth slab (D16: 0.5 u steps)
+    float    g_svmMinRadius = 0.0f;          // statics with a smaller bound radius do not cast
+    uint32_t g_svmNext      = 0;             // round-robin cursor
+    uint32_t g_svmDrawn     = 0;             // tiles drawn since the last layout change
+    float    g_svmBuilt[4]  = {};            // K, res, extent, depthHalf the tiles were drawn with
+    // Per tile: the matrix it was drawn with and the eye it was camera-relative to. A receiver
+    // projects (worldAbs - eye) by vp; the tile keeps its own eye because it is up to K frames old.
+    struct SvmTile { float vp[16]; float eye[3]; uint32_t frame; };
+    SvmTile  g_svmTile[kSvmMaxDirs] = {};
     // --- LONG-RANGE sun occlusion (sunocc.comp.fsl) ---------------------------------------------
     // Derived from the height map above, over the SAME window — so it needs no origin of its own and
     // there is exactly one published mapping between them. HALF the resolution, deliberately: this
@@ -5930,6 +6044,7 @@ namespace {
     constexpr uint32_t kSkyStaticsRowCap = 65536;
     bool               g_skyHeightBuiltStatics = false;  // did the LIVE map include the statics layer?
     float              g_skyHeightBuiltMinR = -1.0f;     // radius floor the LIVE map was built with
+    bool               g_skyHeightBuiltBlur = false;     // was the LIVE sky-AO copy the smoothed one?
     // H1: has the MIN-PYRAMID been built over the CURRENT height map? Its own flag rather than
     // "skyHeightMinReady && g_skyHeightValid", because those two answer different questions — the
     // first is "do the resources exist", the second "does the max field describe this window", and
@@ -6192,11 +6307,24 @@ namespace {
     //     answers "plasticy" and the specular compensation is not.
     constexpr uint32_t kPbrShadeFloat         = kTerrainMacro3Float + 4;
     constexpr uint32_t kPbrShade2Float        = kPbrShadeFloat + 4;
+    // SUNNY 16 (shadowparams.h.fsl sunny16): x R, y m. Appended for the reason every block above
+    // states — this cbuffer is bound BY POINTER into every PerFrame set.
+    constexpr uint32_t kSunny16Float          = kPbrShade2Float + 4;
+    // SKY-VISIBILITY MAPS (shadowparams.h.fsl skyVis): x K (0 = off), y res, z bias, w normal offset.
+    constexpr uint32_t kSkyVisFloat           = kSunny16Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     static_assert((kPbrShade2Float + 4) * sizeof(float) <= kShadowParamsBytes,
                   "pbrParams..pbrShade2 must fit inside the ShadowMaskParams CBV");
+    static_assert((kSunny16Float + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "sunny16 must fit inside the ShadowMaskParams CBV");
+    static_assert(offsetof(ShadowMaskParams, sunny16) == kSunny16Float * sizeof(float),
+                  "kSunny16Float does not land on ShadowMaskParams::sunny16");
+    static_assert((kSkyVisFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "skyVis must fit inside the ShadowMaskParams CBV");
+    static_assert(offsetof(ShadowMaskParams, skyVis) == kSkyVisFloat * sizeof(float),
+                  "kSkyVisFloat does not land on ShadowMaskParams::skyVis");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -6261,6 +6389,11 @@ namespace {
     // map. Both are exterior-only, so both go silent through the same door, but a valid SH with no
     // map yet (the first frames after a load) is a real state and must publish AO strength 0 rather
     // than march a map full of sentinel.
+    // The texture every PerFrame gSkyHeight slot binds: sky AO's smoothed copy when it exists, the
+    // raw max map otherwise (so a failed create falls back to the pre-blur image, never to black).
+    inline Texture** skyAOHeightTexPP() {
+        return g_live.pSkyHeightAO ? &g_live.pSkyHeightAO : &g_live.pSkyHeight->pTexture;
+    }
     void publishSkyAO(float* mp, bool exterior) {
         const float strength = std::max(0.0f, std::min(g_skyAOStrength, 1.0f));
         const bool  active   = exterior && g_skyHeightValid && strength > 0.0f;
@@ -9238,6 +9371,79 @@ namespace {
                 smdd.pName = "sunMomentsDepth";
                 addRenderTarget(R, &smdd, &g_live.pSunMomentsDepth);
 
+                // Sky-visibility maps: one ARRAY SLICE per direction, so each frame's redraw clears
+                // only its own slice (per-slice DSVs) and the rest keep their content.
+                if (g_svm) {
+                    RenderTargetDesc vd = {};
+                    g_svmAllocRes = (uint32_t)std::max(64.0f, std::min(g_svmRes, 2048.0f));
+                    vd.mWidth = g_svmAllocRes; vd.mHeight = g_svmAllocRes; vd.mDepth = 1;
+                    vd.mArraySize = kSvmMaxDirs; vd.mMipLevels = 1;
+                    vd.mSampleCount = SAMPLE_COUNT_1; vd.mSampleQuality = 0;
+                    vd.mFormat = TinyImageFormat_D16_UNORM;
+                    vd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                    vd.mClearValue.depth = 0.0f;   // reverse-Z far: "no caster"
+                    vd.mClearValue.stencil = 0;
+                    vd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE
+                                                     | DESCRIPTOR_TYPE_RENDER_TARGET_ARRAY_SLICES);
+                    vd.pName = "skyVisMaps";
+                    addRenderTarget(R, &vd, &g_live.pSvmDepth);
+                    if (!g_live.pSvmDepth) { g_svmAllocRes = 0; std::printf("[forge][svm] sky-visibility maps alloc FAILED\n"); }
+                }
+                // ...and the screen pass that reads them (skyvis.comp): a half-res (vis, distance,
+                // coverage) texture over this camera's prepass depth, its params CBV, pipeline, set.
+                if (g_live.pSvmDepth && g_live.pLinearDepth) {
+                    TextureDesc sd = {};
+                    sd.mWidth = (width + 1u) / 2u; sd.mHeight = (height + 1u) / 2u; sd.mDepth = 1;
+                    sd.mArraySize = 1; sd.mMipLevels = 1;
+                    sd.mSampleCount = SAMPLE_COUNT_1;
+                    sd.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+                    sd.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    sd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                    sd.pName = "skyVisScreen";
+                    TextureLoadDesc sld = {};
+                    sld.ppTexture = &g_live.pSvmScreen;
+                    sld.pDesc = &sd;
+                    addResource(&sld, nullptr);
+
+                    BufferLoadDesc sp = {};
+                    sp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    sp.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    sp.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    sp.mDesc.mSize = (sizeof(SkyVisParams) + 255u) & ~255u;
+                    sp.mDesc.pName = "skyVisParamsCbv";
+                    sp.pData = nullptr;
+                    sp.ppBuffer = &g_live.pSkyVisParamsCbv;
+                    addResource(&sp, nullptr);
+                    waitForAllResourceLoads();
+
+                    ShaderLoadDesc vsd = {};
+                    vsd.mComp.pFileName = "skyvis.comp";
+                    addShader(R, &vsd, &g_live.pSkyVisShader);
+                    if (g_live.pSkyVisShader) {
+                        PipelineDesc vpd = {};
+                        vpd.mType = PIPELINE_TYPE_COMPUTE;
+                        vpd.mComputeDesc.pShaderProgram = g_live.pSkyVisShader;
+                        addPipeline(R, &vpd, &g_live.pSkyVisPipeline);
+                    }
+                    DescriptorSetDesc vset = SRT_SET_DESC(SkyVisSrtData, PerBatch, 1, 0);
+                    addDescriptorSet(R, &vset, &g_live.pSkyVisSet);
+                    if (g_live.pSvmScreen && g_live.pSkyVisParamsCbv && g_live.pSkyVisPipeline && g_live.pSkyVisSet) {
+                        DescriptorData d[4] = {};
+                        d[0].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSkyVisParams);
+                        d[0].ppBuffers = &g_live.pSkyVisParamsCbv;
+                        d[1].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSvDepth);
+                        d[1].mCount = 1; d[1].ppTextures = &g_live.pLinearDepth;
+                        d[2].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSvMaps);
+                        d[2].mCount = 1; d[2].ppTextures = &g_live.pSvmDepth->pTexture;
+                        d[3].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSvOut);
+                        d[3].mCount = 1; d[3].ppTextures = &g_live.pSvmScreen;
+                        updateDescriptorSet(R, 0, g_live.pSkyVisSet, 4, d);
+                        g_live.skyVisReady = true;
+                    } else {
+                        std::printf("[forge][svm] screen pass pipeline/set FAILED — lit paths keep the march\n");
+                    }
+                }
+
                 // One frame CBV per cascade — the caster draws are recorded back to back into the
                 // same command list, so a single buffer restamped between them would give every
                 // cascade whichever matrix was written last.
@@ -9277,6 +9483,9 @@ namespace {
                 shd.pName = "skyHeight";
                 vramMark(R, "  sceneColor + sun moments");
                 addRenderTarget(R, &shd, &g_live.pSkyHeight);
+                shd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;   // raster-only: no terrain RMW into it
+                shd.pName = "skyHeightLow";
+                addRenderTarget(R, &shd, &g_live.pSkyHeightLow);
 
                 BufferLoadDesc shp = {};
                 shp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -9362,6 +9571,22 @@ namespace {
                     sml.pDesc = &smd;
                     addResource(&sml, nullptr);
                     g_live.skyHeightMinMips = mips;
+                }
+                // Sky AO's smoothed copy (skyheightblur.srt.h). Same format and size as its source; a
+                // plain texture — compute writes it whole once per rebuild, nothing rasters into it.
+                {
+                    TextureDesc sbd = {};
+                    sbd.mWidth = kSkyHeightRes; sbd.mHeight = kSkyHeightRes; sbd.mDepth = 1;
+                    sbd.mArraySize = 1; sbd.mMipLevels = 1;
+                    sbd.mSampleCount = SAMPLE_COUNT_1; sbd.mSampleQuality = 0;
+                    sbd.mFormat = TinyImageFormat_R16_SFLOAT;
+                    sbd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                    sbd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                    sbd.pName = "skyHeightAO";
+                    TextureLoadDesc sbl = {};
+                    sbl.ppTexture = &g_live.pSkyHeightAO;
+                    sbl.pDesc = &sbd;
+                    addResource(&sbl, nullptr);
                 }
 
                 // --- S2: THE ATMOSPHERE's LUTs, CREATED HERE AND NOT WITH THEIR PIPELINES -------
@@ -10178,7 +10403,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[23] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc,
+            DescriptorData p[24] = {};   // was 9; +gSkyVisScreen, +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc,
                                          // +gAtmosSkyView, +gAtmosParams (and headroom)
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
@@ -10270,8 +10495,12 @@ namespace {
             if (g_live.pSkyHeight) {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
                 p[np].mCount = 1;
-                p[np].ppTextures = &g_live.pSkyHeight->pTexture;
+                p[np].ppTextures = skyAOHeightTexPP();
                 ++np;
+            }
+            if (g_live.pSvmScreen) {   // sky-visibility screen term: the MAIN camera's pixels only
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyVisScreen);
+                p[np].mCount = 1; p[np].ppTextures = &g_live.pSvmScreen; ++np;
             }
             // ...and the LONG-RANGE sun occlusion derived from it — REAL here. Every receiver that
             // calls sunShadowVisibility samples it past the last cascade, which since P2 is where
@@ -11704,6 +11933,55 @@ namespace {
                 std::printf("[forge] addShader(volfog) FAILED — volumetric fog disabled\n");
             }
 
+            // --- SKY-AO GROUND TRUTH (dev tool, tasks/forge-skyao-oracle.md) ----------------------
+            // Built ONLY when MGE_HOST_KNOBS armed it (env overrides are applied before init), so a
+            // normal session carries neither the PSO nor 2 x 64 MB of targets. Same fullscreen
+            // triangle and PerFrame set as volfog; TWO float32 targets, ADDED into (ONE/ONE) so K
+            // frames of directions sum in place. Non-MSAA and render-sized: it measures pixels.
+            if (g_skyOracleAt > 0.0f && width && height) {
+                ShaderLoadDesc soDesc = {};
+                soDesc.mVert.pFileName = "shadowatlasview.vert";
+                soDesc.mFrag.pFileName = "skyoracle.frag";
+                addShader(R, &soDesc, &g_live.pSkyOracleShader);
+                RenderTarget** soRTs[3] = { &g_live.pSkyOracleA, &g_live.pSkyOracleB, &g_live.pSkyOracleC };
+                for (int t = 0; t < 3 && g_live.pSkyOracleShader; ++t) {
+                    RenderTargetDesc d = {};
+                    // ALLOC-sized like every screen RT (the render rect is a sub-viewport of it); the
+                    // readback crops to the render rect.
+                    d.mWidth = width; d.mHeight = height; d.mDepth = 1; d.mArraySize = 1;
+                    d.mMipLevels = 1; d.mSampleCount = SAMPLE_COUNT_1;
+                    d.mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                    d.mStartState = RESOURCE_STATE_RENDER_TARGET;
+                    d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                    d.pName = (t == 0) ? "skyOracleA" : (t == 1) ? "skyOracleB" : "skyOracleC";
+                    addRenderTarget(R, &d, soRTs[t]);
+                }
+                if (g_live.pSkyOracleShader && g_live.pSkyOracleA && g_live.pSkyOracleB && g_live.pSkyOracleC) {
+                    BlendStateDesc soBlend = {};
+                    soBlend.mIndependentBlend = false;   // [0] applies to every masked target
+                    soBlend.mRenderTargetMask = (BlendStateTargets)(BLEND_STATE_TARGET_0 | BLEND_STATE_TARGET_1
+                                                                    | BLEND_STATE_TARGET_2);
+                    soBlend.mSrcFactors[0] = BC_ONE; soBlend.mDstFactors[0] = BC_ONE; soBlend.mBlendModes[0] = BM_ADD;
+                    soBlend.mSrcAlphaFactors[0] = BC_ONE; soBlend.mDstAlphaFactors[0] = BC_ONE;
+                    soBlend.mBlendAlphaModes[0] = BM_ADD;
+                    soBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                    TinyImageFormat soFmts[3] = { TinyImageFormat_R32G32B32A32_SFLOAT,
+                                                  TinyImageFormat_R32G32B32A32_SFLOAT,
+                                                  TinyImageFormat_R32G32B32A32_SFLOAT };
+                    PipelineDesc soPd = savPd;   // the fullscreen state (no depth, no cull, no VB)
+                    GraphicsPipelineDesc& sog = soPd.mGraphicsDesc;
+                    sog.mRenderTargetCount = 3;
+                    sog.pColorFormats = soFmts;
+                    sog.mSampleCount = SAMPLE_COUNT_1;
+                    sog.pShaderProgram = g_live.pSkyOracleShader;
+                    sog.pBlendState = &soBlend;
+                    addPipeline(R, &soPd, &g_live.pSkyOraclePipeline);
+                }
+                LOG::logline(">> [skyoracle] armed: start frame %.0f, %.0f directions, %ux%u targets, pipeline %s",
+                             (double)g_skyOracleAt, (double)g_skyOracleDirs, width, height,
+                             g_live.pSkyOraclePipeline ? "ok" : "FAILED (tool disabled)");
+            }
+
             // --- W8 UNDERWATER BACKSTOP (waterfill.frag) -----------------------------------------
             // Same fullscreen triangle and the same PerFrame set, but the blend is what makes it
             // work rather than the shader:
@@ -12793,7 +13071,7 @@ namespace {
                 }
                 if (g_live.pSkyHeight) {   // gSkyHeight: type-valid bind (the sky pass has no ambient)
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
-                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSkyHeight->pTexture;
+                    p[rn].mCount = 1; p[rn].ppTextures = skyAOHeightTexPP();
                     ++rn;
                 }
                 if (g_live.pSunOcc) {      // gSunOcc: type-valid bind (the sky pass takes no sun shadow)
@@ -12939,7 +13217,7 @@ namespace {
                 // mirrored, not the geometry), so the world-space lookup applies unchanged.
                 if (g_live.pSkyHeight) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
-                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSkyHeight->pTexture;
+                    p[rn].mCount = 1; p[rn].ppTextures = skyAOHeightTexPP();
                     ++rn;
                 }
                 // ...and the sun-occlusion map, REAL for the same reason: the mirror redraws terrain
@@ -13052,7 +13330,7 @@ namespace {
                     // entirely, so the value is dead here; the BIND is what has to exist.
                     if (g_live.pSkyHeight) {
                         p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
-                        p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSkyHeight->pTexture;
+                        p[sn].mCount = 1; p[sn].ppTextures = skyAOHeightTexPP();
                         ++sn;
                     }
                     if (g_live.pSunOcc) {   // type-valid bind (a caster pass computes no shadowing)
@@ -14590,6 +14868,38 @@ namespace {
             //
             // Not fatal on failure: skyHeightMinReady stays false, the rebuild's tail skips the
             // dispatch, and every consumer is gated on the flag — i.e. exactly the pre-H1 world.
+            // Sky AO's smoothed copy: two variants over one set instance (source SRV, dest UAV). On
+            // failure skyBlurReady stays false and the PerFrame binds fall back to the raw map, i.e.
+            // the pre-blur image — see skyAOHeightTexPP().
+            if (g_live.pSkyHeight && g_live.pSkyHeightAO) {
+                ShaderLoadDesc sb = {}; sb.mComp.pFileName = "skyheightblur.comp";
+                addShader(R, &sb, &g_live.pSkyBlurShader);
+                ShaderLoadDesc sc = {}; sc.mComp.pFileName = "skyheightcopy.comp";
+                addShader(R, &sc, &g_live.pSkyCopyShader);
+                for (int v = 0; v < 2; ++v) {
+                    Shader* sh = v ? g_live.pSkyCopyShader : g_live.pSkyBlurShader;
+                    if (!sh) { continue; }
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = sh;
+                    addPipeline(R, &pd, v ? &g_live.pSkyCopyPipeline : &g_live.pSkyBlurPipeline);
+                }
+                if (g_live.pSkyBlurPipeline && g_live.pSkyCopyPipeline) {
+                    DescriptorSetDesc sbs = SRT_SET_DESC(SkyHeightBlurSrtData, PerBatch, 1, 0);
+                    addDescriptorSet(R, &sbs, &g_live.pSkyBlurSet);
+                }
+                if (g_live.pSkyBlurSet) {
+                    DescriptorData d[2] = {};
+                    d[0].mIndex = SRT_RES_IDX(SkyHeightBlurSrtData, PerBatch, gSkyBlurSrc);
+                    d[0].mCount = 1; d[0].ppTextures = &g_live.pSkyHeight->pTexture;
+                    d[1].mIndex = SRT_RES_IDX(SkyHeightBlurSrtData, PerBatch, gSkyBlurDst);
+                    d[1].mCount = 1; d[1].ppTextures = &g_live.pSkyHeightAO;
+                    updateDescriptorSet(R, 0, g_live.pSkyBlurSet, 2, d);
+                    g_live.skyBlurReady = true;
+                }
+                std::printf("[forge][skyao] smoothed height copy %s\n",
+                            g_live.skyBlurReady ? "READY" : "DISABLED (create failed) — sky AO reads the raw map");
+            }
             if (g_live.pSkyHeight && g_live.pSkyHeightMin && g_live.skyHeightMinMips) {
                 ShaderLoadDesc smf = {};
                 smf.mComp.pFileName = "skyheightminfirst.comp";
@@ -15585,7 +15895,7 @@ namespace {
                 // view is a second camera at the SAME eye, so the world-space lookup is unchanged.
                 if (g_live.pSkyHeight) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
-                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSkyHeight->pTexture;
+                    p[fpn].mCount = 1; p[fpn].ppTextures = skyAOHeightTexPP();
                     ++fpn;
                 }
                 // ...and the long-range sun occlusion, for the same reason again: walk out of a
@@ -19006,6 +19316,33 @@ namespace {
     float g_calAmbGain   = 1.0f;   // ambCol   — host-side, at the one decode site
     float g_calEmisGain  = 1.0f;   // material emissive — gShadowParams lane, applied in the frags
 
+    // ─── SUNNY 16: TWO UNIT FAMILIES, ONE HONEST CONVERSION EACH (tasks/forge-sunny16.md) ────────
+    // Everything MW authored (point lights, emissive, glow maps, interior and night ambient, fog) is
+    // in "MW units" that the scene scale treated as daylight, so an interior was exposed DARKER than
+    // noon — about 13 stops upside down. Two families, each with one scale:
+    //   PHYSICAL   x R        the atmosphere's toScene: sun, sky, the ambient it measures, its haze.
+    //   MW-AUTHORED x m = R * s_art   every authored light, where s_art is what an MW light's "1.0"
+    //                                 is worth physically (the [sunny16] s_art probe measures it).
+    // The closed-loop servo then does the dimming: a candle at noon falls ~11 stops below the
+    // exposure it gets indoors, because the two families finally sit where cameras put them.
+    //
+    // Stated in STOPS (R = 2^rStops, m = 2^mStops) because both span powers of two and a linear
+    // slider cannot reach 1/128. OFF, or both at 0, is the pre-feature image bit for bit: every site
+    // that applies a scale skips the multiply when the scale is exactly 1.
+    bool  g_sunny16      = false;
+    float g_sunnyRStops  = 0.0f;
+    float g_sunnyMStops  = 0.0f;
+    inline float sunnyR() { return g_sunny16 ? std::exp2(g_sunnyRStops) : 1.0f; }
+    inline float sunnyM() { return g_sunny16 ? std::exp2(g_sunnyMStops) : 1.0f; }
+    // What one scene unit is worth in cd/m² RIGHT NOW. kSceneUnitCd stays pinned (scenecal.h); R is
+    // applied explicitly, so every instrument that turns scene units into photometry divides by it.
+    inline double sceneUnitCdNow() { return SceneCal::kSceneUnitCd / (double)sunnyR(); }
+    // The scale MW's authored FOG colours took this frame: lerp(m, R, w) with w the physical
+    // lighting blend (by day the fog was calibrated against the physical sky, at night and indoors
+    // it is MW's). Latched at the fog site so the per-pass copies (water fog, the deep-water colour)
+    // take the same one.
+    float g_sunnyFogK    = 1.0f;
+
     // ─── THE MW EXPOSURE REFERENCE ───────────────────────────────────────────────────────────────
     // *"exteriors are exposed good in MW. So baseline should be that."* — user, 2026-08-21.
     //
@@ -22202,6 +22539,29 @@ namespace {
             { "atmosMsDirs",        &g_atmosMsDirs        },
             { "atmosAirglow",       &g_atmosAirglow       },
             { "atmosMoonScale",     &g_atmosMoonScale     },
+            // SUNNY 16 (tasks/forge-sunny16.md): the two unit families, in stops. sunny16=1 arms them.
+            { "sunnyRStops",        &g_sunnyRStops        },
+            { "sunnyMStops",        &g_sunnyMStops        },
+            // SKY AO (tasks/forge-skyao-oracle.md): the ground-truth tool and every knob of the model it
+            // calibrates, so a sweep runs minimized with nobody at the panel.
+            { "skyOracleAt",        &g_skyOracleAt        },
+            { "skyOracleDirs",      &g_skyOracleDirs      },
+            { "skyOracleBand",      &g_skyOracleBand      },
+            { "svmDirs",            &g_svmDirs            },
+            { "svmRes",             &g_svmRes             },
+            { "svmExtent",          &g_svmExtent          },
+            { "svmDepthHalf",       &g_svmDepthHalf       },
+            { "svmMinRadius",       &g_svmMinRadius       },
+            { "svmBias",            &g_svmBias            },
+            { "svmPcf",             &g_svmPcf             },
+            { "skyAOStrength",      &g_skyAOStrength      },
+            { "skyAOInner",         &g_skyAOInner         },
+            { "skyAOOuter",         &g_skyAOOuter         },
+            { "skyAOTaps",          &g_skyAOTaps          },
+            { "skyAOOverhang",      &g_skyAOOverhang      },
+            { "skyAOOverhangFade",  &g_skyAOOverhangFade  },
+            { "skyAOOverhangFloor", &g_skyAOOverhangFloor },
+            { "skyAOMinRadius",     &g_skyAOMinRadius     },
             { "waterInscatterGain", &g_waterInscatterGain },
             { "waterScatterRatio",  &g_waterScatterRatio  },
             { "waterMsSimilarity",  &g_waterMsSimilarity  },
@@ -22598,6 +22958,10 @@ namespace {
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
+            { "sunny16",            &g_sunny16            },
+            { "skyAOStatics",       &g_skyAOStatics       },
+            { "skyAOBlur",          &g_skyAOBlur          },
+            { "svm",                &g_svm                },
             { "goboBake",           &g_goboBake           },
             { "goboDump",           &g_goboDump           },
             { "distGobo",           &g_distGobo           },
@@ -22817,6 +23181,11 @@ namespace {
         // Both are empty/unused for the three value-less widget types.
         double      def;
         const char* key;
+        // The DERIVED key this control would have had without a knob-table name, kept whenever `key`
+        // is the knob name. Giving an existing control a harness name changes its save key, and
+        // without this every saved value for it went UNKNOWN on the next load — the user's tuning
+        // silently reverted. The loader accepts either; SAVE writes `key`, so the file migrates.
+        const char* altKey;
     };
     struct PanelTab {
         const char* name;
@@ -22860,7 +23229,9 @@ namespace {
             if (it.data && it.type != WIDGET_TYPE_DYNAMIC_TEXT && it.type != WIDGET_TYPE_LABEL
                         && it.type != WIDGET_TYPE_BUTTON) {
                 const char* envName = knobNameOf(it.data);
-                it.key = envName ? pool(envName) : pool(panelDerivedKey(name, it.label).c_str());
+                const std::string derived = panelDerivedKey(name, it.label);
+                it.key    = envName ? pool(envName) : pool(derived.c_str());
+                it.altKey = envName ? pool(derived.c_str()) : nullptr;
             }
             items.push_back(it);
         }
@@ -23318,7 +23689,8 @@ namespace {
             const PanelItem* hit = nullptr;
             for (const PanelTab& tab : g_panelTabs) {
                 for (const PanelItem& it : tab.items) {
-                    if (it.key && std::strcmp(it.key, key) == 0) { hit = &it; break; }
+                    if ((it.key && std::strcmp(it.key, key) == 0)
+                        || (it.altKey && std::strcmp(it.altKey, key) == 0)) { hit = &it; break; }
                 }
                 if (hit) { break; }
             }
@@ -24680,6 +25052,10 @@ namespace {
           // (they accumulate into d) — a lamp's SPILL is unchanged, the lamp's own glow doubles.
           t.sliderF("CAL emissive gain (self-illumination; NOT point-light spill)",
                     &g_calEmisGain, 0.0f, 8.0f, 0.05f);
+          // SUNNY 16 (tasks/forge-sunny16.md). Off, or both at 0 stops, is the pre-feature image.
+          t.checkbox("SUNNY16: two unit families (physical x R, MW-authored x m)", &g_sunny16);
+          t.sliderF("SUNNY16: R, physical rebase (stops)",      &g_sunnyRStops,   0.0f, 12.0f, 0.25f);
+          t.sliderF("SUNNY16: m, MW-authored scale (stops)",    &g_sunnyMStops, -16.0f,  4.0f, 0.25f);
           t.sliderF("Dist glow: flux (brightness law scale)", &g_glowFlux,      0.0f, 8.0f,   0.05f);
           t.sliderF("Dist glow: extra falloff pow (0=physical radiance; >0 dims far, art only)", &g_glowFalloffPow, 0.0f, 2.0f, 0.05f);
           t.sliderF("Dist glow: fade-in start (world)",       &g_glowFadeStart, 0.0f, 65536.0f, 256.0f);
@@ -25207,6 +25583,11 @@ namespace {
           // in does not. Both of these join the rebuild trigger, so they take effect on the spot
           // rather than after walking a whole snap cell.
           t.checkbox("Sky AO: include STATICS (off = terrain-only, stage A)", &g_skyAOStatics);
+          t.checkbox("Sky AO: SMOOTH the map (kills the 32u staircase; off = raw, the A/B)", &g_skyAOBlur);
+          // The Twister maps (tasks/forge-skyao-oracle.md): live A/B against the march above, and the
+          // compare filter — 1 = 3x3 taps (4 gathers per map), 2 = 5x5 (9 gathers, the oracle look).
+          t.checkbox("Sky AO: direction MAPS (off = the height-map march)", &g_svm);
+          t.sliderF("Sky AO maps: filter radius (1 = 3x3, 2 = 5x5)", &g_svmPcf, 1.0f, 2.0f, 1.0f, "%.0f");
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -27385,6 +27766,199 @@ namespace {
     // before it returns, following drawTriangleAndVerify()'s idiom rather than reinventing one.
     // viewProj = the matrix THIS frame was rasterised with (renderScene's rzViewProj), written into the
     // dump's JSON sidecar so a picture carries its own screen geometry (see the sidecar note below).
+    // SKY-AO GROUND TRUTH — THE READBACK (tasks/forge-skyao-oracle.md O1). Called at the dump's site
+    // (after the frame's submit, before the shared-fence signal) for the same reasons. Fires once, on
+    // the first frame after the K directions: reads back both accumulation targets and the height map
+    // the GPU model marched, and writes them with everything the calibrator needs to re-run that model:
+    //   hdrdump/skyoracle_NNNN.bin  — header, then A, B, C (render rect, float32 RGBA), then the map
+    //                                 (float32, kSkyHeightRes²)
+    //   hdrdump/skyoracle_NNNN.json — the same header, readable
+    // mgeHost64/tools/skyao_fit.py reads them. The grass casters paused for the run are restored here.
+    inline float halfToFloatHost(uint16_t h) {
+        const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+        const uint32_t e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+        uint32_t f;
+        if (e == 0)       { if (m == 0) { f = s; }
+                            else { float v = std::ldexp((float)m, -24); std::memcpy(&f, &v, 4); f |= s; } }
+        else if (e == 31) { f = s | 0x7F800000u | (m << 13); }
+        else              { f = s | ((e + 112u) << 23) | (m << 13); }
+        float out; std::memcpy(&out, &f, 4); return out;
+    }
+    void skyOracleFinishIfDue() {
+        if (g_skyOracleStart == 0 || g_skyOracleDone) { return; }
+        const uint32_t K = (uint32_t)std::max(1.0f, g_skyOracleDirs);
+        if (g_renderFrame - g_skyOracleStart < K) { return; }
+        g_skyOracleDone = true;                  // one shot, set FIRST so no failure path can re-fire
+        g_grassShadows  = g_skyOracleGrassWas;
+        Renderer* R = g_live.pRenderer;
+        if (!R || !g_live.pSkyOracleA || !g_live.pSkyOracleB || !g_live.pSkyOracleC || g_skyOracleDrawn == 0) {
+            LOG::logline("!! [skyoracle] nothing to write (drawn=%u): the sun map was never ready — an"
+                         " interior, night with sun shadows off, or DL not resident", g_skyOracleDrawn);
+            LOG::flush();
+            return;
+        }
+        waitQueueIdle(g_live.pQueue);            // the K-th frame's adds must have landed
+
+        const uint32_t texW = g_live.pSkyOracleA->mWidth, texH = g_live.pSkyOracleA->mHeight;
+        const uint32_t W = std::min(g_live.width, texW), H = std::min(g_live.height, texH);
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u)
+                                      ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u)
+                                      ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t pitch    = roundUp(texW * 16u, rowAlign);
+        const uint32_t mapPitch = roundUp(kSkyHeightRes * 2u, rowAlign);
+        auto makeReadback = [&](uint64_t size) -> Buffer* {
+            BufferLoadDesc bd = {};
+            bd.mDesc.mSize = roundUp64(size, texAlign);
+            bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+            bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+            Buffer* b = nullptr; bd.ppBuffer = &b;
+            addResource(&bd, nullptr);
+            waitForAllResourceLoads();
+            return b;
+        };
+        auto readTex = [&](Texture* tex, ResourceState st, Buffer* rb) {
+            if (!tex || !rb) { return; }
+            TextureCopyDesc c = {};
+            c.pTexture = tex; c.pBuffer = rb;
+            c.mTextureState = st; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+            SyncToken tk = {}; copyResource(&c, &tk); waitForToken(&tk);
+        };
+        Buffer* rbA = makeReadback((uint64_t)pitch * texH);
+        Buffer* rbB = makeReadback((uint64_t)pitch * texH);
+        Buffer* rbC = makeReadback((uint64_t)pitch * texH);
+        Buffer* rbM = (g_live.pSkyHeight && g_skyHeightValid) ? makeReadback((uint64_t)mapPitch * kSkyHeightRes) : nullptr;
+        Buffer* rbL = (rbM && g_live.pSkyHeightLow) ? makeReadback((uint64_t)mapPitch * kSkyHeightRes) : nullptr;
+        readTex(g_live.pSkyOracleA->pTexture, RESOURCE_STATE_RENDER_TARGET, rbA);
+        readTex(g_live.pSkyOracleB->pTexture, RESOURCE_STATE_RENDER_TARGET, rbB);
+        readTex(g_live.pSkyOracleC->pTexture, RESOURCE_STATE_RENDER_TARGET, rbC);
+        if (rbM) { readTex(g_live.pSkyHeight->pTexture, RESOURCE_STATE_SHADER_RESOURCE, rbM); }
+        if (rbL) { readTex(g_live.pSkyHeightLow->pTexture, RESOURCE_STATE_SHADER_RESOURCE, rbL); }
+
+        CreateDirectoryA("hdrdump", nullptr);
+        unsigned n = 0;
+        char binPath[MAX_PATH] = {}, jsonPath[MAX_PATH] = {};
+        for (; n < 10000u; ++n) {
+            std::snprintf(binPath, sizeof(binPath), "hdrdump\\skyoracle_%04u.bin", n);
+            if (GetFileAttributesA(binPath) == INVALID_FILE_ATTRIBUTES) { break; }
+        }
+        std::snprintf(jsonPath, sizeof(jsonPath), "hdrdump\\skyoracle_%04u.json", n);
+
+        // Header: 8-byte magic, then u32 W, H, mapRes, K, drawn, then f32 mapOrigin.xy, mapExtent,
+        // eyeAbs.xyz, and the sky-AO knobs AS PUBLISHED (publishSkyAO's clamps applied), so the
+        // calibrator re-runs exactly the model the GPU channel B.w evaluated.
+        const float inner = std::max(1.0f, g_skyAOInner);
+        const float outer = std::max(g_skyAOInner + 1.0f, g_skyAOOuter);
+        const float taps  = std::max(1.0f, std::min(g_skyAOTaps, 16.0f));
+        const float strength = std::max(0.0f, std::min(g_skyAOStrength, 1.0f));
+        const float ovS = std::max(0.0f, g_skyAOOverhang), ovF = std::max(1.0f, g_skyAOOverhangFade);
+        const float ovFloor = std::max(0.0f, std::min(g_skyAOOverhangFloor, 1.0f));
+        bool ok = false;
+        if (FILE* f = std::fopen(binPath, "wb")) {
+            // 2: + target C (GTAO). 3: + the LOW layer (-lowest static surface) after the map.
+            const char magic[8] = { 'S','K','Y','O','R','C','L', rbL ? '3' : '2' };
+            const uint32_t hu[5] = { W, H, rbM ? kSkyHeightRes : 0u, K, g_skyOracleDrawn };
+            const float hf[14] = { g_skyHeightOrigin[0], g_skyHeightOrigin[1], kSkyHeightExtent,
+                                   g_eyeAbsShadow[0], g_eyeAbsShadow[1], g_eyeAbsShadow[2],
+                                   strength, inner, outer, taps, ovS, ovF, ovFloor,
+                                   g_skyAOStatics ? 1.0f : 0.0f };
+            std::fwrite(magic, 1, 8, f);
+            std::fwrite(hu, 4, 5, f);
+            std::fwrite(hf, 4, 14, f);
+            for (Buffer* rb : { rbA, rbB, rbC }) {
+                const uint8_t* src = rb ? (const uint8_t*)rb->pCpuMappedAddress : nullptr;
+                for (uint32_t y = 0; y < H; ++y) {
+                    if (src) { std::fwrite(src + (size_t)y * pitch, 16, W, f); }
+                }
+            }
+            for (Buffer* rbMap : { rbM, rbL }) {
+                if (!rbMap || !rbMap->pCpuMappedAddress) { continue; }
+                std::vector<float> row(kSkyHeightRes);
+                const uint8_t* src = (const uint8_t*)rbMap->pCpuMappedAddress;
+                for (uint32_t y = 0; y < kSkyHeightRes; ++y) {
+                    const uint16_t* hrow = (const uint16_t*)(src + (size_t)y * mapPitch);
+                    for (uint32_t x = 0; x < kSkyHeightRes; ++x) { row[x] = halfToFloatHost(hrow[x]); }
+                    std::fwrite(row.data(), 4, kSkyHeightRes, f);
+                }
+            }
+            ok = (std::ferror(f) == 0);
+            std::fclose(f);
+        }
+        if (FILE* jf = std::fopen(jsonPath, "w")) {
+            std::fprintf(jf, "{\n  \"bin\": \"skyoracle_%04u.bin\",\n  \"render\": [%u, %u],\n"
+                             "  \"mapRes\": %u,\n  \"directions\": %u,\n  \"band\": %d,\n  \"drawn\": %u,\n"
+                             "  \"mapOrigin\": [%.3f, %.3f],\n  \"mapExtent\": %.1f,\n"
+                             "  \"eyeAbs\": [%.3f, %.3f, %.3f],\n"
+                             "  \"skyAO\": {\"strength\": %.4f, \"inner\": %.2f, \"outer\": %.2f, \"taps\": %.0f,"
+                             " \"overhang\": %.2f, \"overhangFade\": %.2f, \"overhangFloor\": %.4f, \"statics\": %d,"
+                             " \"blur\": %d}\n}\n",
+                         n, W, H, rbM ? kSkyHeightRes : 0u, K, (int)g_skyOracleBand, g_skyOracleDrawn,
+                         (double)g_skyHeightOrigin[0], (double)g_skyHeightOrigin[1], (double)kSkyHeightExtent,
+                         (double)g_eyeAbsShadow[0], (double)g_eyeAbsShadow[1], (double)g_eyeAbsShadow[2],
+                         (double)strength, (double)inner, (double)outer, (double)taps,
+                         (double)ovS, (double)ovF, (double)ovFloor, g_skyAOStatics ? 1 : 0,
+                         (g_live.skyBlurReady && g_skyHeightBuiltBlur) ? 1 : 0);
+            std::fclose(jf);
+        }
+        for (Buffer* rb : { rbA, rbB, rbC, rbM, rbL }) { if (rb) { removeResource(rb); } }
+        LOG::logline(">> [skyoracle] %s %s (%ux%u, %u of %u directions drew, map %s) — grass casters restored",
+                     binPath, ok ? "written" : "WRITE FAILED", W, H, g_skyOracleDrawn, K,
+                     rbM ? "included" : "MISSING (height map not valid)");
+
+        // The SKY-VISIBILITY MAPS beside it, same number, for tools/skyao_fit.py to score against the
+        // oracle: hdrdump/skyvis_NNNN.bin = "SKYVIS01", u32 K, res, drawn, f32 extent, depthHalf,
+        // eyeAbsShadow.xyz (the oracle's worldAbs origin, to cross-check against the tile eyes), then
+        // per tile { f32 vp[16], f32 eye[3], u32 frame }, then per tile res² f32 depth (D16 / 65535).
+        if (g_svm && g_live.pSvmDepth) {
+            const uint32_t sK = (uint32_t)g_svmBuilt[0], sRes = (uint32_t)g_svmBuilt[1];
+            if (sK == 0 || g_svmDrawn < sK) {
+                LOG::logline("!! [svm] not dumped: %u of %u maps drawn", g_svmDrawn, sK);
+            } else {
+                const uint32_t dPitch = roundUp(g_svmAllocRes * 2u, rowAlign);
+                char svPath[MAX_PATH] = {};
+                std::snprintf(svPath, sizeof(svPath), "hdrdump\\skyvis_%04u.bin", n);
+                bool sok = false;
+                if (FILE* f = std::fopen(svPath, "wb")) {
+                    const uint32_t hu[3] = { sK, sRes, g_svmDrawn };
+                    const float hf[5] = { g_svmBuilt[2], g_svmBuilt[3],
+                                          g_eyeAbsShadow[0], g_eyeAbsShadow[1], g_eyeAbsShadow[2] };
+                    std::fwrite("SKYVIS01", 1, 8, f);
+                    std::fwrite(hu, 4, 3, f);
+                    std::fwrite(hf, 4, 5, f);
+                    for (uint32_t s = 0; s < sK; ++s) {
+                        std::fwrite(g_svmTile[s].vp, 4, 16, f);
+                        std::fwrite(g_svmTile[s].eye, 4, 3, f);
+                        std::fwrite(&g_svmTile[s].frame, 4, 1, f);
+                    }
+                    std::vector<float> row(sRes);
+                    for (uint32_t s = 0; s < sK; ++s) {
+                        Buffer* rb = makeReadback((uint64_t)dPitch * g_svmAllocRes);
+                        if (!rb) { break; }
+                        TextureCopyDesc c = {};
+                        c.pTexture = g_live.pSvmDepth->pTexture; c.pBuffer = rb;
+                        c.mTextureArrayLayer = s;
+                        c.mTextureState = RESOURCE_STATE_SHADER_RESOURCE; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+                        SyncToken tk = {}; copyResource(&c, &tk); waitForToken(&tk);
+                        const uint8_t* src = (const uint8_t*)rb->pCpuMappedAddress;
+                        for (uint32_t y = 0; y < sRes; ++y) {
+                            const uint16_t* d = (const uint16_t*)(src + (size_t)y * dPitch);
+                            for (uint32_t x = 0; x < sRes; ++x) { row[x] = (float)d[x] * (1.0f / 65535.0f); }
+                            std::fwrite(row.data(), 4, sRes, f);
+                        }
+                        removeResource(rb);
+                    }
+                    sok = (std::ferror(f) == 0);
+                    std::fclose(f);
+                }
+                LOG::logline(">> [svm] %s %s (K=%u res=%u ext=%.0f)", svPath, sok ? "written" : "WRITE FAILED",
+                             sK, sRes, (double)g_svmBuilt[2]);
+            }
+        }
+        LOG::flush();
+    }
+
     void hdrDumpIfArmed(const float* viewProj) {
         if (!g_hdrDumpArmed) { return; }
         g_hdrDumpArmed = false;   // one shot, and cleared FIRST so no failure path can re-arm it
@@ -29237,7 +29811,13 @@ void destroyHostWindow(Renderer* R);
         // from, and that is the entire diff.
         constexpr float kA0 = 1.0f;
         constexpr float kA1 = 2.0f / 3.0f;
-        const float toScene = (float)SceneCal::kNativeToScene;
+        // SUNNY 16: THE PHYSICAL FAMILY'S ONE SITE. R rebases the scene unit for everything the
+        // atmosphere lights — ambScene, sunScene and sceneScale all derive from this, and through
+        // them the drawn sky, clouds, disc, fog haze and the blend's physical end. The branch keeps
+        // R = 1 textually the pre-feature expression.
+        const float sunR    = sunnyR();
+        const float toScene = (sunR != 1.0f) ? (float)SceneCal::kNativeToScene * sunR
+                                             : (float)SceneCal::kNativeToScene;
         for (int ch = 0; ch < 3; ++ch) {
             const float dc = kA0 * 0.28209479f * rb[kAtmosShC00 + ch];
             p.ambScene[ch] = std::max(0.0f, dc * toScene);
@@ -29267,7 +29847,8 @@ void destroyHostWindow(Renderer* R);
         // ⚠ NO g_skyHwStrength, which it DID carry until the first play session. That lane is the
         // atmosphere's A/B level; a star is not atmosphere. Coupling them meant the tuned star value
         // silently depended on where the sky slider sat.
-        p.starScene  = std::max(0.0f, g_skyStarRadiance);
+        // ...in the MW family (SUNNY 16): tuned against MW's night exposure, not a measurement.
+        p.starScene  = std::max(0.0f, g_skyStarRadiance) * sunnyM();
 
         // --- the reported numbers, which are the falsification tests, not decoration ---------------
         // ⚠⚠ AND THEY ARE PREDICTIONS NOW, WHICH THEY WERE NOT BEFORE. Hosek's `sunBeamScale()`
@@ -29336,7 +29917,7 @@ void destroyHostWindow(Renderer* R);
         const float albPi  = std::max(0.0f, g_skyCloudAlbedo) / (float)SceneCal::kPi;
         const double EkeepW = EtotW - (double)beamK * lumSun * (double)sinE;
         p.cloudScene = std::max(0.0f, g_skyCloudAlbedo) * (float)(EkeepW / SceneCal::kPi) * p.sceneScale
-                     + std::max(0.0f, g_skyCloudNight);
+                     + std::max(0.0f, g_skyCloudNight) * sunnyM();   // night floor: MW family (SUNNY 16)
         p.cloudBeamScale = albPi * p.sceneScale * beamK;
         {
             // The deck BASE: the beam that lights the underside you see has crossed the whole deck
@@ -29867,6 +30448,9 @@ void destroyHostWindow(Renderer* R);
     void grassRecordDepth(Cmd* cmd);  // G1f: its Z-prepass half, inside the prepass block
     void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
     void publishGrassCrushParams(float* mp);                     // G7: the crush field's own lanes
+    void publishSkyVis();        // the maps' receiver lane (armed or not, and the distance match)
+    void dispatchSkyVisScreen(const float* rzViewProj);   // the maps averaged per half-res pixel
+    void renderSkyVisMaps();     // Twister-style sky visibility: one direction's depth map per frame
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
     void atmosDispatch();                // S2: the atmosphere's four-pass LUT chain, every frame
@@ -30484,6 +31068,30 @@ void destroyHostWindow(Renderer* R);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             cmdEndDebugMarker(g_live.pCmd);
         }
+        // SKY-AO GROUND TRUTH (dev tool): accumulate this frame's sampled direction. HERE for the same
+        // two guarantees volfog needs — the prepass depth, and a sun map built THIS frame (for the
+        // direction the override published). A frame whose map was not ready simply adds nothing;
+        // A.w counts the frames that did, per pixel. The first frame that draws CLEARS.
+        if (g_skyOracleStart != 0 && !g_skyOracleDone && g_live.pSkyOraclePipeline && g_live.pLinearDepth
+            && g_live.sunShadowReady
+            && g_renderFrame - g_skyOracleStart < (uint32_t)std::max(1.0f, g_skyOracleDirs)) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.9f, 0.3f, "SKY-AO ORACLE");
+            const LoadActionType la = (g_skyOracleDrawn == 0) ? LOAD_ACTION_CLEAR : LOAD_ACTION_LOAD;
+            BindRenderTargetsDesc soBind = {};
+            soBind.mRenderTargetCount = 3;
+            soBind.mRenderTargets[0] = { g_live.pSkyOracleA, la };
+            soBind.mRenderTargets[1] = { g_live.pSkyOracleB, la };
+            soBind.mRenderTargets[2] = { g_live.pSkyOracleC, la };
+            cmdBindRenderTargets(g_live.pCmd, &soBind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyOraclePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+            ++g_skyOracleDrawn;
+        }
         // ===================== W8: UNDERWATER BACKSTOP =====================
         // Fill whatever the frame never covered. LAST of the world passes so every earlier one has
         // already staked its coverage — and still before the first-person arms, which are drawn a
@@ -30695,6 +31303,10 @@ void destroyHostWindow(Renderer* R);
                 // THE LESSON, so the next per-pass cbuffer does not repeat it: "is it authored?" is
                 // not answered by which buffer a value arrives in.
                 decodeAuthoredRGB(p + 4);
+                // SUNNY 16: built out of MW's sun, horizon and fog colours, so it takes the fog's
+                // family scale (g_sunnyFogK; this pass may read the previous frame's, which differs
+                // only across a door crossing). p is a host staging copy, not the mapped buffer.
+                if (g_sunnyFogK != 1.0f) { p[4] *= g_sunnyFogK; p[5] *= g_sunnyFogK; p[6] *= g_sunnyFogK; }
                 p[7] = underwater ? 1.0f : 0.0f;
                 p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
                 p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
@@ -32529,8 +33141,8 @@ void destroyHostWindow(Renderer* R);
                     double hazeCd[3];
                     for (int c = 0; c < 3; ++c) {
                         hazeCd[c] = (g_fogHazeScale > 0.0f)
-                            ? (double)g_skyPhys.horizonNative[c] * (double)g_fogHazeScale * SceneCal::kSceneUnitCd
-                            : (double)g_fogNearScene[c] * SceneCal::kSceneUnitCd;
+                            ? (double)g_skyPhys.horizonNative[c] * (double)g_fogHazeScale * sceneUnitCdNow()
+                            : (double)g_fogNearScene[c] * sceneUnitCdNow();
                     }
                     // `aim` is the elevation change aimSunLightAtDisc actually applied to the LIGHT
                     // this frame and `w` its handover weight, printed beside the two suns they are
@@ -32570,12 +33182,12 @@ void destroyHostWindow(Renderer* R);
                                  (double)g_skyPhys.belowNative[0] * 683.0,
                                  (double)g_skyPhys.belowNative[1] * 683.0,
                                  (double)g_skyPhys.belowNative[2] * 683.0,
-                                 (double)g_fogNearScene[0] * SceneCal::kSceneUnitCd,
-                                 (double)g_fogNearScene[1] * SceneCal::kSceneUnitCd,
-                                 (double)g_fogNearScene[2] * SceneCal::kSceneUnitCd,
+                                 (double)g_fogNearScene[0] * sceneUnitCdNow(),
+                                 (double)g_fogNearScene[1] * sceneUnitCdNow(),
+                                 (double)g_fogNearScene[2] * sceneUnitCdNow(),
                                  hazeCd[0], hazeCd[1], hazeCd[2],
                                  ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
-                                 SceneCal::kSceneUnitCd,
+                                 sceneUnitCdNow(),
                                  (double)g_mwAmbCodeRef, (double)g_mwSunCodeRef,
                                  (double)(g_skyPhys.active
                                      ? std::max(0.0f, std::sin(g_skyPhys.elevLight
@@ -33929,11 +34541,21 @@ void destroyHostWindow(Renderer* R);
                                   (g_expRail < 0) ? "MIN" : "MAX",
                                   g_expRailMs * 0.001, g_expRailWorstMs * 0.001);
                 }
+                // SUNNY 16 P0 (tasks/forge-sunny16.md): E restated as the EV100 a real camera would
+                // be set to. Mid-grey (0.18 display) sits at scene 0.18/E, i.e. 0.18/E x kSceneUnitCd
+                // cd/m^2, and a reflected meter (K = 12.5) reads EV100 = log2(L x 100 / 12.5). Clear
+                // noon should say ~15 and an interior ~5; before the unit split it reads the other way
+                // round, and this is the number that records it.
+                // ...in the scene unit IN FORCE (kSceneUnitCd / R — see sceneUnitCdNow), so the number
+                // stays a camera setting when SUNNY 16 rebases the unit.
+                const double evApplied = std::log2(0.18 / std::max(g_exposure, 1.0e-12)
+                                                   * sceneUnitCdNow() * (100.0 / 12.5));
                 LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
                              " cast=(%.3f,%.3f,%.3f) n=%u [%s sky=%.0f%%]"
                              " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
-                             " exp=%.3g(%s,%s,%s) rail=%s(ceil %.3g) cal=(sun %.2f amb %.2f emis %.2f)",
+                             " exp=%.3g(%s,%s,%s) EVapplied=%.2f s16=%s(R 2^%.2f m 2^%.2f fog x%.3g)"
+                             " rail=%s(ceil %.3g) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
@@ -33944,6 +34566,9 @@ void destroyHostWindow(Renderer* R);
                              g_expEnable ? "servo" : "OFF",
                              (g_expStat < 0.5f) ? "mean" : ((g_expStat < 1.5f) ? "p90" : "geo"),
                              agxActive() ? "agx" : "legacy",
+                             evApplied,
+                             g_sunny16 ? "ON" : "off", std::log2((double)sunnyR()),
+                             std::log2((double)sunnyM()), (double)g_sunnyFogK,
                              railTxt, (double)g_expMaxNow,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
 
@@ -34293,6 +34918,13 @@ void destroyHostWindow(Renderer* R);
                 if (g_calAmbGain != 1.0f) {
                     fdc[24] *= g_calAmbGain; fdc[25] *= g_calAmbGain; fdc[26] *= g_calAmbGain;
                 }
+                // SUNNY 16 — MW's authored pair is the MW family: m, at the same one site and for
+                // the same reason the CAL gains are here (every copy of gFrameData inherits it). This
+                // is the blend's MW end, i.e. interior and night lighting; the physical end already
+                // carries R from toScene. A uniform scale, so the solve-ratio below is unaffected.
+                if (const float m = sunnyM(); m != 1.0f) {
+                    for (int c = 0; c < 3; ++c) { fdc[20 + c] *= m; fdc[24 + c] *= m; }
+                }
                 // S3a — the "solve ratio" press, consumed HERE and nowhere else, because this is the
                 // only point in the frame where the POST-GAIN sun and ambient both exist: the widget
                 // callback runs mid-frame with nothing but the gains themselves in scope, and
@@ -34391,6 +35023,12 @@ void destroyHostWindow(Renderer* R);
             // reaches the render target — it is a lighting input.
             g_mwSkyZenith[0] = lighting[28]; g_mwSkyZenith[1] = lighting[29]; g_mwSkyZenith[2] = lighting[30];
             decodeAuthoredRGB(g_mwSkyZenith);
+            // SUNNY 16: the legacy SH projection (its only reader) combines this with sunCol and the
+            // fog horizon, both of which carry m by the time it runs; an unscaled zenith would tilt
+            // the normalised direction. That path runs only with the physical sky off, i.e. MW family.
+            if (const float m = sunnyM(); m != 1.0f) {
+                for (int c = 0; c < 3; ++c) { g_mwSkyZenith[c] *= m; }
+            }
             fd[71] = lighting[31];
             // ...and skyZenith.w (71), which the dome never used, carries the enchanted-item glow:
             // the client's bindless slot for MW's current caustic frame, plus the texgen mode bit
@@ -34482,6 +35120,36 @@ void destroyHostWindow(Renderer* R);
             // would cast; before it, every shadow in the frame was struck for a sun up to 29 degrees
             // lower than the one drawn in the sky.
             aimSunLightAtDisc(fd);
+            // SKY-AO GROUND TRUTH (dev tool): for K frames the SHADOW sun is swung through the sky. Here,
+            // after the last writer of fd[16..18], so the sun cull, the caster and the receivers all
+            // read the one sampled direction — they take it from this lane and nowhere else. The colour
+            // pass is lit from it too, which is fine for a tool whose output is the targets, not the
+            // frame. Grass casters are paused for the run: a blade is below what the sky-AO model
+            // resolves, and letting it cast would score the model against a term it cannot have.
+            if (g_skyOracleAt > 0.0f && !g_skyOracleDone && g_live.pSkyOraclePipeline) {
+                if (g_skyOracleStart == 0 && g_renderFrame >= (uint32_t)g_skyOracleAt) {
+                    g_skyOracleStart = g_renderFrame;
+                    g_skyOracleDrawn = 0;
+                    g_skyOracleGrassWas = g_grassShadows;
+                    g_grassShadows = false;
+                    LOG::logline(">> [skyoracle] started at frame %u: %.0f directions", g_renderFrame,
+                                 (double)g_skyOracleDirs);
+                }
+                const uint32_t K = (uint32_t)std::max(1.0f, g_skyOracleDirs);
+                if (g_skyOracleStart != 0 && g_renderFrame - g_skyOracleStart < K) {
+                    // Hammersley: u stratified, v the base-2 radical inverse — a low-discrepancy set
+                    // that needs no RNG and repeats bit for bit between runs. Cosine-weighted about +Z
+                    // (z = sqrt(1-u)), so the PLAIN average of visibility is the cos-weighted integral.
+                    const uint32_t k = g_renderFrame - g_skyOracleStart;
+                    // skyOracleBand (diagnostic): 0 = the whole hemisphere; 1 = the HIGH half of the
+                    // cos-weighted mass (u < 0.5, elevation > 45 deg); 2 = the LOW half. A flat open
+                    // floor must read ~1 in band 1 — anything less there is shadow acne, not sky.
+                    const double uLo = (g_skyOracleBand == 2.0f) ? 0.5 : 0.0;
+                    const double uHi = (g_skyOracleBand == 1.0f) ? 0.5 : 1.0;
+                    // fd[16..18] is the sun's TRAVEL direction; the sampled to-sky vector is its negative.
+                    skyHemiDir(k, K, uLo, uHi, fd + 16);
+                }
+            }
             // P2b: ...and the SUN DISC's own radiance, off the same cook and THIS frame's sky list.
             // It reads g_skyPhys.sunScene, so it must follow the line above; it is read by
             // publishSkyView further down, so it must precede that. Both halves are why it is called
@@ -34532,6 +35200,26 @@ void destroyHostWindow(Renderer* R);
                 const float ls = nightAmbScaleNow();
                 if (ls != 1.0f) {
                     for (int c = 0; c < 3; ++c) { fd[24 + c] *= ls; }
+                }
+            }
+            // SUNNY 16 — MW's FOG COLOUR, which belongs to whichever family it was calibrated against:
+            // the physical sky by day (it is what the haze melts toward below the knee), MW's own
+            // lighting at night and indoors. So it rides the SAME weight the lighting blend just used,
+            // lerp(m, R, w), and it is applied HERE rather than at the decode because this is the
+            // first point where THIS frame's w exists — the decode ran before skyPhysicalMeasure, and
+            // last frame's weight is wrong for exactly one frame at every door crossing.
+            // Rewritten from the host copy (g_fogNearScene), never read back off the write-combined
+            // cbuffer ([[project_forge_wc_read_trap]]). Still ahead of every gFrameData copy.
+            {
+                const float m = sunnyM(), r = sunnyR();
+                float k = m;
+                if (g_skyPhys.active) {
+                    const float w = std::max(0.0f, std::min(1.0f, g_skyPhysBlend)) * g_skyPhys.nightRamp;
+                    k = m + (r - m) * w;
+                }
+                g_sunnyFogK = k;
+                if (k != 1.0f) {
+                    for (int c = 0; c < 3; ++c) { g_fogNearScene[c] *= k; fd[28 + c] = g_fogNearScene[c]; }
                 }
             }
             // ...and a LATCH of the same colour as MW authored it, for the unified water fog, whose
@@ -34901,6 +35589,14 @@ void destroyHostWindow(Renderer* R);
                     float* lf = (float*)(lc + 16);
                     for (uint32_t i = 0; i < nL; ++i) { decodeAuthoredRGB(lf + i * 12 + 4); }
                 }
+                // SUNNY 16: every near light is MW-authored — m. Scaled after the decode for the
+                // reason the CAL gains are: the scale is a statement about radiance.
+                if (const float m = sunnyM(); m != 1.0f) {
+                    float* lf = (float*)(lc + 16);
+                    for (uint32_t i = 0; i < nL; ++i) {
+                        lf[i * 12 + 4] *= m; lf[i * 12 + 5] *= m; lf[i * 12 + 6] *= m;
+                    }
+                }
                 // G4b: hand the twinless lights to the distant fill (dlLiveCullAndBuild runs later in
                 // this frame). Past the handover only the distant list lights a fragment, so a light
                 // that is not in it stops on a line there; with it, the torch continues at the same
@@ -34968,6 +35664,117 @@ void destroyHostWindow(Renderer* R);
                     acc += lum * (den > 0.0 ? num / den : 0.0);
                 }
                 g_mwPtCode = (float)acc;
+            }
+
+            // ─── SUNNY 16 P0: WHAT AN MW LIGHT'S "1.0" IS WORTH (tasks/forge-sunny16.md) ─────────
+            // s_art(d) = (a real candle's E/pi at distance d, in scene units) / (what this light puts
+            // there). The frag's own arithmetic, lambert 1: att = 1/(k0 + k1 d + k2 d^2) with the tail
+            // ramp, times the DECODED colour's luma — `lit = amb + sun*ndl` is E/pi, so that is the
+            // quantity to compare. A candle is ~1 cd, so E = 1/d^2 lux and E/pi = 1/(pi d^2) cd/m^2.
+            //
+            // ⚠ AVERAGED OVER A WINDOW, NOT ONE FRAME. The colour is MW's per-frame diffuse, which a
+            // flicker/pulse light modulates, and the first version's single-frame samples of one candle
+            // spread 4x. So the light is tracked by id for 5 s: luma min/mean/max (the spread is the
+            // flicker depth), with E averaged in log2 alongside it.
+            // ⚠ AND AT THREE DISTANCES, because MW's k0 flattens the near field where a real flame
+            // falls as 1/d^2: s_art is only defined together with the distance the two are made to
+            // agree at, and the line shows how far apart the choices are.
+            // The last group restates the frame under the CANDIDATE s_art (scenecal.h kArtCandidate):
+            // the candle's own lux, the lux an 18% card needs to read mid-grey at this E, and the EV.
+            // Meaningful on an MW-family frame (interior / night) only; the tag says which.
+            // The carried light when there is one, else the one nearest the eye.
+            {
+                static uint32_t s_id = 0xFFFFFFFFu;
+                static double   s_t0 = 0.0, s_lastLogMs = -1.0e9;
+                static uint32_t s_n = 0;
+                static double   s_sumLum = 0.0, s_minLum = 0.0, s_maxLum = 0.0, s_sumLogE = 0.0;
+                static double   s_rawMin = 0.0, s_rawMax = 0.0;
+                const float* lw = (const float*)lightBlob;
+                int pick = -1; bool pickCarried = false; float pickD2 = 3.4e38f;
+                for (uint32_t i = 0; lw && i < nL; ++i) {
+                    const float* e = lw + i * 12;
+                    uint32_t id = 0, flags = 0;
+                    IPC::unpackLightIdFlags(e[7], id, flags);
+                    const bool carried = (flags & IPC::kLightFlagCarried) != 0;
+                    const float d2 = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+                    if ((carried && !pickCarried) || (carried == pickCarried && d2 < pickD2)) {
+                        pick = (int)i; pickCarried = carried; pickD2 = d2;
+                    }
+                }
+                const double nowMs = hostNowMs();
+                if (pick >= 0) {
+                    const float* e = lw + pick * 12;
+                    uint32_t id = 0, flags = 0;
+                    IPC::unpackLightIdFlags(e[7], id, flags);
+                    float col[3] = { e[4], e[5], e[6] };
+                    const double raw = SceneCal::luma709(col);
+                    if (g_live.linearScene) { decodeAuthoredRGB(col); }
+                    const double lum = SceneCal::luma709(col);
+                    if (id != s_id) {   // a different light: start its window over
+                        s_id = id; s_t0 = nowMs; s_n = 0;
+                        s_sumLum = 0.0; s_sumLogE = 0.0;
+                        s_minLum = s_maxLum = lum; s_rawMin = s_rawMax = raw;
+                    }
+                    ++s_n;
+                    s_sumLum  += lum;
+                    s_sumLogE += std::log2(std::max(g_exposure, 1.0e-12));
+                    s_minLum = std::min(s_minLum, lum); s_maxLum = std::max(s_maxLum, lum);
+                    s_rawMin = std::min(s_rawMin, raw); s_rawMax = std::max(s_rawMax, raw);
+
+                    if (nowMs - s_t0 >= 5000.0 && nowMs - s_lastLogMs >= 10000.0 && s_n > 0) {
+                        s_lastLogMs = nowMs;
+                        const double meanLum = s_sumLum / (double)s_n;
+                        const double meanE   = std::exp2(s_sumLogE / (double)s_n);
+                        const double reach   = (double)e[3] * (double)((float*)lc)[1];
+                        const double ucdPi   = SceneCal::kSceneUnitCd * SceneCal::kPi;   // scene E/pi -> lux
+                        const double dM[3]   = { 0.5, 1.0, 2.0 };
+                        double att[3], lit[3], sArt[3], luxArt[3];
+                        for (int q = 0; q < 3; ++q) {
+                            const double d = dM[q] / (double)Atmosphere::kMwUnitToMetre;   // MW units
+                            double a = 1.0 / std::max((double)e[10] * d * d + (double)e[9] * d + (double)e[8], 1.0e-4);
+                            const double t = std::max(0.0, std::min(1.0,
+                                                (d - (double)POINT_LIGHT_TAIL * reach)
+                                                / std::max(1.0e-6, reach - (double)POINT_LIGHT_TAIL * reach)));
+                            a *= 1.0 - t * t * (3.0 - 2.0 * t);
+                            att[q]    = a;
+                            lit[q]    = a * meanLum;                                   // scene units today
+                            const double candle = 1.0 / (SceneCal::kPi * dM[q] * dM[q]) / SceneCal::kSceneUnitCd;
+                            sArt[q]   = (lit[q] > 1.0e-12) ? candle / lit[q] : 0.0;
+                            luxArt[q] = lit[q] * ucdPi * SceneCal::kArtCandidate;
+                        }
+                        // EV in the unit IN FORCE; then restated as if an MW "1.0" were worth kArt.
+                        // With SUNNY 16 on it is currently worth sCur = m/R pinned units, so the
+                        // restatement is by kArt/sCur (1 when the feature is off).
+                        const double evNow  = std::log2(0.18 / meanE * sceneUnitCdNow() * (100.0 / 12.5));
+                        const double sCur   = (double)sunnyM() / (double)sunnyR();
+                        const double evArt  = evNow + std::log2(SceneCal::kArtCandidate / sCur);
+                        const double midLux = SceneCal::kPi * sceneUnitCdNow() / meanE
+                                            * (SceneCal::kArtCandidate / sCur);
+                        LOG::logline(">> [sunny16] s_art: id=%u %s dist=%.2fm radius=%.0f k=(%.3g,%.3g,%.3g)"
+                                     " | %.1fs %u frames: lum min/mean/max=%.4f/%.4f/%.4f (raw %.3f-%.3f, depth %.0f%%)"
+                                     " | att@0.5/1/2m=%.2f/%.2f/%.2f lit=%.4g/%.4g/%.4g"
+                                     " | s_art@0.5/1/2m=1/%.0f 1/%.0f 1/%.0f"
+                                     " | E=%.3g EVapplied=%.2f [%s]"
+                                     " | @kArt=1/%.0f: candle=%.1f/%.1f/%.1f lux, mid-grey card=%.1f lux, EV=%.2f",
+                                     id, pickCarried ? "CARRIED" : "nearest",
+                                     std::sqrt((double)pickD2) * (double)Atmosphere::kMwUnitToMetre,
+                                     (double)e[3], (double)e[8], (double)e[9], (double)e[10],
+                                     (nowMs - s_t0) * 0.001, s_n, s_minLum, meanLum, s_maxLum,
+                                     s_rawMin, s_rawMax,
+                                     (s_maxLum > 1.0e-9) ? 100.0 * (1.0 - s_minLum / s_maxLum) : 0.0,
+                                     att[0], att[1], att[2], lit[0], lit[1], lit[2],
+                                     (sArt[0] > 0.0) ? 1.0 / sArt[0] : 0.0,
+                                     (sArt[1] > 0.0) ? 1.0 / sArt[1] : 0.0,
+                                     (sArt[2] > 0.0) ? 1.0 / sArt[2] : 0.0,
+                                     meanE, evNow,
+                                     g_skyPhys.active ? "ext: @kArt not meaningful" : "MW-family frame",
+                                     1.0 / SceneCal::kArtCandidate,
+                                     luxArt[0], luxArt[1], luxArt[2], midLux, evArt);
+                        // the next window starts here, same light
+                        s_t0 = nowMs; s_n = 0; s_sumLum = 0.0; s_sumLogE = 0.0;
+                        s_minLum = s_maxLum = lum; s_rawMin = s_rawMax = raw;
+                    }
+                }
             }
 
             // Near clustered forward: bin the just-uploaded near lights (same order as gLights) into a
@@ -35390,7 +36197,11 @@ void destroyHostWindow(Renderer* R);
             // identical reason: a receiver reading zero here would erase every self-illuminated
             // surface in the frame, and "the lamps went black" must not be able to depend on whether
             // some other subsystem came up. 1.0 is today's image byte for byte.
-            cp[kCalFloat + 0] = std::max(0.0f, g_calEmisGain);
+            // SUNNY 16: ...times m, because material emissive and vertex-colour emissive (flames,
+            // particles) are MW-authored light, and this is the one lane every emitter's frag reads.
+            // The client's flux/area emissive calibration is a RATIO to the fixture's own light colour,
+            // so it rides the same family with no change of its own.
+            cp[kCalFloat + 0] = std::max(0.0f, g_calEmisGain) * sunnyM();
             // P2b — THE EXPOSURE, into the lane that was reserved for it. Same folded expression the
             // resolve reads (gResolveParams.tone.x below), written from here so the pass that
             // MULTIPLIES by E and sky.frag's moon pin, which DIVIDES by it, can never disagree about
@@ -35405,6 +36216,13 @@ void destroyHostWindow(Renderer* R);
             // written 0 so a stale receiver reads a value that is obviously not a scale.
             cp[kCalFloat + 2] = 0.0f;
             cp[kCalFloat + 3] = 0.0f;
+            // SUNNY 16 — the two family scales for the terms that enter IN a shader (shadowparams.h.fsl
+            // sunny16). Same unconditional block as the emissive gain and for its reason: 1.0 whenever
+            // the feature is off, and never a 0 a receiver could black a lamp with.
+            cp[kSunny16Float + 0] = sunnyR();
+            cp[kSunny16Float + 1] = sunnyM();
+            cp[kSunny16Float + 2] = 0.0f;
+            cp[kSunny16Float + 3] = 0.0f;
             // P2b — THE ARMED CURVE, for the one consumer that has to run it BACKWARDS (the moon
             // pin, sky.frag). Same three expressions gResolveParams.curve/curveScale/look are
             // written from, in the same frame, from this one block; .w of the first mirrors
@@ -37539,6 +38357,11 @@ void destroyHostWindow(Renderer* R);
         // other trigger — the height map changing under it — is handled inside the call above, which
         // is why this one only has to watch the sun. Also almost always a no-op.
         rebuildSunOccMap(/*force*/false);
+        // ...and one direction of the sky-visibility maps (a no-op unless svm is armed).
+        gpuPhaseBegin(kGpuPhaseSkyVis);
+        renderSkyVisMaps();
+        gpuPhaseEnd(kGpuPhaseSkyVis);
+        publishSkyVis();   // every frame: armed or not (the screen pass itself runs after the prepass)
 
         // ─── S2: THE ATMOSPHERE's LUT CHAIN, REBUILT EVERY FRAME ─────────────────────────────────
         // Here because here is the last point in the frame with no render target bound, and beside
@@ -38444,6 +39267,13 @@ void destroyHostWindow(Renderer* R);
                                   gpuPhaseBegin, gpuPhaseEnd);
         // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
         const bool aoBlockRan = passLinearizeAndGtao(rzViewProj, gpuPhaseBegin, gpuPhaseEnd);
+        // Sky visibility from the direction maps, once per half-res pixel, off the depth just
+        // linearized. pLinearDepth is SHADER_RESOURCE only when that block ran.
+        if (aoBlockRan) {
+            gpuPhaseBegin(kGpuPhaseSkyVisScreen);
+            dispatchSkyVisScreen(rzViewProj);
+            gpuPhaseEnd(kGpuPhaseSkyVisScreen);
+        }
 
         // ===================== O1: intra-frame split-submit =====================
         // Everything recorded so far (cull → froxel → prepass → shadow → postdepth) goes to the
@@ -43937,6 +44767,7 @@ void destroyHostWindow(Renderer* R);
         // ...and the unattended arm, one shot, checked HERE so it lands in exactly the same place
         // in the frame a keypress would have: after queueSubmit, before the shared-fence signal.
         // Zeroed before arming so a failed capture cannot re-fire every frame for the rest of the run.
+        skyOracleFinishIfDue();   // the sky-AO ground truth's one-shot readback, same placement argument
         if (g_dumpAtFrame > 0.0f && g_renderFrame >= (uint32_t)g_dumpAtFrame) {
             g_dumpAtFrame = 0.0f;
             armHdrDump();
@@ -45667,6 +46498,7 @@ void destroyHostWindow(Renderer* R);
     // sunshadow_statics.frag → RGBA16_UNORM). Same vertex layout as g_pStaticsPipeline; front = CCW.
     // (kSunShadowRes / g_sunShadowRange / g_drawSunShadow declared early near the atlas constants.)
     Shader*   g_pSunShadowStaticsShader   = nullptr;
+    Pipeline* g_pSvmStaticsPipeline = nullptr;   // sky-visibility maps: same program, depth only, D16, no cull
     Pipeline* g_pSunShadowStaticsPipeline = nullptr;
     Shader*   g_pSkyHeightStaticsShader   = nullptr;   // SH2 stage B: statics.vert + skyheight_statics.frag
     Pipeline* g_pSkyHeightStaticsPipeline = nullptr;
@@ -46627,6 +47459,9 @@ void destroyHostWindow(Renderer* R);
     // reflection has one: the LOD array is read by the neighbour stitch, so two culls sharing it
     // would tear whichever recorded second.
     TerrainView g_terrainSun;
+    // ...and the SKY-VISIBILITY maps' view: one sky direction per frame, its own ortho box, so it
+    // needs its own LOD array and ring for the same reason the sun has one.
+    TerrainView g_terrainSvm;
 
     Shader*   g_pTerrainShader     = nullptr;
     Pipeline* g_pTerrainPipeline   = nullptr;
@@ -46645,6 +47480,7 @@ void destroyHostWindow(Renderer* R);
     Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
     Pipeline* g_pTerrainDepthPipeline = nullptr;
     Shader*   g_pSunShadowTerrainShader   = nullptr;   // terrain.vert + sunshadow_terrain.frag
+    Pipeline* g_pSvmTerrainPipeline = nullptr;         // ...and into a sky-visibility map (depth only, D16)
     Pipeline* g_pSunShadowTerrainPipeline = nullptr;   // ...into the MSM moments atlas
     Buffer*   g_pTerrainVB         = nullptr;   // shared lattice (all LODs)
     Buffer*   g_pTerrainIB         = nullptr;   // all LOD strides back to back
@@ -46786,7 +47622,7 @@ void destroyHostWindow(Renderer* R);
 
         // One instance ring PER VIEW — the reflect and sun culls run mid-command-buffer, after the
         // main cull has already filled its own ring, so they cannot share storage.
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun, &g_terrainSvm }) {
             BufferLoadDesc ir = {};
             ir.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             ir.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -46797,14 +47633,15 @@ void destroyHostWindow(Renderer* R);
             ir.mDesc.mSize        = (uint64_t)kTerrainMaxRows * kTerrainInstStride;
             ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing"
                                   : (v == &g_terrainRefl) ? "terrainInstRingRefl"
-                                                          : "terrainInstRingSun";
+                                  : (v == &g_terrainSun)  ? "terrainInstRingSun"
+                                                          : "terrainInstRingSvm";
             ir.pData              = nullptr;
             ir.ppBuffer           = &v->instRing;
             addResource(&ir, nullptr);
         }
         waitForAllResourceLoads();
         if (!g_pTerrainVB || !g_pTerrainIB || !g_terrainMain.instRing || !g_terrainRefl.instRing
-            || !g_terrainSun.instRing) {
+            || !g_terrainSun.instRing || !g_terrainSvm.instRing) {
             std::printf("[forge][terrain] lattice buffer alloc FAILED\n");
             return false;
         }
@@ -46978,6 +47815,27 @@ void destroyHostWindow(Renderer* R);
             // Non-fatal: the sun pass then keeps casting statics only, which is where this started.
             if (!g_pSunShadowTerrainPipeline) {
                 std::printf("[forge][terrain] sun-caster PSO FAILED — landscape casts no sun shadow\n");
+            }
+            // Sky-visibility twin: the same program with NO colour target (the moments it writes are
+            // discarded) into the D16 map array. CULL_NONE for the sun twin's reason, which holds for
+            // every sky direction.
+            if (g_svm && g_pSunShadowTerrainShader) {
+                RasterizerStateDesc vr = rs; vr.mCullMode = CULL_MODE_NONE;
+                PipelineDesc vpd = {};
+                vpd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& vg = vpd.mGraphicsDesc;
+                vg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                vg.mRenderTargetCount  = 0;
+                vg.pColorFormats       = nullptr;
+                vg.mSampleCount        = SAMPLE_COUNT_1;
+                vg.mSampleQuality      = 0;
+                vg.mDepthStencilFormat = TinyImageFormat_D16_UNORM;
+                vg.pDepthState         = &ds;
+                vg.pVertexLayout       = &vl;
+                vg.pRasterizerState    = &vr;
+                vg.pShaderProgram      = g_pSunShadowTerrainShader;
+                addPipeline(R, &vpd, &g_pSvmTerrainPipeline);
+                if (!g_pSvmTerrainPipeline) { std::printf("[forge][svm] terrain PSO FAILED\n"); }
             }
         }
 
@@ -47715,7 +48573,7 @@ void destroyHostWindow(Renderer* R);
         // The per-view LOD arrays are indexed by CULL INDEX (the stitch reads a neighbour's entry),
         // so they size to the cull table, not to the slot count.
         const uint32_t cullN = (uint32_t)g_terrainCull.size();
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun, &g_terrainSvm }) {
             // Seeded with the BASE rung, not 0 — rung 0 is the FINEST one, and a default that
             // means "8 u" is the wrong thing for an entry nobody has picked yet.
             // The stitch only reads an entry whose lodStamp matches this frame, so this is a
@@ -48359,6 +49217,27 @@ void destroyHostWindow(Renderer* R);
                 sg.pShaderProgram = g_pSunShadowStaticsShader;
                 addPipeline(R, &sunPd, &g_pSunShadowStaticsPipeline);
                 if (!g_pSunShadowStaticsPipeline) { std::printf("[forge][dl] addPipeline(sunshadow statics) FAILED\n"); }
+                // Sky-visibility twin: depth only into the D16 map array, and CULL_NONE — from a low
+                // sky direction a single-sided wall or roof is as likely to face away as toward, and
+                // back-culling it would leave a hole exactly where the sky is blocked.
+                if (g_svm) {
+                    RasterizerStateDesc vr = rs; vr.mCullMode = CULL_MODE_NONE;
+                    PipelineDesc vpd = {};
+                    vpd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& vg = vpd.mGraphicsDesc;
+                    vg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    vg.mRenderTargetCount = 0;
+                    vg.pColorFormats = nullptr;
+                    vg.mSampleCount = SAMPLE_COUNT_1;
+                    vg.mSampleQuality = 0;
+                    vg.mDepthStencilFormat = TinyImageFormat_D16_UNORM;
+                    vg.pDepthState = &ds;
+                    vg.pVertexLayout = &vl;
+                    vg.pRasterizerState = &vr;
+                    vg.pShaderProgram = g_pSunShadowStaticsShader;
+                    addPipeline(R, &vpd, &g_pSvmStaticsPipeline);
+                    if (!g_pSvmStaticsPipeline) { std::printf("[forge][svm] statics PSO FAILED\n"); }
+                }
             } else {
                 std::printf("[forge][dl] addShader(sunshadow statics) FAILED — sun shadow disabled\n");
             }
@@ -48568,7 +49447,8 @@ void destroyHostWindow(Renderer* R);
             khd.mFrag.pFileName = "skyheight_statics.frag";
             addShader(R, &khd, &g_pSkyHeightStaticsShader);
             if (g_pSkyHeightStaticsShader) {
-                TinyImageFormat khFmt = TinyImageFormat_R16_SFLOAT;
+                // Two targets, ONE blend: target 1 receives -z, so BM_MAX there keeps the LOWEST surface.
+                TinyImageFormat khFmts[2] = { TinyImageFormat_R16_SFLOAT, TinyImageFormat_R16_SFLOAT };
                 BlendStateDesc khBlend = {};
                 khBlend.mSrcFactors[0]      = BC_ONE;
                 khBlend.mDstFactors[0]      = BC_ONE;
@@ -48577,7 +49457,7 @@ void destroyHostWindow(Renderer* R);
                 khBlend.mBlendModes[0]      = BM_MAX;
                 khBlend.mBlendAlphaModes[0] = BM_MAX;
                 khBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
-                khBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+                khBlend.mRenderTargetMask   = (BlendStateTargets)(BLEND_STATE_TARGET_0 | BLEND_STATE_TARGET_1);
                 khBlend.mIndependentBlend   = false;
                 DepthStateDesc khDepth = {};
                 khDepth.mDepthTest  = false;
@@ -48590,8 +49470,8 @@ void destroyHostWindow(Renderer* R);
                 khPd.mType = PIPELINE_TYPE_GRAPHICS;
                 GraphicsPipelineDesc& khg = khPd.mGraphicsDesc;
                 khg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
-                khg.mRenderTargetCount  = 1;
-                khg.pColorFormats       = &khFmt;
+                khg.mRenderTargetCount  = 2;
+                khg.pColorFormats       = khFmts;
                 khg.mSampleCount        = SAMPLE_COUNT_1;
                 khg.mSampleQuality      = 0;
                 khg.mDepthStencilFormat = TinyImageFormat_UNDEFINED;   // no depth attachment
@@ -53968,12 +54848,14 @@ void destroyHostWindow(Renderer* R);
                     const uint32_t nDyn = (uint32_t)s_dyn.size();
                     if (nUp > kMaxPointLights - nDyn) { nUp = kMaxPointLights - nDyn; }
                     lc[0] = (float)(nUp + nDyn); lc[1] = reachK; lc[2] = 0.0f; lc[3] = 0.0f;
+                    const float sunM = sunnyM();   // SUNNY 16: the MW family's scale, both loops below
                     for (uint32_t k = 0; k < nDyn; ++k) {
                         const DlDynLight& D = *s_dyn[k];
                         float* e = lc + 4 + (nUp + k) * 12;
                         e[0] = D.x - eye[0]; e[1] = D.y - eye[1]; e[2] = D.z - eye[2]; e[3] = D.radius;
                         e[4] = D.col[0]; e[5] = D.col[1]; e[6] = D.col[2]; e[7] = 0.0f;
                         decodeAuthoredRGB(e + 4);                 // as the near upload does
+                        if (sunM != 1.0f) { e[4] *= sunM; e[5] *= sunM; e[6] *= sunM; }   // ...and its m
                         e[8] = D.fo[0]; e[9] = D.fo[1]; e[10] = D.fo[2]; e[11] = 0.0f;   // its own falloff, no gobo
                     }
                     for (uint32_t k = 0; k < nUp; ++k) {
@@ -53992,6 +54874,8 @@ void destroyHostWindow(Renderer* R);
                         // a lantern would change colour across the near/far handover — the one place
                         // a domain mismatch is guaranteed to be visible as a moving seam.
                         decodeAuthoredRGB(e + 4);
+                        // SUNNY 16: m, exactly as the near upload applies it — the handover seam again.
+                        if (sunM != 1.0f) { e[4] *= sunM; e[5] *= sunM; e[6] *= sunM; }
                         // MW ini-baked attenuation: c=0.36, l=0, q=3.25/R². Same coefficients the engine
                         // gives the near lights → distant is byte-identical, no shader change.
                         e[8] = kMWLightConstant; e[9] = 0.0f; e[10] = q; e[11] = 0.0f;   // k0,k1,k2 ; w=0
@@ -55502,6 +56386,261 @@ void destroyHostWindow(Renderer* R);
     //       the resident heightfield, no cull and no instance build.
     // Compute LAST is deliberate: it lets stage (2) get away with pure blending, and it makes "no
     // LAND record here" a natural sentinel rather than a hole.
+    // The sky lane's statics cull: survivors of a box (six camera-relative planes) into pSkyArgs /
+    // pSkyInstOut, left in draw state. Shared by the height-map rebuild and the sky-visibility maps;
+    // its params CBV is CPU-written, so only ONE of them may use it per frame (the maps stand down
+    // on a rebuild frame). The caller checks the lane is ready.
+    void skyLaneCull(const float box[24], float minRadius) {
+        ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+        auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
+            BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+        };
+        auto uavBarrier = [&](Buffer* buf) { bufBarrier(buf, RESOURCE_STATE_UNORDERED_ACCESS,
+                                                         RESOURCE_STATE_UNORDERED_ACCESS); };
+        // Same clone contract as dispatchSunCull: copy the camera params whole (inherits eye,
+        // instance/subset counts and the dynamic visibility mask), then override only what
+        // differs. The copy MUST span all 512 B — this cull runs with no near cut and no
+        // ownership, so an instance the camera cull dropped still has to be considered here.
+        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+        float*       kp  = (float*)g_live.pSkyCullParamsCbv->pCpuMappedAddress;
+        std::memcpy(kp, cam, 512);
+
+        // Six box planes, camera-relative: inside == dot(n, c - eye) + d >= -r.
+        std::memcpy(kp, box, 24 * sizeof(float));
+        // EVERY tier passes, unbounded. The first cut of this used the LOD tier as a free size
+        // filter (ranges.x = 0, rejecting tier 0) — but the tier answers "is this worth a draw
+        // call from far away", a question about silhouette at distance, and it threw away
+        // precisely the occluders sky AO lives on: a Balmora shack is tier 0 because MGE's
+        // BUILDING rule needs radius*2 > FarStaticMinSize (600), so anything under 300 drops out,
+        // and so does every mod-authored STATIC_NEAR. The size question the MAP has is a
+        // different one — "can a 32-unit texel represent this at all" — and it is asked below by
+        // radius (misc.w), which is also WORLD-LOCKED where a tier+distance filter would not be.
+        // That matters: eye-relative content would break the rebuild's whole invariant, that a
+        // snap crossing reproduces identical values over the overlap.
+        kp[28]=1e18f; kp[29]=1e18f; kp[30]=1e18f; kp[31]=0.0f;   // nearCut² = 0 as well
+        kp[35] = std::max(0.0f, minRadius);   // misc.w = THE size filter (bound radius)
+        kp[55]=0.0f;    // hizParams.w = 0 → Hi-Z off (that pyramid is the CAMERA's; meaningless here)
+        kp[127]=0.0f;   // cellOwn.w = 0 → near/far ownership off: a near-owned building's LOD
+                        // proxy occluding the same sky its real copy does is a no-op, whereas
+                        // suppressing it would punch a hole in the map exactly where the player is.
+
+        // Reset the counters from the SHARED zero-staging buffers (same as the sun cull).
+        bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(g_live.pSkyCullCount->mDx.pResource, 0,
+                             g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+        bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        bufBarrier(g_live.pSkySubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(g_live.pSkySubsetCount->mDx.pResource, 0,
+                             g_live.pSubsetCountZero->mDx.pResource, 0,
+                             (uint64_t)sizeof(uint32_t) * g_live.cullSubsetCount);
+        bufBarrier(g_live.pSkySubsetCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        if (g_live.skyArgsInDrawState) {
+            bufBarrier(g_live.pSkyArgs,    RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
+            bufBarrier(g_live.pSkyInstOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
+            g_live.skyArgsInDrawState = false;
+        }
+
+        cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
+        cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        uavBarrier(g_live.pSkySubsetCount);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
+        cmdDispatch(g_live.pCmd, 1, 1, 1);
+        uavBarrier(g_live.pSkySubsetOffset);
+        uavBarrier(g_live.pSkySubsetCursor);
+        uavBarrier(g_live.pSkyArgs);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
+        cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        uavBarrier(g_live.pSkyInstOut);
+        bufBarrier(g_live.pSkyArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
+        bufBarrier(g_live.pSkyInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        g_live.skyArgsInDrawState = true;
+    }
+
+    // SKY-VISIBILITY MAPS (see g_svm): redraw ONE direction's map per frame, round-robin. Statics
+    // through the sky lane's cull, terrain through its own view, both depth-only into slice k of the
+    // D16 array with the direction's ortho. Borrows the height map's frame CBV + PerFrame set too.
+    // The receiver lane. Armed only once EVERY map of the current layout has been drawn since the
+    // layout (or the exterior) began — a half-filled set would read its empty slices (depth 0 =
+    // "nothing there") as open sky — and only when the screen pass can run. Unarmed = K 0 = every lit
+    // path takes the height-map march.
+    bool skyVisArmed() {
+        const uint32_t K = (uint32_t)g_svmBuilt[0];
+        return g_svm && g_live.skyVisReady && g_dlExterior && K > 0 && g_svmDrawn >= K;
+    }
+    void publishSkyVis() {
+        if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
+        float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        mp[kSkyVisFloat + 0] = skyVisArmed() ? g_svmBuilt[0] : 0.0f;
+        // The distance match (skyamb.h.fsl skyAOTermPx): 2% + 16 u. Loose enough for the half-res
+        // neighbour on one surface, tight enough that the next surface back never qualifies.
+        mp[kSkyVisFloat + 1] = 0.02f;
+        mp[kSkyVisFloat + 2] = 16.0f;
+        mp[kSkyVisFloat + 3] = 0.0f;
+    }
+
+    // THE SCREEN PASS (skyvis.comp): after the linearize, before the colour pass. Fills the params
+    // (the camera's inverse matrix, the dims, and per map its clip rows + eye relative to THIS
+    // frame's camera) and dispatches over the half-res rect. Leaves pSvmScreen in SHADER_RESOURCE.
+    void dispatchSkyVisScreen(const float* rzViewProj) {
+        if (!skyVisArmed() || !g_live.pSkyVisParamsCbv || !g_live.pSkyVisParamsCbv->pCpuMappedAddress) { return; }
+        SkyVisParams* sp = (SkyVisParams*)g_live.pSkyVisParamsCbv->pCpuMappedAddress;
+        float invVP[16];
+        if (!invert4x4(rzViewProj, invVP)) { return; }
+        std::memcpy(&sp->invViewProj, invVP, sizeof(invVP));
+        const uint32_t w = g_live.width, h = g_live.height;
+        const uint32_t hw = (w + 1u) / 2u, hh = (h + 1u) / 2u;
+        const uint32_t K = (uint32_t)g_svmBuilt[0];
+        float* f = (float*)sp;
+        f[16] = (float)w;  f[17] = (float)h;  f[18] = (float)hw; f[19] = (float)hh;
+        f[20] = (float)K;  f[21] = (float)g_svmAllocRes;
+        f[22] = std::max(0.0f, g_svmBias) / (2.0f * std::max(1.0f, g_svmBuilt[3]));
+        f[23] = std::round(std::max(0.0f, std::min(g_svmPcf, 4.0f)));
+        // Past the corner of the maps' box (half-width ext, redrawn around an eye that may have
+        // moved since) no map covers the point: skip the loop and let the frag march.
+        f[24] = g_svmBuilt[2] * 1.5f; f[25] = 0.0f; f[26] = 0.0f; f[27] = 0.0f;
+        float* t = f + 28;
+        for (uint32_t i = 0; i < K; ++i) {
+            const SvmTile& T = g_svmTile[i];
+            for (int j = 0; j < 3; ++j) {
+                t[i * 16 + j * 4 + 0] = T.vp[0 * 4 + j];
+                t[i * 16 + j * 4 + 1] = T.vp[1 * 4 + j];
+                t[i * 16 + j * 4 + 2] = T.vp[2 * 4 + j];
+                t[i * 16 + j * 4 + 3] = T.vp[3 * 4 + j];
+            }
+            // Kept in double until the subtraction so a map drawn thousands of units back stays exact.
+            t[i * 16 + 12] = (float)((double)T.eye[0] - (double)g_dlEye[0]);
+            t[i * 16 + 13] = (float)((double)T.eye[1] - (double)g_dlEye[1]);
+            t[i * 16 + 14] = (float)((double)T.eye[2] - (double)g_dlEye[2]);
+            t[i * 16 + 15] = 0.0f;
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, "SKY-VISIBILITY SCREEN");
+        TextureBarrier tb = {};
+        tb.pTexture = g_live.pSvmScreen;
+        if (g_live.svmScreenInSR) {
+            tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            tb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        }
+        cmdBindPipeline(g_live.pCmd, g_live.pSkyVisPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyVisSet);
+        cmdDispatch(g_live.pCmd, (hw + 7u) / 8u, (hh + 7u) / 8u, 1);
+        tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+        tb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        g_live.svmScreenInSR = true;
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    void renderSkyVisMaps() {
+        // Leaving the exterior invalidates every map: the next world is another place.
+        if (!g_dlExterior) { g_svmDrawn = 0; return; }
+        if (!g_svm || !g_live.pSvmDepth || !g_pSvmStaticsPipeline) { return; }
+        // The lane's params CBV and the frame CBV are CPU-written and read at execution: a rebuild
+        // frame has already claimed them.
+        if (g_skyHeightBuildFrame == g_renderFrame && g_skyHeightBuilds > 0) { return; }
+        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+        const bool lane = g_live.skyCullReady && g_live.pPerFrameSetSkyHeight && g_live.pSkyHeightFrameCbv
+                       && g_live.pCullPipeline && g_live.cullInstCount && g_dlLiveInit && g_staticsLiveOk
+                       && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress
+                       && g_live.pSkyCullParamsCbv && g_live.pSkyCullParamsCbv->pCpuMappedAddress;
+        if (!lane) { return; }
+
+        const uint32_t K   = (uint32_t)std::max(1.0f, std::min(g_svmDirs, (float)kSvmMaxDirs));
+        const uint32_t res = g_svmAllocRes;
+        const float    ext = std::max(64.0f, g_svmExtent);
+        const float    dh  = std::max(256.0f, g_svmDepthHalf);
+        const float built[4] = { (float)K, (float)res, ext, dh };
+        if (std::memcmp(built, g_svmBuilt, sizeof(built)) != 0) {   // layout changed: start over
+            std::memcpy(g_svmBuilt, built, sizeof(built));
+            g_svmNext = 0; g_svmDrawn = 0;
+        }
+        const uint32_t k = g_svmNext % K;
+        g_svmNext = (k + 1) % K;
+
+        // The direction's ortho, snapped to its own texel grid in WORLD space (sunSnapOffset of the
+        // eye's absolute coordinate), so a redraw after the eye moved lands texels where the last one
+        // did — the maps swim no more than the world does.
+        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
+        float t[3], xa[3], ya[3], za[3];
+        skyHemiDir(k, K, 0.0, 1.0, t);
+        sunLightBasis(t, xa, ya, za);
+        const float texel = 2.0f * ext / (float)res;
+        auto dotEye = [&](const float* a) {
+            return (double)eye[0] * a[0] + (double)eye[1] * a[1] + (double)eye[2] * a[2];
+        };
+        SvmTile& T = g_svmTile[k];
+        buildSunOrthoVP(xa, ya, za, ext, dh, sunSnapOffset(dotEye(xa), texel),
+                        sunSnapOffset(dotEye(ya), texel), T.vp);
+        T.eye[0] = eye[0]; T.eye[1] = eye[1]; T.eye[2] = eye[2];
+        T.frame = g_renderFrame;
+
+        // Casters: the ortho box, one texel of slack for the snap.
+        const float e = ext + texel;
+        const float planes[6][4] = {
+            { -xa[0], -xa[1], -xa[2], e  }, {  xa[0],  xa[1],  xa[2], e  },
+            { -ya[0], -ya[1], -ya[2], e  }, {  ya[0],  ya[1],  ya[2], e  },
+            { -za[0], -za[1], -za[2], dh }, {  za[0],  za[1],  za[2], dh },
+        };
+        skyLaneCull(&planes[0][0], g_svmMinRadius);
+        terrainCullAndBuild(g_terrainSvm, /*primary*/false, planes, eye, /*nearCut*/0.0f,
+                            /*lodBias*/0u, /*lodFloor*/kTerrainBaseLod);
+        std::memcpy(g_live.pSkyHeightFrameCbv->pCpuMappedAddress, mfd, kFrameDataBytes);
+        std::memcpy(g_live.pSkyHeightFrameCbv->pCpuMappedAddress, T.vp, 16 * sizeof(float));
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, "SKY-VISIBILITY MAP");
+        RenderTargetBarrier rtb = {};
+        rtb.pRenderTarget = g_live.pSvmDepth;
+        rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+        rtb.mNewState     = RESOURCE_STATE_DEPTH_WRITE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+        BindRenderTargetsDesc b = {};
+        b.mRenderTargetCount = 0;
+        b.mDepthStencil = { g_live.pSvmDepth, LOAD_ACTION_CLEAR };
+        b.mDepthStencil.mArraySlice = k;       // CLEAR touches this slice only
+        b.mDepthStencil.mUseArraySlice = 1;
+        cmdBindRenderTargets(g_live.pCmd, &b);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)res, (float)res, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, res, res);
+
+        cmdBindPipeline(g_live.pCmd, g_pSvmStaticsPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                                     : g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetSkyHeight);
+        Buffer*  vbs[2]     = { g_pStaticsVB, g_live.pSkyInstOut };
+        uint32_t strides[2] = { 20, kStaticsInstStride };
+        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount, g_live.pSkyArgs, 0, nullptr, 0);
+        if (g_pSvmTerrainPipeline) {
+            terrainRecord(g_live.pCmd, g_terrainSvm, g_live.pPerFrameSetSkyHeight, /*mirror*/false,
+                          /*frameSetIndex*/0, g_pSvmTerrainPipeline);
+        }
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+        rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+        rtb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+        cmdEndDebugMarker(g_live.pCmd);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        ++g_svmDrawn;
+
+        static uint32_t s_svmLog = 0;
+        if ((s_svmLog++ % 300) == 0) {
+            LOG::logline(">> [svm] dir %u/%u res=%u ext=%.0f texel=%.2f depthHalf=%.0f drawn=%u"
+                         " terrainCells=%u travel=(%.3f,%.3f,%.3f) | gpu redraw=%.3f screen=%.3f ms",
+                         k, K, res, ext, texel, dh, g_svmDrawn, g_terrainSvm.cells, t[0], t[1], t[2],
+                         g_lastGpuPhaseMs[kGpuPhaseSkyVis], g_lastGpuPhaseMs[kGpuPhaseSkyVisScreen]);
+        }
+    }
+
     void rebuildSkyHeightMap() {
         if (!g_live.skyHeightReady || !g_dlExterior) { return; }
         if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
@@ -55517,7 +56656,8 @@ void destroyHostWindow(Renderer* R);
         // effect after walking a whole snap cell, which is not an A/B anyone can use.
         if (g_skyHeightValid && wantX == g_skyHeightOrigin[0] && wantY == g_skyHeightOrigin[1]
             && g_skyAOStatics == g_skyHeightBuiltStatics
-            && g_skyAOMinRadius == g_skyHeightBuiltMinR) { return; }
+            && g_skyAOMinRadius == g_skyHeightBuiltMinR
+            && (g_skyAOBlur == g_skyHeightBuiltBlur || !g_live.skyBlurReady)) { return; }
 
         g_skyHeightOrigin[0] = wantX;
         g_skyHeightOrigin[1] = wantY;
@@ -55551,76 +56691,16 @@ void destroyHostWindow(Renderer* R);
         cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.8f, 0.6f, "SKY HEIGHT MAP (rebuild)");
 
         if (doStatics) {
-            // Same clone contract as dispatchSunCull: copy the camera params whole (inherits eye,
-            // instance/subset counts and the dynamic visibility mask), then override only what
-            // differs. The copy MUST span all 512 B — this cull runs with no near cut and no
-            // ownership, so an instance the camera cull dropped still has to be considered here.
-            const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
-            float*       kp  = (float*)g_live.pSkyCullParamsCbv->pCpuMappedAddress;
-            std::memcpy(kp, cam, 512);
-
             // Six axis-aligned box planes for the MAP's window. Unlike the sun cull's box these are
             // NOT centred on the camera, so the offset from eye to map centre is folded into each
             // plane constant: inside == |dot(c,a) - o·a| <= h  ==>  the pair (-a, h + o·a), (a, h - o·a).
             const float h  = 0.5f * kSkyHeightExtent;
             const float ox = ctrX - eyeX, oy = ctrY - eyeY;
             const float hz = 1.0e6f;   // vertical: the map covers every height there is
-            kp[0]=-1; kp[1]= 0; kp[2]= 0; kp[3]= h + ox;
-            kp[4]= 1; kp[5]= 0; kp[6]= 0; kp[7]= h - ox;
-            kp[8]= 0; kp[9]=-1; kp[10]=0; kp[11]= h + oy;
-            kp[12]=0; kp[13]=1; kp[14]=0; kp[15]= h - oy;
-            kp[16]=0; kp[17]=0; kp[18]=-1; kp[19]= hz;
-            kp[20]=0; kp[21]=0; kp[22]= 1; kp[23]= hz;
-            // EVERY tier passes, unbounded. The first cut of this used the LOD tier as a free size
-            // filter (ranges.x = 0, rejecting tier 0) — but the tier answers "is this worth a draw
-            // call from far away", a question about silhouette at distance, and it threw away
-            // precisely the occluders sky AO lives on: a Balmora shack is tier 0 because MGE's
-            // BUILDING rule needs radius*2 > FarStaticMinSize (600), so anything under 300 drops out,
-            // and so does every mod-authored STATIC_NEAR. The size question the MAP has is a
-            // different one — "can a 32-unit texel represent this at all" — and it is asked below by
-            // radius (misc.w), which is also WORLD-LOCKED where a tier+distance filter would not be.
-            // That matters: eye-relative content would break the rebuild's whole invariant, that a
-            // snap crossing reproduces identical values over the overlap.
-            kp[28]=1e18f; kp[29]=1e18f; kp[30]=1e18f; kp[31]=0.0f;   // nearCut² = 0 as well
-            kp[35] = std::max(0.0f, g_skyAOMinRadius);   // misc.w = THE size filter (bound radius)
-            kp[55]=0.0f;    // hizParams.w = 0 → Hi-Z off (that pyramid is the CAMERA's; meaningless here)
-            kp[127]=0.0f;   // cellOwn.w = 0 → near/far ownership off: a near-owned building's LOD
-                            // proxy occluding the same sky its real copy does is a no-op, whereas
-                            // suppressing it would punch a hole in the map exactly where the player is.
-
-            // Reset the counters from the SHARED zero-staging buffers (same as the sun cull).
-            bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
-            cl->CopyBufferRegion(g_live.pSkyCullCount->mDx.pResource, 0,
-                                 g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
-            bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
-            bufBarrier(g_live.pSkySubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
-            cl->CopyBufferRegion(g_live.pSkySubsetCount->mDx.pResource, 0,
-                                 g_live.pSubsetCountZero->mDx.pResource, 0,
-                                 (uint64_t)sizeof(uint32_t) * g_live.cullSubsetCount);
-            bufBarrier(g_live.pSkySubsetCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
-            if (g_live.skyArgsInDrawState) {
-                bufBarrier(g_live.pSkyArgs,    RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
-                bufBarrier(g_live.pSkyInstOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
-                g_live.skyArgsInDrawState = false;
-            }
-
-            cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
-            cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
-            uavBarrier(g_live.pSkySubsetCount);
-            cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
-            cmdDispatch(g_live.pCmd, 1, 1, 1);
-            uavBarrier(g_live.pSkySubsetOffset);
-            uavBarrier(g_live.pSkySubsetCursor);
-            uavBarrier(g_live.pSkyArgs);
-            cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
-            cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
-            uavBarrier(g_live.pSkyInstOut);
-            bufBarrier(g_live.pSkyArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
-            bufBarrier(g_live.pSkyInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-            g_live.skyArgsInDrawState = true;
+            const float box[24] = { -1, 0, 0, h + ox,   1, 0, 0, h - ox,
+                                     0,-1, 0, h + oy,   0, 1, 0, h - oy,
+                                     0, 0,-1, hz,       0, 0, 1, hz };
+            skyLaneCull(box, g_skyAOMinRadius);
 
             // Survivor count back to the CPU, so the panel can say what this cull actually FOUND
             // rather than how many indirect commands were issued (a constant). One extra frame of
@@ -55656,15 +56736,18 @@ void destroyHostWindow(Renderer* R);
 
         // --- (1) Clear to the sentinel, then (2) draw the statics into it -------------------------
         {
-            RenderTargetBarrier rtb = {};
-            rtb.pRenderTarget = g_live.pSkyHeight;
-            rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-            rtb.mNewState = RESOURCE_STATE_RENDER_TARGET;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            RenderTargetBarrier rtb[2] = {};
+            rtb[0].pRenderTarget = g_live.pSkyHeight;
+            rtb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rtb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
+            rtb[1] = rtb[0];
+            rtb[1].pRenderTarget = g_live.pSkyHeightLow;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rtb);
         }
         BindRenderTargetsDesc hb = {};
-        hb.mRenderTargetCount = 1;
+        hb.mRenderTargetCount = 2;
         hb.mRenderTargets[0] = { g_live.pSkyHeight, LOAD_ACTION_CLEAR };
+        hb.mRenderTargets[1] = { g_live.pSkyHeightLow, LOAD_ACTION_CLEAR };
         cmdBindRenderTargets(g_live.pCmd, &hb);
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kSkyHeightRes, (float)kSkyHeightRes, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, kSkyHeightRes, kSkyHeightRes);
@@ -55685,6 +56768,14 @@ void destroyHostWindow(Renderer* R);
             cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, drawnSubsets, g_live.pSkyArgs, 0, nullptr, 0);
         }
         cmdBindRenderTargets(g_live.pCmd, nullptr);
+        {
+            // The low layer is finished here — terrain never folds into it — so it rests again now.
+            RenderTargetBarrier rtb = {};
+            rtb.pRenderTarget = g_live.pSkyHeightLow;
+            rtb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+        }
 
         // --- (3) Terrain, by compute, folding max() over the raster -------------------------------
         {
@@ -55764,6 +56855,25 @@ void destroyHostWindow(Renderer* R);
             cmdEndDebugMarker(g_live.pCmd);
             g_skyHeightMinValid = true;
             ++g_skyHeightMinBuilds;
+        }
+
+        // Sky AO's smoothed copy, from the finished raw map (back in SHADER_RESOURCE above). Blur or
+        // verbatim copy per skyAOBlur; the copy arm keeps the A/B a single knob with no rebinds.
+        if (g_live.skyBlurReady) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.45f, 0.75f, 0.55f, "SKY-HEIGHT AO COPY");
+            TextureBarrier tb = {};
+            tb.pTexture = g_live.pSkyHeightAO;
+            tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            cmdBindPipeline(g_live.pCmd, g_skyAOBlur ? g_live.pSkyBlurPipeline : g_live.pSkyCopyPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyBlurSet);
+            cmdDispatch(g_live.pCmd, (kSkyHeightRes + 7u) / 8u, (kSkyHeightRes + 7u) / 8u, 1);
+            tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+            g_skyHeightBuiltBlur = g_skyAOBlur;
         }
 
         g_skyHeightValid = true;
@@ -56618,6 +57728,10 @@ void destroyHostWindow(Renderer* R);
             for (int i = 0; i < 3; ++i) { col[i] = inverseTonemap(col[i]); }
         }
         decodeAuthoredRGB(col);
+        // SUNNY 16: the same family scale fogColNear took this frame (g_sunnyFogK, latched at its
+        // site). The two are the same kind of colour, and a different scale here would put a seam at
+        // the waterline — the argument the gate above already makes for the lift.
+        if (g_sunnyFogK != 1.0f) { for (int i = 0; i < 3; ++i) { col[i] *= g_sunnyFogK; } }
 
         // DENSITY. MW ships five values (sunrise/day/sunset/night/indoor); the interior one wins
         // indoors and has no time-of-day blend, which is how MW itself uses it.
@@ -57243,6 +58357,7 @@ void destroyHostWindow(Renderer* R);
         uint32_t n = 0;
         const size_t nSrc = g_glowSrc.size();
         const GlowSrc* src = g_glowSrc.data();
+        const float glowM = sunnyM();
         for (size_t i = 0; i < nSrc && n < cap; ++i) {
             const GlowSrc& L = src[i];                             // meshed + non-black only (compacted at build)
             if (!dlVisEnabled(L.visIndex)) { continue; }           // fixture's vis group is hidden
@@ -57278,6 +58393,7 @@ void destroyHostWindow(Renderer* R);
             // clamp below (intensity /= grow², grow ∝ d) supplies the 1/d² per-pixel dimming. g_glowFalloffPow
             // is an ARTISTIC extra term (default 0 = no-op = physical); >0 double-counts with the clamp.
             float intensity = g_glowFlux * lum * fade;
+            if (glowM != 1.0f) { intensity *= glowM; }   // SUNNY 16: a lamp's glow is MW family
             if (g_glowFalloffPow > 0.0f) { intensity *= std::pow(fadeStart / d, g_glowFalloffPow); }
 
             // Min-pixel floor (flux-conserving), host-side so g_glowMinPx stays a live knob and the shader
@@ -58417,6 +59533,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainPipelineWire) { removePipeline(R, g_pTerrainPipelineWire); g_pTerrainPipelineWire = nullptr; }
         if (g_pTerrainPipelineMirror) { removePipeline(R, g_pTerrainPipelineMirror); g_pTerrainPipelineMirror = nullptr; }
         if (g_pSunShadowTerrainPipeline) { removePipeline(R, g_pSunShadowTerrainPipeline); g_pSunShadowTerrainPipeline = nullptr; }
+        if (g_pSvmTerrainPipeline) { removePipeline(R, g_pSvmTerrainPipeline); g_pSvmTerrainPipeline = nullptr; }
         if (g_pSunShadowTerrainShader)   { removeShader(R, g_pSunShadowTerrainShader);     g_pSunShadowTerrainShader = nullptr; }
         if (g_pTerrainDepthPipeline) { removePipeline(R, g_pTerrainDepthPipeline); g_pTerrainDepthPipeline = nullptr; }
         if (g_pTerrainDepthShader)   { removeShader(R, g_pTerrainDepthShader);     g_pTerrainDepthShader = nullptr; }
@@ -58430,7 +59547,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainTex)          { removeResource(g_pTerrainTex);             g_pTerrainTex = nullptr; }
         if (g_pTerrainParamTex)     { removeResource(g_pTerrainParamTex);        g_pTerrainParamTex = nullptr; }
         if (g_pTerrainCellGrid)     { removeResource(g_pTerrainCellGrid);        g_pTerrainCellGrid = nullptr; }
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun, &g_terrainSvm }) {
             if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
             v->visible.clear(); v->lodOf.clear(); v->lodStamp.clear();
             v->cells = 0;
@@ -58644,6 +59761,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsPipeline) { removePipeline(R, g_pSunShadowStaticsPipeline); g_pSunShadowStaticsPipeline = nullptr; }
+        if (g_pSvmStaticsPipeline) { removePipeline(R, g_pSvmStaticsPipeline); g_pSvmStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsShader)   { removeShader(R, g_pSunShadowStaticsShader); g_pSunShadowStaticsShader = nullptr; }
         for (Pipeline*& gp : g_gobo.pBakePso) { if (gp) { removePipeline(R, gp); gp = nullptr; } }
         if (g_gobo.pBakeShader)   { removeShader(R, g_gobo.pBakeShader);     g_gobo.pBakeShader = nullptr; }
@@ -58852,6 +59970,13 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSunMomentsScratch)   { removeResource(g_live.pSunMomentsScratch); g_live.pSunMomentsScratch = nullptr; }
         if (g_live.pSunMoments)          { removeRenderTarget(R, g_live.pSunMoments); g_live.pSunMoments = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
+        if (g_live.pSvmDepth)            { removeRenderTarget(R, g_live.pSvmDepth); g_live.pSvmDepth = nullptr; }
+        if (g_live.pSkyVisSet)           { removeDescriptorSet(R, g_live.pSkyVisSet); g_live.pSkyVisSet = nullptr; }
+        if (g_live.pSkyVisPipeline)      { removePipeline(R, g_live.pSkyVisPipeline); g_live.pSkyVisPipeline = nullptr; }
+        if (g_live.pSkyVisShader)        { removeShader(R, g_live.pSkyVisShader); g_live.pSkyVisShader = nullptr; }
+        if (g_live.pSkyVisParamsCbv)     { removeResource(g_live.pSkyVisParamsCbv); g_live.pSkyVisParamsCbv = nullptr; }
+        if (g_live.pSvmScreen)           { removeResource(g_live.pSvmScreen); g_live.pSvmScreen = nullptr; }
+        g_live.skyVisReady = false; g_live.svmScreenInSR = false;
         if (g_live.pShadowAtlas)         { removeRenderTarget(R, g_live.pShadowAtlas); }
         if (g_live.pShadowAtlasDyn)      { removeRenderTarget(R, g_live.pShadowAtlasDyn); }
         // P3: drop the persistent slot cache — the recreated atlas is undefined, so no slot may

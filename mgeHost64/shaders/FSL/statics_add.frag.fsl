@@ -53,5 +53,6 @@ float4 PS_MAIN( VSOutput In )
     // leak show up "seen through alpha blending" rather than on the surfaces themselves.
     // Per pixel, like the base pass's applyFog now is — an interpolated factor here against a per-pixel
     // one there would put the layer and its surface on two different fogs (fog.h.fsl mwFogFactorAt).
-    RETURN(float4(liftInPass(tex.rgb) * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
+    // SUNNY 16: a glow map is MW-authored light — m (gShadowParams.sunny16.y, exactly 1 when off).
+    RETURN(float4(liftInPass(tex.rgb) * gShadowParams.sunny16.y * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
 }

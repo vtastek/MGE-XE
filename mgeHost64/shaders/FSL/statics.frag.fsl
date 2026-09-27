@@ -309,8 +309,8 @@ PSOut PS_MAIN( VSOutput In )
             // statics.vert keeps emissive outside its own multiply).
             const float2 st = pbrSpecTerms(nShade, -gFrameData.sunDir.xyz, pbrV, ndlS, pbrNoV, pbrAlpha2);
             const float3 w  = gFrameData.sunCol.rgb * (ndlS * sunVis);
-            pbrSpecA += w * st.x;
-            pbrSpecB += w * st.y;
+            pbrSpecA += clampSceneTerm(w * st.x);   // headroom (scenemax.h.fsl) — see opaque.frag
+            pbrSpecB += clampSceneTerm(w * st.y);
         }
     }
 
@@ -451,7 +451,7 @@ PSOut PS_MAIN( VSOutput In )
         // skyAmbFactor — statics.vert's own ambient source), evaluated in the mirror direction, so
         // what lights a distant static and what it reflects cannot drift apart.
         const float3 R = reflect(-pbrV, nShade);
-        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactor(R, In.WorldPos);
+        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy);
         result += (f0 * pbrSpecA + pbrSpecB) + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
         // MULTIPLE-SCATTERING SPECULAR, as the DIFFERENCE from the line above (W32 gobo rule).
         if (gShadowParams.pbrShade.w > 0.0f)

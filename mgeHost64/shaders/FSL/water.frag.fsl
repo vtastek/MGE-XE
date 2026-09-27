@@ -1781,7 +1781,7 @@ float4 PS_MAIN( VSOutput In )
         if (!physFresnel) {
             float3 sunPosU    = -gFrameData.sunDir.xyz;   // sunDir = travel dir; to-sun = -dir
             float  refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
-            resultU += gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog;
+            resultU += clampSceneTerm(gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog);   // headroom (P2)
         }
 
         RETURN(float4(resultU, 1.0f));
@@ -2508,7 +2508,9 @@ float4 PS_MAIN( VSOutput In )
     // that value above leaves it standing, and a "no reflection" reading that still contains the
     // moon's glitter path is measuring the wrong thing. kDst does not move here for the reason the
     // line above gives, so removing it needs no counterpart.
-    if (!noReflect) { result += tonemapInPass(spec); }
+    // Clamped BEFORE the sum (scenemax.h.fsl): the calm-water core is the renderer's largest generated
+    // value, and it scales with the sun's R.
+    if (!noReflect) { result += tonemapInPass(clampSceneTerm(spec)); }
 
     // --- water cut feature (vtastek) ---
     // W28: `wcut` and `wcutdark` are computed near the top of the shader now, because the cut also

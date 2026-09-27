@@ -52,6 +52,13 @@ namespace SceneCal {
     // primaries (atmosphere.cpp). Two models, one unit, no second conversion.
     constexpr double kNativeToScene = 683.0 / kSceneUnitCd;
 
+    // ─── SUNNY 16: THE CANDIDATE WORTH OF AN MW LIGHT'S "1.0" (tasks/forge-sunny16.md) ──────────
+    // REPORTING ONLY until P4 flips it on. A literal 1 cd candle measures ~1/15000 at 0.5 m, but the
+    // target is a FILMED candle, not a metered one: Barry Lyndon shot candlelight at f/0.7, 1/50 s on
+    // 5254 pushed one stop (EI 200), i.e. EV100 = log2(0.49 x 50) - 1 = 3.6, which puts an 18% card at
+    // pi x 12.5 x 2^3.6 / 100 / 0.18 ~= 26 lux incident. 2^-13 lands the settled interior E there.
+    constexpr double kArtCandidate = 1.0 / 8192.0;
+
     // ─── THE REFERENCE CONFIGURATION ─────────────────────────────────────────────────────────────
     // The one configuration every gate in the programme is measured at, and the reason the
     // atmosphere table's row 0 is not allowed to be a look.
