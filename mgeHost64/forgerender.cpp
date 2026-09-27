@@ -6512,6 +6512,17 @@ namespace {
         bool   active;              // exterior, armed, model cooked and non-degenerate
     };
     SkyPhysical g_skyPhys = {};
+    // THE DOOR BRIDGE (Sunny 16 P3). The measurement is dropped at every exterior entry (see the
+    // dispatch's interior early-out), and the first two exterior frames were then lit by MW's
+    // authored pair — which under SUNNY 16 is the m family, ~4 stops under the physical light that
+    // replaced it on the third frame: a dark pair of frames, then a flash the servo had to chase.
+    // This keeps the last real measurement and the conditions it was taken under; if the sky outside
+    // is provably the same one (identical weather params, sun moved < 3 deg = ~12 game minutes) the
+    // bridge frames are lit by it. Anything else still falls back to MW's pair — the stale-dusk case
+    // the drop exists for.
+    SkyPhysical        g_skyPhysLast = {};
+    Atmosphere::Params g_skyPhysLastRow = {};
+    bool               g_skyPhysLastOk = false;
 
     // ─── S2: THE ATMOSPHERE'S LUT DIMENSIONS ─────────────────────────────────────────────────────
     // Hillaire's published sizes. They are small because the PARAMETERISATIONS are chosen to put
@@ -19709,8 +19720,11 @@ namespace {
     // ASYMMETRIC BY CONSTRUCTION, like every eye model: brightening is slow (you walk out of a cave
     // and are dazzled for a moment), darkening is quicker. These are the time constants of a
     // first-order lag, i.e. the 63% time, so the visible ramp is ~3x these.
+    // Since SUNNY 16 P3 the lag runs on log2(E), so these are time constants IN STOPS, and they act
+    // only on what is left after the visible-error cap (g_expResidBright/Dark) — not on the jump.
     float  g_expTauRise  = 1.5f;   // seconds, E climbing (frame too dark -> brighten)
-    float  g_expTauFall  = 0.6f;   // seconds, E falling  (frame too bright -> darken)
+    float  g_expTauFall  = 1.5f;   // seconds, E falling  (frame too bright -> darken). 0.6 -> 1.5 at P3: walking
+                                   // out, the half stop of glare left after the cap read too short (user)
     // AUTHORITY LIMIT, and it is NOT the envelope. The envelope is the target range and lives in
     // calTarget(); this is the guard on how far the servo may ever push, so a pathological frame
     // (a loading screen, a fullscreen menu tint, a black interior) cannot park E somewhere the next
@@ -19790,6 +19804,39 @@ namespace {
     // THE SERVO'S STATE. Published to resolve.frag as gResolveParams.tone.x, and to the heartbeat as
     // `exp=`. double rather than float because it is integrated one lag step per frame at ~165 Hz.
     double g_exposure    = 1.0;
+    // The E the RESOLVE last published — i.e. the E the frame the APL readback measures was rendered
+    // with. The closed-loop correction must multiply THAT, not the current state: once the servo can
+    // snap, a reading taken before the snap would otherwise ask for the same correction twice.
+    double g_expPublished = 0.0;   // 0 = nothing published yet (fall back to the state)
+    // ...and the CONTEXT that frame was rendered in (g_dlExterior, which is what calTarget() keys its
+    // row on). At a door the target flips with the cell while the reading still comes from a frame of
+    // the OTHER side: an interior frame (lvl ~10-18, right for its 16-21 row) read against the
+    // exterior's 76-100 looked 3.5 stops too dark, and the snap threw the first exterior frames
+    // "very bright" (user, 2026-09-27). A reading from the other context is not an error — HOLD.
+    bool   g_expPublishedExt = false;
+    bool   g_expPublishedPhys = false;   // ...and whether its exterior light was the REAL one (see the servo)
+    // ─── SUNNY 16 P3: ADAPTATION IN STOPS, WITH A VISIBLE-ERROR CAP ──────────────────────────────
+    // *"1 or half stop coming down or up would be felt nice. just not blinding."* — user, 2026-09-27.
+    // The lag used to run on LINEAR E. A door crossing asks for 3-6 stops; falling linearly from 16x
+    // to 1x at tau 0.6 s takes ~1% of the gap per frame in the first frames, so the exterior sat
+    // FOUR STOPS over for most of a second — blinding — and the climb the other way crossed the same
+    // stops at a different speed. Now the state is log2(E): an error beyond the cap SNAPS to exactly
+    // the cap (you still see a half or one stop of adaptation), and the rest eases out with the taus
+    // below, which are therefore in stops. Asymmetric like the taus: too bright is capped tighter
+    // than too dark, because over-exposure is the one that hurts.
+    float  g_expSnap        = 1.0f;   // 1 = cap the visible error; 0 = ease the whole way (no snap)
+    float  g_expResidBright = 2.5f;   // stops a BRIGHTER place starts over-exposed (user-set 2.5 after walking Arrille's door)
+    float  g_expResidDark   = 1.0f;   // stops a DARKER place starts under-exposed (user-set 1.0)
+    uint32_t g_expSnaps     = 0;      // heartbeat: snaps since start
+    // THE DOOR PREDICTION. The first reading from the new side arrives ~4-5 frames after the door
+    // (held and in-flight readbacks), so a placement made there left the first frames at the OLD
+    // side's exposure — "starts well exposed, the fifth frame is the bright one" (user). Each side's
+    // last settled target is remembered, and on the frame the context flips the state is placed
+    // from it at once; the first real reading then only corrects a memory that turned out wrong.
+    double g_expMem[2]          = { 0.0, 0.0 };   // last `want` per context: [0] interior, [1] exterior
+    bool   g_expDoorPredicted   = false;          // a prediction is standing, awaiting its check
+    int    g_expDoorDir         = 0;              // +1 = entered a brighter place (start over), -1 darker
+    float    g_expLastSnap  = 0.0f;   // heartbeat: size of the last snap (stops, signed)
     double g_expLastMs   = 0.0;    // hostNowMs() at the previous readback; 0 = no step yet
     // ─── RAIL CONTACT (P2) ───────────────────────────────────────────────────────────────────────
     // "E is pinned, and for how long" is the number that says where the clamp actually needs to be,
@@ -22855,6 +22902,11 @@ namespace {
             // re-deriving the band makes the servo inert (measured 2026-08-18). Sweep it WITH
             // calDayCentre, never alone.
             { "expStat",             &g_expStat             },
+            { "expSnap",             &g_expSnap             },
+            { "expResidBright",      &g_expResidBright      },
+            { "expResidDark",        &g_expResidDark        },
+            { "expTauRise",          &g_expTauRise          },
+            { "expTauFall",          &g_expTauFall          },
     };
     const BKnob bknobs[] = {
             // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
@@ -24619,6 +24671,9 @@ namespace {
           // fighting the one-frame readback latency — lengthen it, do not shorten it.
           t.sliderF("Tau RISE (s) — brightening, the slow direction", &g_expTauRise, 0.1f, 6.0f, 0.1f);
           t.sliderF("Tau FALL (s) — darkening", &g_expTauFall, 0.1f, 6.0f, 0.1f);
+          t.sliderF("Adapt: door adaptation (1 = place it at a door, 0 = ease all of it)", &g_expSnap, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Adapt: stops OVER-exposed entering a brighter place", &g_expResidBright, 0.0f, 4.0f, 0.25f);
+          t.sliderF("Adapt: stops UNDER-exposed entering a darker place", &g_expResidDark, 0.0f, 4.0f, 0.25f);
           // ⚠ The AUTHORITY limit, NOT the adaptation envelope. The envelope is the target range in
           // calTarget() and it is where the level is allowed to float; these two bound how far the
           // servo may ever push, so a loading screen or a fullscreen menu tint cannot park E
@@ -25625,6 +25680,7 @@ namespace {
           // compare filter — 1 = 3x3 taps (4 gathers per map), 2 = 5x5 (9 gathers, the oracle look).
           t.checkbox("Sky AO: direction MAPS (off = the height-map march)", &g_svm);
           t.sliderF("Sky AO maps: filter radius (1 = 3x3, 2 = 5x5)", &g_svmPcf, 1.0f, 2.0f, 1.0f, "%.0f");
+          t.sliderF("Sky AO maps: fill all in the entry frame (0 = one per frame)", &g_svmFill, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Sky AO floor: interior ambient (authored grey, 0 = pitch black)", &g_skyAOFloorAmb, 0.0f, 0.5f, 0.01f);
           t.sliderF("Sky AO floor: cap (fraction of open-sky ambient)", &g_skyAOFloorMax, 0.0f, 1.0f, 0.05f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
@@ -29836,7 +29892,27 @@ void destroyHostWindow(Renderer* R);
         // state. `active` stays false for the two frames before the first result, so the lighting
         // blend sits at MW's authored end exactly as it does in an interior, which is a state every
         // consumer already handles. A zero here would black the world for two frames at every load.
-        if (!g_atmosShValid) { g_skyPhys = p; return; }
+        if (!g_atmosShValid) {
+            if (g_skyPhysLastOk) {
+                const Atmosphere::Params row = Atmosphere::atmosphereAt(g_eyeAbsShadow[0], g_eyeAbsShadow[1]);
+                const float cosA = toSun[0] * g_skyPhysLast.toSun[0] + toSun[1] * g_skyPhysLast.toSun[1]
+                                 + toSun[2] * g_skyPhysLast.toSun[2];
+                if (cosA > 0.99863f   // cos 3 deg
+                    && std::memcmp(&row, &g_skyPhysLastRow, sizeof(row)) == 0
+                    && g_skyPhysLast.albedo == p.albedo) {
+                    static uint32_t s_bridgeLog = 0;
+                    if ((s_bridgeLog++ % 20u) == 0u) {
+                        LOG::logline(">> [forge-atmos] door bridge: lit from the last measurement (sun moved %.2f deg,"
+                                     " same weather) until this sky's own lands",
+                                     std::acos(std::min(1.0f, cosA)) * 180.0 / SceneCal::kPi);
+                    }
+                    g_skyPhys = g_skyPhysLast;
+                    return;
+                }
+            }
+            g_skyPhys = p;
+            return;
+        }
 
         const float* rb = g_atmosShLast;      // native units throughout — see scenecal.h
 
@@ -29969,6 +30045,9 @@ void destroyHostWindow(Renderer* R);
         p.cloudOverZenith = (p.qZenith > 1.0e-9) ? ((double)g_skyCloudAlbedo / p.qZenith) : 0.0;
         p.active = true;
         g_skyPhys = p;
+        g_skyPhysLast    = p;   // the door bridge's copy (see its declaration)
+        g_skyPhysLastRow = Atmosphere::atmosphereAt(g_eyeAbsShadow[0], g_eyeAbsShadow[1]);
+        g_skyPhysLastOk  = true;
     }
 
     // ─── RE-AIM MW'S SUN LIGHT AT THE SUN YOU CAN SEE ────────────────────────────────────────────
@@ -30249,6 +30328,30 @@ void destroyHostWindow(Renderer* R);
         if (lvl < 0.5) {
             return;   // a black frame carries no information about how bright it should be — HOLD
         }
+        // The reading is from a frame of the OTHER context (see g_expPublishedExt): its level is
+        // judged against a row it was never exposed for. HOLD; the first reading from this side
+        // makes the jump, and makes it to the right place.
+        // DOOR TRACE: the 16 servo steps after every interior/exterior switch, one line each — the
+        // swing a door produces is a handful of frames, below any heartbeat's resolution.
+        static bool s_traceExt = false;
+        static int  s_trace    = 0;
+        // A DOOR: the next reading from this side places the adaptation (see the snap below).
+        static bool s_doorPending = false;
+        if (g_dlExterior != s_traceExt) { s_traceExt = g_dlExterior; s_trace = 16; s_doorPending = true; }
+        // ...and an EXTERIOR frame lit without the physical sky (the first frames after a door, when
+        // the bridge could not vouch for the old measurement) is lit by a placeholder ~4 stops off
+        // under SUNNY 16. Metering it drove E a stop the wrong way just before the real light landed.
+        const bool placeholder = g_expPublished > 0.0 && g_expPublishedExt && !g_expPublishedPhys;
+        if ((g_expPublished > 0.0 && g_expPublishedExt != g_dlExterior) || placeholder) {
+            if (s_trace > 0) {
+                --s_trace;
+                LOG::logline(">> [exp-door] f=%u HOLD (reading from %s%s, now %s) lvl=%.1f E=%.4g",
+                             g_renderFrame, g_expPublishedExt ? "ext" : "int",
+                             placeholder ? " lit by MW placeholder" : "", g_dlExterior ? "ext" : "int",
+                             lvl, g_exposure);
+            }
+            return;
+        }
 
         const CalTarget ct = calTarget();
         // The authority ceiling in force RIGHT NOW. Night gets a lower one (see g_expMaxNight) and
@@ -30261,10 +30364,12 @@ void destroyHostWindow(Renderer* R);
                                      * std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp)))
             : (double)g_expMax;
         const double gm = calGainDomain(lvl);
+        // The E the measured frame was rendered with (see g_expPublished).
+        const double eMeas = (g_expPublished > 0.0) ? g_expPublished : g_exposure;
         double want = g_exposure;
         if (gm > 1.0e-9) {
-            if      (lvl < (double)ct.lo) { want = g_exposure * calGainDomain((double)ct.lo) / gm; }
-            else if (lvl > (double)ct.hi) { want = g_exposure * calGainDomain((double)ct.hi) / gm; }
+            if      (lvl < (double)ct.lo) { want = eMeas * calGainDomain((double)ct.lo) / gm; }
+            else if (lvl > (double)ct.hi) { want = eMeas * calGainDomain((double)ct.hi) / gm; }
             // ...and inside [lo,hi] `want` stays put: the dead zone IS the target range, so the
             // level floats across the envelope instead of being pinned to a point inside it.
         }
@@ -30280,12 +30385,79 @@ void destroyHostWindow(Renderer* R);
             g_expRailMs = (railNow != 0) ? (dt * 1000.0) : 0.0;
         }
         want = std::max((double)g_expMin, std::min(expMaxNow, want));
+        // The door prediction's memory of this side — SETTLED values only. Storing every step's `want` let a
+        // fade-out (the frames before a door go dark and ask for 2-3 stops more) write the memory,
+        // and the next door out predicted from 5.4 where the sky wanted 1.9: two blinding frames.
+        // "Settled" = E has caught up with what the loop asks for (within 0.15 stop). NOT "inside the
+        // band": the servo drives the level to the band's EDGE and approaches it from outside, so a
+        // side coming down from bright never entered and never got a memory. A fade opens the gap
+        // between want and E faster than the ease closes it, so it stays out of the memory.
+        if (want > 0.0 && std::fabs(std::log2(want / std::max(g_exposure, 1.0e-12))) < 0.15) {
+            g_expMem[g_dlExterior ? 1 : 0] = want;
+        }
 
         // First-order lag toward `want`, asymmetric. Framerate-independent by construction — the
         // exponential is evaluated at the real dt rather than a per-frame fraction, so the ramp takes
         // the same wall-clock time at 30 fps and at 165.
-        const double tau = std::max(0.01, (double)((want < g_exposure) ? g_expTauFall : g_expTauRise));
-        g_exposure += (want - g_exposure) * (1.0 - std::exp(-dt / tau));
+        // P3: in STOPS. First the cap — an error past it is removed at once, leaving exactly the cap
+        // to be seen — then a first-order lag on what is left. Framerate-independent: the lag is
+        // evaluated at the real dt, and the snap does not depend on dt at all.
+        double L  = std::log2(std::max(g_exposure, 1.0e-12));
+        const double Lw = std::log2(std::max(want, 1.0e-12));
+        // ⚠ ONCE PER DOOR, NOT EVERY FRAME. The first cut capped the error on every step, and `want`
+        // is revised a little by each new reading (the gain-domain model of the curve is not exact),
+        // so the cap re-fired frame after frame and walked E the whole way in ~5 frames — the ease
+        // never ran (user: "goes down in only 5 frames"). And a cap only LIMITS: a door whose true
+        // difference was under it showed no adaptation at all ("the first interior frame has no
+        // darkening"). So a door now PLACES the state: the first reading from the new side puts E
+        // exactly capDark under a darker place's target or capBright over a brighter one's, and
+        // from there only the ease acts. Away from doors a snap is a safety net for errors far past
+        // the cap (a load, a teleport), never the ordinary drift.
+        const bool door = s_doorPending;
+        s_doorPending = false;
+        if (!door) { g_expDoorPredicted = false; }
+        if (g_expSnap > 0.5f) {
+            const double capDark   = std::max(0.0, (double)g_expResidDark);    // e > 0: brighten
+            const double capBright = std::max(0.0, (double)g_expResidBright);  // e < 0: darken
+            const double L0 = L;
+            if (door && g_expDoorPredicted) {
+                // Placed on the flip frame from memory; the first real reading only CORRECTS it,
+                // and only if the memory was off (hours indoors, the weather turned) — a second
+                // jump for a few tenths of a stop would be a visible hiccup for nothing.
+                const double Lp = Lw + ((g_expDoorDir > 0) ? capBright : -capDark);
+                if (std::fabs(L - Lp) > 0.5) { L = Lp; }
+            }
+            else if (door) {
+                // PLACED both ways: under for a darker place, over for a brighter one. (A cap-only
+                // exterior was tried and read too tame — "outgoing, need brighter start"; the delayed
+                // bright frame that first prompted it came from the placement arriving LATE, which
+                // the flip-frame prediction now removes.)
+                L = (Lw >= L) ? (Lw - capDark) : (Lw + capBright);
+            }
+            else if (Lw - L >  capDark   + 2.0) { L = Lw - capDark; }
+            else if (Lw - L < -capBright - 2.0) { L = Lw + capBright; }
+            if (L != L0) {
+                ++g_expSnaps;
+                g_expLastSnap = (float)(L - L0);
+                static double s_lastSnapLogMs = 0.0;
+                if ((door || std::fabs(L - L0) >= 1.0) && now - s_lastSnapLogMs > 1000.0) {
+                    s_lastSnapLogMs = now;
+                    LOG::logline(">> [exp] %s %+.2f stops (E %.4g -> %.4g, want %.4g, lvl %.1f vs %.0f-%.0f)"
+                                 " — the remaining %.2f stops ease out",
+                                 door ? "DOOR" : "snap", L - L0, g_exposure, std::exp2(L), want, lvl,
+                                 (double)ct.lo, (double)ct.hi, Lw - L);
+                }
+            }
+        }
+        const double tau = std::max(0.01, (double)((Lw < L) ? g_expTauFall : g_expTauRise));
+        L += (Lw - L) * (1.0 - std::exp(-dt / tau));
+        g_exposure = std::exp2(L);
+        if (s_trace > 0) {
+            --s_trace;
+            LOG::logline(">> [exp-door] f=%u %s lvl=%.1f vs %.0f-%.0f eMeas=%.4g want=%.4g -> E=%.4g dt=%.1fms",
+                         g_renderFrame, g_dlExterior ? "ext" : "int", lvl, (double)ct.lo, (double)ct.hi,
+                         eMeas, want, g_exposure, dt * 1000.0);
+        }
         // The state itself, not just the destination — dragging the clamp sliders inward has to bite
         // NOW rather than over a tau, or the guard is advisory while the frame is out of authority.
         g_exposure = std::max((double)g_expMin, std::min(expMaxNow, g_exposure));
@@ -30296,6 +30468,31 @@ void destroyHostWindow(Renderer* R);
     // namespace that declares g_expEnable, so it cannot touch the flag directly. Declared there and
     // defined here rather than moving the global: the probe needs the servo OFF (its call site says
     // why), and that is one line at each end.
+    // Called on EVERY frame from the lighting block, right where the frame's exterior flag is
+    // latched and before the resolve publishes E — so a placement here is what the first frame
+    // through the door is exposed with. See g_expMem.
+    void exposureDoorPredict(bool ext) {
+        static bool s_have = false, s_ext = false;
+        if (!s_have) { s_have = true; s_ext = ext; return; }
+        if (ext == s_ext) { return; }
+        s_ext = ext;
+        g_expDoorPredicted = false;
+        if (!g_expEnable || !g_live.sceneReferred || g_expSnap <= 0.5f) { return; }
+        const double mem = g_expMem[ext ? 1 : 0];
+        if (mem <= 0.0) { return; }   // never been on this side this session: the reading places it
+        const double Lcur = std::log2(std::max(g_exposure, 1.0e-12));
+        const double Lt   = std::log2(mem);
+        // A brighter place needs LESS exposure: start over it; a darker one: start under.
+        g_expDoorDir = (Lt < Lcur) ? +1 : -1;
+        const double L = (g_expDoorDir > 0) ? (Lt + std::max(0.0, (double)g_expResidBright))
+                                            : (Lt - std::max(0.0, (double)g_expResidDark));
+        const double before = g_exposure;
+        g_exposure = std::max((double)g_expMin, std::min((double)g_expMax, std::exp2(L)));
+        g_expDoorPredicted = true;
+        LOG::logline(">> [exp] DOOR predicted (%s, %s place): E %.4g -> %.4g from the remembered %.4g",
+                     ext ? "out" : "in", (g_expDoorDir > 0) ? "brighter" : "darker", before, g_exposure, mem);
+    }
+
     void expDisableForProbe() {
         g_expEnable = false;
         g_exposure  = 1.0;
@@ -30488,6 +30685,7 @@ void destroyHostWindow(Renderer* R);
     void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
     void publishGrassCrushParams(float* mp);                     // G7: the crush field's own lanes
     void publishSkyVis();        // the maps' receiver lane (armed or not, and the distance match)
+    bool skyVisArmed();          // all K maps drawn, screen pass ready, exterior
     void dispatchSkyVisScreen(const float* rzViewProj);   // the maps averaged per half-res pixel
     void renderSkyVisMaps();     // Twister-style sky visibility: one direction's depth map per frame
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
@@ -34594,7 +34792,7 @@ void destroyHostWindow(Renderer* R);
                              " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
                              " exp=%.3g(%s,%s,%s) EVapplied=%.2f s16=%s(R 2^%.2f m 2^%.2f fog x%.3g)"
-                             " rail=%s(ceil %.3g) cal=(sun %.2f amb %.2f emis %.2f)",
+                             " rail=%s(ceil %.3g) adapt=%s(snaps %u last %+.2f st) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
@@ -34609,6 +34807,7 @@ void destroyHostWindow(Renderer* R);
                              g_sunny16 ? "ON" : "off", std::log2((double)sunnyR()),
                              std::log2((double)sunnyM()), (double)g_sunnyFogK,
                              railTxt, (double)g_expMaxNow,
+                             (g_expSnap > 0.5f) ? "cap" : "ease", g_expSnaps, (double)g_expLastSnap,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
 
                 // --- THE REGION SPLIT, ON ITS OWN LINE -------------------------------------
@@ -35001,6 +35200,7 @@ void destroyHostWindow(Renderer* R);
             // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
             // ABSOLUTE coords, so the live DL cull/build shifts it by -realEye. lodEye -> gFrameData[56..59].
             dlSetFrameEye(lighting[24], lighting[25], lighting[26], lighting[27] != 0.0f);
+            exposureDoorPredict(lighting[27] != 0.0f);   // P3: the door's adaptation, from this frame on
             // lodEye = the ABSOLUTE camera eye, consumed EVERY frame by water/reflection/Hi-Z/AO
             // to camera-relativize their absolute anchors. dlCullAndBuild also writes fd[56..58],
             // but it early-returns in interiors (g_dlExterior=false), so interiors would keep a
@@ -35239,6 +35439,24 @@ void destroyHostWindow(Renderer* R);
                 const float ls = nightAmbScaleNow();
                 if (ls != 1.0f) {
                     for (int c = 0; c < 3; ++c) { fd[24 + c] *= ls; }
+                }
+            }
+            // DOOR TRACE (lighting half; the servo half is [exp-door]): the first frames after an
+            // interior/exterior switch (8 frames). Reads the write-combined cbuffer — trace window only.
+            {
+                static bool s_ltExt = false;
+                static int  s_lt    = 0;
+                if (g_dlExterior != s_ltExt) { s_ltExt = g_dlExterior; s_lt = 8; }
+                if (s_lt > 0) {
+                    --s_lt;
+                    auto lum = [](const float* c) { return 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2]; };
+                    LOG::logline(">> [light-door] f=%u %s phys=%d w=%.3f nightRamp=%.3f physSun=%.4g physAmb=%.4g"
+                                 " -> sun=%.4g amb=%.4g | skyAO height=%d vis=%d svmDrawn=%u cullInst=%u",
+                                 g_renderFrame, g_dlExterior ? "ext" : "int", (int)g_skyPhys.active,
+                                 std::max(0.0f, std::min(1.0f, g_skyPhysBlend)) * g_skyPhys.nightRamp,
+                                 g_skyPhys.nightRamp, lum(g_skyPhys.sunScene), lum(g_skyPhys.ambScene),
+                                 lum(fd + 20), lum(fd + 24), (int)g_skyHeightValid, (int)skyVisArmed(),
+                                 g_svmDrawn, g_live.cullInstCount);
                 }
             }
             // SUNNY 16 — MW's FOG COLOUR, which belongs to whichever family it was calibrated against:
@@ -44577,6 +44795,9 @@ void destroyHostWindow(Renderer* R);
                 // p[32] = prefilter.x — set only when the compute filter ACTUALLY dispatched this
                 // frame, which is decided a few lines below and read back here. A frame where the
                 // dispatch is skipped must leave it 0 or resolve.frag reads a stale intermediate.
+                g_expPublished = (g_live.sceneReferred && g_expEnable) ? g_exposure : 0.0;   // P3: what the APL will measure
+                g_expPublishedExt = g_dlExterior;                                                // ...and in which context
+                g_expPublishedPhys = g_skyPhys.active;
                 const float p[36] = { (float)deliveredW, (float)deliveredH, diam, radius,
                                       g_resolveInvLuma ? 1.0f : 0.0f,
                                       g_live.sceneReferred ? 1.0f : 0.0f,
@@ -57305,6 +57526,18 @@ void destroyHostWindow(Renderer* R);
             // blend-0 end on a frame where nothing happened, once every few frames, forever.
             // g_atmosShArmed stays false, so the drain in settleFrameFence correctly reads no
             // readback this frame and keeps g_atmosShLast.
+            //
+            // ⚠⚠ ...AND AFTER A DOOR, THE SKIP RE-ARMS IT. The interior early-out clears the
+            // measurement but not this key, so walking back out under an unchanged sky hit THIS
+            // branch every frame and the measurement stayed dropped until the key happened to move —
+            // the exterior was lit by MW's placeholder for an arbitrary stretch (0-360 frames seen).
+            // A matching key is the proof the dropped measurement was taken of exactly this sky, so
+            // it is valid again. (Unless it was a gate frame's bytes: those never arm the light.)
+            if (!g_atmosShValid && g_atmosShLastRan == 1u && g_atmosGateFrame != g_renderFrame) {
+                g_atmosShValid = true;
+                LOG::logline(">> [forge-atmos] same sky as the last measurement (key unchanged) —"
+                             " re-armed without a dispatch (frame %u)", g_renderFrame);
+            }
             ++g_atmosSkips;
             return;
         }
