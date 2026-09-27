@@ -376,7 +376,8 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniSSSuffix = new INIFile.INIVariableDef("SSSuffix", siniRendState, "Screenshot Name Suffix", INIFile.INIVariableType.Dictionary, "Timestamp", ssSuffixDict);
         private static INIFile.INIVariableDef iniSSName = new INIFile.INIVariableDef("SSName", siniRendState, "Screenshot Name Prefix", INIFile.INIVariableType.String, "Morrowind");
         private static INIFile.INIVariableDef iniSSDir = new INIFile.INIVariableDef("SSDir", siniRendState, "Screenshot Output Directory", INIFile.INIVariableType.String, "");
-        private static INIFile.INIVariableDef iniUseSharedMemory = new INIFile.INIVariableDef("UseSharedMemory", siniMisc, "Use Shared Memory", INIFile.INIBoolType.Text, "False");
+        // ON by default: the Forge renderer needs it (and mgecore's own default, inidata.h, is True).
+        private static INIFile.INIVariableDef iniUseSharedMemory = new INIFile.INIVariableDef("UseSharedMemory", siniMisc, "Use Shared Memory", INIFile.INIBoolType.Text, "True");
         // In-game
         private static INIFile.INIVariableDef iniDisableMGE = new INIFile.INIVariableDef("DisableMGE", siniMisc, "MGE Disabled", INIFile.INIBoolType.Text, "False");
         private static INIFile.INIVariableDef iniDisableMWSE = new INIFile.INIVariableDef("DisableMWSE", siniMisc, "Internal MWSE Disabled", INIFile.INIBoolType.Text, "False");
@@ -988,8 +989,13 @@ namespace MGEgui {
             }
             key.Close();
 
+            // First run on this install = no MGE.ini yet (LoadGraphicsSettings creates it, so ask first).
+            bool firstRun = !File.Exists(Statics.fn_inifile);
             LoadGraphicsSettings(false);
             LoadMWINI();
+            if (firstRun) {
+                ApplyPPLLightingCoefficients();
+            }
 
             if (File.Exists(Statics.fn_didata)) {
                 // Convert 0.9.x macro and remap settings
@@ -1713,6 +1719,24 @@ namespace MGEgui {
             if (cbAutoFOV.Checked) {
                 UpdateFOV();
             }
+        }
+
+        // A fresh install's Morrowind.ini holds the vanilla attenuation (linear 3), tuned for MW's
+        // per-vertex lighting; MGE XE lights per pixel, and the per-pixel set below is what the
+        // renderer is balanced against. Written to Morrowind.ini at once, so a player who launches
+        // the game without pressing Save still gets it. The lighting group can change it after.
+        private void ApplyPPLLightingCoefficients() {
+            udLightingConst.Value = 0.36M;
+            udLightingLinear.Value = 0;
+            udLightingQuad.Value = 3.25M;
+            var mwini = new INIFile(Statics.fn_mwini, mwSettings, System.Text.Encoding.Default, true);
+            mwini.setKey("UseConstant", true);
+            mwini.setKey("ConstantValue", Decimal.ToSingle(udLightingConst.Value));
+            mwini.setKey("UseLinear", true);
+            mwini.setKey("LinearValue", Decimal.ToSingle(udLightingLinear.Value));
+            mwini.setKey("UseQuadratic", true);
+            mwini.setKey("QuadraticValue", Decimal.ToSingle(udLightingQuad.Value));
+            mwini.save();
         }
 
         private void bMWLightingReset_Click(object sender, EventArgs e) {

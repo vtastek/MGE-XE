@@ -38,7 +38,14 @@ namespace LOG {
     static volatile LONG noticeWritten = 0;
 
     // The tag: from the first '[' to its ']' if both fall within the first 48 characters, plus
-    // whatever precedes it (so "!! [x]" and ">> [x]" are separate). Untagged lines share one bucket.
+    // whatever precedes it (so "!! [x]" and ">> [x]" are separate).
+    //
+    // ⚠ AN UNTAGGED LINE IS KEYED BY ITS OWN FIRST 24 CHARACTERS, NOT A SHARED BUCKET. The legacy
+    // messages are untagged one-offs — "MGE XE 0.20.4", "GPU: ...", ">> Starting Distant Land init",
+    // and every "!! Distant land files have not been generated"-style FAILURE REASON. One shared
+    // budget of 4 was spent by the version/GPU lines and silently ate the reason a release install
+    // showed the serious-error overlay. The one untagged line that does repeat ("-- draws: TOTAL=",
+    // 1654 times a dev session) shares its prefix with itself, so it is still capped.
     static unsigned tagHash(const char* s, const char** tagEnd) {
         unsigned h = 2166136261u;
         const char* open = nullptr;
@@ -46,8 +53,12 @@ namespace LOG {
             if (s[i] == '[' && !open) { open = s + i; }
             if (s[i] == ']' && open) { *tagEnd = s + i + 1; break; }
         }
-        if (!*tagEnd) { return 0u; }
-        for (const char* p = s; p < *tagEnd; ++p) { h = (h ^ (unsigned char)*p) * 16777619u; }
+        const char* end = *tagEnd;
+        if (!end) {
+            end = s;
+            while (end < s + 24 && *end) { ++end; }
+        }
+        for (const char* p = s; p < end; ++p) { h = (h ^ (unsigned char)*p) * 16777619u; }
         return h;
     }
 

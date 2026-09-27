@@ -948,19 +948,24 @@ bool DistantLand::initLandscape() {
         return false;
     }
 
+    // Under Forge nothing here has a consumer: the host builds the land from the plugins' LAND
+    // records itself, and the one thing the upload below fed — the host's legacy LandQuadTree,
+    // keyed by this process's VB pointers — only ever answered VIS_LAND cull requests, which nothing
+    // has issued since S4b. Skipping it keeps ~80 MB of VB/IB + atlas textures out of Morrowind.exe.
+    //
+    // ⚠ AND IT MUST COME BEFORE THE FILE CHECK. The generator no longer writes distantland\world,
+    // so a clean install has none; checked first, its absence failed the whole distant-land init
+    // (the "serious error condition" overlay and a white screen) for a file Forge never reads. Dev
+    // installs never saw it because they still carry a world file from an older generator.
+    if (Configuration.UseRenderProcess) {
+        LOG::logline("-- Distant landscape: not loaded in this process under Forge (the host draws it)");
+        return true;
+    }
+
     if (GetFileAttributes("Data Files\\distantland\\world") == INVALID_FILE_ATTRIBUTES) {
         LOG::logline("!! Distant land files have not been generated");
         LOG::flush();
         return !(Configuration.MGEFlags & USE_DISTANT_LAND);
-    }
-
-    // Under Forge nothing here has a consumer: the host loads and draws the distant landscape from
-    // these same files, and the one thing the upload below fed — the host's legacy LandQuadTree,
-    // keyed by this process's VB pointers — only ever answered VIS_LAND cull requests, which nothing
-    // has issued since S4b. Skipping it keeps ~80 MB of VB/IB + atlas textures out of Morrowind.exe.
-    if (Configuration.UseRenderProcess) {
-        LOG::logline("-- Distant landscape: not loaded in this process under Forge (the host draws it)");
-        return true;
     }
 
     hr = D3DXCreateTextureFromFileEx(device, "Data Files\\distantland\\world.dds", 0, 0, 0, 0, D3DFMT_UNKNOWN, D3DPOOL_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, 0, 0, &texWorldColour);
