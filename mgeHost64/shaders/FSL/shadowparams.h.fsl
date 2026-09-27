@@ -1043,4 +1043,14 @@ STRUCT(ShadowMaskParams)
     //   y, z = the distance match: a screen texel serves a fragment iff |its distance - the
     //       fragment's| <= y * distance + z (relative, world units).   w = spare
     DATA(float4,   skyVis,           None);
+    // SKY-AO FLOOR (skyamb.h.fsl skyAmbFactorAO): the fill a sealed spot keeps. A tunnel's sky AO is
+    // ~0, and with no floor its ambient went PITCH BLACK — the servo then chased that black up and
+    // amplified every small bright term in view. Real enclosed space is lit by bounce; MW's stand-in
+    // for bounce is an interior cell's ambient, so the floor is a TYPICAL INTERIOR AMBIENT:
+    //   x = its absolute luma in scene units (authored grey, decoded, CAL gain, x m — the same
+    //       MW-family path an interior's own ambCol takes); 0 = no floor.
+    //   y = the cap on floor / (this frame's ambCol luma): at night the open sky is dimmer than an
+    //       interior, and an uncapped floor would light the tunnel brighter than the ground outside.
+    //   zw = spare
+    DATA(float4,   skyAOFloor,       None);
 };

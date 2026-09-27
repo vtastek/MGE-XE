@@ -1255,7 +1255,17 @@ STRUCT(ShadowMaskParams)
 
 
     float4 skyVis;
-#line 1046
+
+
+
+
+
+
+
+
+
+    float4 skyAOFloor;
+#line 1056
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2212,7 +2222,28 @@ float skyAOTermPx(float3 N, float3 worldPosRel, float2 svPos)
         float w = (abs(s.y - myD) <= tol) ? wb : 0.0f;
         wSum += w; vSum += w * s.x; cSum += w * s.z;
     }
-    if (wSum <= 0.0f) { return skyAOTerm(N, worldPosRel); }
+    if (wSum <= 0.0f)
+    {
+
+
+
+
+
+
+        float bestE = 1.0e30f;
+        float4 best = f4(0.0f);
+        for (int by = -1; by <= 2; ++by)
+        {
+            for (int bx = -1; bx <= 2; ++bx)
+            {
+                float4 s = LoadTex2D(gSkyVisScreen, NO_SAMPLER, clamp(i0 + int2(bx, by), int2(0, 0), mx), 0);
+                float e = abs(s.y - myD);
+                if (s.y >= 0.0f && e < bestE) { bestE = e; best = s; }
+            }
+        }
+        if (bestE > myD * 0.25f + 64.0f) { return skyAOTerm(N, worldPosRel); }
+        wSum = 1.0f; vSum = best.x; cSum = best.z;
+    }
     float vis = vSum / wSum, cov = cSum / wSum;
     float v = lerp(1.0f, vis, strength);
     if (cov >= 0.999f) { return v; }
@@ -2225,16 +2256,13 @@ float skyAOTermPx(float3 N, float3 worldPosRel, float2 svPos)
 
 float3 skyAmbFactorAO(float3 N, float ao)
 {
-
-
-
-
-
-
-
+#line 283 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    float ambL = dot(gFrameData.ambCol.rgb, float3(0.299f, 0.587f, 0.114f));
+    float fl = (ambL > 1.0e-6f) ? min(gShadowParams.skyAOFloor.x / ambL, gShadowParams.skyAOFloor.y) : 0.0f;
+    float fill = fl * (1.0f - ao);
 
     float s = gShadowParams.skyParams.x;
-    if (s <= 0.0f) { return float3(ao, ao, ao); }
+    if (s <= 0.0f) { return f3(ao + fill); }
 
     float4 n = float4(normalize(N), 1.0f);
     float3 f = float3(dot(gShadowParams.shAr, n),
@@ -2248,7 +2276,7 @@ float3 skyAmbFactorAO(float3 N, float ao)
 
 
 
-    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
+    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao + f3(fill);
 }
 
 

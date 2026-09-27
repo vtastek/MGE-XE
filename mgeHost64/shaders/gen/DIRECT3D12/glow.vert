@@ -1255,7 +1255,17 @@ STRUCT(ShadowMaskParams)
 
 
     float4 skyVis;
-#line 1046
+
+
+
+
+
+
+
+
+
+    float4 skyAOFloor;
+#line 1056
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

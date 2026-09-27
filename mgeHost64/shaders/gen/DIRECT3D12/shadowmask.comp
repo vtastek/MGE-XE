@@ -1255,7 +1255,17 @@ STRUCT(ShadowMaskParams)
 
 
     float4 skyVis;
-#line 1046
+
+
+
+
+
+
+
+
+
+    float4 skyAOFloor;
+#line 1056
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

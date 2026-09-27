@@ -2959,6 +2959,12 @@ namespace {
         DescriptorSet* pSkyCullSet       = nullptr;   // CullSrtData PerBatch bound to the above
         Buffer*        pSkyHeightFrameCbv = nullptr;  // gFrameData copy, viewProj := the top-down ortho
         DescriptorSet* pPerFrameSetSkyHeight = nullptr;  // PerFrame set bound to pSkyHeightFrameCbv
+        // SKY-VISIBILITY MAPS: one frame CBV and one cull CBV PER DIRECTION (instance 1+k of
+        // pPerFrameSetSkyHeight / pSkyCullSet; instance 0 stays the height map's). Both are
+        // CPU-written and read at execution, so directions sharing one would all draw with the last
+        // one's matrix — per-direction copies are what let the loading frame draw all of them.
+        Buffer*        pSvmFrameCbv[32] = {};
+        Buffer*        pSvmCullCbv[32]  = {};
         bool           skyCullReady   = false;
         bool           skyArgsInDrawState = false;
 
@@ -5965,6 +5971,7 @@ namespace {
     // cascade resolution. S1 (now): built, and dumped beside the oracle for scoring in
     // tools/skyao_fit.py. Nothing samples them yet.
     constexpr uint32_t kSvmMaxDirs = 32;
+    static_assert(kSvmMaxDirs == 32, "pSvmFrameCbv/pSvmCullCbv/g_terrainSvmV and the 1+32 set instances are sized 32");
     // DEFAULT ON (2026-09-27, the user's call after the oracle and the look). Allocation happens at
     // startup only when this is true, so svm=0 in MGE_HOST_KNOBS is the no-VRAM arm; the panel
     // checkbox is a live A/B against the march on top of the allocated maps.
@@ -5985,6 +5992,15 @@ namespace {
     float    g_svmPcf       = 2.0f;
     float    g_svmDepthHalf = 16384.0f;      // half the depth slab (D16: 0.5 u steps)
     float    g_svmMinRadius = 0.0f;          // statics with a smaller bound radius do not cast
+    // 1 = when the maps are incomplete (exterior entry, layout change) draw ALL of them in that one
+    // frame, so the maps are armed from the first frame shown; 0 = fill one per frame (the old ramp).
+    float    g_svmFill      = 1.0f;
+    // SKY-AO FLOOR (shadowparams.h.fsl skyAOFloor). The ambient a fully sky-occluded spot keeps, as
+    // an AUTHORED sRGB grey — what an interior cell's ambient is written in (a logged interior:
+    // (0.176,0.118,0.118)). 0 = the old pitch-black tunnel. The cap keeps a floor from exceeding
+    // this fraction of the open-sky ambient (night: the sky is dimmer than a room).
+    float    g_skyAOFloorAmb = 0.15f;
+    float    g_skyAOFloorMax = 0.5f;
     uint32_t g_svmNext      = 0;             // round-robin cursor
     uint32_t g_svmDrawn     = 0;             // tiles drawn since the last layout change
     float    g_svmBuilt[4]  = {};            // K, res, extent, depthHalf the tiles were drawn with
@@ -6312,6 +6328,8 @@ namespace {
     constexpr uint32_t kSunny16Float          = kPbrShade2Float + 4;
     // SKY-VISIBILITY MAPS (shadowparams.h.fsl skyVis): x K (0 = off), y res, z bias, w normal offset.
     constexpr uint32_t kSkyVisFloat           = kSunny16Float + 4;
+    // SKY-AO FLOOR (shadowparams.h.fsl skyAOFloor): x absolute interior-ambient luma, y cap.
+    constexpr uint32_t kSkyAOFloorFloat       = kSkyVisFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6325,6 +6343,10 @@ namespace {
                   "skyVis must fit inside the ShadowMaskParams CBV");
     static_assert(offsetof(ShadowMaskParams, skyVis) == kSkyVisFloat * sizeof(float),
                   "kSkyVisFloat does not land on ShadowMaskParams::skyVis");
+    static_assert((kSkyAOFloorFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "skyAOFloor must fit inside the ShadowMaskParams CBV");
+    static_assert(offsetof(ShadowMaskParams, skyAOFloor) == kSkyAOFloorFloat * sizeof(float),
+                  "kSkyAOFloorFloat does not land on ShadowMaskParams::skyAOFloor");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -9511,6 +9533,11 @@ namespace {
                 shf.pData = nullptr;
                 shf.ppBuffer = &g_live.pSkyHeightFrameCbv;
                 addResource(&shf, nullptr);
+                for (uint32_t d = 0; d < 32; ++d) {
+                    shf.mDesc.pName = "svmFrameCbv";
+                    shf.ppBuffer = &g_live.pSvmFrameCbv[d];
+                    addResource(&shf, nullptr);
+                }
 
                 // LONG-RANGE sun occlusion: 1024² R16F = 2 MB, derived from the map above. A plain
                 // texture (SRV + UAV, no RTV) — nothing rasters into it, one compute pass writes it
@@ -13396,7 +13423,7 @@ namespace {
             // (skyheight_statics.frag ignores Out.Color entirely), so a type-valid stand-in is
             // exactly right; what matters is that the descriptor is not the target we are drawing to.
             if (g_live.pSkyHeightFrameCbv) {
-                DescriptorSetDesc khDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
+                DescriptorSetDesc khDesc = SRT_SET_DESC(SrtData, PerFrame, 1 + 32, 0);   // 0 = height map, 1+k = map k
                 addDescriptorSet(R, &khDesc, &g_live.pPerFrameSetSkyHeight);
                 if (g_live.pPerFrameSetSkyHeight) {
                     Texture* khVol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
@@ -13481,8 +13508,15 @@ namespace {
                         p[kn].mCount = 1; p[kn].ppTextures = &g_live.pSkyColor;
                         ++kn;
                     }
-                    updateDescriptorSet(R, 0, g_live.pPerFrameSetSkyHeight, kn, p);
-                    bindCausticField(R, g_live.pPerFrameSetSkyHeight, 0);   // W23
+                    // Every instance binds the same set; only gFrameData differs (a direction whose
+                    // CBV failed to allocate shares the height map's, and renderSkyVisMaps skips it).
+                    for (uint32_t si = 0; si <= 32; ++si) {
+                        Buffer* fb = (si > 0 && g_live.pSvmFrameCbv[si - 1]) ? g_live.pSvmFrameCbv[si - 1]
+                                                                                   : g_live.pSkyHeightFrameCbv;
+                        p[0].ppBuffers = &fb;
+                        updateDescriptorSet(R, si, g_live.pPerFrameSetSkyHeight, kn, p);
+                        bindCausticField(R, g_live.pPerFrameSetSkyHeight, si);   // W23
+                    }
                 }
             }
 
@@ -22552,6 +22586,9 @@ namespace {
             { "svmExtent",          &g_svmExtent          },
             { "svmDepthHalf",       &g_svmDepthHalf       },
             { "svmMinRadius",       &g_svmMinRadius       },
+            { "svmFill",            &g_svmFill            },
+            { "skyAOFloorAmb",      &g_skyAOFloorAmb      },
+            { "skyAOFloorMax",      &g_skyAOFloorMax      },
             { "svmBias",            &g_svmBias            },
             { "svmPcf",             &g_svmPcf             },
             { "skyAOStrength",      &g_skyAOStrength      },
@@ -25588,6 +25625,8 @@ namespace {
           // compare filter — 1 = 3x3 taps (4 gathers per map), 2 = 5x5 (9 gathers, the oracle look).
           t.checkbox("Sky AO: direction MAPS (off = the height-map march)", &g_svm);
           t.sliderF("Sky AO maps: filter radius (1 = 3x3, 2 = 5x5)", &g_svmPcf, 1.0f, 2.0f, 1.0f, "%.0f");
+          t.sliderF("Sky AO floor: interior ambient (authored grey, 0 = pitch black)", &g_skyAOFloorAmb, 0.0f, 0.5f, 0.01f);
+          t.sliderF("Sky AO floor: cap (fraction of open-sky ambient)", &g_skyAOFloorMax, 0.0f, 1.0f, 0.05f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -35851,7 +35890,7 @@ void destroyHostWindow(Renderer* R);
                     // "Dark" light: negative (subtractive) OR clamped-to-black (MW negative lights,
                     // and whatever the Darkening MWSE mods produce) — the shadow manager skips these.
                     const float cmax = std::max(lf[4 + i * 12 + 4], std::max(lf[4 + i * 12 + 5], lf[4 + i * 12 + 6]));
-                    if (cmax < 0.01f) { ++nDark; }
+                    if (cmax < 0.01f * sunnyM()) { ++nDark; }   // authored units: the CBV carries x m
                 }
                 static uint64_t s_lastLightIdLog = 0;
                 const bool spawn = (nNew > 0) && (g_renderFrame - s_lastLightIdLog >= 20);
@@ -36917,8 +36956,12 @@ void destroyHostWindow(Renderer* R);
                     // TO BLACK (MW applies the darkening in its own light path; e.g. dark_64_01
                     // arrives color=(0,0,0) r=150) — plus any genuinely-off light. They still take
                     // part in forward lighting (opaque.frag loops them); just never shadow-managed.
+                    // ⚠ The threshold is in AUTHORED units. This buffer's colours were multiplied by the
+                    // SUNNY 16 m in place (the near-light upload), so a fixed 0.01 dropped every light
+                    // dimmer than 0.01/m from shadow management: at m = 2^-3 ordinary lamps lost their
+                    // shadows, and a pulsing crystal crossed the line every cycle — slot on, slot off.
                     const float cmax = std::max(pl[4], std::max(pl[5], pl[6]));
-                    if (cmax < 0.01f) { continue; }
+                    if (cmax < 0.01f * sunnyM()) { continue; }
                     // Skip synthetic ambient/sun fill lights: a nonzero LINEAR attenuation (pl[9], the
                     // wire's falloff.y) marks the nameless engine/mod-injected fill (r~512, warm-white,
                     // k=(0.36,0.01,0.01)). Real placed fixtures + the client's magic/projectile/spell
@@ -47450,6 +47493,7 @@ void destroyHostWindow(Renderer* R);
         uint32_t              drawCounts[kTerrainFamilies][kTerrainLods] = {};   // per-(family,rung) ROW count
         Buffer*               instRing = nullptr;             // per-frame instance rows (CPU_TO_GPU)
         uint32_t              cells = 0;                       // = visible.size(), for the record gate
+        uint32_t              maxRows = kTerrainMaxRows;       // instRing capacity in rows (the bound checks)
     };
     TerrainView g_terrainMain;
     TerrainView g_terrainRefl;
@@ -47459,9 +47503,17 @@ void destroyHostWindow(Renderer* R);
     // reflection has one: the LOD array is read by the neighbour stitch, so two culls sharing it
     // would tear whichever recorded second.
     TerrainView g_terrainSun;
-    // ...and the SKY-VISIBILITY maps' view: one sky direction per frame, its own ortho box, so it
-    // needs its own LOD array and ring for the same reason the sun has one.
-    TerrainView g_terrainSvm;
+    // ...and the SKY-VISIBILITY maps' views: ONE PER DIRECTION, each with its own ortho box, LOD
+    // array and ring for the same reason the sun has one — and one per direction so the loading frame
+    // can draw all of them (the ring is CPU-written and read at execution). A map is floored at the
+    // base rung and touches at most ~13 cells, so each ring is small (kSvmTerrainRows).
+    constexpr uint32_t kSvmTerrainRows = 256;
+    TerrainView g_terrainSvmV[32];
+    // Every view, for the alloc / reset / teardown loops.
+    template <class F> void forEachTerrainView(F f) {
+        f(g_terrainMain); f(g_terrainRefl); f(g_terrainSun);
+        for (TerrainView& v : g_terrainSvmV) { f(v); }
+    }
 
     Shader*   g_pTerrainShader     = nullptr;
     Pipeline* g_pTerrainPipeline   = nullptr;
@@ -47622,7 +47674,10 @@ void destroyHostWindow(Renderer* R);
 
         // One instance ring PER VIEW — the reflect and sun culls run mid-command-buffer, after the
         // main cull has already filled its own ring, so they cannot share storage.
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun, &g_terrainSvm }) {
+        for (TerrainView& v : g_terrainSvmV) { v.maxRows = kSvmTerrainRows; }
+        bool ringsOk = true;
+        forEachTerrainView([&](TerrainView& tv) {
+            TerrainView* v = &tv;
             BufferLoadDesc ir = {};
             ir.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             ir.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -47630,7 +47685,7 @@ void destroyHostWindow(Renderer* R);
             // ROWS, not cells — see kTerrainMaxRows. The reflection and sun views never emit
             // patches (they are floored at the base rung), so two of these three are oversized by
             // ~295 KB; one size for all three is worth more than the saving.
-            ir.mDesc.mSize        = (uint64_t)kTerrainMaxRows * kTerrainInstStride;
+            ir.mDesc.mSize        = (uint64_t)v->maxRows * kTerrainInstStride;
             ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing"
                                   : (v == &g_terrainRefl) ? "terrainInstRingRefl"
                                   : (v == &g_terrainSun)  ? "terrainInstRingSun"
@@ -47638,10 +47693,10 @@ void destroyHostWindow(Renderer* R);
             ir.pData              = nullptr;
             ir.ppBuffer           = &v->instRing;
             addResource(&ir, nullptr);
-        }
+        });
         waitForAllResourceLoads();
-        if (!g_pTerrainVB || !g_pTerrainIB || !g_terrainMain.instRing || !g_terrainRefl.instRing
-            || !g_terrainSun.instRing || !g_terrainSvm.instRing) {
+        forEachTerrainView([&](TerrainView& v) { ringsOk = ringsOk && v.instRing; });
+        if (!g_pTerrainVB || !g_pTerrainIB || !ringsOk) {
             std::printf("[forge][terrain] lattice buffer alloc FAILED\n");
             return false;
         }
@@ -48573,7 +48628,8 @@ void destroyHostWindow(Renderer* R);
         // The per-view LOD arrays are indexed by CULL INDEX (the stitch reads a neighbour's entry),
         // so they size to the cull table, not to the slot count.
         const uint32_t cullN = (uint32_t)g_terrainCull.size();
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun, &g_terrainSvm }) {
+        forEachTerrainView([&](TerrainView& tv) {
+            TerrainView* v = &tv;
             // Seeded with the BASE rung, not 0 — rung 0 is the FINEST one, and a default that
             // means "8 u" is the wrong thing for an entry nobody has picked yet.
             // The stitch only reads an entry whose lodStamp matches this frame, so this is a
@@ -48582,7 +48638,7 @@ void destroyHostWindow(Renderer* R);
             v->lodOf.assign(cullN, (uint8_t)kTerrainBaseLod);
             v->lodStamp.assign(cullN, 0);
             v->visible.reserve(kTerrainMaxInst);
-        }
+        });
 
         const uint64_t bufBytes = hBytes + cBytes + tBytes + gBytes;
         std::printf("[forge][terrain] residency: %u cells (+%u default), %llu MB buffers (heights %llu + colour %llu)\n",
@@ -48882,7 +48938,7 @@ void destroyHostWindow(Renderer* R);
             // GPU-visible host memory. One patched cell is 256 rows, so "one row per visible cell"
             // stopped being true here and the cap has to be counted in rows.
             const uint32_t need = patched ? kTerrainPatchesPerCell : 1u;
-            if (rows + need > kTerrainMaxRows) { break; }
+            if (rows + need > V.maxRows) { break; }
             rows += need;
 
             // ⚠ A PATCHED CELL RECORDS THE BASE RUNG, because that is the rung its PERIMETER is
@@ -48937,7 +48993,7 @@ void destroyHostWindow(Renderer* R);
         auto emit = [&](const TerrainCellCull& t, uint32_t fam, uint32_t rung,
                         uint32_t nbrRungs, uint32_t ox, uint32_t oy) {
             uint32_t& cur = cursor[fam][rung];
-            if (cur >= kTerrainMaxRows) { return; }
+            if (cur >= V.maxRows) { return; }
             uint8_t* row = dst + (size_t)(cur++) * kTerrainInstStride;
             const float originRel[2] = { (float)((double)t.gx * Terrain::kCellSize - (double)eye[0]),
                                          (float)((double)t.gy * Terrain::kCellSize - (double)eye[1]) };
@@ -54249,6 +54305,11 @@ void destroyHostWindow(Renderer* R);
             kpc.mDesc.pName        = "skyCullParamsCbv";
             kpc.ppBuffer           = &g_live.pSkyCullParamsCbv;
             addResource(&kpc, nullptr);
+            for (uint32_t d = 0; d < 32; ++d) {
+                kpc.mDesc.pName = "svmCullParamsCbv";
+                kpc.ppBuffer    = &g_live.pSvmCullCbv[d];
+                addResource(&kpc, nullptr);
+            }
 
             BufferLoadDesc kcc = {};
             kcc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -54301,7 +54362,7 @@ void destroyHostWindow(Renderer* R);
             if (g_live.pSkyCullParamsCbv && g_live.pSkyCullCount && g_live.pSkySubsetCount
                 && g_live.pSkySubsetOffset && g_live.pSkySubsetCursor && g_live.pSkyArgs
                 && g_live.pSkyInstOut && g_live.pSkyHeightFrameCbv) {
-                DescriptorSetDesc kset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
+                DescriptorSetDesc kset = SRT_SET_DESC(CullSrtData, PerBatch, 1 + 32, 0);   // 0 = height map, 1+k = map k
                 addDescriptorSet(R, &kset, &g_live.pSkyCullSet);
                 if (g_live.pSkyCullSet) {
                     DescriptorData kd[12] = {};
@@ -54337,7 +54398,12 @@ void destroyHostWindow(Renderer* R);
                     kd[kn].mCount = 1;
                     kd[kn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
                                                                    : &g_live.pSkyHeight->pTexture; ++kn;
-                    updateDescriptorSet(R, 0, g_live.pSkyCullSet, kn, kd);
+                    for (uint32_t si = 0; si <= 32; ++si) {   // only gCullParams (kd[0]) differs
+                        Buffer* cb = (si > 0 && g_live.pSvmCullCbv[si - 1]) ? g_live.pSvmCullCbv[si - 1]
+                                                                                 : g_live.pSkyCullParamsCbv;
+                        kd[0].ppBuffers = &cb;
+                        updateDescriptorSet(R, si, g_live.pSkyCullSet, kn, kd);
+                    }
                     g_live.skyCullReady = true;
                     std::printf("[forge][cull] SKY-HEIGHT cull ready (SH2 stage B): subsets=%u\n", subsetCount);
                 }
@@ -56387,10 +56453,14 @@ void destroyHostWindow(Renderer* R);
     // Compute LAST is deliberate: it lets stage (2) get away with pure blending, and it makes "no
     // LAND record here" a natural sentinel rather than a hole.
     // The sky lane's statics cull: survivors of a box (six camera-relative planes) into pSkyArgs /
-    // pSkyInstOut, left in draw state. Shared by the height-map rebuild and the sky-visibility maps;
-    // its params CBV is CPU-written, so only ONE of them may use it per frame (the maps stand down
-    // on a rebuild frame). The caller checks the lane is ready.
-    void skyLaneCull(const float box[24], float minRadius) {
+    // pSkyInstOut, left in draw state. Shared by the height-map rebuild (dir = ~0: params CBV and set
+    // instance 0) and the sky-visibility maps (dir k: its own CBV, instance 1+k). The params are
+    // CPU-written and read at execution, so each user owns its own; the GPU outputs are reused in
+    // command order, which the barriers below serialise. The caller checks the lane is ready.
+    void skyLaneCull(const float box[24], float minRadius, uint32_t dir = ~0u) {
+        const bool     perDir = dir < 32u && g_live.pSvmCullCbv[dir];
+        Buffer* const  kcbv   = perDir ? g_live.pSvmCullCbv[dir] : g_live.pSkyCullParamsCbv;
+        const uint32_t kset   = perDir ? 1u + dir : 0u;
         ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
         auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
             BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
@@ -56403,7 +56473,7 @@ void destroyHostWindow(Renderer* R);
         // differs. The copy MUST span all 512 B — this cull runs with no near cut and no
         // ownership, so an instance the camera cull dropped still has to be considered here.
         const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
-        float*       kp  = (float*)g_live.pSkyCullParamsCbv->pCpuMappedAddress;
+        float*       kp  = (float*)kcbv->pCpuMappedAddress;
         std::memcpy(kp, cam, 512);
 
         // Six box planes, camera-relative: inside == dot(n, c - eye) + d >= -r.
@@ -56442,17 +56512,17 @@ void destroyHostWindow(Renderer* R);
         }
 
         cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
+        cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pSkySubsetCount);
         cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
+        cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
         uavBarrier(g_live.pSkySubsetOffset);
         uavBarrier(g_live.pSkySubsetCursor);
         uavBarrier(g_live.pSkyArgs);
         cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyCullSet);
+        cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pSkyInstOut);
         bufBarrier(g_live.pSkyArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
@@ -56480,6 +56550,15 @@ void destroyHostWindow(Renderer* R);
         mp[kSkyVisFloat + 1] = 0.02f;
         mp[kSkyVisFloat + 2] = 16.0f;
         mp[kSkyVisFloat + 3] = 0.0f;
+        // The floor, in the MW family's units: decoded like any authored colour, the ambient CAL
+        // gain, then m. Published every frame; interiors never read it (AO strength is 0 there).
+        float g[3] = { std::max(0.0f, std::min(g_skyAOFloorAmb, 1.0f)), 0.0f, 0.0f };
+        g[1] = g[2] = g[0];
+        decodeAuthoredRGB(g);
+        mp[kSkyAOFloorFloat + 0] = g[0] * g_calAmbGain * sunnyM();
+        mp[kSkyAOFloorFloat + 1] = std::max(0.0f, std::min(g_skyAOFloorMax, 1.0f));
+        mp[kSkyAOFloorFloat + 2] = 0.0f;
+        mp[kSkyAOFloorFloat + 3] = 0.0f;
     }
 
     // THE SCREEN PASS (skyvis.comp): after the linearize, before the colour pass. Fills the params
@@ -56540,14 +56619,12 @@ void destroyHostWindow(Renderer* R);
         // Leaving the exterior invalidates every map: the next world is another place.
         if (!g_dlExterior) { g_svmDrawn = 0; return; }
         if (!g_svm || !g_live.pSvmDepth || !g_pSvmStaticsPipeline) { return; }
-        // The lane's params CBV and the frame CBV are CPU-written and read at execution: a rebuild
-        // frame has already claimed them.
-        if (g_skyHeightBuildFrame == g_renderFrame && g_skyHeightBuilds > 0) { return; }
+        // No rebuild-frame stand-down any more: each direction has its OWN frame and cull CBVs
+        // (instance 1+k), so the height-map rebuild's instance 0 is never overwritten under it.
         if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
-        const bool lane = g_live.skyCullReady && g_live.pPerFrameSetSkyHeight && g_live.pSkyHeightFrameCbv
+        const bool lane = g_live.skyCullReady && g_live.pPerFrameSetSkyHeight
                        && g_live.pCullPipeline && g_live.cullInstCount && g_dlLiveInit && g_staticsLiveOk
-                       && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress
-                       && g_live.pSkyCullParamsCbv && g_live.pSkyCullParamsCbv->pCpuMappedAddress;
+                       && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress;
         if (!lane) { return; }
 
         const uint32_t K   = (uint32_t)std::max(1.0f, std::min(g_svmDirs, (float)kSvmMaxDirs));
@@ -56559,84 +56636,112 @@ void destroyHostWindow(Renderer* R);
             std::memcpy(g_svmBuilt, built, sizeof(built));
             g_svmNext = 0; g_svmDrawn = 0;
         }
-        const uint32_t k = g_svmNext % K;
-        g_svmNext = (k + 1) % K;
+        // THE FILL. Until all K maps are valid the screen pass is not armed and the frame shows the
+        // height-map march — so the maps "kicked in" a visible half second after every exterior
+        // entry. Instead, the first frame that finds them incomplete draws EVERY direction: one
+        // ~20 ms frame at the loading door, and the first frame the player sees is already the
+        // finished look. After that, one direction per frame round-robin keeps them following.
+        const bool     fill = g_svmFill > 0.5f && g_svmDrawn < K;
+        const uint32_t nDraw = fill ? K : 1u;
 
-        // The direction's ortho, snapped to its own texel grid in WORLD space (sunSnapOffset of the
-        // eye's absolute coordinate), so a redraw after the eye moved lands texels where the last one
-        // did — the maps swim no more than the world does.
-        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        // gFrameData once, off the write-combined CBV (not once per direction).
+        alignas(16) uint8_t fdCopy[kFrameDataBytes];
+        std::memcpy(fdCopy, g_live.pFrameCbv->pCpuMappedAddress, kFrameDataBytes);
         const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
-        float t[3], xa[3], ya[3], za[3];
-        skyHemiDir(k, K, 0.0, 1.0, t);
-        sunLightBasis(t, xa, ya, za);
         const float texel = 2.0f * ext / (float)res;
         auto dotEye = [&](const float* a) {
             return (double)eye[0] * a[0] + (double)eye[1] * a[1] + (double)eye[2] * a[2];
         };
-        SvmTile& T = g_svmTile[k];
-        buildSunOrthoVP(xa, ya, za, ext, dh, sunSnapOffset(dotEye(xa), texel),
-                        sunSnapOffset(dotEye(ya), texel), T.vp);
-        T.eye[0] = eye[0]; T.eye[1] = eye[1]; T.eye[2] = eye[2];
-        T.frame = g_renderFrame;
 
-        // Casters: the ortho box, one texel of slack for the snap.
-        const float e = ext + texel;
-        const float planes[6][4] = {
-            { -xa[0], -xa[1], -xa[2], e  }, {  xa[0],  xa[1],  xa[2], e  },
-            { -ya[0], -ya[1], -ya[2], e  }, {  ya[0],  ya[1],  ya[2], e  },
-            { -za[0], -za[1], -za[2], dh }, {  za[0],  za[1],  za[2], dh },
-        };
-        skyLaneCull(&planes[0][0], g_svmMinRadius);
-        terrainCullAndBuild(g_terrainSvm, /*primary*/false, planes, eye, /*nearCut*/0.0f,
-                            /*lodBias*/0u, /*lodFloor*/kTerrainBaseLod);
-        std::memcpy(g_live.pSkyHeightFrameCbv->pCpuMappedAddress, mfd, kFrameDataBytes);
-        std::memcpy(g_live.pSkyHeightFrameCbv->pCpuMappedAddress, T.vp, 16 * sizeof(float));
-
-        cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, "SKY-VISIBILITY MAP");
+        cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, fill ? "SKY-VISIBILITY MAPS (fill)" : "SKY-VISIBILITY MAP");
         RenderTargetBarrier rtb = {};
         rtb.pRenderTarget = g_live.pSvmDepth;
         rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
         rtb.mNewState     = RESOURCE_STATE_DEPTH_WRITE;
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
-        BindRenderTargetsDesc b = {};
-        b.mRenderTargetCount = 0;
-        b.mDepthStencil = { g_live.pSvmDepth, LOAD_ACTION_CLEAR };
-        b.mDepthStencil.mArraySlice = k;       // CLEAR touches this slice only
-        b.mDepthStencil.mUseArraySlice = 1;
-        cmdBindRenderTargets(g_live.pCmd, &b);
-        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)res, (float)res, 0.0f, 1.0f);
-        cmdSetScissor(g_live.pCmd, 0, 0, res, res);
 
-        cmdBindPipeline(g_live.pCmd, g_pSvmStaticsPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
-                                                                     : g_live.pPerLightsSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetSkyHeight);
-        Buffer*  vbs[2]     = { g_pStaticsVB, g_live.pSkyInstOut };
-        uint32_t strides[2] = { 20, kStaticsInstStride };
-        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount, g_live.pSkyArgs, 0, nullptr, 0);
-        if (g_pSvmTerrainPipeline) {
-            terrainRecord(g_live.pCmd, g_terrainSvm, g_live.pPerFrameSetSkyHeight, /*mirror*/false,
-                          /*frameSetIndex*/0, g_pSvmTerrainPipeline);
+        uint32_t drawnNow = 0, lastK = 0;
+        float    lastT[3] = {};
+        for (uint32_t n = 0; n < nDraw; ++n) {
+            const uint32_t k = fill ? n : (g_svmNext % K);
+            if (!fill) { g_svmNext = (k + 1) % K; }
+            Buffer* const fcbv = g_live.pSvmFrameCbv[k];
+            if (!fcbv || !fcbv->pCpuMappedAddress || !g_live.pSvmCullCbv[k]) { continue; }
+
+            // The direction's ortho, snapped to its own texel grid in WORLD space (sunSnapOffset of
+            // the eye's absolute coordinate), so a redraw after the eye moved lands texels where the
+            // last one did — the maps swim no more than the world does.
+            float t[3], xa[3], ya[3], za[3];
+            skyHemiDir(k, K, 0.0, 1.0, t);
+            sunLightBasis(t, xa, ya, za);
+            SvmTile& T = g_svmTile[k];
+            buildSunOrthoVP(xa, ya, za, ext, dh, sunSnapOffset(dotEye(xa), texel),
+                            sunSnapOffset(dotEye(ya), texel), T.vp);
+            T.eye[0] = eye[0]; T.eye[1] = eye[1]; T.eye[2] = eye[2];
+            T.frame = g_renderFrame;
+
+            // Casters: the ortho box, one texel of slack for the snap.
+            const float e = ext + texel;
+            const float planes[6][4] = {
+                { -xa[0], -xa[1], -xa[2], e  }, {  xa[0],  xa[1],  xa[2], e  },
+                { -ya[0], -ya[1], -ya[2], e  }, {  ya[0],  ya[1],  ya[2], e  },
+                { -za[0], -za[1], -za[2], dh }, {  za[0],  za[1],  za[2], dh },
+            };
+            skyLaneCull(&planes[0][0], g_svmMinRadius, k);   // leaves the RT unbound (compute)
+            TerrainView& TV = g_terrainSvmV[k];
+            terrainCullAndBuild(TV, /*primary*/false, planes, eye, /*nearCut*/0.0f,
+                                /*lodBias*/0u, /*lodFloor*/kTerrainBaseLod);
+            std::memcpy(fcbv->pCpuMappedAddress, fdCopy, kFrameDataBytes);
+            std::memcpy(fcbv->pCpuMappedAddress, T.vp, 16 * sizeof(float));
+
+            BindRenderTargetsDesc b = {};
+            b.mRenderTargetCount = 0;
+            b.mDepthStencil = { g_live.pSvmDepth, LOAD_ACTION_CLEAR };
+            b.mDepthStencil.mArraySlice = k;       // CLEAR touches this slice only
+            b.mDepthStencil.mUseArraySlice = 1;
+            cmdBindRenderTargets(g_live.pCmd, &b);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)res, (float)res, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, res, res);
+
+            cmdBindPipeline(g_live.pCmd, g_pSvmStaticsPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                                         : g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+            cmdBindDescriptorSet(g_live.pCmd, 1u + k, g_live.pPerFrameSetSkyHeight);
+            Buffer*  vbs[2]     = { g_pStaticsVB, g_live.pSkyInstOut };
+            uint32_t strides[2] = { 20, kStaticsInstStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount, g_live.pSkyArgs, 0, nullptr, 0);
+            if (g_pSvmTerrainPipeline) {
+                terrainRecord(g_live.pCmd, TV, g_live.pPerFrameSetSkyHeight, /*mirror*/false,
+                              /*frameSetIndex*/1u + k, g_pSvmTerrainPipeline);
+            }
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            ++drawnNow; lastK = k; lastT[0] = t[0]; lastT[1] = t[1]; lastT[2] = t[2];
         }
-        cmdBindRenderTargets(g_live.pCmd, nullptr);
+
         rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
         rtb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
         cmdEndDebugMarker(g_live.pCmd);
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-        ++g_svmDrawn;
+        // A fill drew every direction (or found the ones it skipped unallocatable, which the
+        // round-robin could not draw either); otherwise count the one redraw toward the fill.
+        g_svmDrawn = fill ? ((drawnNow == K) ? K : g_svmDrawn) : g_svmDrawn + drawnNow;
 
+        if (fill) {
+            LOG::logline(">> [svm] FILL: drew %u/%u directions in one frame (res=%u ext=%.0f) —"
+                         " the maps are armed from this frame", drawnNow, K, res, ext);
+        }
         static uint32_t s_svmLog = 0;
         if ((s_svmLog++ % 300) == 0) {
             LOG::logline(">> [svm] dir %u/%u res=%u ext=%.0f texel=%.2f depthHalf=%.0f drawn=%u"
                          " terrainCells=%u travel=(%.3f,%.3f,%.3f) | gpu redraw=%.3f screen=%.3f ms",
-                         k, K, res, ext, texel, dh, g_svmDrawn, g_terrainSvm.cells, t[0], t[1], t[2],
+                         lastK, K, res, ext, texel, dh, g_svmDrawn, g_terrainSvmV[lastK].cells,
+                         lastT[0], lastT[1], lastT[2],
                          g_lastGpuPhaseMs[kGpuPhaseSkyVis], g_lastGpuPhaseMs[kGpuPhaseSkyVisScreen]);
         }
     }
@@ -59547,12 +59652,13 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainTex)          { removeResource(g_pTerrainTex);             g_pTerrainTex = nullptr; }
         if (g_pTerrainParamTex)     { removeResource(g_pTerrainParamTex);        g_pTerrainParamTex = nullptr; }
         if (g_pTerrainCellGrid)     { removeResource(g_pTerrainCellGrid);        g_pTerrainCellGrid = nullptr; }
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun, &g_terrainSvm }) {
+        forEachTerrainView([&](TerrainView& tv) {
+            TerrainView* v = &tv;
             if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
             v->visible.clear(); v->lodOf.clear(); v->lodStamp.clear();
             v->cells = 0;
             std::memset(v->drawCounts, 0, sizeof(v->drawCounts));
-        }
+        });
         // [0] is the reserved "no texture of this kind" slot in both sets — g_pTerrainWhite for
         // the albedo set (removed below, once), nothing at all for the companion set.
         for (std::vector<TerrainTexBucket>* bs : { &g_terrainBuckets, &g_terrainParamBuckets }) {
@@ -59976,6 +60082,10 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSkyVisShader)        { removeShader(R, g_live.pSkyVisShader); g_live.pSkyVisShader = nullptr; }
         if (g_live.pSkyVisParamsCbv)     { removeResource(g_live.pSkyVisParamsCbv); g_live.pSkyVisParamsCbv = nullptr; }
         if (g_live.pSvmScreen)           { removeResource(g_live.pSvmScreen); g_live.pSvmScreen = nullptr; }
+        for (uint32_t d = 0; d < 32; ++d) {
+            if (g_live.pSvmFrameCbv[d]) { removeResource(g_live.pSvmFrameCbv[d]); g_live.pSvmFrameCbv[d] = nullptr; }
+            if (g_live.pSvmCullCbv[d])  { removeResource(g_live.pSvmCullCbv[d]);  g_live.pSvmCullCbv[d]  = nullptr; }
+        }
         g_live.skyVisReady = false; g_live.svmScreenInSR = false;
         if (g_live.pShadowAtlas)         { removeRenderTarget(R, g_live.pShadowAtlas); }
         if (g_live.pShadowAtlasDyn)      { removeRenderTarget(R, g_live.pShadowAtlasDyn); }
