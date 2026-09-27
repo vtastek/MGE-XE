@@ -107,8 +107,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgecore.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
-del "$(OutDir)MGEXEgui.exe.Backup"</Command>
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\set-laa.ps1" "$(OutDir)MGEXEgui.exe"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -136,8 +135,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgecore.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
-del "$(OutDir)MGEXEgui.exe.Backup"</Command>
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\set-laa.ps1" "$(OutDir)MGEXEgui.exe"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -161,8 +159,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgecore.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
-del "$(OutDir)MGEXEgui.exe.Backup"</Command>
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\set-laa.ps1" "$(OutDir)MGEXEgui.exe"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -190,8 +187,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgecore.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
-del "$(OutDir)MGEXEgui.exe.Backup"</Command>
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)tools\set-laa.ps1" "$(OutDir)MGEXEgui.exe"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

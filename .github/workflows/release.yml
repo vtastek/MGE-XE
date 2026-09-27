@@ -2,7 +2,7 @@ name: Release
 
 # Builds the full MGE XE distribution zip:
 #   - mgecore.dll + d3d8.dll shim + dinput8.dll + MGEfuncs.dll (x86)
-#   - MGEXEgui.exe (.NET 4.8, 4gb-patched) + SlimDX.dll
+#   - MGEXEgui.exe (.NET 4.8, large address aware) + SlimDX.dll
 #   - mgeHost64.exe (Release-Fast|x64, no D3D12 validation) + Forge runtime
 #     (Agility SDK / DXC DLLs, gpu.cfg/gpu.data, fonts, compiled FSL shaders)
 #   - assets (Data Files incl. prebuilt msoc.dll, readme, customfunctions.dat)
@@ -95,7 +95,7 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       # Builds every project incl. the RELEASE packaging step (robocopies assets
-      # + copies binaries + 4gb-patches the GUI) into bin\MSVC-Packaged-Release.
+      # + copies binaries + marks the GUI large address aware via tools\set-laa.ps1) into bin\MSVC-Packaged-Release.
       - name: Build solution (Release x86)
         working-directory: mgexe/MGE-XE
         run: msbuild MGE-XE.sln /m /p:Configuration=Release /p:Platform=x86
