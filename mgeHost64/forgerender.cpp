@@ -12309,8 +12309,16 @@ namespace {
                 g_upscaleName = nullptr;
                 g_upscaleTemporal = false;
                 g_upscaleDeclineReason = declined;
-                LOG::logline("!! [upscale] DECLINED — %s. Frame renders exactly as it does without "
-                             "this feature; no target allocated.", declined);
+                // A warning only when somebody ASKED for it: the upscaler ships Off, and a player's
+                // log opening with "!! DECLINED — MSAA is ON" reads as a fault in the default
+                // setup. The reason still reaches the panel (g_upscaleDeclineReason).
+                if (g_upscaleMode != (uint32_t)kUpscaleModeOff) {
+                    LOG::logline("!! [upscale] DECLINED — %s. Frame renders exactly as it does without "
+                                 "this feature; no target allocated.", declined);
+                } else {
+                    LOG::logline(">> [upscale] unavailable in this configuration (%s); the mode is Off.",
+                                 declined);
+                }
                 LOG::flush();
                 std::printf("[forge][upscale] DECLINED — %s\n", declined);
             } else {
@@ -57530,9 +57538,12 @@ void destroyHostWindow(Renderer* R);
         // deg puts the zenith 49 deg from the sun and the aerosol's forward lobe never reaches it —
         // which is how atmosMieMul x40 passed this gate and turned the sky white in play.
         //   state 4 -> force CLEAR @ 78.6 deg -> 5 (bytes in flight) -> report -> 6 (done)
-        const bool gateClear = (g_atmosGate && g_atmosGateState == 0 && g_live.pAtmosShPipeline);
-        const bool gateDeck  = (g_atmosGate && g_atmosGateState == 2 && g_live.pAtmosShPipeline);
-        const bool gateHigh  = (g_atmosGate && g_atmosGateState == 4 && g_live.pAtmosShPipeline);
+        // The gate is a developer self-test whose only output is its log report, and it forces
+        // reference parameters for a frame at startup — so a quiet-log (release) install skips it.
+        const bool gateOn    = g_atmosGate && LOG::verbose();
+        const bool gateClear = (gateOn && g_atmosGateState == 0 && g_live.pAtmosShPipeline);
+        const bool gateDeck  = (gateOn && g_atmosGateState == 2 && g_live.pAtmosShPipeline);
+        const bool gateHigh  = (gateOn && g_atmosGateState == 4 && g_live.pAtmosShPipeline);
         const bool gateFrame = gateClear || gateDeck || gateHigh;
         if (gateFrame) {
             row = gateDeck ? Atmosphere::overcastGateRow()   // row 0's air under a full lid

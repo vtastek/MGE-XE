@@ -27,10 +27,15 @@ namespace LOG {
     //
     // Budgets are hashed buckets, not a keyed table: lock-free (several threads log), and a
     // collision only makes two tags share one budget.
+    // Budgets: a warning ("!! ") keeps a few more lines than routine output, which in a player's
+    // log is almost all developer instrumentation. One notice says the cap exists — the first time
+    // anything is capped, not once per tag (that was ~70 lines of notices on its own).
     static const char* const kVerboseMarker = "mgeXE_verbose_log.txt";
-    static const LONG kQuietBudget = 32;
+    static const LONG kQuietBudgetInfo = 4;
+    static const LONG kQuietBudgetWarn = 8;
     static bool quiet = true;
     static volatile LONG tagCount[1024];
+    static volatile LONG noticeWritten = 0;
 
     // The tag: from the first '[' to its ']' if both fall within the first 48 characters, plus
     // whatever precedes it (so "!! [x]" and ">> [x]" are separate). Untagged lines share one bucket.
@@ -51,24 +56,27 @@ namespace LOG {
         if (!quiet) { return true; }
         const char* tagEnd = nullptr;
         const unsigned h = tagHash(line, &tagEnd);
+        const LONG budget = (line[0] == '!' && line[1] == '!') ? kQuietBudgetWarn : kQuietBudgetInfo;
         const LONG n = InterlockedIncrement(&tagCount[h & 1023u]);
-        if (n <= kQuietBudget) { return true; }
-        if (n == kQuietBudget + 1) {
-            char note[160];
-            const int len = tagEnd ? (int)(tagEnd - line) : 0;
+        if (n <= budget) { return true; }
+        if (InterlockedExchange(&noticeWritten, 1) == 0) {
+            char note[200];
             std::snprintf(note, sizeof(note),
-                          "   (quiet log: further '%.*s' lines suppressed; put %s beside Morrowind.exe for the full log)\r\n",
-                          len, line, kVerboseMarker);
+                          "   (quiet log: repeating lines are capped from here on; put %s beside Morrowind.exe for the full log)\r\n",
+                          kVerboseMarker);
             write(note);
         }
         return false;
     }
+
+    bool verbose() { return !quiet; }
 
 
     bool open(const char* filename) {
         close();
         quiet = (GetFileAttributesA(kVerboseMarker) == INVALID_FILE_ATTRIBUTES);
         for (auto& c : tagCount) { c = 0; }
+        noticeWritten = 0;
         handle = CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
         if (handle == INVALID_HANDLE_VALUE) {
