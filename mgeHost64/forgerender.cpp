@@ -19374,9 +19374,13 @@ namespace {
     // Stated in STOPS (R = 2^rStops, m = 2^mStops) because both span powers of two and a linear
     // slider cannot reach 1/128. OFF, or both at 0, is the pre-feature image bit for bit: every site
     // that applies a scale skips the multiply when the scale is exactly 1.
-    bool  g_sunny16      = false;
-    float g_sunnyRStops  = 0.0f;
-    float g_sunnyMStops  = 0.0f;
+    // ⚠ P4 (2026-09-27): ON by default at R = 2^3, m = 2^-3 — a 6-stop split between the families,
+    // the setting played through P3's door work and chosen by eye (user). Not the full photometric
+    // 2^6 / 2^-7 of the s_art probe: the FILMED-not-metered target (Kubrick candles) wants the
+    // artificial light a few stops brighter than a meter would put it.
+    bool  g_sunny16      = true;
+    float g_sunnyRStops  = 3.0f;
+    float g_sunnyMStops  = -3.0f;
     inline float sunnyR() { return g_sunny16 ? std::exp2(g_sunnyRStops) : 1.0f; }
     inline float sunnyM() { return g_sunny16 ? std::exp2(g_sunnyMStops) : 1.0f; }
     // What one scene unit is worth in cd/m² RIGHT NOW. kSceneUnitCd stays pinned (scenecal.h); R is
