@@ -240,9 +240,14 @@ float4 PS_MAIN( VSOutput In )
     d *= gFrameData.dbgScales.y;
 
     // Tier 2b material routing — identical to opaque.frag, S3a emissive gain included.
-    float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
+    // vColSource 3 (host-only, captured alpha-over smoke): DiffAmb, but the authored emissive is an
+    // ambient response rather than light — it scales with a, so the plume greys in shade by day and
+    // darkens with the night instead of glowing. Its emis is 0, so no emissive gain reaches it.
+    float3 emis = ((In.VColSource == 1u) ? In.Color.rgb
+                   : (In.VColSource == 3u) ? f3(0.0f) : In.MatEmissive)
                 * gShadowParams.calParams.x;
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+               : (In.VColSource == 3u) ? (In.Color.rgb * (d + a) + In.MatEmissive * a)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
     float4 albedo = sampleBase(In.TexIndex, clampMode, In.Uv, useLowAF(In.AlphaRef, true));
@@ -328,7 +333,8 @@ float4 PS_MAIN( VSOutput In )
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
     if (dbg == 7u) {                                      // ambient-only (matches opaque.frag)
         float3 al;
-        if (In.VColSource == 2u)      { al = In.Color.rgb * a + In.MatEmissive; }
+        if (In.VColSource == 3u)      { al = (In.Color.rgb + In.MatEmissive) * a; }
+        else if (In.VColSource == 2u) { al = In.Color.rgb * a + In.MatEmissive; }
         else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
         else                          { al = In.MatAmbient * a + In.MatEmissive; }
         RETURN(float4(al, 1.0f));

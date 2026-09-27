@@ -1053,4 +1053,11 @@ STRUCT(ShadowMaskParams)
     //       interior, and an uncapped floor would light the tunnel brighter than the ground outside.
     //   zw = spare
     DATA(float4,   skyAOFloor,       None);
+    // SUN PCSS DISC ROTATION NOISE (msmrecv.h.fsl sunDiscRotation):
+    //   x = 0 the legacy white hash of worldPosRel | 1 interleaved gradient noise on the PIXEL
+    //       (low-discrepancy: any 3x3 block covers the rotation range evenly) | 2 the same, offset per
+    //       frame so a temporal resolve (DLAA/DLSS) integrates it. The host picks 2 only while the
+    //       upscaler runs; without one a per-frame offset is plain flicker.
+    //   y = frame index (mod 64), read only in mode 2.   zw = spare
+    DATA(float4,   sunNoise,         None);
 };

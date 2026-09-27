@@ -4472,6 +4472,11 @@ namespace {
     float              g_sunPcssSearch   = 8.0f;  // blocker-search radius in TEXELS
     float              g_sunPcfMinRadius = 1.2f;  // TEXELS — contact hardness floor
     float              g_sunPcfMaxRadius = 3.9f; // TEXELS — past this SUN_PCF_TAPS breaks into rings
+    // Disc-rotation noise (shadowparams.h.fsl sunNoise): 0 white world hash (the old look), 1 pixel
+    // IGN static, 2 pixel IGN per frame, 3 auto = 2 under a temporal upscaler, else 1. The white hash
+    // left the penumbra grainy: under DLAA it re-rolls every frame (jitter moves the hashed point)
+    // but white noise has no spatial structure, so the resolve's neighbourhood clamp keeps it.
+    uint32_t           g_sunPcssNoise    = 3u;
     // Depth biases for the near cascade, in WORLD units (normalised at publish, like g_sunShadowBias).
     // Separate numbers because a binary depth compare and MSM's quadrature fail differently: MSM
     // needs a large constant bias to survive moment quantisation, PCF needs a small constant one plus
@@ -6330,6 +6335,8 @@ namespace {
     constexpr uint32_t kSkyVisFloat           = kSunny16Float + 4;
     // SKY-AO FLOOR (shadowparams.h.fsl skyAOFloor): x absolute interior-ambient luma, y cap.
     constexpr uint32_t kSkyAOFloorFloat       = kSkyVisFloat + 4;
+    // SUN PCSS NOISE (shadowparams.h.fsl sunNoise): x mode, y frame index.
+    constexpr uint32_t kSunNoiseFloat         = kSkyAOFloorFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6347,6 +6354,10 @@ namespace {
                   "skyAOFloor must fit inside the ShadowMaskParams CBV");
     static_assert(offsetof(ShadowMaskParams, skyAOFloor) == kSkyAOFloorFloat * sizeof(float),
                   "kSkyAOFloorFloat does not land on ShadowMaskParams::skyAOFloor");
+    static_assert((kSunNoiseFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "sunNoise must fit inside the ShadowMaskParams CBV");
+    static_assert(offsetof(ShadowMaskParams, sunNoise) == kSunNoiseFloat * sizeof(float),
+                  "kSunNoiseFloat does not land on ShadowMaskParams::sunNoise");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -26090,6 +26101,8 @@ namespace {
           // PCSS/PCF over the raw depth — the COLOUR receiver on every cascade. Unrelated to the MSM
           // softness above, which now exists only for the volumetric fog's per-step tap.
           t.checkbox("Sun PCSS: enable (off = MSM everywhere, the A/B)", &g_sunPcfNear);
+          t.sliderU("Sun PCSS: noise (0 white hash, 1 pixel IGN, 2 IGN per frame, 3 auto)",
+                    &g_sunPcssNoise, 0u, 3u, 1u);
           t.sliderF("Sun PCSS: penumbra SPREAD (fraction of blocker gap)", &g_sunPcssSpread, 0.0f, 0.5f, 0.005f, "%.3f");
           t.sliderF("Sun PCSS: blocker search radius (TEXELS)", &g_sunPcssSearch, 1.0f, 32.0f, 1.0f, "%.0f");
           t.sliderF("Sun PCSS: min PCF radius (TEXELS; contact hardness)", &g_sunPcfMinRadius, 0.5f, 8.0f, 0.1f, "%.2f");
@@ -30363,8 +30376,12 @@ void destroyHostWindow(Renderer* R);
         // describe different times of day. Read once here and used for the rail test AND both
         // clamps below — three sites that must agree or `rail=` reports on a limit that is not the
         // one being applied.
+        // g_expMaxNight is stated against MW's authored night at identity, and Sunny 16 scales that
+        // whole family by m — so the ceiling is divided by m, or a clear night (m = 2^-3) sits on
+        // the rail 3 stops under its setpoint. Same number in the knob, correct in either family.
+        const double expMaxNightNow = (double)g_expMaxNight / (double)sunnyM();
         const double expMaxNow = (g_skyPhys.active)
-            ? (double)(g_expMaxNight + (g_expMax - g_expMaxNight)
+            ? (expMaxNightNow + ((double)g_expMax - expMaxNightNow)
                                      * std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp)))
             : (double)g_expMax;
         const double gm = calGainDomain(lvl);
@@ -42446,7 +42463,19 @@ void destroyHostWindow(Renderer* R);
                     }
                     inst[idx * kStaticInstU32 + 0] = idx | (uvId << 16);   // DrawIndex | uv-anim id
                 }
-                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode, twoSided);
+                // SMOKE IS LIT, NOT LIGHT. A captured, lit, alpha-OVER particle (chimney smoke:
+                // tx_smokealpha00A, material emissive 0.76 grey) carries an authored emissive that MW
+                // adds flat, so the plume glows at night in MW too. The author wanted "pale in shade",
+                // not "self-lit", so vColSource 3 makes alpha.frag scale that emissive by the ambient
+                // instead of adding it. Additive draws (fire) and unlit ones (flames, whose client
+                // record forces emissive 1) keep their emission.
+                const uint32_t vcs = (isCaptured && !additive && it.vColSource == 2u
+                                      && (it.matEmissive[0] > 0.0f || it.matEmissive[1] > 0.0f
+                                          || it.matEmissive[2] > 0.0f)
+                                      && (it.matDiffuse[0] > 0.0f || it.matDiffuse[1] > 0.0f
+                                          || it.matDiffuse[2] > 0.0f))
+                                   ? 3u : it.vColSource;
+                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, vcs, it.clampMode, twoSided);
                 float* finst = (float*)inst;
                 // C3 debug: with the classify toggle on, matDiffuse carries the classification
                 // color instead (alpha.frag's bit3 branch returns In.MatDiffuse flat).
@@ -56784,6 +56813,16 @@ void destroyHostWindow(Renderer* R);
         mp[kSkyAOFloorFloat + 1] = std::max(0.0f, std::min(g_skyAOFloorMax, 1.0f));
         mp[kSkyAOFloorFloat + 2] = 0.0f;
         mp[kSkyAOFloorFloat + 3] = 0.0f;
+        // Sun PCSS disc noise. Auto (3) takes the per-frame sequence only while a TEMPORAL upscaler
+        // runs — it is what integrates it; without one, the static pixel pattern.
+        static uint32_t s_sunNoiseFrame = 0;
+        ++s_sunNoiseFrame;
+        uint32_t mode = g_sunPcssNoise;
+        if (mode >= 3u) { mode = upscaleTemporalActive() ? 2u : 1u; }
+        mp[kSunNoiseFloat + 0] = (float)mode;
+        mp[kSunNoiseFloat + 1] = (float)(s_sunNoiseFrame & 63u);
+        mp[kSunNoiseFloat + 2] = 0.0f;
+        mp[kSunNoiseFloat + 3] = 0.0f;
     }
 
     // THE SCREEN PASS (skyvis.comp): after the linearize, before the colour pass. Fills the params

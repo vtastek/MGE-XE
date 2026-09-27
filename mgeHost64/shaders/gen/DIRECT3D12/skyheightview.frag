@@ -1265,7 +1265,14 @@ STRUCT(ShadowMaskParams)
 
 
     float4 skyAOFloor;
-#line 1056
+
+
+
+
+
+
+    float4 sunNoise;
+#line 1063
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
