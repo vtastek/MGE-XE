@@ -4431,13 +4431,13 @@ namespace {
     // far-extent knob moves (going 2560 -> 8192 turned a tuned 15-unit bias into 49 units of
     // peter-panning). Same lesson as the softness knob. All cascades share one slab, so ONE number
     // covers them all — the texel-dependent part of the acne fix is the normal offset below.
-    float              g_sunShadowBias     = 12.0f;   // world units along the sun axis
-    float              g_sunShadowLBR      = 0.25f;  // light-bleeding reduction (amplify occlusion 1/(1-x))
+    float              g_sunShadowBias     = 64.0f;   // world units along the sun axis
+    float              g_sunShadowLBR      = 0.891f;  // light-bleeding reduction (amplify occlusion 1/(1-x))
     // Normal-offset in TEXELS of whichever cascade the receiver sampled, not world units: the acne it
     // fixes is a one-texel depth-quantisation error, so a world-unit offset is simultaneously too weak
     // for the coarse far cascade and a peter-panning gap in the fine near one. All cascades share one
     // depth slab, so the DEPTH bias above stays a single cascade-independent number.
-    float              g_sunShadowNormalOff= 1.5f;   // normal-offset in TEXELS (slope acne)
+    float              g_sunShadowNormalOff= 7.28f;   // normal-offset in TEXELS (slope acne)
     // Moments-map blur sigma in TEXELS (0 = raw map). This is the softness control: MSM's penumbra
     // comes from the DEPTH SPREAD inside a texel's neighbourhood, and an unblurred texel is a Dirac
     // (no spread → hard, pixel-shaped edges). Because it is measured in texels, softness scales with
@@ -4471,13 +4471,13 @@ namespace {
     float              g_sunPcssSpread   = 0.06f;
     float              g_sunPcssSearch   = 8.0f;  // blocker-search radius in TEXELS
     float              g_sunPcfMinRadius = 1.2f;  // TEXELS — contact hardness floor
-    float              g_sunPcfMaxRadius = 12.0f; // TEXELS — past this SUN_PCF_TAPS breaks into rings
+    float              g_sunPcfMaxRadius = 3.9f; // TEXELS — past this SUN_PCF_TAPS breaks into rings
     // Depth biases for the near cascade, in WORLD units (normalised at publish, like g_sunShadowBias).
     // Separate numbers because a binary depth compare and MSM's quadrature fail differently: MSM
     // needs a large constant bias to survive moment quantisation, PCF needs a small constant one plus
     // a slope term for surfaces raking away from the sun.
-    float              g_sunPcfBias      = 3.0f;  // world units, constant
-    float              g_sunPcfSlopeBias = 2.0f;  // world units, scaled by tan(acos(N.L))
+    float              g_sunPcfBias      = 0.0f;  // world units, constant
+    float              g_sunPcfSlopeBias = 0.24f;  // world units, scaled by tan(acos(N.L))
     // --- VOLUMETRIC height fog (volfog.frag.fsl) ------------------------------------------------
     // The moments map's remaining consumer: a ray march wants ONE filterable tap per step, which is
     // what MSM is for and what PCSS could never afford. Exponential height fog with single
@@ -4493,16 +4493,16 @@ namespace {
     // between clear air and pea soup. Expressing it as visibility distance spreads the same range
     // over thousands of units and makes it readable: 16000 units is roughly 230 m, i.e. light haze.
     float              g_volFogVisDist   = 16000.0f;// world units to optical depth 1 at the base
-    float              g_volFogFalloff   = 900.0f;  // world units of height per e-fold
-    float              g_volFogBase      = 0.0f;    // ABSOLUTE world height of the fog base (MW Z up)
+    float              g_volFogFalloff   = 399.0f;  // world units of height per e-fold
+    float              g_volFogBase      = 1091.0f;    // ABSOLUTE world height of the fog base (MW Z up)
     float              g_volFogMaxDist   = 12288.0f;// march clamp; sky rays run to here
     float              g_volFogSteps     = 24.0f;
     // How much a sun shadow dims the HAZE. 0 = not at all, and that is the energy-safe default: a
     // shadow then removes only the SHAFT. Anything above 0 makes the pass a net darkener at occlude 1,
     // because the haze no longer returns the fog radiance the occlude term took out.
-    float              g_volFogHazeShadow = 0.0f;
+    float              g_volFogHazeShadow = 1.0f;
     float              g_volFogTint[3]   = { 1.0f, 1.0f, 1.0f };   // neutral: keep the energy-neutral point honest
-    float              g_volFogIntensity = 1.0f;
+    float              g_volFogIntensity = 0.04f;
     // HAZE + DUAL-LOBE shafts. One HG lobe tied the sun halo, the anti-sun lift and the side
     // scattering to a single number, so the only way to get more fog at 90 degrees to the sun was to
     // make the halo explode. Split into a fog-coloured isotropic haze plus two sun-coloured lobes:
@@ -4514,15 +4514,15 @@ namespace {
     // The ceiling is a soft Reinhard knee on the LOBES (not a clamp — that would draw a disc edge
     // round the sun); the haze needs none, it is bounded by construction.
     float              g_volFogHaze      = 1.0f;    // haze gain: the side/horizontal knob; 1 = neutral
-    float              g_volFogAniso     = 0.72f;   // forward-lobe g
-    float              g_volFogFwdGain   = 0.55f;   // forward-lobe gain
-    float              g_volFogBackG     = -0.45f;  // back-lobe g (negative = back-scatter)
-    float              g_volFogBackGain  = 0.18f;   // back-lobe gain
-    float              g_volFogPhaseCeil = 4.0f;    // soft ceiling on the summed LOBES (0 = off)
+    float              g_volFogAniso     = 0.63f;   // forward-lobe g
+    float              g_volFogFwdGain   = 0.09f;   // forward-lobe gain
+    float              g_volFogBackG     = -0.72f;  // back-lobe g (negative = back-scatter)
+    float              g_volFogBackGain  = 0.44f;   // back-lobe gain
+    float              g_volFogPhaseCeil = 4.1f;    // soft ceiling on the summed LOBES (0 = off)
     // Sunshafts.fx `sunrayocclude`: how much of the image behind the fog is removed before the fog's
     // colour is added. 1.0 = the physically exact dst*transmittance composite; 0.75 is the legacy
     // shader's value and keeps bright shafts from blowing out. Never makes fog denser than physical.
-    float              g_volFogOcclude   = 0.75f;
+    float              g_volFogOcclude   = 0.45f;
     // Water-plane march clamp (volFog4.zw), restamped per frame from the water params — see the
     // clamp in volfog.frag for why the opaque prepass depth is not enough over open sea.
     float              g_volFogWaterZ    = 0.0f;
@@ -5878,9 +5878,9 @@ namespace {
     // Isles) against the old 256 / 8192 / 4, with the Tel Mutthada tunnel +0.68 -> +0.05. The inner
     // radius has to sit INSIDE a tunnel's walls for the march to see them; 8 taps are what keep a
     // 4096 reach from skipping over them.
-    float              g_skyAOInner     = 128.0f;
-    float              g_skyAOOuter     = 4096.0f;   // how far a cliff can still shade you
-    float              g_skyAOTaps      = 8.0f;      // steps per direction; 5 directions => 40 samples
+    float              g_skyAOInner     = 445.0f;
+    float              g_skyAOOuter     = 512.0f;   // how far a cliff can still shade you
+    float              g_skyAOTaps      = 5.0f;      // steps per direction; 5 directions => 40 samples
     // Sky AO marches a Gaussian-smoothed COPY of the map (skyheightblur.srt.h): the 32 u raster
     // staircase was the "square artifacts". Off = a verbatim copy, the A/B.
     bool               g_skyAOBlur      = true;
@@ -5921,15 +5921,15 @@ namespace {
     // Coverage belongs INSIDE the measure, because rgb x coverage is what MW displayed and
     // therefore what its encode clipped. See scenecolor.h.fsl.
     float              g_emisSdrExpand      = 6.0f;
-    float              g_skyAOOverhang      = 128.0f;
-    float              g_skyAOOverhangFade  = 1024.0f;
+    float              g_skyAOOverhang      = 2048.0f;
+    float              g_skyAOOverhangFade  = 8192.0f;
     // Never 0: a blocker the size of the meteor genuinely does remove sky, so the correction may only
     // lighten toward the truth and not past it. The residue in that band is GTAO's to own.
     // 1.0 = THE CORRECTION IS OFF, and the oracle is why: at every one of 160 swept settings on two
     // saves the best error had it off. It lightened every receiver with anything overhead toward open
     // sky — right under a bridge, badly wrong in a tunnel or under Tel Mutthada's roots, and the
     // oracle weighs the second kind heavily. The two-layer map is the honest fix for bridges.
-    float              g_skyAOOverhangFloor = 1.0f;
+    float              g_skyAOOverhangFloor = 0.354f;
     // --- SKY-AO GROUND TRUTH (skyoracle.frag.fsl, tasks/forge-skyao-oracle.md) ------------------
     // A DEV TOOL, armed only from MGE_HOST_KNOBS: skyOracleAt = the host frame to start at (0 = off,
     // and then not even the pipeline is built), skyOracleDirs = K. For K frames the published sun
@@ -7669,7 +7669,7 @@ namespace {
     // is a physical property of dirt, and the multiplier follows from the measurement above.
     //
     // It is still a look dial.
-    float    g_pbrTerrainDepth = 0.08f;
+    float    g_pbrTerrainDepth = 0.025f;
     // TERRAIN HEIGHT AO (pbrmaterial.h.fsl::pbrHeightAO) — occlusion from the `_paramh` height
     // field itself, at TEXEL scale, multiplying the ambient beside GTAO's contact-scale term and
     // skyAmbFactor's world-scale one. Three scales, three terms, all multiplying; none can see what
@@ -7680,7 +7680,7 @@ namespace {
     // `pbrTerrain` A/B is still outstanding. Arming an unmeasured cost on top of another unmeasured
     // cost is how a frame budget disappears without a suspect
     // ([[feedback_bracket_a_ceiling_before_building_for_it]]).
-    bool     g_pbrTerrainHeightAO = false;
+    bool     g_pbrTerrainHeightAO = true;
     float    g_pbrTerrainHeightAOStr = 1.0f;
     // The averaging level, ABSOLUTE mip of the param map. 4 = a 16-texel neighbourhood, which at
     // the ground's 1024 slices over a 512-unit square is ~8 world units (11 cm) — pit scale rather
@@ -7886,14 +7886,14 @@ namespace {
     // g_parallaxMesh / g_parallaxTerrain — the two surfaces, two arms. Separate for pbrTerrain's
     // reason exactly: the ground is a different shader over a different residency and it is the
     // expensive half, so the two have to be priced and judged apart.
-    bool     g_parallaxMesh    = false;
-    bool     g_parallaxTerrain = false;
+    bool     g_parallaxMesh    = true;
+    bool     g_parallaxTerrain = true;
     // The height range as a fraction of one UV unit — the same dimensionless, scale-free convention
     // every other depth here uses (slope = depth x dH/duv; see g_pbrTerrainDepth for the
     // derivation). 0.008 is the live DX9 value, and it is also what bounds the approximation D3
     // rests on: at 0.008 the uv offset is ~1/125 of a texture square, far too small to make
     // terrain's four fixed corner weights mean anything different.
-    float    g_parallaxScale   = 0.008f;
+    float    g_parallaxScale   = 0.01f;
     // THE OFFSET LIMITER. The offset is Vts.xy / (Vts.z + bias), and without the bias it diverges
     // as a surface turns edge-on — an unbounded uv step that smears the texture into streaks. At
     // 0.5 (the live DX9 value) the worst case is 2x the head-on offset.
@@ -7912,7 +7912,7 @@ namespace {
     // lowest of the four against this pixel's own. Its OWN arm because it is the expensive half on
     // the ground — it traces the height-BLENDED surface (so a shadow follows the profile the eye
     // sees), which is five taps per covered layer and up to 20 where four land textures meet.
-    bool     g_parallaxShadows      = false;
+    bool     g_parallaxShadows      = true;
     float    g_parallaxShadowSoften = 5.0f;    // DX9
     float    g_parallaxShadowScale  = 0.03f;   // DX9's 0.04 * 0.75
     // ─── The additive "Witcher" height blend, generalised from 2 layers to 4. TERRAIN ONLY ───────
@@ -7921,7 +7921,7 @@ namespace {
     // transfer unchanged. The new weights replace the bilinear ones at the ONE site they are
     // defined, so the albedo, the `_paramh` material, the cdblur gradient and the height AO all
     // track the same surface.
-    bool     g_heightBlend         = false;
+    bool     g_heightBlend         = true;
     // 1.0 = DX9. 0.559 is the tuned value under the SOFTMAX cut, by eye, 2026-09-21: the softmax
     // sharpens more gently than the hard cut did, so it wants less of it, not more.
     float    g_heightBlendStrength = 0.559f;   // was 1.0 (DX9)
@@ -7952,7 +7952,7 @@ namespace {
     // whole square. Read by terrain.frag with every other arm off, so it is NOT gated on one.
     // Ships at the identity on purpose: widening is a LOOK decision, and roads and cultivated
     // fields are precisely the content a wider ramp moves.
-    float    g_heightBlendWidth    = 0.25f;
+    float    g_heightBlendWidth    = 0.599f;
     // ─── MACRO VARIATION — the TILING repeat, which is a third artifact and not the blend ──────
     // `uv = lat * 0.25` tiles every land texture once per 512 world units, axis-aligned, in global
     // phase, with no variation — a grid that survives however well the squares blend. Broken here
@@ -7964,7 +7964,7 @@ namespace {
     // want a world-XY field, which is a different knob and does not exist yet.
     // Ships OFF: no artifact was reported here and the amplitude is a taste decision. 0.08-0.12 is
     // the range to try first.
-    float    g_terrainMacroAmp     = 0.0f;
+    float    g_terrainMacroAmp     = 0.35f;
     // Two INCOMMENSURATE periods in world Z, so the field does not read as one sine (a contour map).
     // Tuned by eye 2026-09-21 — both roughly 3x the first guess. Longer bands read as weathering;
     // the short ones read as contour lines, which is the failure this pair was chosen to avoid.
@@ -7976,7 +7976,7 @@ namespace {
     // ARM 2 — world-XY value noise. The band arm above is a function of elevation and slope, so it
     // is CONSTANT on a plane, and a plane is exactly where the 512-unit repeat is easiest to see.
     // This one has no such blind spot: its coordinate IS the ground plane. No tap, ~20 ALU.
-    float    g_terrainMacroNoiseAmp = 0.0f;
+    float    g_terrainMacroNoiseAmp = 0.35f;
     // Tuned by eye 2026-09-21. ⚠ At 365.75 the SECOND octave runs at 99 world units, which the
     // band-limit fades out at almost any distance — so this setting is close range only, and most
     // of the frame is carried by the first octave alone. That is a deliberate look choice, not an
@@ -7986,7 +7986,7 @@ namespace {
     // texture's 1x1 mip, so the factor is exactly mean 1 PER TEXTURE and the variation is the
     // texture's own tonal statistics. It is the only arm that cannot look foreign, and the only one
     // that costs taps — two, on the axis terrain is actually bound on, so price it before arming it.
-    float    g_terrainMacroTexAmp   = 0.0f;
+    float    g_terrainMacroTexAmp   = 0.673f;
     // ⚠ THE TILE AND THE LEVEL SET THIS ARM'S CONTRAST, NOT JUST ITS SCALE, and that is measured,
     // not assumed. A coarse mip of a land texture is a 64x-averaged image and is nearly flat, so a
     // low-resolution copy carries almost no variation to scale up. At amp 1.0, `geo` moved:
@@ -8019,10 +8019,10 @@ namespace {
     //     with no motion vector to match — ghosting at the effect's edge under TAA/DLSS. The DX9 side
     //     paid for this already (`dispfix:91013bc2 "fix terrain displacement motion blur issue"`).
     // 4a exists to find where those two break, cheaply, BEFORE any geometry work is committed.
-    bool     g_terrainDisp       = false;
-    float    g_terrainDispScale  = 6.0f;      // DX9 displacementScale, WORLD UNITS, one-sided (down)
+    bool     g_terrainDisp       = true;
+    float    g_terrainDispScale  = 8.0f;      // DX9 displacementScale, WORLD UNITS, one-sided (down)
     float    g_terrainDispGamma  = 0.25f;     // DX9 displacementGamma — a 4th power, so only deep parts carve
-    float    g_terrainDispPivot  = 1.0f;      // DX9 displacementPivot (1.0 = identity)
+    float    g_terrainDispPivot  = 0.25f;      // DX9 displacementPivot (1.0 = identity)
     // The disc. Near-player by design, and SHRUNK in 4b (was 1280/2560): the patch system spends
     // its triangles inside the disc rather than across whole cells, so the right reach is the one
     // the eye actually inspects — DX9's own inner figure is ~1500.
@@ -8050,7 +8050,7 @@ namespace {
     // = ~256 texels of a 1024 map tiling once per 512, so mip 0 would sample the field at 1/256 of
     // its rate: aliasing that crawls as the camera moves. 8 is the band-limit that matches the
     // lattice; it is a knob because the right answer moves with the map's resolution.
-    float    g_terrainDispLod    = 8.0f;
+    float    g_terrainDispLod    = 6.0f;
     // THE fade end, as everything that consumes it must see it: the shader's own max(), and the
     // ring-bounding ceiling above. ONE accessor so the cbuffer lane, the geometry disc and the
     // panel read-back cannot disagree — [[feedback_one_knob_two_jobs]] / gate at the PRODUCER.
@@ -18466,7 +18466,7 @@ namespace {
     // uniformly bright sky blooms to itself and adds no haze because blur(const) == const. 0 is an
     // exact identity — verification step 3 is exactly that claim, and it is a real regression test on
     // the param upload, the extra descriptor and the SRT append.
-    float    g_bloomStrength = 0.06f;
+    float    g_bloomStrength = 0.5f;
     // THRESHOLD, in post-exposure scene-referred units. **SHIPS AT 0 — thresholdless**, per the
     // decision this step was built to. The knob exists so the question can be asked in a running
     // game, not because a non-zero answer is expected: a threshold is what a bloom needs when the
@@ -18525,7 +18525,7 @@ namespace {
     // ⚠ THE LERP STAYS. It is not what was making the image darker — at b = 0.25 the core gives up
     // 1.5%, i.e. 0.02 stops, and the lerp is the entire reason the form needs no threshold
     // (blur(const) == const). Reach was the problem; energy conservation was not.
-    float    g_bloomPsf = 0.25f;
+    float    g_bloomPsf = 0.491f;
     // Inverse-luminance (Karis) prefilter weighting, 1/(1 + luma).
     //
     // ⚠ **OFF, AND THE REASON IS THAT THIS BLOOM IS PHYSICAL** (user, 2026-08-18: *"physical bloom was
@@ -19102,7 +19102,7 @@ namespace {
     // g_ao* knob, so this declaration IS the persistence story — the host starts every session with
     // AO live and nothing needs ticking. The checkbox stays, as an A/B.
     bool  g_aoEnable         = true;    // AO visibility modulates ambient (also arms the AO dispatch)
-    bool  g_bentNormalEnable = false;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
+    bool  g_bentNormalEnable = true;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
     bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
     // AO MULTI-BOUNCE (Activision/Jimenez GTAO course notes) — bit5. `ambient *= visibility` drives
     // an occluded pocket toward BLACK, and a crevice in a green field is dark GREEN because the
@@ -19505,7 +19505,7 @@ namespace {
     //
     // Ships at 80 per the user's own number (*"It should reach 80 APL"*).
     // `calDayCentre=69.28203 calBandHalf=1.154701 calBandUp=1.154701` restores the old row exactly.
-    float g_calDayCentre = 80.0f;
+    float g_calDayCentre = 80.02f;
     // A floor, so a pathological weather (or a frame with no lighting at all) cannot walk the
     // setpoint to zero and take E with it. Well below MW's darkest authored night.
     constexpr float kCalMwMinCentre = 10.0f;
@@ -20382,7 +20382,7 @@ namespace {
     // roughness by construction — they are the same physical quantity, and every past attempt to move
     // them independently produced a surface whose highlights disagreed with its shape. 1.0 = the
     // texture's own baked amplitude, i.e. the pre-W1 look.
-    float g_waterWaveAmp = 1.0f;
+    float g_waterWaveAmp = 0.39f;
     bool  g_waveHeightView = false;
     // The GGX specular tilts with camera MOTION and is correct the moment the camera stops — which a
     // rasterizer cannot do on its own, so an input is stale. Reflections are stable, so it is not the
@@ -21826,10 +21826,10 @@ namespace {
     bool  g_shadowEnable     = true;
     bool  g_shadowFaceDebug  = false;   // shadowmask debug 1: nibble = face id (convention check FIRST)
     bool  g_shadowAtlasDebug = false;   // shadowmask debug 2: nibble = atlas depth (slot-0 block on screen)
-    float g_shadowSlack      = 0.030f;  // relative reverse-Z compare slack (acne knob; live via mask params).
+    float g_shadowSlack      = 0.04f;  // relative reverse-Z compare slack (acne knob; live via mask params).
                                         // Tuned for the CULL_FRONT (back-face) caster default below — storing the
                                         // far faces removes acne, so positive slack just tightens contact.
-    float g_shadowBias       = 0.0023f; // ABSOLUTE reverse-Z compare bias (contact/interpenetration knob; live).
+    float g_shadowBias       = 0.00032f; // ABSOLUTE reverse-Z compare bias (contact/interpenetration knob; live).
                                         // Replaces the old baked PSO constant depth bias. Tuned to +0.0023 with
                                         // CULL_FRONT casters: positive = tighter contact with no gap (back faces
                                         // stored, nothing to acne against).
@@ -21917,7 +21917,7 @@ namespace {
     // instance record carries final colour+size+intensity), so these are plain live knobs — no shader
     // or FrameData change. See [[project_light_radius_mesh_independent]] / [[project_emissive_light_coupling]].
     bool  g_drawGlow        = true;              // A/B enable (dev panel checkbox)
-    float g_glowFlux        = 1.0f;              // kGlowFlux: sprite brightness law scale (the tunable far-border knob)
+    float g_glowFlux        = 0.1f;              // kGlowFlux: sprite brightness law scale (the tunable far-border knob)
     float g_glowFalloffPow  = 1.45f;             // ARTISTIC extra falloff exponent: intensity ∝ (fadeStart/d)^pow.
                                                  //   (user-tuned 2026-07-16; 0 = pure physical radiance — see below)
                                                  // DEFAULT 0 (flat) is the PHYSICAL answer: a resolved emitter's
