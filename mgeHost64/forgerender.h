@@ -90,6 +90,12 @@ namespace ForgeRender {
     // blocking on its own fence. Null ⇒ client keeps the old "RPC reply implies GPU-complete".
     void* sharedFenceHandle();
 
+    // Tier 1 EVENT handoff: a manual-reset Win32 event (host-process handle) the host sets, via
+    // SetEventOnCompletion, when the shared fence reaches the frame's value. For clients that cannot
+    // import the fence as a semaphore (Wine/Proton): they CPU-wait this before the RT copy. Null
+    // when the host has no shared fence.
+    void* frameEventHandle();
+
     // Tier 1: the value signalled on that shared fence for the frame renderScene just submitted.
     // Monotonic, one increment per submitted frame. The server puts it in the RenderFrame reply so
     // the client knows WHICH value to wait on before copying the shared RT. 0 until the first
@@ -101,7 +107,9 @@ namespace ForgeRender {
     // here before renderScene. false ⇒ renderScene fence-waits its own frame before returning, i.e.
     // the pre-Tier-1 behaviour, so the reply again implies "GPU-complete". Defaults to false, so a
     // client that never calls this can never be handed a half-drawn frame.
-    void setClientSyncsOnFence(bool syncs);
+    // mode (bridge.h clientSyncsOnFence): 0 = host must settle, 1 = client GPU-waits the fence as a
+    // semaphore, 2 = client CPU-waits frameEventHandle().
+    void setClientSyncsOnFence(unsigned mode);
 
     // (eyeNow - bakeEye) for this frame: the mode-3 park delta the client pre-cancelled the SKY
     // payload by. Zero on the serial paths. The reflect pass needs it to place its sky mirror plane

@@ -152,6 +152,10 @@ namespace {
     // DevInput each kickoff (bridge.h DevInput frame-ahead fields). Set at the collect
     // (wait) and the mwstart close; read at the next kickoff — 1-frame skew, panel only.
     double g_lastWaitMsStat = 0.0;     // last residual collect wait (pipeline success metric)
+    // Tier 1 event handoff: CPU ms the last RT copy spent waiting the host's frame event (part of
+    // the [hb] copy= bucket; echoed alone as evw= so a host GPU tail landing on MW's main thread is
+    // visible). Always 0 on the semaphore and blocking paths.
+    double g_lastEventWaitMs = 0.0;
     // Last host phase split received over the wire (Tier 1, tasks/forge-host-gpu-lane.md). Feeds
     // the Tracy plots at the finish site and the [hb] echo below — the echo is the CHECK that the
     // x86/x64 struct actually arrived intact: its numbers must match mgeHost64.log's own
@@ -177,7 +181,7 @@ namespace {
     // own cost (kickoff prep + residual wait + copy + blit), so feed is comparable across
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
-    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN;
+    struct Accum { double feed, geom, build, render, host, overlap, copy, evwait, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN;
                    double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; double bKeys;
                    double maxBuild, bCaptures; };   // Phase 0: build-split sub-probe (+ Stage 0 spike observability)
     Accum g_hb = {};
@@ -1096,6 +1100,12 @@ namespace {
     HANDLE      g_fenceHandle = nullptr;          // duplicated host fence NT handle (we own it)
     VkSemaphore g_frameSem    = VK_NULL_HANDLE;   // owned
     bool        g_frameSemOk  = false;
+    // Tier 1 EVENT handoff — the fallback when the semaphore import is unavailable (Wine/Proton).
+    // A manual-reset event the HOST resets and re-arms (SetEventOnCompletion) with every frame's
+    // fence signal; we only ever WAIT it, on the CPU, before the RT copy. g_frameEventOk ⇒ we told
+    // the host clientSyncsOnFence = 2. Never used while g_frameSemOk (the GPU wait is strictly better).
+    HANDLE      g_frameEvent   = nullptr;         // duplicated host event handle (we own it)
+    bool        g_frameEventOk = false;
 
     HMODULE g_vulkanDll = nullptr;
 
@@ -1477,6 +1487,8 @@ namespace {
         g_dstImg = VK_NULL_HANDLE;
         if (g_hostHandle)  { CloseHandle(g_hostHandle); g_hostHandle = nullptr; }
         if (g_fenceHandle) { CloseHandle(g_fenceHandle); g_fenceHandle = nullptr; }
+        if (g_frameEvent)  { CloseHandle(g_frameEvent); g_frameEvent = nullptr; }
+        g_frameEventOk = false;
         if (g_vki)         { g_vki->Release(); g_vki = nullptr; }
         g_inst = VK_NULL_HANDLE; g_phys = VK_NULL_HANDLE; g_dev = VK_NULL_HANDLE; g_queue = VK_NULL_HANDLE;
     }
@@ -1614,17 +1626,20 @@ namespace {
         // duplicated into THIS process.
         HANDLE hostHandle = nullptr;
         HANDLE hostFence = nullptr;
+        HANDLE hostEvent = nullptr;
         // MSAA: Configuration.AALevel is the D3DMULTISAMPLE value (0/2/4/8); map 0 -> 1 sample.
         const std::uint32_t sampleCount = Configuration.AALevel > 0 ? (std::uint32_t)Configuration.AALevel : 1u;
         // AF: Configuration.AnisoLevel (0 = off, else max anisotropy) — host sampler (Phase 2).
         const std::uint32_t anisoLevel = (std::uint32_t)Configuration.AnisoLevel;
-        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr, &hostHandle, &hostFence) || hostHandle == nullptr) {
+        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr, &hostHandle, &hostFence, &hostEvent) || hostHandle == nullptr) {
+            if (hostEvent) { CloseHandle(hostEvent); }
             LOG::logline("!! [seam] renderInit RPC failed or no shared handle; seam disabled");
             releaseAll();
             return;
         }
         g_hostHandle = hostHandle;
         g_fenceHandle = hostFence;   // may be null; probeSharedFenceSemaphore reports either way
+        g_frameEvent  = hostEvent;   // may be null; only adopted if the semaphore import fails
         LOG::logline(">> [seam] host shared-RT NT handle (this process) = %p", hostHandle);
 
         // Cross-vendor: pick the first external handle type the GPU can import.
@@ -1661,10 +1676,15 @@ namespace {
         // its own frame once we have said we can wait it ourselves, so an import failure silently
         // degrades to the old blocking behaviour instead of to a torn composite.
         probeSharedFenceSemaphore();
-        g_client->setClientSyncsOnFence(g_frameSemOk);
+        // No semaphore ⇒ fall back to the host's frame EVENT: a CPU wait before the copy instead of
+        // a GPU one, but it still frees the host from settling its own frame. Needs the fence too —
+        // the event is only ever set by that fence's SetEventOnCompletion.
+        g_frameEventOk = !g_frameSemOk && g_frameEvent != nullptr && g_fenceHandle != nullptr;
+        g_client->setClientSyncsOnFence(g_frameSemOk ? 1u : g_frameEventOk ? 2u : 0u);
         LOG::logline(">> [seam][tier1] host frame overlap %s",
-                     g_frameSemOk ? "ENABLED (client waits the shared fence before each RT copy)"
-                                  : "DISABLED (no semaphore — host keeps its own fence wait)");
+                     g_frameSemOk   ? "ENABLED (client GPU-waits the shared fence before each RT copy)"
+                     : g_frameEventOk ? "ENABLED via EVENT (client CPU-waits the host's frame event before each RT copy)"
+                                      : "DISABLED (no semaphore, no event — host keeps its own fence wait)");
 
         g_initOk = true;
         LOG::logline(">> [seam] DXVK Vulkan-interop seam ready (%ux%u). F11 toggles the composite.", g_w, g_h);
@@ -1770,7 +1790,27 @@ namespace {
             si.pWaitDstStageMask    = &waitStage;
         }
 
+        // Tier 1 EVENT handoff: no semaphore to put on the submit, so hold the submit itself until
+        // the host's frame event says its fence reached this frame's value. Placed after recording
+        // so the record overlaps the host's GPU tail. The event is manual-reset and only the host
+        // resets it (before the Signal of the NEXT frame, which cannot happen until we kick it off),
+        // so a set event here always vouches for THIS frame — or for a later-still one if the host
+        // skipped its signal, which is the same "last completed frame" the semaphore path would
+        // copy. A timeout copies anyway: a torn frame beats a hung game; it is logged.
+        const double tcEv0 = nowMs();
+        if (g_frameEventOk && waitValue != 0) {
+            MGE_ZoneScopedN("RTcopy: frame event wait");
+            const DWORD w = WaitForSingleObject(g_frameEvent, 2000);
+            if (w != WAIT_OBJECT_0) {
+                static unsigned s_evTimeouts = 0;
+                if (s_evTimeouts++ < 8) {
+                    LOG::logline("!! [seam][tier1] frame event wait for fence %llu timed out (wait=0x%lX) — copying anyway",
+                                 (unsigned long long)waitValue, (unsigned long)w);
+                }
+            }
+        }
         const double tcRecord = nowMs();
+        g_lastEventWaitMs = tcRecord - tcEv0;
         double tcLocked = tcRecord, tcSubmit = tcRecord;
         // [experimental, uncommitted] Hold DXVK's submission-queue lock ONLY for the submit —
         // NOT across the fence wait. The fence is ours; waiting on it touches no DXVK queue state.
@@ -1797,6 +1837,7 @@ namespace {
         const double total = tcEnd - tc0;
         MGE_TracyPlot("Forge RTcopy flush ms", tcFlush - tc0);
         MGE_TracyPlot("Forge RTcopy wait ms",  tcEnd - tcSubmit);
+        MGE_TracyPlot("Forge RTcopy event wait ms", tcRecord - tcEv0);
         // Only rare spikes log. The trigger deliberately EXCLUDES the fence-wait phase: since Tier 1
         // that phase also contains the semaphore wait for the host's draw, which is multi-ms by
         // design on every frame — testing `total` here made this fire once per frame (1848 lines in
@@ -1804,10 +1845,13 @@ namespace {
         // the multimap night scene. What is still worth a line is a stall in the parts that are
         // supposed to be ~0: the DXVK flush, the submit lock, the record, the submit. The waiting
         // itself stays visible in the Tracy plot below and in the [hb] copy= average.
-        const double nonWait = total - (tcEnd - tcSubmit);
+        // The frame-event wait (Wine path) is a host-GPU wait by design too, so it is excluded the
+        // same way and reported as its own column.
+        const double evWait = tcRecord - tcEv0;
+        const double nonWait = total - (tcEnd - tcSubmit) - evWait;
         if (nonWait > 3.0) {
-            LOG::logline(">> [rtcopy] spike nonWait=%.2fms total=%.2f | flush=%.2f record=%.2f lock=%.2f submit=%.2f wait=%.2f",
-                         nonWait, total, tcFlush - tc0, tcRecord - tcFlush, tcLocked - tcRecord,
+            LOG::logline(">> [rtcopy] spike nonWait=%.2fms total=%.2f | flush=%.2f record=%.2f evwait=%.2f lock=%.2f submit=%.2f wait=%.2f",
+                         nonWait, total, tcFlush - tc0, tcEv0 - tcFlush, evWait, tcLocked - tcRecord,
                          tcSubmit - tcLocked, tcEnd - tcSubmit);
         }
         return r == VK_SUCCESS;
@@ -5446,7 +5490,7 @@ namespace RenderProcess {
         g_hb.feed += feed; g_hb.geom += (ks.tGeomFlush - ks.tBuild);
         g_hb.build += (ks.tBuild - ks.tStart);
         g_hb.render += renderBucket; g_hb.host += fr.hostMs; g_hb.overlap += fr.overlap;
-        g_hb.copy += (fr.tCopy - fr.tRender); g_hb.blit += blitMs; g_hb.dt += ks.dtPresent;
+        g_hb.copy += (fr.tCopy - fr.tRender); g_hb.evwait += g_lastEventWaitMs; g_hb.blit += blitMs; g_hb.dt += ks.dtPresent;
         g_hb.mwstart += g_pendingMwStart; g_pendingMwStart = 0.0;   // A0 Cut-4 probe (1-frame skew on deferred frames)
         g_hb.captured += ks.capturedCount;
         // [alpha-dedup] window min/max. A steady count is a real duplicate being suppressed every
@@ -5471,10 +5515,10 @@ namespace RenderProcess {
             // window-guard refusals (must stay 0 — nonzero means an unaudited RPC site
             // fired inside the now frame-long async window).
             LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f build=%.2f render=%.2f[host=%.2f] "
-                         "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f mwstart=%.2f early=%u pipe=%u refuse=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
+                         "overlap=%.2f copy=%.2f[evw=%.2f] blit=%.2f dt=%.2f mwstart=%.2f early=%u pipe=%u refuse=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
                          g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n, g_hb.build / g_hb.n,
                          g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
-                         g_hb.copy / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n,
+                         g_hb.copy / g_hb.n, g_hb.evwait / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n,
                          g_hb.mwstart / g_hb.n, g_hb.earlyN,
                          g_hb.pipeN, g_client ? g_client->windowRefusals() : 0u,
                          g_hb.captured / g_hb.n,

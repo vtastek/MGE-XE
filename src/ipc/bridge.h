@@ -305,6 +305,14 @@ namespace IPC {
         // create a shared fence; the client must keep the old blocking contract. Appended after
         // `ok` so every existing field offset is unchanged.
         OUT HANDLE32 frameFenceHandle;
+
+        // Tier 1 EVENT handoff: a manual-reset Win32 event, duplicated into the client, that the host
+        // has SetEventOnCompletion set when the shared fence reaches the frame's value. For clients
+        // that cannot import the fence as a semaphore (Wine/Proton, where the import crashes
+        // win32u): the client CPU-waits it before the RT copy and reports clientSyncsOnFence = 2.
+        // The client never resets it — the host does. Null ⇒ unavailable. Appended after
+        // frameFenceHandle so every existing field offset is unchanged.
+        OUT HANDLE32 frameEventHandle;
     };
 
     // Dev overlay input snapshot forwarded client -> host each frame (Stage 2). Mouse is in host
@@ -527,7 +535,11 @@ namespace IPC {
         // this DXVK build) and cannot make the copy safe. The host must then keep its old
         // end-of-frame fence wait, which restores the "reply implies GPU-complete" contract. This
         // field is the ONLY thing standing between such a machine and a torn frame every frame, so
-        // it is fail-SAFE by construction: anything but an explicit 1 means "host must block".
+        // it is fail-SAFE by construction: anything but an explicit 1 or 2 means "host must block".
+        //
+        // 2 ⇒ no semaphore, but the client will CPU-wait renderInit's frameEventHandle (set by the
+        // host's SetEventOnCompletion for this frame's value) before touching the shared RT. The
+        // host also needs the event armed for the frame, or it settles regardless.
         // Appended after the near-cell fields so every existing IN offset is unchanged.
         IN std::uint32_t clientSyncsOnFence;
 

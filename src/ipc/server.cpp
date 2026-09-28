@@ -426,6 +426,7 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.renderInitParams;
 		params.framebufferHandle = nullptr;   // reused as the shared-RT NT handle (client-process value)
 		params.frameFenceHandle = nullptr;    // Tier 1 shared frame fence (client-process value)
+		params.frameEventHandle = nullptr;    // Tier 1 frame-complete event (client-process value)
 		params.ok = false;
 
 		if (!ForgeRender::init(params.width, params.height, params.sampleCount, params.anisoLevel)) {
@@ -466,16 +467,29 @@ namespace IPC {
 				clientFence = nullptr;
 			}
 		}
+		// ...and the frame-complete event (the CPU handoff for clients that cannot import the fence).
+		// Same best-effort rule. SYNCHRONIZE is all the client needs — it only ever waits it.
+		HANDLE clientEvent = nullptr;
+		HANDLE hostEvent = static_cast<HANDLE>(ForgeRender::frameEventHandle());
+		if (hostEvent != nullptr) {
+			if (!DuplicateHandle(GetCurrentProcess(), hostEvent, m_clientProcess, &clientEvent,
+					SYNCHRONIZE, FALSE, 0)) {
+				LOG::winerror("[seam] failed to duplicate frame event handle to client");
+				clientEvent = nullptr;
+			}
+		}
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4302 4311)
 		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
 		params.frameFenceHandle = static_cast<HANDLE32>(clientFence);
+		params.frameEventHandle = static_cast<HANDLE32>(clientEvent);
 #pragma warning(pop)
 		params.ok = true;
 		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT, host handle %p -> client %p) sceneReady=%d",
 			params.width, params.height, hostHandle, clientHandle, (int)ForgeRender::sceneReady());
 		LOG::logline(">> [seam] shared frame fence: host %p -> client %p", hostFence, clientFence);
+		LOG::logline(">> [seam] frame event: host %p -> client %p", hostEvent, clientEvent);
 		LOG::flush();
 	}
 
@@ -686,9 +700,9 @@ namespace IPC {
 			ForgeRender::setNearCells(params.nearCellX, params.nearCellY,
 				params.nearCellMask, params.nearCellReach, params.nearRefsVersion, params.nearFwd);
 			// Tier 1: does the client hold the sync object that makes overlapping this frame's GPU
-			// work past our reply safe? Fail-safe — anything but an explicit 1 makes renderScene
-			// settle its own frame before returning, exactly as it did pre-Tier-1.
-			ForgeRender::setClientSyncsOnFence(params.clientSyncsOnFence == 1u);
+			// work past our reply safe? Fail-safe — anything but an explicit 1 (semaphore) or 2 (event)
+			// makes renderScene settle its own frame before returning, exactly as it did pre-Tier-1.
+			ForgeRender::setClientSyncsOnFence(params.clientSyncsOnFence);
 			// Mode-3 park: the delta the sky payload was pre-cancelled by, so the reflect pass can
 			// put its sky mirror plane at the FIRE-time camera height (see bridge.h).
 			ForgeRender::setSkyParkEyeDelta(params.skyParkEyeDelta);

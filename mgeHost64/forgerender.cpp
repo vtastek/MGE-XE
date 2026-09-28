@@ -2477,6 +2477,12 @@ namespace {
         ID3D12Fence*    pSharedFence = nullptr;
         HANDLE          ntFenceHandle = nullptr;   // host-process NT shared handle for pSharedFence
         uint64_t        sharedFenceValue = 0;      // last value signalled on pSharedFence
+        // Tier 1 EVENT handoff (the Wine/Proton path, where the client cannot import the fence as a
+        // semaphore): a MANUAL-reset Win32 event, duplicated into the client, that
+        // SetEventOnCompletion sets when pSharedFence reaches the frame's value. The client only
+        // WAITS it; the host is the only side that resets it (see armFrameEvent). Created
+        // signalled, meaning "no registration outstanding".
+        HANDLE          hFrameEvent = nullptr;
         // Tier 1: between-frames GPU work (arena grow-by-copy) gets its OWN pool/cmd/fence, following
         // the pHizCmdPool precedent. It used to borrow the frame loop's pCmdPool/pCmd/pFence and
         // resetCmdPool them, which was safe only while renderScene fence-waited its own frame before
@@ -16696,6 +16702,12 @@ namespace {
     // Defaults FALSE: a client that never reports (old build, failed import, no shared fence) gets
     // the pre-Tier-1 blocking behaviour rather than a torn composite.
     bool      g_clientSyncsOnFence = false;
+    // Which sync object the client waits (bridge.h clientSyncsOnFence): 1 = GPU semaphore,
+    // 2 = CPU wait on g_live.hFrameEvent. Only meaningful while g_clientSyncsOnFence is true.
+    uint32_t  g_clientSyncMode = 0;
+    // Latched when SetEventOnCompletion refuses: the event can no longer vouch for a frame, so
+    // renderScene falls back to settling its own frame (the pre-Tier-1 contract) for good.
+    bool      g_frameEventBroken = false;
     // Tier 1 retirement queue. A texture-revision re-upload (uploadTextures, dlLoadAtlas) used to
     // removeResource the OLD Texture* on the spot, on the grounds that "the GPU doesn't read them
     // until renderScene (its own fence). Safe between frames." That grounds is gone: a frame may be
@@ -28712,8 +28724,13 @@ void destroyHostWindow(Renderer* R);
             g_live.ntFenceHandle = nullptr;
         } else {
             std::printf("[forge] live shared FENCE NT handle = %p\n", (void*)g_live.ntFenceHandle);
+            // The event handoff rides on the same fence, so it only exists alongside it. Manual
+            // reset, initially SIGNALLED = "no SetEventOnCompletion registration outstanding".
+            g_live.hFrameEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+            std::printf("[forge] live shared frame EVENT = %p\n", (void*)g_live.hFrameEvent);
         }
         g_live.sharedFenceValue = 0;
+        g_frameEventBroken = false;
 
         RenderTargetDesc rtDesc = {};
         rtDesc.mWidth = width;
@@ -29294,6 +29311,10 @@ void destroyHostWindow(Renderer* R);
         return (void*)g_live.ntFenceHandle;
     }
 
+    void* frameEventHandle() {
+        return (void*)g_live.hFrameEvent;
+    }
+
     // 0 when the host has no shared fence — the client reads that as "no sync object, don't
     // overlap" and keeps the old blocking contract.
     unsigned long long lastFrameFenceValue() {
@@ -29391,16 +29412,55 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
-    void setClientSyncsOnFence(bool syncs) {
+    void setClientSyncsOnFence(unsigned mode) {
         // AND with our own half: no shared fence here means no value for the client to wait on, no
-        // matter what it believes it imported.
-        const bool want = syncs && (g_live.pSharedFence != nullptr);
-        if (want != g_clientSyncsOnFence) {
-            std::printf("[forge] Tier 1 frame overlap %s (client sync=%d, host shared fence=%d)\n",
-                        want ? "ENABLED" : "DISABLED (host will fence-wait its own frame)",
-                        (int)syncs, (int)(g_live.pSharedFence != nullptr));
+        // matter what it believes it imported — and mode 2 additionally needs the event, armed.
+        const bool haveFence = (g_live.pSharedFence != nullptr);
+        const bool want = (mode == 1u && haveFence)
+                       || (mode == 2u && haveFence && g_live.hFrameEvent && !g_frameEventBroken);
+        const uint32_t m = want ? mode : 0u;
+        if (want != g_clientSyncsOnFence || m != g_clientSyncMode) {
+            std::printf("[forge] Tier 1 frame overlap %s (client sync=%u, host shared fence=%d, event=%d%s)\n",
+                        !want      ? "DISABLED (host will fence-wait its own frame)"
+                        : m == 2u  ? "ENABLED via CPU EVENT"
+                                   : "ENABLED via GPU SEMAPHORE",
+                        mode, (int)haveFence, (int)(g_live.hFrameEvent != nullptr),
+                        g_frameEventBroken ? ", BROKEN" : "");
         }
         g_clientSyncsOnFence = want;
+        g_clientSyncMode = m;
+    }
+
+    // Tier 1 event handoff: make g_live.hFrameEvent mean "pSharedFence has reached `value`".
+    // Called with the frame's Signal, so the event and the value it vouches for move together.
+    //
+    // ⚠ THE WAIT BEFORE THE RESET IS WHAT MAKES A MANUAL-RESET EVENT SOUND HERE. SetEventOnCompletion
+    // sets the event ASYNCHRONOUSLY (vkd3d-proton's fence worker; the driver on Windows), so the
+    // previous frame's registration can fire AFTER our own fence wait has already returned. Reset
+    // before it lands and that late set would open the gate for THIS frame while it is still being
+    // drawn — a torn composite. Waiting for the event first means the one outstanding registration
+    // has been consumed, so nothing can set it behind our back after the reset. In steady state the
+    // previous frame settled at the top of this renderScene, so the wait returns immediately.
+    //
+    // Returns false if the event can no longer be trusted; the caller then settles this frame itself.
+    bool armFrameEvent(uint64_t value) {
+        if (!g_live.hFrameEvent || g_frameEventBroken) { return false; }
+        const DWORD w = WaitForSingleObject(g_live.hFrameEvent, 5000);
+        if (w != WAIT_OBJECT_0) {
+            std::printf("!! [forge][tier1] previous frame EVENT never fired (wait=0x%lX) — event handoff OFF\n",
+                        (unsigned long)w);
+            g_frameEventBroken = true;
+            return false;
+        }
+        ResetEvent(g_live.hFrameEvent);
+        const HRESULT hr = g_live.pSharedFence->SetEventOnCompletion(value, g_live.hFrameEvent);
+        if (FAILED(hr)) {
+            std::printf("!! [forge][tier1] SetEventOnCompletion(%llu) failed hr=0x%08lX — event handoff OFF\n",
+                        (unsigned long long)value, (unsigned long)hr);
+            g_frameEventBroken = true;
+            return false;
+        }
+        return true;
     }
 
     bool sceneReady() {
@@ -45128,8 +45188,12 @@ void destroyHostWindow(Renderer* R);
         // the Hi-Z prologue on purpose — the prologue builds NEXT frame's pyramid and touches
         // nothing the client reads, so making the client wait for it would add latency for nothing.
         ++g_live.sharedFenceValue;
+        bool frameEventArmed = false;
         if (g_live.pSharedFence && g_live.pQueue && g_live.pQueue->mDx.pQueue) {
             g_live.pQueue->mDx.pQueue->Signal(g_live.pSharedFence, g_live.sharedFenceValue);
+            // Event handoff: registered right behind the Signal so the event vouches for exactly
+            // this value. Kept armed in every mode (cheap) so switching modes never finds it stale.
+            frameEventArmed = armFrameEvent(g_live.sharedFenceValue);
         }
         g_framePending = true;
         // ⚠ AFTER the shared-fence signal, deliberately. That signal is the client's permission to
@@ -45149,7 +45213,9 @@ void destroyHostWindow(Renderer* R);
         // still land this frame; it clears g_framePending, so next frame's top-of-frame call then
         // finds nothing left to do. Placed after g_lastRecMs so its dlLogGpuSlow reports THIS
         // frame's record time rather than the previous frame's.
-        if (!g_clientSyncsOnFence) {
+        // Mode 2 also needs THIS frame's event armed; a refused registration means the client's
+        // wait proves nothing, so settle (and the event handoff is off from here on).
+        if (!g_clientSyncsOnFence || (g_clientSyncMode == 2u && !frameEventArmed)) {
             settleFrameFence(R);
         }
         // NOTE: g_lastGpuMs / g_lastGpuPhaseMs / the three readback buffers are NOT read here any
@@ -60651,6 +60717,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPipeline) { removePipeline(R, g_live.pPipeline); }
         if (g_live.ntHandle)  { CloseHandle(g_live.ntHandle); }
         if (g_live.ntFenceHandle) { CloseHandle(g_live.ntFenceHandle); }
+        if (g_live.hFrameEvent)   { CloseHandle(g_live.hFrameEvent); }
         if (g_live.pSharedFence)  { g_live.pSharedFence->Release(); }
         if (g_live.pRT)       { removeRenderTarget(R, g_live.pRT); }  // releases pSharedRes
         if (g_live.pShader)   { removeShader(R, g_live.pShader); exitRootSignature(R); }

@@ -477,7 +477,7 @@ namespace IPC {
 
 	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
 		std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle,
-		HANDLE* outFrameFenceHandle) {
+		HANDLE* outFrameFenceHandle, HANDLE* outFrameEventHandle) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderInitParams;
@@ -492,6 +492,7 @@ namespace IPC {
 #pragma warning(pop)
 		params.framebufferHandle = nullptr;
 		params.frameFenceHandle = nullptr;
+		params.frameEventHandle = nullptr;
 		params.ok = false;
 		if (!beginRpc(Command::RenderInit)) {
 			return false;
@@ -506,6 +507,9 @@ namespace IPC {
 		}
 		if (params.ok && outFrameFenceHandle) {
 			*outFrameFenceHandle = static_cast<HANDLE>(params.frameFenceHandle);
+		}
+		if (params.ok && outFrameEventHandle) {
+			*outFrameEventHandle = static_cast<HANDLE>(params.frameEventHandle);
 		}
 		return params.ok;
 	}

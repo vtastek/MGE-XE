@@ -77,7 +77,8 @@ namespace IPC {
 		float m_nearCellReach = 0.0f;
 		std::uint32_t m_nearRefsVersion = 0;
 		float m_nearFwd[3] = { 0.0f, 1.0f, 0.0f };
-		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting.
+		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting,
+		// 1 = semaphore, 2 = event.
 		std::uint32_t m_clientSyncsOnFence = 0;
 		// Mode-3 park sky re-anchor delta — see setSkyParkEyeDelta. 0 on the serial paths.
 		float m_skyParkEyeDelta[4] = {};
@@ -317,11 +318,13 @@ namespace IPC {
 		* @param outFramebufferHandle A path only: receives a file-mapping HANDLE for the W*H*4 pixel blob (null on B).
 		* @param outFrameFenceHandle Tier 1: receives the host's SHARED D3D12 frame-fence NT handle
 		*        (this process's value), or null if the host has none. Optional.
+		* @param outFrameEventHandle Tier 1: receives the host's frame-complete EVENT handle (this
+		*        process's value; set by the host when the frame's fence value is reached), or null. Optional.
 		* @return Whether the host renderer initialized successfully (blocking).
 		*/
 		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
 			std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle,
-			HANDLE* outFrameFenceHandle = nullptr);
+			HANDLE* outFrameFenceHandle = nullptr, HANDLE* outFrameEventHandle = nullptr);
 
 		/**
 		* @brief Present-seam spike: render one frame into shared buffer targetIndex.
@@ -430,11 +433,12 @@ namespace IPC {
 			m_nearFwd[0] = fwd[0]; m_nearFwd[1] = fwd[1]; m_nearFwd[2] = fwd[2];
 		}
 
-		// Tier 1: tell the host whether we hold an imported timeline semaphore for its shared frame
-		// fence, i.e. whether it may return from renderScene without settling its own frame. Set
-		// once at seam bring-up (after the import attempt) and stamped into every render RPC.
-		// Defaults false so a client that never calls it can never be handed a half-drawn frame.
-		void setClientSyncsOnFence(bool syncs) { m_clientSyncsOnFence = syncs ? 1u : 0u; }
+		// Tier 1: tell the host which sync object we will wait before copying the shared RT, i.e.
+		// whether it may return from renderScene without settling its own frame: 0 = none (host
+		// settles), 1 = imported timeline semaphore, 2 = CPU wait on the host's frame event. Set once
+		// at seam bring-up and stamped into every render RPC. Defaults 0 so a client that never calls
+		// it can never be handed a half-drawn frame.
+		void setClientSyncsOnFence(std::uint32_t mode) { m_clientSyncsOnFence = mode; }
 
 		// (eyeNow - bakeEye), the mode-3 park delta the sky payload was pre-cancelled by. The host
 		// needs it to place the REFLECT pass's sky mirror plane at the FIRE-time camera height rather
