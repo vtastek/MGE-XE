@@ -2433,6 +2433,12 @@ namespace {
         uint32_t       parity = 0;          // which texture holds the CURRENT field
         bool           ready  = false;
         bool           cleared = false;
+        // CALM SLEEP (see advanceRippleGrid). quietDecay = the product of every step's amplitude
+        // damping since the last frame that put a source into this domain — an upper bound on the
+        // field relative to its last forcing (0 after a clear: the field is then exactly zero). Below kRippleSleepDecay the grid is zeroed once and
+        // stops stepping (`sleeping`) until a source returns. A sleeping field is exactly zero.
+        float          quietDecay = 1.0f;
+        bool           sleeping   = false;
         // tex[0] is read by water.frag through an SRV but written by compute through a UAV, so it
         // has to be transitioned each way around the dispatch. Tracked rather than assumed because
         // the sim is skipped entirely on frames with no water, and a texture left in
@@ -4237,6 +4243,10 @@ namespace {
            kGpuPhaseGrassColor,
            kGpuPhaseSkyVis,     // one sky-visibility map redraw (renderSkyVisMaps), top of the frame
            kGpuPhaseSkyVisScreen, // ...and the half-res screen pass that reads them (skyvis.comp)
+           // The ripple/wake wave sims (advanceRippleGrid) and the actor-track rebuild, between the
+           // cull and the caustic maps. Had no bracket: a 1660S frame trace found a 4.5 ms span with no
+           // pass in it exactly there, and this is the only GPU work recorded in it.
+           kGpuPhaseRippleSim,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -21577,6 +21587,10 @@ namespace {
     // It costs nothing: the trail is then 6.7 s long, and at swim speed that is ~700 units inside a
     // 8192-unit domain.
     float g_wakeDamp     = 0.15f;   // 1/s
+    // Calm sleep for BOTH ripple grids (advanceRippleGrid): stop stepping once the damping since the
+    // last source bounds the field below this fraction of it. `ripSleepOff` = the A/B (always step).
+    constexpr float kRippleSleepDecay = 1.0e-3f;
+    bool  g_ripSleepOff  = false;
     // ⚠ W28h — GRID-SCALE DAMPING RATE, 1/s. The uniform `g_wakeDamp` above cannot do this job at
     // any value: it is k-independent, and under omega^2 = g|k| the group velocity is (1/2)sqrt(g/k),
     // so the SHORTEST waves are the SLOWEST and grid-scale excitation never leaves the domain. Turn
@@ -23127,6 +23141,7 @@ namespace {
             // since W24b, so these are here to turn a layer OFF for an A/B rather than on.
             { "ripSimOn",           &g_ripSimOn           },
             { "wakeOn",             &g_wakeOn             },
+            { "ripSleepOff",        &g_ripSleepOff        },
             // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
             // proof that what is on screen is being cast by the surface and not painted on.
             { "waterFlatTest",      &g_waterFlatTest      },
@@ -27146,6 +27161,55 @@ namespace {
         }
         rp->sim[3] = (float)nImp;
 
+        // ---- CALM SLEEP -------------------------------------------------------------------------
+        // The sim is a fixed cost over a fixed grid whether or not anything is in the water: on a
+        // 1660S the dispersive wake grid alone (1024², 441 taps/texel, 2 steps/frame) was 4.1 ms of
+        // every exterior frame with water, integrating a flat field in a town nobody was swimming
+        // through. Nothing about a zero field changes when you step it, so stop stepping it.
+        //
+        // EXACT, not a heuristic: every step multiplies the whole field by at most `stepDecay` (the
+        // mode's own damping; sources are the only thing that adds energy), so once the running
+        // product falls below kRippleSleepDecay the field is below that fraction of its last
+        // forcing. At that point ONE zeroing pass runs — the existing clear path, both sub-steps
+        // scrolled out of range — and after it the grid holds exact zeros and parks. The first
+        // frame with a source in the domain wakes it; it resumes from zeros at the current origin.
+        {
+            float stepDecay = 1.0f;
+            if (dispersive)  { stepDecay = rp->wave[2]; }                      // exp(-damp*dt)
+            else if (mge)    { stepDecay = rp->wave[2]; }                      // 1 - vdamp
+            else             { stepDecay = std::min(g_ripSimDecay, 1.0f); }    // per-step decay
+            if (!G.cleared) {
+                // This frame's steps run the clear path (scroll out of range, no impulses are gathered
+                // on it), so afterwards the field is EXACTLY zero: the bound is 0, not 1. Without this
+                // a grid that has never been forced — every load into a dry town — would keep stepping
+                // zeros for the whole decay time of a source that never existed (46 s for the wake).
+                G.quietDecay = 0.0f;
+                G.sleeping   = false;
+            } else if (nImp > 0) {
+                if (G.sleeping) { LOG::logline(">> [ripple] %s: source in the domain — WAKES", marker); }
+                G.quietDecay = 1.0f;
+                G.sleeping   = false;
+            } else if (stepDecay < 0.99999f && !g_ripSleepOff) {
+                if (G.sleeping) {
+                    parkRippleGrid(G);          // we transitioned it back to UAV above
+                    cmdEndDebugMarker(g_live.pCmd);
+                    return;
+                }
+                for (int s = 0; s < steps; ++s) { G.quietDecay *= stepDecay; }
+                if (G.quietDecay < kRippleSleepDecay) {
+                    // Last frame awake: zero both ping-pong textures (both sub-steps scroll the
+                    // whole domain out, which is how the !cleared path clears), then sleep.
+                    rp->scroll[0] = rp1->scroll[0] = (float)(G.grid * 2);
+                    rp->scroll[1] = rp1->scroll[1] = (float)(G.grid * 2);
+                    rp->sim[3] = rp1->sim[3] = 0.0f;
+                    steps = 2;
+                    G.sleeping = true;
+                    LOG::logline(">> [ripple] %s: calm (decay %.1e since last source) — zeroed, SLEEPS",
+                                marker, (double)G.quietDecay);
+                }
+            }
+        }
+
         const uint32_t stepGroups = (G.grid + stepThreads - 1) / stepThreads;
         // ⚠ The slope pass has its OWN thread count (RIPPLE_THREADS = 8 in ripplenormal.comp) and it
         // is not the step's — ripplewave.comp uses 16 so its halo amortises. Deriving both group
@@ -29428,7 +29492,7 @@ void destroyHostWindow(Renderer* R);
                        || (mode == 2u && haveFence && g_live.hFrameEvent && !g_frameEventBroken);
         const uint32_t m = want ? mode : 0u;
         if (want != g_clientSyncsOnFence || m != g_clientSyncMode) {
-            std::printf("[forge] Tier 1 frame overlap %s (client sync=%u, host shared fence=%d, event=%d%s)\n",
+            LOG::logline(">> [forge] Tier 1 frame overlap %s (client sync=%u, host shared fence=%d, event=%d%s)",
                         !want      ? "DISABLED (host will fence-wait its own frame)"
                         : m == 2u  ? "ENABLED via CPU EVENT"
                                    : "ENABLED via GPU SEMAPHORE",
@@ -29455,7 +29519,7 @@ void destroyHostWindow(Renderer* R);
         if (!g_live.hFrameEvent || g_frameEventBroken) { return false; }
         const DWORD w = WaitForSingleObject(g_live.hFrameEvent, 5000);
         if (w != WAIT_OBJECT_0) {
-            std::printf("!! [forge][tier1] previous frame EVENT never fired (wait=0x%lX) — event handoff OFF\n",
+            LOG::logline("!! [forge][tier1] previous frame EVENT never fired (wait=0x%lX) — event handoff OFF",
                         (unsigned long)w);
             g_frameEventBroken = true;
             return false;
@@ -29463,7 +29527,7 @@ void destroyHostWindow(Renderer* R);
         ResetEvent(g_live.hFrameEvent);
         const HRESULT hr = g_live.pSharedFence->SetEventOnCompletion(value, g_live.hFrameEvent);
         if (FAILED(hr)) {
-            std::printf("!! [forge][tier1] SetEventOnCompletion(%llu) failed hr=0x%08lX — event handoff OFF\n",
+            LOG::logline("!! [forge][tier1] SetEventOnCompletion(%llu) failed hr=0x%08lX — event handoff OFF",
                         (unsigned long long)value, (unsigned long)hr);
             g_frameEventBroken = true;
             return false;
@@ -31031,7 +31095,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseAOBlur, "ao blur" }, { kGpuPhaseAOUp, "ao up" }, { kGpuPhaseResolveFilter, "rfilter" },
             { kGpuPhaseHizMip0, "hiz mip0" }, { kGpuPhaseReLinear, "relin" }, { kGpuPhaseApl, "apl" },
             { kGpuPhaseGrassDepth, "grass depth" }, { kGpuPhaseGrassColor, "grass" }, { kGpuPhaseSkyVis, "skyvis" },
-            { kGpuPhaseSkyVisScreen, "skyvis screen" },
+            { kGpuPhaseSkyVisScreen, "skyvis screen" }, { kGpuPhaseRippleSim, "ripple sim" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -38990,6 +39054,7 @@ void destroyHostWindow(Renderer* R);
         // ⚠ waterParams/waterEnabled directly, NOT g_waterFogOn: that global is assigned in the
         // water block below, so reading it here would gate this frame's sim on last frame's water.
         const bool ripWaterNow = (waterParams && waterEnabled);
+        gpuPhaseBegin(kGpuPhaseRippleSim);
         {
             // ONE clock for both grids, and it is real elapsed time. The fine grid does not use it
             // (its rates are per step), but the wake grid's wavelength is set by gravity and the
@@ -39082,6 +39147,7 @@ void destroyHostWindow(Renderer* R);
                 parkRippleGrid(g_live.rippleWake);
             }
         }
+        gpuPhaseEnd(kGpuPhaseRippleSim);
 
         // ---- W23/W24: the caustic maps ----------------------------------------------------------
         // In the pure-compute section beside the ripple advance and for the same reason: the colour
@@ -45293,6 +45359,9 @@ void destroyHostWindow(Renderer* R);
             FrameTrace::span("host CPU", "setup",  traceQpc(tEntry),  traceQpc(tCull0), fv);
             FrameTrace::span("host CPU", "cull",   traceQpc(tCull0),  traceQpc(tCull1), fv);
             FrameTrace::span("host CPU", "record", traceQpc(tRec0),   traceQpc(tRec1), fv);
+            if (tSubmitA > 0.0) {   // split submit: chunk A went to the GPU here, mid-record
+                FrameTrace::span("host CPU submit A", "chunk A submitted", traceQpc(tSubmitA) - 0.05, traceQpc(tSubmitA), fv);
+            }
             FrameTrace::span("host CPU", "submit", traceQpc(tRec1),   traceQpc(tSubmit1), fv);
             FrameTrace::span("host CPU", "post",   traceQpc(tSubmit1), traceQpc(tEnd), fv);
             if ((fv % 300) == 0) { FrameTrace::dump("mgeHost64-trace.csv", "host"); }
