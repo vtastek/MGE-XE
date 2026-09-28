@@ -1262,6 +1262,20 @@ namespace {
             return;
         }
 
+        // Wine/Proton (through GE-Proton 11-7 at least) cannot import a D3D12 fence owned by another
+        // process: win32u logs "fixme: d3d12 fence from other process" and then faults inside its own
+        // Unix side, taking Morrowind down with it. The call never returns an error we could handle,
+        // so skip it and let the host keep its own fence wait. MGE_WINE_FENCE_IMPORT=1 retries it.
+        if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) {
+            char force[8] = {};
+            if (GetEnvironmentVariableA("MGE_WINE_FENCE_IMPORT", force, sizeof(force)) == 0 || force[0] != '1') {
+                LOG::logline("!! [seam][tier1] RESULT: running under Wine — cross-process D3D12 fence import "
+                             "skipped (crashes win32u); set MGE_WINE_FENCE_IMPORT=1 to try it anyway");
+                return;
+            }
+            LOG::logline(">> [seam][tier1] running under Wine, MGE_WINE_FENCE_IMPORT=1 — attempting the import");
+        }
+
         // The import does NOT consume the handle (NT handles: we keep ownership and CloseHandle it),
         // so both attempts can use g_fenceHandle directly.
         for (int pass = 0; pass < 2; ++pass) {

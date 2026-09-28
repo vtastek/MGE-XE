@@ -333,7 +333,7 @@ namespace IPC {
 		// truncation warnings are unnecessary because these handles and pointers have been allocated for the target process and only have 32 significant bits
 #pragma warning(push)
 #pragma warning(disable: 4244 4302 4311)
-		m_shared->header32 = reinterpret_cast<ptr32<VecBase::VecShare>>(MapViewOfFileNuma2(sharedMem, clientProcess, 0, NULL, sizeof(VecShare), 0, PAGE_READWRITE, NUMA_NO_PREFERRED_NODE));
+		m_shared->header32 = reinterpret_cast<ptr32<VecBase::VecShare>>(MapViewOfFile3(sharedMem, clientProcess, NULL, 0, sizeof(VecShare), 0, PAGE_READWRITE, NULL, 0));
 		if (m_shared->header32 == 0) {
 			LOG::winerror("Failed to map vector %u header into client process", m_id);
 			goto failedOnClientMap;

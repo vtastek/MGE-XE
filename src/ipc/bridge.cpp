@@ -3,7 +3,6 @@
 
 #include <cmath>
 
-IPC::MapViewOfFileNuma2_t IPC::MapViewOfFileNuma2 = nullptr;
 IPC::MapViewOfFile3_t IPC::MapViewOfFile3 = nullptr;
 IPC::UnmapViewOfFile2_t IPC::UnmapViewOfFile2 = nullptr;
 IPC::UnmapViewOfFileEx_t IPC::UnmapViewOfFileEx = nullptr;
@@ -22,17 +21,15 @@ bool IPC::initImports() {
     }
 
     // the docs claim MapViewOfFile3 and VirtualAlloc2 are in kernel32, but they're actually in kernelbase
-    IPC::MapViewOfFileNuma2 = reinterpret_cast<IPC::MapViewOfFileNuma2_t>(GetProcAddress(kernelbase, "MapViewOfFileNuma2"));
     IPC::MapViewOfFile3 = reinterpret_cast<IPC::MapViewOfFile3_t>(GetProcAddress(kernelbase, "MapViewOfFile3"));
     IPC::UnmapViewOfFile2 = reinterpret_cast<IPC::UnmapViewOfFile2_t>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
     IPC::UnmapViewOfFileEx = reinterpret_cast<IPC::UnmapViewOfFileEx_t>(GetProcAddress(kernel32, "UnmapViewOfFileEx"));
     IPC::VirtualAlloc2 = reinterpret_cast<IPC::VirtualAlloc2_t>(GetProcAddress(kernelbase, "VirtualAlloc2"));
 
-    auto success = IPC::MapViewOfFileNuma2 != nullptr && IPC::MapViewOfFile3 != nullptr && IPC::UnmapViewOfFile2 != nullptr && IPC::UnmapViewOfFileEx != nullptr && IPC::VirtualAlloc2 != nullptr;
+    auto success = IPC::MapViewOfFile3 != nullptr && IPC::UnmapViewOfFile2 != nullptr && IPC::UnmapViewOfFileEx != nullptr && IPC::VirtualAlloc2 != nullptr;
     if (!success) {
         FreeLibrary(kernel32);
         FreeLibrary(kernelbase);
-        IPC::MapViewOfFileNuma2 = nullptr;
         IPC::MapViewOfFile3 = nullptr;
         IPC::UnmapViewOfFile2 = nullptr;
         IPC::UnmapViewOfFileEx = nullptr;

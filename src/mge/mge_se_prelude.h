@@ -49,6 +49,7 @@
 // d3d9-aware code.
 #define D3DPRESENT_PARAMETERS    D3DPRESENT_PARAMETERS8
 
+#include <intrin.h> // SharedSE/NIBound.h uses SSE intrinsics (_mm_sqrt_ss)
 #include <array>
 #include <cassert>
 #include <filesystem>
