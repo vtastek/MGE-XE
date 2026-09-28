@@ -14031,12 +14031,16 @@ namespace {
                         GraphicsPipelineDesc& og = ovp.mGraphicsDesc;
                         og.mPrimitiveTopo  = PRIMITIVE_TOPO_TRI_LIST;
                         // NO COLOUR ATTACHMENT — the result goes out through the UAV. Same
-                        // arrangement as the Z-prepass pipelines, and it is what keeps this pass
-                        // free of the scene's sample count: with no colour target there is no MSAA
-                        // state to match, in either arm.
+                        // arrangement as the Z-prepass pipelines, and like them it must still carry
+                        // the SCENE's sample count: the depth attachment is pDepth, which is MSAA
+                        // above 1x, and the PSO's count has to match the DSV's as well as any RTV's.
+                        // It was SAMPLE_COUNT_1 on the theory that no colour target meant no MSAA
+                        // state to match. Native D3D12 on NVIDIA tolerated the mismatch; Vulkan
+                        // (vkd3d-proton) does not define it, and the GEQUAL test failed in blocks
+                        // around actors, which motion blur spread into squares.
                         og.mRenderTargetCount   = 0;
                         og.pColorFormats        = nullptr;
-                        og.mSampleCount         = SAMPLE_COUNT_1;
+                        og.mSampleCount         = (SampleCount)g_live.sampleCount;
                         og.mSampleQuality       = 0;
                         og.mDepthStencilFormat  = TinyImageFormat_D32_SFLOAT;
                         og.pDepthState          = &ovDepth;
@@ -14153,7 +14157,7 @@ namespace {
                             sg2.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
                             sg2.mRenderTargetCount  = 0;    // UAV write; see objvelocity.srt.h
                             sg2.pColorFormats       = nullptr;
-                            sg2.mSampleCount        = SAMPLE_COUNT_1;
+                            sg2.mSampleCount        = (SampleCount)g_live.sampleCount;   // pDepth's; see the rigid lane
                             sg2.mSampleQuality      = 0;
                             sg2.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
                             sg2.pDepthState         = &osDepth;
