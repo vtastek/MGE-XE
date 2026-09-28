@@ -26,7 +26,13 @@
 #include "tri.frag.fsl"
 #end
 
-#vert opaque.vert
+// FT_INVARIANT (opaque, skinned, multimap, objvelocity, objvelocity_skin): SV_POSITION is `precise`.
+// objvelocity* re-rasterise the movers GEQUAL against the Z-prepass these write, so both sides must
+// produce bit-identical depth. Native D3D12 happened to; vkd3d-proton (Proton) recompiles each
+// shader on its own and does not support invariant position for DXIL, so without `precise` FMA
+// contraction differed per shader, velocity pixels randomly failed the test (z-fight noise in F12
+// mode 17) and motion blur's tiles turned that into blocks around actors under MSAA.
+#vert FT_INVARIANT opaque.vert
 #include "opaque.vert.fsl"
 #end
 
@@ -147,11 +153,11 @@
 #include "shadowclear.frag.fsl"
 #end
 
-#vert skinned.vert
+#vert FT_INVARIANT skinned.vert
 #include "skinned.vert.fsl"
 #end
 
-#vert multimap.vert
+#vert FT_INVARIANT multimap.vert
 #include "multimap.vert.fsl"
 #end
 
@@ -811,7 +817,7 @@
 // ⚠ No SAMPLE_COUNT split and none is needed: it binds NO colour target (mRenderTargetCount = 0) and
 // writes its result through a UAV, so the scene's sample count never reaches this pipeline. The
 // depth format does, and that is D32_SFLOAT in every arm.
-#vert objvelocity.vert
+#vert FT_INVARIANT objvelocity.vert
 #include "objvelocity.vert.fsl"
 #end
 
@@ -823,7 +829,7 @@
 // part's position comes from a bone palette, not a world matrix — pairing with the SAME
 // objvelocity.frag above, which reads only CurClip/PrevClip and already carries
 // EARLY_FRAGMENT_TESTS. Graphics, so it does NOT hot-reload; kill mgeHost64 to pick up an edit.
-#vert objvelocity_skin.vert
+#vert FT_INVARIANT objvelocity_skin.vert
 #include "objvelocity_skin.vert.fsl"
 #end
 
