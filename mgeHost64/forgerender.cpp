@@ -19,6 +19,7 @@
 #include "forgerender.h"
 #include "ipc/geomwire.h"
 #include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (fillFrameTimings)
+#include "ipc/frametrace.h"          // MGE_FRAME_TRACE=1 timeline spans (frametrace-html.py)
 #include "mge/configuration.h"   // Configuration.DL.* for the host-owned live distant-land cull
 #include "support/log.h"   // LOG::logline -> mgeHost64.log (LOGF goes to uncaptured stdout)
 // The knob registry (tasks/forge-host-decomposition.md Phase 1). This file still DECLARES most of
@@ -16541,6 +16542,13 @@ namespace {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    // Frame trace: hostNowMs() -> the QPC ms the client records in, so both processes share one axis.
+    // steady_clock IS QPC on MSVC, so the offset is ~constant; measured once rather than assumed.
+    inline double traceQpc(double hostMs) {
+        static const double off = FrameTrace::qpcMs() - hostNowMs();
+        return hostMs + off;
+    }
+
     // Consecutive same-shape re-uploads before a slot migrates to the upload-heap ring.
     // 2 = promote on the 3rd consecutive frame (a couple of static recreates at morph onset,
     // then fence-free). Cell churn never reaches it (one-off re-uploads).
@@ -31003,6 +31011,50 @@ void destroyHostWindow(Renderer* R);
     //
     // Everything this fills is therefore one frame stale by construction. That is a diagnostic cost
     // only, EXCEPT for g_lastGpuMs — see below.
+    // Frame trace: one GPU phase's timestamps as a span on the QPC axis. Calibrated per call against
+    // the graphics queue (GetClockCalibration: a GPU tick and the QPC at the same instant), so GPU
+    // clock drift over a long session never skews the boxes. Only runs with MGE_FRAME_TRACE=1.
+    const char* traceGpuPhaseName(uint32_t i) {
+        static const struct { uint32_t id; const char* name; } kN[] = {
+            { kGpuPhasePrepass, "prepass" }, { kGpuPhasePostDepth, "postdepth" }, { kGpuPhaseReflect, "reflect" },
+            { kGpuPhaseColor, "color" }, { kGpuPhaseWater, "water" }, { kGpuPhaseResolve, "resolve" },
+            { kGpuPhaseCull, "cull" }, { kGpuPhaseFrame, "GPU frame" }, { kGpuPhaseReflGeo, "refl geo" },
+            { kGpuPhaseColorSky, "sky" }, { kGpuPhaseColorNear, "near" }, { kGpuPhaseColorSkin, "skin" },
+            { kGpuPhaseColorMM, "multimap" }, { kGpuPhaseColorDL, "dl" }, { kGpuPhaseColorAlpha, "alpha" },
+            { kGpuPhaseShadow, "shadow" }, { kGpuPhaseShadowMask, "shadowmask" }, { kGpuPhaseLinearize, "linearize" },
+            { kGpuPhaseShadowStatic, "shadow st" }, { kGpuPhaseShadowDyn, "shadow dyn" }, { kGpuPhaseShadowSun, "shadow sun" },
+            { kGpuPhaseColorFP, "fp" }, { kGpuPhaseColorGlow, "glow" }, { kGpuPhaseFroxelNear, "froxel" },
+            { kGpuPhaseVolFog, "volfog" }, { kGpuPhaseBloom, "bloom" }, { kGpuPhaseCaustic, "caustic" },
+            { kGpuPhaseGrassCrush, "grasscrush" }, { kGpuPhaseAtmos, "atmos" }, { kGpuPhaseMotionVec, "mv" },
+            { kGpuPhaseUpscale, "upscale" }, { kGpuPhaseObjVel, "objvel" }, { kGpuPhaseObjVelFP, "objvel fp" },
+            { kGpuPhaseMotionBlur, "mb" }, { kGpuPhaseAODown, "ao down" }, { kGpuPhaseAOSearch, "ao search" },
+            { kGpuPhaseAOBlur, "ao blur" }, { kGpuPhaseAOUp, "ao up" }, { kGpuPhaseResolveFilter, "rfilter" },
+            { kGpuPhaseHizMip0, "hiz mip0" }, { kGpuPhaseReLinear, "relin" }, { kGpuPhaseApl, "apl" },
+            { kGpuPhaseGrassDepth, "grass depth" }, { kGpuPhaseGrassColor, "grass" }, { kGpuPhaseSkyVis, "skyvis" },
+            { kGpuPhaseSkyVisScreen, "skyvis screen" },
+        };
+        static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
+        for (const auto& n : kN) { if (n.id == i) { return n.name; } }
+        return "?";
+    }
+    void traceGpuPhase(uint32_t i, uint64_t b, uint64_t e) {
+        static uint64_t s_calFrame = ~0ull;
+        static UINT64 s_gpuTs = 0, s_cpuTs = 0;
+        static double s_qpcFreq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
+        static bool s_calOk = false;
+        if (s_calFrame != g_live.sharedFenceValue) {   // once per settled frame
+            s_calFrame = g_live.sharedFenceValue;
+            s_calOk = g_live.pQueue && g_live.pQueue->mDx.pQueue
+                   && SUCCEEDED(g_live.pQueue->mDx.pQueue->GetClockCalibration(&s_gpuTs, &s_cpuTs));
+        }
+        if (!s_calOk) { return; }
+        const double base = 1000.0 * (double)s_cpuTs / s_qpcFreq;
+        const double t0 = base + ((double)(int64_t)(b - s_gpuTs) / g_live.gpuTickFreq) * 1000.0;
+        const double t1 = base + ((double)(int64_t)(e - s_gpuTs) / g_live.gpuTickFreq) * 1000.0;
+        FrameTrace::span(i == kGpuPhaseFrame ? "host GPU frame" : "host GPU", traceGpuPhaseName(i), t0, t1,
+                         (int64_t)g_live.sharedFenceValue);
+    }
+
     void settleFrameFence(Renderer* R) {
         if (!g_live.pFence) { return; }
         const double tFence0 = hostNowMs();
@@ -31017,6 +31069,8 @@ void destroyHostWindow(Renderer* R);
         if (fs == FENCE_STATUS_INCOMPLETE && g_clientSyncsOnFence) { ++g_frameOverruns; }
         waitForFences(R, 1, &g_live.pFence);
         g_lastGpuWaitMs = hostNowMs() - tFence0;
+        FrameTrace::span("host CPU", "settle wait", traceQpc(tFence0), traceQpc(tFence0 + g_lastGpuWaitMs),
+                         (int64_t)g_live.sharedFenceValue);
         // Every submission up to this point has now retired, so anything the between-frames paths
         // parked is safe to free (see g_texRetire). Drained before the g_framePending early-out:
         // a load burst can queue retirements on a frame that never submitted.
@@ -31040,6 +31094,7 @@ void destroyHostWindow(Renderer* R);
                 getQueryData(R, g_live.pGpuQueryPool, i, &qd);
                 const uint64_t b = qd.mBeginTimestamp, e = qd.mEndTimestamp;
                 g_lastGpuPhaseMs[i] = (e > b) ? ((double)(e - b) / g_live.gpuTickFreq) * 1000.0 : 0.0;
+                if (FrameTrace::enabled() && e > b) { traceGpuPhase(i, b, e); }
             }
         }
         // THE ONE THAT IS NOT COSMETIC. g_lastGpuMs used to be `hostNowMs() - tRec1`, i.e. the CPU's
@@ -45231,6 +45286,17 @@ void destroyHostWindow(Renderer* R);
         // ===================== THE FRAME EPILOGUE (accounting, heartbeat, cost model) ============
         frameEpilogue(drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
                       tEntry, tSubmit1, rzViewProj, fpRzSaved, fpRzValid);
+        if (FrameTrace::enabled()) {
+            const double tEnd = hostNowMs();
+            const int64_t fv = (int64_t)g_live.sharedFenceValue;
+            FrameTrace::span("host RPC", "renderScene", traceQpc(tEntry), traceQpc(tEnd), fv);
+            FrameTrace::span("host CPU", "setup",  traceQpc(tEntry),  traceQpc(tCull0), fv);
+            FrameTrace::span("host CPU", "cull",   traceQpc(tCull0),  traceQpc(tCull1), fv);
+            FrameTrace::span("host CPU", "record", traceQpc(tRec0),   traceQpc(tRec1), fv);
+            FrameTrace::span("host CPU", "submit", traceQpc(tRec1),   traceQpc(tSubmit1), fv);
+            FrameTrace::span("host CPU", "post",   traceQpc(tSubmit1), traceQpc(tEnd), fv);
+            if ((fv % 300) == 0) { FrameTrace::dump("mgeHost64-trace.csv", "host"); }
+        }
         return true;
     }
 

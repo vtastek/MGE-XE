@@ -2,6 +2,7 @@
 #include "configuration.h"
 #include "ipc/client.h"
 #include "ipc/geomwire.h"
+#include "ipc/frametrace.h"   // MGE_FRAME_TRACE=1 timeline spans (frametrace-html.py)
 #include "support/log.h"
 #include "dxvk_interop.h"
 #include "distantland.h"
@@ -156,6 +157,9 @@ namespace {
     // the [hb] copy= bucket; echoed alone as evw= so a host GPU tail landing on MW's main thread is
     // visible). Always 0 on the semaphore and blocking paths.
     double g_lastEventWaitMs = 0.0;
+    // Frame trace: the shared-fence value of the frame the last RT copy delivered — the key that
+    // ties the client's spans to the host's in the timeline.
+    std::int64_t g_traceCopyFence = -1;
     // Last host phase split received over the wire (Tier 1, tasks/forge-host-gpu-lane.md). Feeds
     // the Tracy plots at the finish site and the [hb] echo below — the echo is the CHECK that the
     // x86/x64 struct actually arrived intact: its numbers must match mgeHost64.log's own
@@ -1680,6 +1684,13 @@ namespace {
         // a GPU one, but it still frees the host from settling its own frame. Needs the fence too —
         // the event is only ever set by that fence's SetEventOnCompletion.
         g_frameEventOk = !g_frameSemOk && g_frameEvent != nullptr && g_fenceHandle != nullptr;
+        {   // MGE_TIER1_EVENT=0: force the old blocking contract, for A/B against the event handoff.
+            char v[4] = {};
+            if (g_frameEventOk && GetEnvironmentVariableA("MGE_TIER1_EVENT", v, sizeof(v)) > 0 && v[0] == '0') {
+                g_frameEventOk = false;
+                LOG::logline(">> [seam][tier1] MGE_TIER1_EVENT=0 — event handoff declined");
+            }
+        }
         g_client->setClientSyncsOnFence(g_frameSemOk ? 1u : g_frameEventOk ? 2u : 0u);
         LOG::logline(">> [seam][tier1] host frame overlap %s",
                      g_frameSemOk   ? "ENABLED (client GPU-waits the shared fence before each RT copy)"
@@ -1838,6 +1849,15 @@ namespace {
         MGE_TracyPlot("Forge RTcopy flush ms", tcFlush - tc0);
         MGE_TracyPlot("Forge RTcopy wait ms",  tcEnd - tcSubmit);
         MGE_TracyPlot("Forge RTcopy event wait ms", tcRecord - tcEv0);
+        if (FrameTrace::enabled()) {
+            const std::int64_t fv = (std::int64_t)waitValue;
+            g_traceCopyFence = fv;
+            FrameTrace::span("client main", "RT flush",      tc0,      tcFlush,  fv);
+            FrameTrace::span("client main", "RT record",     tcFlush,  tcEv0,    fv);
+            FrameTrace::span("client main", "event wait",    tcEv0,    tcRecord, fv);
+            FrameTrace::span("client main", "RT submit",     tcRecord, tcSubmit, fv);
+            FrameTrace::span("client main", "RT copy GPU",   tcSubmit, tcEnd,    fv);
+        }
         // Only rare spikes log. The trigger deliberately EXCLUDES the fence-wait phase: since Tier 1
         // that phase also contains the semaphore wait for the host's draw, which is multi-ms by
         // design on every frame — testing `total` here made this fire once per frame (1848 lines in
@@ -5468,7 +5488,9 @@ namespace RenderProcess {
 
         device->SetTexture(0, nullptr);
         if (sb) { sb->Apply(); sb->Release(); }
-        return nowMs() - t0;
+        const double t1 = nowMs();
+        FrameTrace::span("client main", "blit", t0, t1, g_traceCopyFence);
+        return t1 - t0;
     }
 
     // [hb] heartbeat + spike accounting, shared by the finish (same-frame) and the
@@ -5490,6 +5512,18 @@ namespace RenderProcess {
         g_hb.feed += feed; g_hb.geom += (ks.tGeomFlush - ks.tBuild);
         g_hb.build += (ks.tBuild - ks.tStart);
         g_hb.render += renderBucket; g_hb.host += fr.hostMs; g_hb.overlap += fr.overlap;
+        if (FrameTrace::enabled()) {
+            // ks = the kick whose host frame fr collected, so all of these carry that frame's fence.
+            const std::int64_t fv = g_traceCopyFence;
+            if (ks.dtPresent > 0.0) {
+                FrameTrace::span("client frames", "MW frame", ks.tStart - ks.dtPresent, ks.tStart, fv);
+            }
+            FrameTrace::span("client main", "build",       ks.tStart,     ks.tBuild,     fv);
+            FrameTrace::span("client main", "geom flush",  ks.tBuild,     ks.tGeomFlush, fv);
+            FrameTrace::span("client main", "kick",        ks.tGeomFlush, ks.tKick,      fv);
+            FrameTrace::span("client RPC",  "host frame in flight", ks.tKick, fr.tRender, fv);
+            FrameTrace::span("client main", "finish wait", fr.tWait0,     fr.tRender,    fv);
+        }
         g_hb.copy += (fr.tCopy - fr.tRender); g_hb.evwait += g_lastEventWaitMs; g_hb.blit += blitMs; g_hb.dt += ks.dtPresent;
         g_hb.mwstart += g_pendingMwStart; g_pendingMwStart = 0.0;   // A0 Cut-4 probe (1-frame skew on deferred frames)
         g_hb.captured += ks.capturedCount;
@@ -5524,6 +5558,7 @@ namespace RenderProcess {
                          g_hb.captured / g_hb.n,
                          g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
+            FrameTrace::dump("mgeXE-trace.csv", "client");
             // white= is the count of captured-alpha DIPs in THIS window whose GPU texture had no
             // registered source name and drew as bindless slot 0 (host default white — an opaque
             // white quad). The [alpha-cap] log for it is capped at 20 per session, so only this
