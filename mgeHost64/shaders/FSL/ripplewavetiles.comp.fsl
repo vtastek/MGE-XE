@@ -9,8 +9,9 @@
 //   (a) gWakeMaskNext is set — the target still holds old non-zero data there, which has to be
 //       rewritten (to the new values, or to zeros);
 //   (b) any tile of gWakeMaskPrev under its READ FOOTPRINT is set. The step reads prev at
-//       (its texel + shift) with a 10-texel halo, so the footprint is T*16 + shift - 10 .. + 25,
-//       at most 3x3 prev tiles. `shift` is the integer domain scroll, so this also follows the camera;
+//       (its texel + shift) out to a halo (scroll.w: 10 for the wake's kernel, 2 for the fine
+//       grid), so the footprint is T*16 + shift - halo .. + 15 + halo, at most 3x3 prev tiles.
+// Serves BOTH grids: ripplewave.comp (the wake) and ripplesim.comp (the fine grid). `shift` is the integer domain scroll, so this also follows the camera;
 //   (c) it overlaps srcBounds while the moving obstacle is live (the pin writes non-zero values
 //       into a field that may be all zeros there).
 // Anything else reads only zeros and has no source, so the step would write zeros that are already
@@ -42,12 +43,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     if (T.x == 0 && T.y == 0) { gWakeStats[0] = 0u; gWakeStats[1] = 0u; }
 
     int2   shift  = int2(gRippleSimParams.scroll.xy);
+    int    halo   = int(gRippleSimParams.scroll.w);
     int    nImp   = int(gRippleSimParams.sim.w);
     float4 sb     = gRippleSimParams.srcBounds;
     uint   packed = uint(T.x) | (uint(T.y) << 16u);
     uint   slot;
 
-    if (wakeTileNeeded(T, nT, shift, nImp, sb))
+    if (wakeTileNeeded(T, nT, shift, halo, nImp, sb))
     {
         AtomicAdd(gWakeArgs[0], 1u, slot);
         gWakeTileList[slot] = packed;
@@ -58,7 +60,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     {
         for (int dx = -1; dx <= 1; ++dx)
         {
-            if (!ring && wakeTileNeeded(T + int2(dx, dy), nT, shift, nImp, sb)) { ring = true; }
+            if (!ring && wakeTileNeeded(T + int2(dx, dy), nT, shift, halo, nImp, sb)) { ring = true; }
         }
     }
     if (ring)

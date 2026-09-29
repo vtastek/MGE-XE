@@ -987,6 +987,8 @@ STRUCT(RippleSimParams)
 
 
 
+
+
     float4 scroll;
 
 
@@ -1013,7 +1015,7 @@ STRUCT(RippleSimParams)
 
 
     float4 impulses[ 64 ];
-#line 114
+#line 116
 };
 
         CBUFFER(RippleSimParams) gRippleSimParams :  register(b0,space0);

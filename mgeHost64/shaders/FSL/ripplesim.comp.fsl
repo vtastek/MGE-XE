@@ -10,7 +10,17 @@
 
 #include "ripplesim.srt.h"
 
-#define RIPPLE_THREADS 8
+// 16x16 = one ACTIVE TILE per group (ripplewavetiles.comp), so the quiet test below can reduce a
+// whole tile in groupshared memory. Was 8; nothing here depended on it. Host: kRippleStepThreads.
+#define RIPPLE_THREADS 16
+
+// This tile's max(|h|,|v|) as an ordered uint (non-negative floats order as uints).
+GroupShared(uint, g_tileMax);
+
+// Same route as grasscrushsplat.comp: FSL declares no AtomicMax, InterlockedMax is core HLSL.
+#ifndef AtomicMax
+#define AtomicMax(DEST, VALUE, ORIGINAL_VALUE) InterlockedMax(DEST, VALUE, ORIGINAL_VALUE)
+#endif
 
 // The scrolled fetch. Returns zero outside the previous domain, which is exactly right: those
 // texels are water the sim has never seen, and zero is undisturbed water. Clamping instead would
@@ -27,12 +37,27 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     INIT_MAIN;
 
     int  size = int(gRippleSimParams.sim.x);
-    int2 id   = int2(did.xy);
-    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
-    if (id.x >= size || id.y >= size)
+
+    // ACTIVE TILES: indirect over the tile list, one 16x16 group per tile; otherwise the whole grid.
+    // Same mapping as ripplewave.comp. NO early RETURN below: the quiet test has a barrier every
+    // thread of the group must reach, so an out-of-range thread computes and simply does not write.
+    uint  nT = uint(gRippleSimParams.tiles.z);
+    uint2 lt = uint2(did.x & 15u, did.y & 15u);
+    uint2 tileId;
+    if (gRippleSimParams.tiles.x > 0.5f)
     {
-        RETURN();
+        uint packed = gWakeTileList[did.x >> 4u];
+        tileId = uint2(packed & 0xFFFFu, packed >> 16u);
     }
+    else
+    {
+        tileId = did.xy >> 4u;
+    }
+    int2 id     = int2(tileId) * RIPPLE_THREADS + int2(lt);
+    bool inside = id.x < size && id.y < size;
+    uint tid    = lt.y * 16u + lt.x;
+    if (tid == 0u) { g_tileMax = 0u; }
+    GroupMemoryBarrier();
 
     float speed = gRippleSimParams.sim.y;
     float decay = gRippleSimParams.sim.z;
@@ -150,9 +175,31 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     // 1e-30 forever, which would keep the whole field non-zero and defeat any future early-out.
     if (abs(h.x) < 1e-6f && abs(h.y) < 1e-6f) { h.x = 0.0f; h.y = 0.0f; }
 
+    // Quiet tile -> exact zeros + its mask bit. Same block and same reasoning as ripplewave.comp:
+    // at tiles.y = 0 only an already-zero tile is quiet, and it runs in both dispatch modes so the
+    // masks stay true whichever mode ran last.
+    float mag = inside ? max(abs(h.x), abs(h.y)) : 0.0f;
+    uint  prevMax;
+    AtomicMax(g_tileMax, asuint(mag), prevMax);
+    GroupMemoryBarrier();
+    bool quiet = asfloat(g_tileMax) <= gRippleSimParams.tiles.y;
+    if (quiet) { h = f4(0.0f); }
+
     // .zw (slope) is written by ripplenormal.comp; carry the scrolled values so the water frag
     // never samples a frame-old slope against a new height.
-    Write2D(gRippleSimNext, id, float4(h.x, h.y, h.z, h.w));
+    if (inside)
+    {
+        Write2D(gRippleSimNext, id, float4(h.x, h.y, h.z, h.w));
+    }
+    if (tid == 0u && nT > 0u)
+    {
+        gWakeMaskNext[tileId.y * nT + tileId.x] = quiet ? 0u : 1u;
+        if (!quiet)
+        {
+            uint nzPrev;
+            AtomicAdd(gWakeStats[0], 1u, nzPrev);     // nonzero tiles after this step (stats + sleep)
+        }
+    }
 
     RETURN();
 }

@@ -15,14 +15,16 @@ bool wakeTileInSource(int2 T, int nImp, float4 sb)
 }
 
 // Does output tile T have to be stepped? Uses the MASKS only — that is the point of it.
-bool wakeTileNeeded(int2 T, int nT, int2 shift, int nImp, float4 sb)
+bool wakeTileNeeded(int2 T, int nT, int2 shift, int halo, int nImp, float4 sb)
 {
     if (T.x < 0 || T.y < 0 || T.x >= nT || T.y >= nT) { return false; }
     if (gWakeMaskNext[uint(T.y * nT + T.x)] != 0u) { return true; }
 
+    // The step reads prev at (texel + shift) out to `halo` texels (scroll.w: 10 for the wake's
+    // 21x21 kernel, 2 for the fine grid's grad^4).
     // >> on a signed int is an arithmetic shift, i.e. floor division by 16 for negatives too.
-    int2 lo  = T * 16 + shift - 10;
-    int2 hi  = lo + 35;
+    int2 lo  = T * 16 + shift - halo;
+    int2 hi  = T * 16 + shift + 15 + halo;
     int2 tlo = max(lo >> 4, int2(0, 0));
     int2 thi = min(hi >> 4, int2(nT - 1, nT - 1));
     for (int ty = tlo.y; ty <= thi.y; ++ty)

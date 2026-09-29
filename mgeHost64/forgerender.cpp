@@ -21300,7 +21300,10 @@ namespace {
 
     constexpr uint32_t kRippleGrid       = 1024;   // texels per side
     constexpr float    kRippleUnitsPerTexel = 1.0f;
-    constexpr uint32_t kRippleThreads    = 8;      // must match RIPPLE_THREADS in the .comp
+    constexpr uint32_t kRippleThreads    = 8;      // must match RIPPLE_THREADS in ripplenormal.comp
+    // The fine STEP (ripplesim.comp) runs 16x16 so one group is one active tile; the slope pass
+    // above stays 8x8. Must match RIPPLE_THREADS in ripplesim.comp.
+    constexpr uint32_t kRippleStepThreads = 16;
     float g_ripSimSpeed  = 1.0f;    // ⚠ CFL: values > 2.0 diverge. Clamped in-shader as well.
     // ⚠ PER STEP, and there are 120 steps a second — so this lives in a thin sliver below 1 and the
     // number that matters is the per-SECOND retention: 0.995^120 = 0.55, 0.985^120 = 0.16.
@@ -21633,6 +21636,11 @@ namespace {
     // DEBUG AUDIT of the skip (ripplewavecheck.comp): counts skipped tiles whose TEXELS say they had
     // to run. Must read 0; `tiles=` in the gpu split heartbeat gains `check=<violations>`.
     bool  g_wakeTileCheck = false;
+    // ACTIVE TILES for the FINE grid (ripplesim.comp), same machinery. `ripTiles=0` = the A/B. The
+    // threshold is a fraction of the birth impulse's height (g_ripSimAmp). The audit knob above
+    // covers both grids.
+    bool  g_ripTiles     = true;
+    float g_ripTileEps   = 0.035f;
     // ⚠ W28h — GRID-SCALE DAMPING RATE, 1/s. The uniform `g_wakeDamp` above cannot do this job at
     // any value: it is k-independent, and under omega^2 = g|k| the group velocity is (1/2)sqrt(g/k),
     // so the SHORTEST waves are the SLOWEST and grid-scale excitation never leaves the domain. Turn
@@ -22821,6 +22829,7 @@ namespace {
             // means a long unattended run, which is exactly what the minimized harness is for.
             { "wakeGridDamp",        &g_wakeGridDamp        },
             { "wakeTileEps",         &g_wakeTileEps         },
+            { "ripTileEps",          &g_ripTileEps          },
             { "wakeCalmFade",        &g_wakeCalmFade        },
             { "wakeCalmFadeLen",     &g_wakeCalmFadeLen     },
             { "ripGridDamp",         &g_ripGridDamp         },
@@ -23189,6 +23198,7 @@ namespace {
             { "ripSleepOff",        &g_ripSleepOff        },
             { "wakeTiles",          &g_wakeTiles          },
             { "wakeTileCheck",      &g_wakeTileCheck      },
+            { "ripTiles",           &g_ripTiles           },
             // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
             // proof that what is on screen is being cast by the surface and not painted on.
             { "waterFlatTest",      &g_waterFlatTest      },
@@ -25762,7 +25772,12 @@ namespace {
           t.checkbox("Dispersive: ACTIVE TILES (step only where the field is non-zero)", &g_wakeTiles);
           t.sliderF("Dispersive: quiet tile threshold (x obstacle depth; LOOK knob)",
                     &g_wakeTileEps, 0.0f, 0.1f, 0.001f, "%.3f");
-          t.checkbox("Dispersive: AUDIT the tile skip (debug; heartbeat check= must read 0)", &g_wakeTileCheck);
+          t.checkbox("Ripples: AUDIT the tile skip, both grids (debug; heartbeat check= must read 0)", &g_wakeTileCheck);
+          // The fine (1 unit/texel splash) grid's own active tiles + threshold, as a fraction of the
+          // birth impulse's height.
+          t.checkbox("Fine grid: ACTIVE TILES (step only where the field is non-zero)", &g_ripTiles);
+          t.sliderF("Fine grid: quiet tile threshold (x impulse height; LOOK knob)",
+                    &g_ripTileEps, 0.0f, 0.1f, 0.001f, "%.3f");
           // Seconds with nobody in the water before the leftover field is faded out, and the fade's
           // length. The measured sleep follows the fade's end. 0 = never fade (the slow long waves
           // then keep the grid awake ~30 s).
@@ -27166,13 +27181,20 @@ namespace {
         // texture is undefined, so the clear has to write every texel — and it writes every mask
         // with them, which is what makes the masks true from then on. The quiet threshold goes to the
         // full-grid step as well, so the two paths stay bit-identical at any eps.
-        const bool tiled = dispersive && g_wakeTiles && G.cleared && G.tilesReady
+        // BOTH the wake (ripplewave.comp, 10-texel read halo) and the fine grid (ripplesim.comp,
+        // 2-texel halo from its grad^4 term) are tiled; MGE mode is not.
+        const bool fineMode = (mode == kRipModeFine);
+        const bool tileable = (dispersive || fineMode) && G.tilesReady;
+        const bool tiled = tileable && (dispersive ? g_wakeTiles : g_ripTiles) && G.cleared
                         && g_live.pRippleTilesPipeline != nullptr;
-        if (dispersive && G.tilesReady) {
-            const float eps = std::max(g_wakeTileEps, 0.0f) * std::max(g_wakeRingDepth, 0.0f);
+        if (tileable) {
+            const float eps = dispersive
+                ? std::max(g_wakeTileEps, 0.0f) * std::max(g_wakeRingDepth, 0.0f)
+                : std::max(g_ripTileEps, 0.0f) * std::max(impAmp, 0.0f);
             rp->tiles[0] = rp1->tiles[0] = tiled ? 1.0f : 0.0f;
             rp->tiles[1] = rp1->tiles[1] = eps;
             rp->tiles[2] = rp1->tiles[2] = (float)G.tilesPerSide;
+            rp->scroll[3] = rp1->scroll[3] = dispersive ? 10.0f : 2.0f;   // the step's read halo
         }
         if (!tiled) { G.zeroReads = 0; }
         if (dispersive) {
@@ -27326,7 +27348,19 @@ namespace {
                 rp->impulses[nImp][1] = ty;
                 rp->impulses[nImp][2] = impRadius;
                 rp->impulses[nImp][3] = impAmp;
+                bMinX = std::min(bMinX, tx); bMaxX = std::max(bMaxX, tx);
+                bMinY = std::min(bMinY, ty); bMaxY = std::max(bMaxY, ty);
                 ++nImp;
+            }
+            if (nImp) {
+                // Active tiles only (ripplesim.comp itself stamps by distance, not by this box). The
+                // impulse's volume-neutral bowl reaches 2r; +1 texel of slack. Sub-step 0 only: rp1
+                // carries no impulses, so its srcBounds stays unused.
+                const float pad = 2.0f * std::max(impRadius, 1e-3f) + 1.0f;
+                rp->srcBounds[0] = bMinX - pad;
+                rp->srcBounds[1] = bMinY - pad;
+                rp->srcBounds[2] = bMaxX + pad;
+                rp->srcBounds[3] = bMaxY + pad;
             }
         }
         rp->sim[3] = (float)nImp;
@@ -34890,21 +34924,22 @@ void destroyHostWindow(Renderer* R);
                 // report from play.
                 std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
             }
-            char wakeTilesText[48] = "full";
-            {
-                const RippleGrid& W = g_live.rippleWake;
-                if (W.tiledLast && W.tileReadback && W.tileReadback->pCpuMappedAddress) {
-                    const uint32_t* rb = (const uint32_t*)W.tileReadback->pCpuMappedAddress;
-                    if (rb[0] != 0xFFFFFFFFu) {
-                        int n = std::snprintf(wakeTilesText, sizeof(wakeTilesText), "%u/%u/%u",
-                                              rb[0], rb[3], W.tilesPerSide * W.tilesPerSide);
-                        if (g_wakeTileCheck && n > 0 && n < (int)sizeof(wakeTilesText)) {
-                            std::snprintf(wakeTilesText + n, sizeof(wakeTilesText) - n, " check=%u", rb[7]);
-                        }
-                    }
+            // <stepped>/<left non-zero>/<total> of a grid's last sub-step, read a frame late; "full"
+            // = the whole grid stepped (knob off, or a clear).
+            auto tilesText = [](const RippleGrid& W, char* out, size_t cap) {
+                std::snprintf(out, cap, "full");
+                if (!W.tiledLast || !W.tileReadback || !W.tileReadback->pCpuMappedAddress) { return; }
+                const uint32_t* rb = (const uint32_t*)W.tileReadback->pCpuMappedAddress;
+                if (rb[0] == 0xFFFFFFFFu) { return; }
+                int n = std::snprintf(out, cap, "%u/%u/%u", rb[0], rb[3], W.tilesPerSide * W.tilesPerSide);
+                if (g_wakeTileCheck && n > 0 && n < (int)cap) {
+                    std::snprintf(out + n, cap - n, " check=%u", rb[7]);
                 }
-            }
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
+            };
+            char wakeTilesText[48], fineTilesText[48];
+            tilesText(g_live.rippleWake, wakeTilesText, sizeof(wakeTilesText));
+            tilesText(g_live.rippleFine, fineTilesText, sizeof(fineTilesText));
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s tiles=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -34943,9 +34978,8 @@ void destroyHostWindow(Renderer* R);
                          // within its 8192-unit domain.
                          g_lastGpuPhaseMs[kGpuPhaseRippleSim],
                          !g_ripSimOn ? "off" : g_live.rippleFine.sleeping ? "sleep" : "awake",
+                         fineTilesText,
                          !g_wakeOn   ? "off" : g_live.rippleWake.sleeping ? "sleep" : "awake",
-                         // tiles=<stepped>/<left non-zero>/<total> of the wake grid's last sub-step,
-                         // read a frame late; "full" = the whole grid stepped (knob off, or a clear).
                          wakeTilesText,
                          // grasscrush=<ms>(<discs>) — G7. Three dispatches over a 512² field: two
                          // full-grid passes whose cost is fixed, and a scatter whose cost is
@@ -39439,7 +39473,7 @@ void destroyHostWindow(Renderer* R);
             if (ripWaterNow && g_ripSimOn) {
                 advanceRippleGrid(g_live.rippleFine, g_live.pRippleSimPipeline, kRipModeFine,
                                   g_eyeAbsShadow[0], g_eyeAbsShadow[1], dtFrame, 2,
-                                  kRippleThreads, g_ripSimRadius, g_ripSimAmp,
+                                  kRippleStepThreads, g_ripSimRadius, g_ripSimAmp,
                                   "RIPPLE wave sim (fine)");
             } else {
                 parkRippleGrid(g_live.rippleFine);

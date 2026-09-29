@@ -81,7 +81,9 @@ STRUCT(RippleSimParams)
     // w = impulse count this frame
     DATA(float4, sim,       None);
     // Scroll in TEXELS from the previous frame's domain origin to this frame's, as a whole number.
-    // xy = shift, zw = unused. The domain origin is snapped to the texel grid host-side precisely
+    // xy = shift, z = fine grid's grad^4 damping (ripplesim.comp), w = the step's READ HALO in texels
+    // (active tiles: ripplewavetiles/ripplewavecheck size the read footprint from it; 10 for
+    // ripplewave.comp's 21x21 kernel, 2 for ripplesim.comp's grad^4). The domain origin is snapped to the texel grid host-side precisely
     // so this is an INTEGER: a fractional scroll would need a resample every frame, and resampling
     // a wave field every frame is a low-pass filter running at 60 Hz — the waves would smear away
     // within a second of walking. An integer shift is an exact copy.

@@ -36,6 +36,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     int   nT    = int(gRippleSimParams.tiles.z);
     int   nImp  = int(gRippleSimParams.sim.w);
     int2  shift = int2(gRippleSimParams.scroll.xy);
+    int   halo  = int(gRippleSimParams.scroll.w);
+    uint  span  = uint(16 + 2 * halo);               // the footprint's side, texels
     uint2 lt    = uint2(did.x & 15u, did.y & 15u);
     int2  T     = int2(did.xy >> 4u);
     int2  org   = T * 16;
@@ -44,10 +46,10 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     GroupMemoryBarrier();
 
     uint hit = 0u;
-    // The prev footprint: the step reads prev at (texel + shift) with a 10-texel halo.
-    for (uint t = tid; t < 1296u; t += 256u)
+    // The prev footprint: the step reads prev at (texel + shift) out to `halo` texels.
+    for (uint t = tid; t < span * span; t += 256u)
     {
-        int2   gp = org + int2(int(t % 36u), int(t / 36u)) - 10;
+        int2   gp = org + int2(int(t % span), int(t / span)) - halo;
         float4 p  = checkFetchPrev(gp + shift, size);
         if (p.x != 0.0f || p.y != 0.0f) { hit = 1u; }
     }
@@ -64,8 +66,25 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
 
     if (tid == 0u && T.x < nT && T.y < nT)
     {
-        bool need   = g_seen != 0u || wakeTileInSource(T, nImp, gRippleSimParams.srcBounds);
-        bool listed = wakeTileNeeded(T, nT, shift, nImp, gRippleSimParams.srcBounds);
+        // Sources judged from the IMPULSES — each shader's own exact reach — not from the host's
+        // srcBounds box the build uses, so a box computed too small fails here.
+        //   fine grid (halo 2, ripplesim.comp): the bowl's smoothstep reaches 0 at d = 2r.
+        //   wake (halo 10, ripplewave.comp): the pinned ring's taper ends at r + max(r/2, 2), and
+        //   the pin is ALSO gated by srcBounds in-shader, so its true reach is clipped to that box.
+        bool   wakeMode = halo >= 10;
+        bool   nearSrc  = false;
+        float2 a = float2(org);
+        float2 b = a + 15.0f;
+        for (int i = 0; i < nImp; ++i)
+        {
+            float4 s     = gRippleSimParams.impulses[i];
+            float2 d     = max(max(a - s.xy, s.xy - b), f2(0.0f));
+            float  reach = wakeMode ? s.z + max(0.5f * s.z, 2.0f) : 2.0f * s.z;
+            if (length(d) < reach) { nearSrc = true; }
+        }
+        if (wakeMode && !wakeTileInSource(T, nImp, gRippleSimParams.srcBounds)) { nearSrc = false; }
+        bool need   = g_seen != 0u || nearSrc;
+        bool listed = wakeTileNeeded(T, nT, shift, halo, nImp, gRippleSimParams.srcBounds);
         if (need && !listed)
         {
             uint prevViol;

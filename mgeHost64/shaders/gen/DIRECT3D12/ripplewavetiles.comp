@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 778 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.comp.fsl"
-#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.comp.fsl"
+#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.h.fsl"
 #line 5 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.srt.h"
@@ -984,6 +984,8 @@ STRUCT(RippleSimParams)
 
 
     float4 sim;
+
+
 
 
 
@@ -1015,7 +1017,7 @@ STRUCT(RippleSimParams)
 
 
     float4 impulses[ 64 ];
-#line 114
+#line 116
 };
 
         CBUFFER(RippleSimParams) gRippleSimParams :  register(b0,space0);
@@ -1047,14 +1049,16 @@ bool wakeTileInSource(int2 T, int nImp, float4 sb)
 }
 
 
-bool wakeTileNeeded(int2 T, int nT, int2 shift, int nImp, float4 sb)
+bool wakeTileNeeded(int2 T, int nT, int2 shift, int halo, int nImp, float4 sb)
 {
     if (T.x < 0 || T.y < 0 || T.x >= nT || T.y >= nT) { return false; }
     if (gWakeMaskNext[uint(T.y * nT + T.x)] != 0u) { return true; }
 
 
-    int2 lo = T * 16 + shift - 10;
-    int2 hi = lo + 35;
+
+
+    int2 lo = T * 16 + shift - halo;
+    int2 hi = T * 16 + shift + 15 + halo;
     int2 tlo = max(lo >> 4, int2(0, 0));
     int2 thi = min(hi >> 4, int2(nT - 1, nT - 1));
     for (int ty = tlo.y; ty <= thi.y; ++ty)
@@ -1066,7 +1070,7 @@ bool wakeTileNeeded(int2 T, int nT, int2 shift, int nImp, float4 sb)
     }
     return wakeTileInSource(T, nImp, sb);
 }
-#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.comp.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.comp.fsl"
 
 
 
@@ -1088,12 +1092,13 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     if (T.x == 0 && T.y == 0) { gWakeStats[0] = 0u; gWakeStats[1] = 0u; }
 
     int2 shift = int2(gRippleSimParams.scroll.xy);
+    int halo = int(gRippleSimParams.scroll.w);
     int nImp = int(gRippleSimParams.sim.w);
     float4 sb = gRippleSimParams.srcBounds;
     uint packed = uint(T.x) | (uint(T.y) << 16u);
     uint slot;
 
-    if (wakeTileNeeded(T, nT, shift, nImp, sb))
+    if (wakeTileNeeded(T, nT, shift, halo, nImp, sb))
     {
         AtomicAdd(gWakeArgs[0], 1u, slot);
         gWakeTileList[slot] = packed;
@@ -1104,7 +1109,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     {
         for (int dx = -1; dx <= 1; ++dx)
         {
-            if (!ring && wakeTileNeeded(T + int2(dx, dy), nT, shift, nImp, sb)) { ring = true; }
+            if (!ring && wakeTileNeeded(T + int2(dx, dy), nT, shift, halo, nImp, sb)) { ring = true; }
         }
     }
     if (ring)

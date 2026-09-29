@@ -987,6 +987,8 @@ STRUCT(RippleSimParams)
 
 
 
+
+
     float4 scroll;
 
 
@@ -1013,7 +1015,7 @@ STRUCT(RippleSimParams)
 
 
     float4 impulses[ 64 ];
-#line 114
+#line 116
 };
 
         CBUFFER(RippleSimParams) gRippleSimParams :  register(b0,space0);
@@ -1039,24 +1041,51 @@ STRUCT(RippleSimParams)
 
 
 
+#define srt_g_tileMax g_tileMax
+#line 18
+groupshared uint g_tileMax;
+
+
+
+
+
+
+
+
+
 float4 rippleFetchPrev(int2 c, int size)
 {
     if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
     return LoadRWTex2D(gRippleSimPrev, c);
 }
 
-NUM_THREADS( 8 ,  8 , 1)
+NUM_THREADS( 16 ,  16 , 1)
 void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 {
     INIT_MAIN;
 
     int size = int(gRippleSimParams.sim.x);
-    int2 id = int2(did.xy);
 
-    if (id.x >= size || id.y >= size)
+
+
+
+    uint nT = uint(gRippleSimParams.tiles.z);
+    uint2 lt = uint2(did.x & 15u, did.y & 15u);
+    uint2 tileId;
+    if (gRippleSimParams.tiles.x > 0.5f)
     {
-        return;
+        uint packed = gWakeTileList[did.x >> 4u];
+        tileId = uint2(packed & 0xFFFFu, packed >> 16u);
     }
+    else
+    {
+        tileId = did.xy >> 4u;
+    }
+    int2 id = int2(tileId) *  16  + int2(lt);
+    bool inside = id.x < size && id.y < size;
+    uint tid = lt.y * 16u + lt.x;
+    if (tid == 0u) { g_tileMax = 0u; }
+    GroupMemoryBarrier();
 
     float speed = gRippleSimParams.sim.y;
     float decay = gRippleSimParams.sim.z;
@@ -1085,7 +1114,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
         float4 imp = gRippleSimParams.impulses[i];
         float d = length(float2(id) - imp.xy);
         float r = max(imp.z, 1e-3f);
-#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
+#line 119 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
         h.x += imp.w * (smoothstep(1.0f, 0.0f, d / r)
                       - 0.25f * smoothstep(1.0f, 0.0f, d / (2.0f * r)));
     }
@@ -1096,7 +1125,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     float avg = 0.25f * (hL + hR + hT + hB);
     h.y += avg - h.x;
     h.y *= decay;
-#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
+#line 149 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
     float gd = clamp(gRippleSimParams.scroll.z, 0.0f, 1.0f / 64.0f);
     if (gd > 0.0f) {
         float vL = rippleFetchPrev(src + int2(-1, 0), size).y;
@@ -1128,7 +1157,29 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
 
 
-    Write2D(gRippleSimNext, id, float4(h.x, h.y, h.z, h.w));
+
+    float mag = inside ? max(abs(h.x), abs(h.y)) : 0.0f;
+    uint prevMax;
+    InterlockedMax(g_tileMax, asuint(mag), prevMax) ;
+    GroupMemoryBarrier();
+    bool quiet = asfloat(g_tileMax) <= gRippleSimParams.tiles.y;
+    if (quiet) { h = f4(0.0f); }
+
+
+
+    if (inside)
+    {
+        Write2D(gRippleSimNext, id, float4(h.x, h.y, h.z, h.w));
+    }
+    if (tid == 0u && nT > 0u)
+    {
+        gWakeMaskNext[tileId.y * nT + tileId.x] = quiet ? 0u : 1u;
+        if (!quiet)
+        {
+            uint nzPrev;
+            AtomicAdd(gWakeStats[0], 1u, nzPrev);
+        }
+    }
 
     return;
 }

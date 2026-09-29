@@ -989,6 +989,8 @@ STRUCT(RippleSimParams)
 
 
 
+
+
     float4 scroll;
 
 
@@ -1015,7 +1017,7 @@ STRUCT(RippleSimParams)
 
 
     float4 impulses[ 64 ];
-#line 114
+#line 116
 };
 
         CBUFFER(RippleSimParams) gRippleSimParams :  register(b0,space0);
@@ -1047,14 +1049,16 @@ bool wakeTileInSource(int2 T, int nImp, float4 sb)
 }
 
 
-bool wakeTileNeeded(int2 T, int nT, int2 shift, int nImp, float4 sb)
+bool wakeTileNeeded(int2 T, int nT, int2 shift, int halo, int nImp, float4 sb)
 {
     if (T.x < 0 || T.y < 0 || T.x >= nT || T.y >= nT) { return false; }
     if (gWakeMaskNext[uint(T.y * nT + T.x)] != 0u) { return true; }
 
 
-    int2 lo = T * 16 + shift - 10;
-    int2 hi = lo + 35;
+
+
+    int2 lo = T * 16 + shift - halo;
+    int2 hi = T * 16 + shift + 15 + halo;
     int2 tlo = max(lo >> 4, int2(0, 0));
     int2 thi = min(hi >> 4, int2(nT - 1, nT - 1));
     for (int ty = tlo.y; ty <= thi.y; ++ty)
@@ -1090,6 +1094,8 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     int nT = int(gRippleSimParams.tiles.z);
     int nImp = int(gRippleSimParams.sim.w);
     int2 shift = int2(gRippleSimParams.scroll.xy);
+    int halo = int(gRippleSimParams.scroll.w);
+    uint span = uint(16 + 2 * halo);
     uint2 lt = uint2(did.x & 15u, did.y & 15u);
     int2 T = int2(did.xy >> 4u);
     int2 org = T * 16;
@@ -1099,9 +1105,9 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
     uint hit = 0u;
 
-    for (uint t = tid; t < 1296u; t += 256u)
+    for (uint t = tid; t < span * span; t += 256u)
     {
-        int2 gp = org + int2(int(t % 36u), int(t / 36u)) - 10;
+        int2 gp = org + int2(int(t % span), int(t / span)) - halo;
         float4 p = checkFetchPrev(gp + shift, size);
         if (p.x != 0.0f || p.y != 0.0f) { hit = 1u; }
     }
@@ -1118,8 +1124,25 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
     if (tid == 0u && T.x < nT && T.y < nT)
     {
-        bool need = g_seen != 0u || wakeTileInSource(T, nImp, gRippleSimParams.srcBounds);
-        bool listed = wakeTileNeeded(T, nT, shift, nImp, gRippleSimParams.srcBounds);
+
+
+
+
+
+        bool wakeMode = halo >= 10;
+        bool nearSrc = false;
+        float2 a = float2(org);
+        float2 b = a + 15.0f;
+        for (int i = 0; i < nImp; ++i)
+        {
+            float4 s = gRippleSimParams.impulses[i];
+            float2 d = max(max(a - s.xy, s.xy - b), f2(0.0f));
+            float reach = wakeMode ? s.z + max(0.5f * s.z, 2.0f) : 2.0f * s.z;
+            if (length(d) < reach) { nearSrc = true; }
+        }
+        if (wakeMode && !wakeTileInSource(T, nImp, gRippleSimParams.srcBounds)) { nearSrc = false; }
+        bool need = g_seen != 0u || nearSrc;
+        bool listed = wakeTileNeeded(T, nT, shift, halo, nImp, gRippleSimParams.srcBounds);
         if (need && !listed)
         {
             uint prevViol;
