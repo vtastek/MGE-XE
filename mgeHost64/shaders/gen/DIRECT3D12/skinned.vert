@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 151 "FSL/shaders.list"
+#line 157 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2485,7 +2485,7 @@ STRUCT(VSInput)
 
 STRUCT(VSOutput)
 {
-    DATA(float4, Position, SV_Position);
+    precise DATA(float4, Position, SV_Position);
     DATA(float3, Normal, NORMAL);
     DATA(float2, Uv, TEXCOORD0);
     DATA(FLAT(uint), TexIndex, TEXCOORD1);
@@ -2584,4 +2584,4 @@ VSOutput VS_MAIN( VSInput In )
                                 dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w);
     return (Out);
 }
-#line 152 "FSL/shaders.list"
+#line 158 "FSL/shaders.list"

@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 100 "FSL/shaders.list"
+#line 106 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyoracle.frag.fsl"
 #line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyoracle.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2291,4 +2291,4 @@ PSOut PS_MAIN(VSOutput In)
     Out.C = float4(gtao, aoOn ? 1.0f : 0.0f, 0.0f, 1.0f);
     return (Out);
 }
-#line 101 "FSL/shaders.list"
+#line 107 "FSL/shaders.list"
