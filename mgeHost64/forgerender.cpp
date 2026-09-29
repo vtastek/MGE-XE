@@ -27400,7 +27400,11 @@ namespace {
                         return;
                     }
                 }
-                for (int s = 0; s < steps; ++s) { G.quietDecay *= stepDecay; }
+                // The calm fade scales the whole field by (1 - tiles.w) per sub-step as well, so it
+                // belongs in the bound too. Without it the full-grid path (no measured sleep) kept
+                // stepping an already-faded field until the 46 s bound (1660S, wakeTiles=0).
+                const float fadeKeep[2] = { 1.0f - rp->tiles[3], 1.0f - rp1->tiles[3] };
+                for (int s = 0; s < steps; ++s) { G.quietDecay *= stepDecay * fadeKeep[s & 1]; }
                 if (G.quietDecay < kRippleSleepDecay) {
                     // Last frame awake: zero both ping-pong textures (both sub-steps scroll the
                     // whole domain out, which is how the !cleared path clears), then sleep.
