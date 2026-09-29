@@ -1,0 +1,77 @@
+// mgeHost64 — AUDIT of the active-tile skip (debug knob `wakeTileCheck`). Model: ripplewavetiles.comp.
+//
+// WHY THIS EXISTS. Skipping a tile is claimed EXACT: a skipped tile reads only zeros, has no source
+// and already holds zeros, so the full-grid step would have written the zeros that are there. The
+// fast path deletes the only oracle for that claim (the full grid). And the obvious self-check — "a
+// tile with mask 0 holds zeros" — cannot catch the likeliest bug: a wrong read footprint (a shift
+// sign, an off-by-one halo) leaves the missed tile ZERO, so its mask stays true while the wave that
+// should have entered it is silently lost.
+//
+// So this pass ignores the masks for the verdict. Between the build and the step, one 16x16 group
+// per tile reads the TEXELS: every prev texel under the tile's scrolled 36x36 footprint and every
+// dst texel of the tile. If any is non-zero (or the obstacle overlaps it) the tile had to run; if the
+// build nevertheless skipped it (wakeTileNeeded, from the masks, says no), that is a violation,
+// counted in gWakeStats[1]. Zero violations over a run is the proof. Cost is a full-grid pass of
+// ~1300 loads per tile — a debug arm, never a shipped one.
+
+#include "ripplewavetiles.h.fsl"
+
+#define CHECK_THREADS 16
+
+GroupShared(uint, g_seen);
+
+// Zero outside the previous domain, exactly as ripplewave.comp's fetch does.
+float4 checkFetchPrev(int2 c, int size)
+{
+    if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
+    return LoadRWTex2D(gRippleSimPrev, c);
+}
+
+NUM_THREADS(CHECK_THREADS, CHECK_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int   size  = int(gRippleSimParams.sim.x);
+    int   nT    = int(gRippleSimParams.tiles.z);
+    int   nImp  = int(gRippleSimParams.sim.w);
+    int2  shift = int2(gRippleSimParams.scroll.xy);
+    uint2 lt    = uint2(did.x & 15u, did.y & 15u);
+    int2  T     = int2(did.xy >> 4u);
+    int2  org   = T * 16;
+    uint  tid   = lt.y * 16u + lt.x;
+    if (tid == 0u) { g_seen = 0u; }
+    GroupMemoryBarrier();
+
+    uint hit = 0u;
+    // The prev footprint: the step reads prev at (texel + shift) with a 10-texel halo.
+    for (uint t = tid; t < 1296u; t += 256u)
+    {
+        int2   gp = org + int2(int(t % 36u), int(t / 36u)) - 10;
+        float4 p  = checkFetchPrev(gp + shift, size);
+        if (p.x != 0.0f || p.y != 0.0f) { hit = 1u; }
+    }
+    // This tile in dst: old data the step would have to overwrite.
+    int2 me = org + int2(lt);
+    if (me.x < size && me.y < size)
+    {
+        float4 d = LoadRWTex2D(gRippleSimNext, me);
+        if (d.x != 0.0f || d.y != 0.0f) { hit = 1u; }
+    }
+    uint prevSeen;
+    if (hit != 0u) { AtomicOr(g_seen, 1u, prevSeen); }
+    GroupMemoryBarrier();
+
+    if (tid == 0u && T.x < nT && T.y < nT)
+    {
+        bool need   = g_seen != 0u || wakeTileInSource(T, nImp, gRippleSimParams.srcBounds);
+        bool listed = wakeTileNeeded(T, nT, shift, nImp, gRippleSimParams.srcBounds);
+        if (need && !listed)
+        {
+            uint prevViol;
+            AtomicAdd(gWakeStats[1], 1u, prevViol);
+        }
+    }
+
+    RETURN();
+}

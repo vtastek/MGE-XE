@@ -1,0 +1,71 @@
+// mgeHost64 — ACTIVE TILES for the dispersive wake step (ripplewave.comp). Model: ripplesim.srt.h.
+//
+// WHY. The wake grid is 1024² texels × 441 taps, stepped twice a frame, and a swimmer disturbs a few
+// percent of it. The whole-grid step was ~4 ms of every 1660S frame with anyone in the water, and the
+// calm SLEEP cannot help while they are there. This pass lists only the 16x16 tiles that can hold
+// anything non-zero after the step, and the step + slope passes run indirectly over those lists.
+//
+// ONE THREAD PER OUTPUT TILE. A tile must run if ANY of:
+//   (a) gWakeMaskNext is set — the target still holds old non-zero data there, which has to be
+//       rewritten (to the new values, or to zeros);
+//   (b) any tile of gWakeMaskPrev under its READ FOOTPRINT is set. The step reads prev at
+//       (its texel + shift) with a 10-texel halo, so the footprint is T*16 + shift - 10 .. + 25,
+//       at most 3x3 prev tiles. `shift` is the integer domain scroll, so this also follows the camera;
+//   (c) it overlaps srcBounds while the moving obstacle is live (the pin writes non-zero values
+//       into a field that may be all zeros there).
+// Anything else reads only zeros and has no source, so the step would write zeros that are already
+// there: skipping it is EXACT, not an approximation. The approximation lives in one place only, the
+// quiet threshold in ripplewave.comp, and it applies to the full-grid path too.
+//
+// The slope list is the step list DILATED BY ONE TILE: a slope reads its neighbours' heights ±1
+// texel, so a skipped tile beside a stepped one can still see its edge slope change.
+
+#include "ripplewavetiles.h.fsl"   // wakeTileNeeded (shared with ripplewavecheck.comp)
+
+#define TILE_THREADS 8
+
+NUM_THREADS(TILE_THREADS, TILE_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int  nT = int(gRippleSimParams.tiles.z);
+    int2 T  = int2(did.xy);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (T.x >= nT || T.y >= nT)
+    {
+        RETURN();
+    }
+
+    // The step that follows counts its non-zero tiles into gWakeStats[0]; start it from zero. The
+    // UAV barrier between this dispatch and the step orders the two.
+    if (T.x == 0 && T.y == 0) { gWakeStats[0] = 0u; gWakeStats[1] = 0u; }
+
+    int2   shift  = int2(gRippleSimParams.scroll.xy);
+    int    nImp   = int(gRippleSimParams.sim.w);
+    float4 sb     = gRippleSimParams.srcBounds;
+    uint   packed = uint(T.x) | (uint(T.y) << 16u);
+    uint   slot;
+
+    if (wakeTileNeeded(T, nT, shift, nImp, sb))
+    {
+        AtomicAdd(gWakeArgs[0], 1u, slot);
+        gWakeTileList[slot] = packed;
+    }
+
+    bool ring = false;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            if (!ring && wakeTileNeeded(T + int2(dx, dy), nT, shift, nImp, sb)) { ring = true; }
+        }
+    }
+    if (ring)
+    {
+        AtomicAdd(gWakeArgs[4], 4u, slot);            // four 8x8 slope groups per tile
+        gWakeNormList[slot >> 2u] = packed;
+    }
+
+    RETURN();
+}

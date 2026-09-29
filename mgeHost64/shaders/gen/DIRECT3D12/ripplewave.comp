@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 754 "FSL/shaders.list"
+#line 760 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.srt.h"
@@ -1005,13 +1005,33 @@ STRUCT(RippleSimParams)
 
 
 
+
+
+
+    float4 tiles;
+
+
+
     float4 impulses[ 64 ];
-#line 107
+#line 114
 };
 
         CBUFFER(RippleSimParams) gRippleSimParams :  register(b0,space0);
         RTex2D(float4) gRippleSimPrev :  register(u1,space0);
         RWTex2D(float4) gRippleSimNext :  register(u2,space0);
+
+
+        RWBuffer(uint) gWakeMaskPrev :  register(u3,space0);
+        RWBuffer(uint) gWakeMaskNext :  register(u4,space0);
+        RWBuffer(uint) gWakeTileList :  register(u5,space0);
+        RWBuffer(uint) gWakeNormList :  register(u6,space0);
+
+
+        RWBuffer(uint) gWakeArgs :  register(u7,space0);
+
+
+
+        RWBuffer(uint) gWakeStats :  register(u8,space0);
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
 
 
@@ -1025,6 +1045,15 @@ STRUCT(RippleSimParams)
 #define srt_g_wave g_wave
 #line 48
 groupshared float g_wave[1296];
+
+#define srt_g_tileMax g_tileMax
+#line 50
+groupshared uint g_tileMax;
+
+
+
+
+
 
 
 
@@ -1043,14 +1072,31 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     int size = int(gRippleSimParams.sim.x);
     int nImp = int(gRippleSimParams.sim.w);
     int2 shift = int2(gRippleSimParams.scroll.xy);
-    int2 me = int2(did.xy);
 
 
 
 
-    uint2 lt = did.xy & 15u;
-    int2 org = int2(did.xy >> 4u) *  16 ;
+
+
+
+
+
+    uint nT = uint(gRippleSimParams.tiles.z);
+    uint2 lt = uint2(did.x & 15u, did.y & 15u);
+    uint2 tileId;
+    if (gRippleSimParams.tiles.x > 0.5f)
+    {
+        uint packed = gWakeTileList[did.x >> 4u];
+        tileId = uint2(packed & 0xFFFFu, packed >> 16u);
+    }
+    else
+    {
+        tileId = did.xy >> 4u;
+    }
+    int2 org = int2(tileId) *  16 ;
+    int2 me = org + int2(lt);
     uint tid = lt.y * 16u + lt.x;
+    if (tid == 0u) { g_tileMax = 0u; }
 
 
 
@@ -1229,7 +1275,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
     float4 pc = waveFetchPrev(me + shift, size);
     float v = (pc.y - grav * acc * dt) * damp;
-#line 285 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+#line 309 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
     float visc4 = clamp(gRippleSimParams.wave.w * dt * (1.0f / 64.0f), 0.0f, 1.0f / 64.0f);
     if (visc4 > 0.0f) {
         float c = pc.y;
@@ -1256,7 +1302,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     }
 
     float h = g_wave[base] + v * dt;
-#line 325 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+#line 349 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
     float4 sb = gRippleSimParams.srcBounds;
     if (nImp > 0 && float(me.x) >= sb.x && float(me.y) >= sb.y
                  && float(me.x) <= sb.z && float(me.y) <= sb.w)
@@ -1265,7 +1311,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
         {
             float4 s = gRippleSimParams.impulses[i];
             float d = length(float2(me) - s.xy);
-#line 350 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+#line 374 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
             float tw = max(0.5f * s.z, 2.0f);
             float tt = saturate(abs(d - s.z) / tw);
             float disp = tt * tt * (3.0f - 2.0f * tt);
@@ -1275,7 +1321,27 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     }
 
 
+
+
+    float fade = 1.0f - gRippleSimParams.tiles.w;
+    h *= fade;
+    v *= fade;
+
+
     if (abs(h) < 1.0e-6f && abs(v) < 1.0e-6f) { h = 0.0f; v = 0.0f; }
+
+
+
+
+
+
+
+    float mag = (me.x < size && me.y < size) ? max(abs(h), abs(v)) : 0.0f;
+    uint prevMax;
+    InterlockedMax(g_tileMax, asuint(mag), prevMax) ;
+    GroupMemoryBarrier();
+    bool quiet = asfloat(g_tileMax) <= gRippleSimParams.tiles.y;
+    if (quiet) { h = 0.0f; v = 0.0f; pc.z = 0.0f; pc.w = 0.0f; }
 
 
 
@@ -1283,7 +1349,16 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     {
         Write2D(gRippleSimNext, me, float4(h, v, pc.z, pc.w));
     }
+    if (tid == 0u && nT > 0u)
+    {
+        gWakeMaskNext[tileId.y * nT + tileId.x] = quiet ? 0u : 1u;
+        if (!quiet)
+        {
+            uint nzPrev;
+            AtomicAdd(gWakeStats[0], 1u, nzPrev);
+        }
+    }
 
     return;
 }
-#line 755 "FSL/shaders.list"
+#line 761 "FSL/shaders.list"

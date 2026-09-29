@@ -972,9 +972,11 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 752 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
+#line 784 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavecheck.comp.fsl"
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavecheck.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.h.fsl"
+#line 5 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.srt.h"
 #line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.srt.h"
 STRUCT(RippleSimParams)
@@ -1032,104 +1034,99 @@ STRUCT(RippleSimParams)
 
 
         RWBuffer(uint) gWakeStats :  register(u8,space0);
-#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
+#line 6 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavetiles.h.fsl"
 
 
 
+bool wakeTileInSource(int2 T, int nImp, float4 sb)
+{
+    if (nImp <= 0) { return false; }
+    float2 a = float2(T * 16);
+    float2 b = a + 15.0f;
+    return b.x >= sb.x && a.x <= sb.z && b.y >= sb.y && a.y <= sb.w;
+}
+
+
+bool wakeTileNeeded(int2 T, int nT, int2 shift, int nImp, float4 sb)
+{
+    if (T.x < 0 || T.y < 0 || T.x >= nT || T.y >= nT) { return false; }
+    if (gWakeMaskNext[uint(T.y * nT + T.x)] != 0u) { return true; }
+
+
+    int2 lo = T * 16 + shift - 10;
+    int2 hi = lo + 35;
+    int2 tlo = max(lo >> 4, int2(0, 0));
+    int2 thi = min(hi >> 4, int2(nT - 1, nT - 1));
+    for (int ty = tlo.y; ty <= thi.y; ++ty)
+    {
+        for (int tx = tlo.x; tx <= thi.x; ++tx)
+        {
+            if (gWakeMaskPrev[uint(ty * nT + tx)] != 0u) { return true; }
+        }
+    }
+    return wakeTileInSource(T, nImp, sb);
+}
+#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewavecheck.comp.fsl"
 
 
 
-float4 rippleFetchPrev(int2 c, int size)
+#define srt_g_seen g_seen
+#line 21
+groupshared uint g_seen;
+
+
+float4 checkFetchPrev(int2 c, int size)
 {
     if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
     return LoadRWTex2D(gRippleSimPrev, c);
 }
 
-NUM_THREADS( 8 ,  8 , 1)
+NUM_THREADS( 16 ,  16 , 1)
 void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 {
     INIT_MAIN;
 
     int size = int(gRippleSimParams.sim.x);
-    int2 id = int2(did.xy);
-
-    if (id.x >= size || id.y >= size)
-    {
-        return;
-    }
-
-    float speed = gRippleSimParams.sim.y;
-    float decay = gRippleSimParams.sim.z;
+    int nT = int(gRippleSimParams.tiles.z);
     int nImp = int(gRippleSimParams.sim.w);
     int2 shift = int2(gRippleSimParams.scroll.xy);
+    uint2 lt = uint2(did.x & 15u, did.y & 15u);
+    int2 T = int2(did.xy >> 4u);
+    int2 org = T * 16;
+    uint tid = lt.y * 16u + lt.x;
+    if (tid == 0u) { g_seen = 0u; }
+    GroupMemoryBarrier();
 
+    uint hit = 0u;
 
-
-
-    int2 src = id + shift;
-    float4 h = rippleFetchPrev(src, size);
-
-
-
-    float hL = rippleFetchPrev(src + int2(-1, 0), size).x;
-    float hR = rippleFetchPrev(src + int2( 1, 0), size).x;
-    float hT = rippleFetchPrev(src + int2( 0, 1), size).x;
-    float hB = rippleFetchPrev(src + int2( 0, -1), size).x;
-
-
-
-
-
-    LOOP for (int i = 0; i < nImp; ++i)
+    for (uint t = tid; t < 1296u; t += 256u)
     {
-        float4 imp = gRippleSimParams.impulses[i];
-        float d = length(float2(id) - imp.xy);
-        float r = max(imp.z, 1e-3f);
-#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
-        h.x += imp.w * (smoothstep(1.0f, 0.0f, d / r)
-                      - 0.25f * smoothstep(1.0f, 0.0f, d / (2.0f * r)));
+        int2 gp = org + int2(int(t % 36u), int(t / 36u)) - 10;
+        float4 p = checkFetchPrev(gp + shift, size);
+        if (p.x != 0.0f || p.y != 0.0f) { hit = 1u; }
     }
 
-
-
-
-    float avg = 0.25f * (hL + hR + hT + hB);
-    h.y += avg - h.x;
-    h.y *= decay;
-#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
-    float gd = clamp(gRippleSimParams.scroll.z, 0.0f, 1.0f / 64.0f);
-    if (gd > 0.0f) {
-        float vL = rippleFetchPrev(src + int2(-1, 0), size).y;
-        float vR = rippleFetchPrev(src + int2( 1, 0), size).y;
-        float vT = rippleFetchPrev(src + int2( 0, 1), size).y;
-        float vB = rippleFetchPrev(src + int2( 0, -1), size).y;
-        float vLL = rippleFetchPrev(src + int2(-2, 0), size).y;
-        float vRR = rippleFetchPrev(src + int2( 2, 0), size).y;
-        float vTT = rippleFetchPrev(src + int2( 0, 2), size).y;
-        float vBB = rippleFetchPrev(src + int2( 0, -2), size).y;
-        float vLT = rippleFetchPrev(src + int2(-1, 1), size).y;
-        float vLB = rippleFetchPrev(src + int2(-1, -1), size).y;
-        float vRT = rippleFetchPrev(src + int2( 1, 1), size).y;
-        float vRB = rippleFetchPrev(src + int2( 1, -1), size).y;
-        float vC = rippleFetchPrev(src, size).y;
-        float l0 = vL + vR + vT + vB - 4.0f * vC;
-        float lL = vLL + vC + vLB + vLT - 4.0f * vL;
-        float lR = vRR + vC + vRB + vRT - 4.0f * vR;
-        float lT = vTT + vC + vLT + vRT - 4.0f * vT;
-        float lB = vBB + vC + vLB + vRB - 4.0f * vB;
-        h.y -= gd * (lL + lR + lT + lB - 4.0f * l0);
+    int2 me = org + int2(lt);
+    if (me.x < size && me.y < size)
+    {
+        float4 d = LoadRWTex2D(gRippleSimNext, me);
+        if (d.x != 0.0f || d.y != 0.0f) { hit = 1u; }
     }
+    uint prevSeen;
+    if (hit != 0u) { AtomicOr(g_seen, 1u, prevSeen); }
+    GroupMemoryBarrier();
 
-    h.x += h.y * min(speed, 2.0f);
-
-
-
-    if (abs(h.x) < 1e-6f && abs(h.y) < 1e-6f) { h.x = 0.0f; h.y = 0.0f; }
-
-
-
-    Write2D(gRippleSimNext, id, float4(h.x, h.y, h.z, h.w));
+    if (tid == 0u && T.x < nT && T.y < nT)
+    {
+        bool need = g_seen != 0u || wakeTileInSource(T, nImp, gRippleSimParams.srcBounds);
+        bool listed = wakeTileNeeded(T, nT, shift, nImp, gRippleSimParams.srcBounds);
+        if (need && !listed)
+        {
+            uint prevViol;
+            AtomicAdd(gWakeStats[1], 1u, prevViol);
+        }
+    }
 
     return;
 }
-#line 753 "FSL/shaders.list"
+#line 785 "FSL/shaders.list"

@@ -2439,6 +2439,26 @@ namespace {
         // stops stepping (`sleeping`) until a source returns. A sleeping field is exactly zero.
         float          quietDecay = 1.0f;
         bool           sleeping   = false;
+        // ACTIVE TILES (ripplewavetiles.comp; only the dispersive step uses them, but every grid
+        // owns the buffers because the shared SRT set must bind something). tileMask[i] belongs to
+        // tex[i]; see ripplesim.srt.h for the invariant. tileArgs is reset each step by a copy from
+        // tileArgsReset (Forge has no buffer clear) and read back one frame late for the heartbeat.
+        Buffer*        tileMask[2]   = { nullptr, nullptr };
+        Buffer*        tileList      = nullptr;
+        Buffer*        tileNormList  = nullptr;
+        Buffer*        tileArgs      = nullptr;
+        Buffer*        tileStats     = nullptr;   // [0] non-zero tiles after the step
+        Buffer*        tileArgsReset = nullptr;
+        Buffer*        tileReadback  = nullptr;
+        uint32_t       tilesPerSide  = 0;
+        bool           tilesReady    = false;
+        bool           tiledLast     = false;   // last advance ran tiled: the readback is ours
+        ResourceState  argsState     = RESOURCE_STATE_UNORDERED_ACCESS;
+        // Measured sleep: frames since a source was in the domain, and consecutive readbacks that
+        // saw zero non-zero tiles. See the sleep block in advanceRippleGrid.
+        uint32_t       calmFrames    = 0;
+        uint32_t       zeroReads     = 0;
+        double         lastSourceSec = 0.0;   // g_simClock when a source was last in the domain
         // tex[0] is read by water.frag through an SRV but written by compute through a UAV, so it
         // has to be transitioned each way around the dispatch. Tracked rather than assumed because
         // the sim is skipped entirely on frames with no water, and a texture left in
@@ -3704,6 +3724,10 @@ namespace {
         Shader*        pRippleNormalShader = nullptr;         // ripplenormal.comp
         Pipeline*      pRippleSimPipeline = nullptr;
         Pipeline*      pRippleWavePipeline = nullptr;
+        Shader*        pRippleTilesShader = nullptr;          // ripplewavetiles.comp
+        Pipeline*      pRippleTilesPipeline = nullptr;
+        Shader*        pRippleCheckShader = nullptr;          // ripplewavecheck.comp (debug audit)
+        Pipeline*      pRippleCheckPipeline = nullptr;
         Pipeline*      pRippleMgePipeline = nullptr;
         Pipeline*      pRippleNormalPipeline = nullptr;
         bool           reflectMipReady = false;            // gates the per-frame pyramid build
@@ -21591,6 +21615,24 @@ namespace {
     // last source bounds the field below this fraction of it. `ripSleepOff` = the A/B (always step).
     constexpr float kRippleSleepDecay = 1.0e-3f;
     bool  g_ripSleepOff  = false;
+    // ACTIVE TILES for the dispersive wake step (ripplewavetiles.comp). `wakeTiles=0` = the A/B: the
+    // whole grid, which at the same wakeTileEps must give a BIT-IDENTICAL field — tiles are pure
+    // perf. `wakeTileEps` is the separate quality knob: a 16x16 tile whose max(|h|,|v|) falls to
+    // this fraction of the obstacle depth is zeroed (0 = only exact zeros, i.e. the old field).
+    bool  g_wakeTiles    = true;
+    // 0.035: the wake stops ~12 s after the last swimmer leaves (user, 2026-09-29: it reads as gone at
+    // ~10 s, so 12 for margin). Measured on the wakehop fixture: 1e-2 -> ~20 s, 5e-2 -> ~10 s.
+    float g_wakeTileEps  = 0.035f;
+    // CALM FADE: seconds with no source in the domain before the wake field is faded out, and the
+    // length of that fade. The user sees a wake as gone at ~10 s and asked for the grid to stop at 12.
+    // The leftover field crosses the quiet threshold partway into the fade: starting at 10 measured a
+    // sleep at 10.8-11.0 s, so the fade starts at 11. Without it the slow long waves kept the grid
+    // awake ~30 s at eps 0.035 (measured). Start <= 0 disables it.
+    float g_wakeCalmFade    = 11.0f;
+    float g_wakeCalmFadeLen = 2.0f;
+    // DEBUG AUDIT of the skip (ripplewavecheck.comp): counts skipped tiles whose TEXELS say they had
+    // to run. Must read 0; `tiles=` in the gpu split heartbeat gains `check=<violations>`.
+    bool  g_wakeTileCheck = false;
     // ⚠ W28h — GRID-SCALE DAMPING RATE, 1/s. The uniform `g_wakeDamp` above cannot do this job at
     // any value: it is k-independent, and under omega^2 = g|k| the group velocity is (1/2)sqrt(g/k),
     // so the SHORTEST waves are the SLOWEST and grid-scale excitation never leaves the domain. Turn
@@ -22778,6 +22820,9 @@ namespace {
             // PROGRESSIVE — it only shows after the field has been running a while — so measuring it
             // means a long unattended run, which is exactly what the minimized harness is for.
             { "wakeGridDamp",        &g_wakeGridDamp        },
+            { "wakeTileEps",         &g_wakeTileEps         },
+            { "wakeCalmFade",        &g_wakeCalmFade        },
+            { "wakeCalmFadeLen",     &g_wakeCalmFadeLen     },
             { "ripGridDamp",         &g_ripGridDamp         },
             { "causticCalmDisp",     &g_causticCalmDisp     },
             { "causticCalmHess",     &g_causticCalmHess     },
@@ -23142,6 +23187,8 @@ namespace {
             { "ripSimOn",           &g_ripSimOn           },
             { "wakeOn",             &g_wakeOn             },
             { "ripSleepOff",        &g_ripSleepOff        },
+            { "wakeTiles",          &g_wakeTiles          },
+            { "wakeTileCheck",      &g_wakeTileCheck      },
             // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
             // proof that what is on screen is being cast by the surface and not painted on.
             { "waterFlatTest",      &g_waterFlatTest      },
@@ -25707,6 +25754,20 @@ namespace {
           t.sliderF("Dispersive: grid-scale damping RATE 1/s (grad^4; keeps the wake's gradients)",
                     &g_wakeGridDamp, 0.0f, 20.0f, 0.5f, "%.1f");
           t.sliderF("Dispersive: gravity x (1.0 = physical; sets the arc SPACING)", &g_wakeGravity, 0.1f, 4.0f, 0.05f, "%.2f");
+          // ACTIVE TILES (ripplewavetiles.comp). The checkbox is pure perf — the field is bit-identical
+          // either way (audited: wakeTileCheck). The slider is the LOOK knob: a 16x16 tile whose
+          // height and velocity all fall below this fraction of the obstacle depth is zeroed, so it
+          // decides how far the faint long waves reach before the field stops being stepped there.
+          // 1e-3 ~ the whole domain lit within 30 s of a swimmer; 1e-2 ~22% of it; 5e-2 ~5%.
+          t.checkbox("Dispersive: ACTIVE TILES (step only where the field is non-zero)", &g_wakeTiles);
+          t.sliderF("Dispersive: quiet tile threshold (x obstacle depth; LOOK knob)",
+                    &g_wakeTileEps, 0.0f, 0.1f, 0.001f, "%.3f");
+          t.checkbox("Dispersive: AUDIT the tile skip (debug; heartbeat check= must read 0)", &g_wakeTileCheck);
+          // Seconds with nobody in the water before the leftover field is faded out, and the fade's
+          // length. The measured sleep follows the fade's end. 0 = never fade (the slow long waves
+          // then keep the grid awake ~30 s).
+          t.sliderF("Dispersive: calm FADE starts after (s, no source; 0 = off)", &g_wakeCalmFade, 0.0f, 60.0f, 0.5f, "%.1f");
+          t.sliderF("Dispersive: calm fade length (s)", &g_wakeCalmFadeLen, 0.1f, 10.0f, 0.1f, "%.1f");
           // Kelvin's angle does not depend on speed; ours did, because a fast swimmer's wavelength
           // leaves the kernel's accurate band and the operator degenerates to non-dispersive. This
           // drives gravity from the source's measured speed to hold the wavelength in band.
@@ -26584,10 +26645,68 @@ namespace {
             addResource(&pb, nullptr);
         }
 
+        // (2b) ACTIVE TILES. One uint per 16x16 tile for each mask and list; 8 uints of args. Tiny
+        // (16 KB per buffer at 1024²), and allocated for every grid because the shared SRT set binds
+        // them whether or not that grid's step shader reads them.
+        G.tilesPerSide = size / 16u;
+        const uint32_t nTiles = G.tilesPerSide * G.tilesPerSide;
+        auto addUintBuffer = [&](Buffer** out, uint32_t count, DescriptorType extra, const char* suffix) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "%s%s", tag, suffix);
+            BufferLoadDesc bd = {};
+            bd.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | extra);
+            bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            bd.mDesc.mFormat       = TinyImageFormat_R32_UINT;
+            bd.mDesc.mStructStride = sizeof(uint32_t);
+            bd.mDesc.mElementCount = count;
+            bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * count;
+            bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            bd.mDesc.pName         = name;
+            bd.ppBuffer            = out;
+            addResource(&bd, nullptr);
+        };
+        addUintBuffer(&G.tileMask[0],  nTiles, (DescriptorType)0, "Mask0");
+        addUintBuffer(&G.tileMask[1],  nTiles, (DescriptorType)0, "Mask1");
+        addUintBuffer(&G.tileList,     nTiles, (DescriptorType)0, "TileList");
+        addUintBuffer(&G.tileNormList, nTiles, (DescriptorType)0, "NormList");
+        addUintBuffer(&G.tileArgs,     8u,     DESCRIPTOR_TYPE_INDIRECT_BUFFER, "TileArgs");
+        addUintBuffer(&G.tileStats,    4u,     (DescriptorType)0, "TileStats");
+        {
+            BufferLoadDesc rb = {};
+            rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rb.mDesc.mSize        = sizeof(uint32_t) * 8u;
+            rb.mDesc.mStartState  = RESOURCE_STATE_GENERIC_READ;
+            rb.mDesc.pName        = "rippleTileArgsReset";
+            rb.ppBuffer           = &G.tileArgsReset;
+            addResource(&rb, nullptr);
+            BufferLoadDesc rr = {};
+            rr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            rr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rr.mDesc.mSize        = sizeof(uint32_t) * 8u;
+            rr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+            rr.mDesc.pName        = "rippleTileReadback";
+            rr.ppBuffer           = &G.tileReadback;
+            addResource(&rr, nullptr);
+        }
+
         waitForAllResourceLoads();
         if (!G.tex[0] || !G.tex[1] || !G.cbv[0] || !G.cbv[1]) {
             std::printf("[forge][ripple] %s resource alloc FAILED — that grid disabled\n", tag);
             return false;
+        }
+        G.tilesReady = G.tileMask[0] && G.tileMask[1] && G.tileList && G.tileNormList && G.tileArgs
+                    && G.tileStats && G.tileArgsReset && G.tileArgsReset->pCpuMappedAddress && G.tileReadback
+                    && (size % 16u) == 0u;
+        if (G.tilesReady) {
+            // Groups (0), then y = z = 1, for both the step [0..2] and the slope pass [4..6].
+            static const uint32_t kReset[8] = { 0u, 1u, 1u, 0u, 0u, 1u, 1u, 0u };
+            std::memcpy(G.tileArgsReset->pCpuMappedAddress, kReset, sizeof(kReset));
+            if (G.tileReadback->pCpuMappedAddress) {
+                std::memset(G.tileReadback->pCpuMappedAddress, 0xFF, sizeof(kReset));   // "no read yet"
+            }
+        } else {
+            LOG::logline("!! [ripple] %s active-tile buffers FAILED — this grid steps the whole domain", tag);
         }
 
         // (3) One set per orientation — which, because parity always starts at 0 and the step count
@@ -26601,14 +26720,31 @@ namespace {
             if (!G.set[i]) {
                 std::printf("[forge][ripple] %s addDescriptorSet FAILED\n", tag); return false;
             }
-            DescriptorData d[3] = {};
+            DescriptorData d[9] = {};
             d[0].mIndex     = SRT_RES_IDX(RippleSimSrtData, Persistent, gRippleSimParams);
             d[0].ppBuffers  = &G.cbv[i];
             d[1].mIndex     = SRT_RES_IDX(RippleSimSrtData, Persistent, gRippleSimPrev);
             d[1].ppTextures = &G.tex[i];
             d[2].mIndex     = SRT_RES_IDX(RippleSimSrtData, Persistent, gRippleSimNext);
             d[2].ppTextures = &G.tex[1 - i];
-            updateDescriptorSet(R, 0, G.set[i], 3, d);
+            uint32_t nd = 3;
+            if (G.tilesReady) {
+                // The masks follow the textures: prev mask = the mask of the texture read.
+                d[3].mIndex = SRT_RES_IDX(RippleSimSrtData, Persistent, gWakeMaskPrev);
+                d[3].ppBuffers = &G.tileMask[i];
+                d[4].mIndex = SRT_RES_IDX(RippleSimSrtData, Persistent, gWakeMaskNext);
+                d[4].ppBuffers = &G.tileMask[1 - i];
+                d[5].mIndex = SRT_RES_IDX(RippleSimSrtData, Persistent, gWakeTileList);
+                d[5].ppBuffers = &G.tileList;
+                d[6].mIndex = SRT_RES_IDX(RippleSimSrtData, Persistent, gWakeNormList);
+                d[6].ppBuffers = &G.tileNormList;
+                d[7].mIndex = SRT_RES_IDX(RippleSimSrtData, Persistent, gWakeArgs);
+                d[7].ppBuffers = &G.tileArgs;
+                d[8].mIndex = SRT_RES_IDX(RippleSimSrtData, Persistent, gWakeStats);
+                d[8].ppBuffers = &G.tileStats;
+                nd = 9;
+            }
+            updateDescriptorSet(R, 0, G.set[i], nd, d);
         }
 
         G.ready = true;
@@ -26885,6 +27021,26 @@ namespace {
                 || !g_live.pRippleMgePipeline || !g_live.pRippleNormalPipeline) {
                 std::printf("[forge][ripple] addPipeline FAILED\n"); return false;
             }
+            // Active tiles: OPTIONAL. Without it the wake grid steps the whole domain as before.
+            ShaderLoadDesc ts = {};
+            ts.mComp.pFileName = "ripplewavetiles.comp";
+            addShader(R, &ts, &g_live.pRippleTilesShader);
+            if (g_live.pRippleTilesShader) {
+                PipelineDesc tp = {}; tp.mType = PIPELINE_TYPE_COMPUTE;
+                tp.mComputeDesc.pShaderProgram = g_live.pRippleTilesShader;
+                addPipeline(R, &tp, &g_live.pRippleTilesPipeline);
+            }
+            if (!g_live.pRippleTilesPipeline) {
+                LOG::logline("!! [ripple] ripplewavetiles.comp did not load — wake grid steps the whole domain");
+            }
+            ShaderLoadDesc cks = {};
+            cks.mComp.pFileName = "ripplewavecheck.comp";
+            addShader(R, &cks, &g_live.pRippleCheckShader);
+            if (g_live.pRippleCheckShader) {
+                PipelineDesc ckp = {}; ckp.mType = PIPELINE_TYPE_COMPUTE;
+                ckp.mComputeDesc.pShaderProgram = g_live.pRippleCheckShader;
+                addPipeline(R, &ckp, &g_live.pRippleCheckPipeline);
+            }
         }
 
         const bool fine = createRippleGrid(R, g_live.rippleFine, kRippleGrid,
@@ -27005,6 +27161,20 @@ namespace {
         std::memset(rp,  0, sizeof(*rp));
         std::memset(rp1, 0, sizeof(*rp1));
         rp->sim[0] = rp1->sim[0] = (float)G.grid;
+
+        // ACTIVE TILES (ripplewavetiles.comp), dispersive grid only. Never on a CLEAR: a fresh
+        // texture is undefined, so the clear has to write every texel — and it writes every mask
+        // with them, which is what makes the masks true from then on. The quiet threshold goes to the
+        // full-grid step as well, so the two paths stay bit-identical at any eps.
+        const bool tiled = dispersive && g_wakeTiles && G.cleared && G.tilesReady
+                        && g_live.pRippleTilesPipeline != nullptr;
+        if (dispersive && G.tilesReady) {
+            const float eps = std::max(g_wakeTileEps, 0.0f) * std::max(g_wakeRingDepth, 0.0f);
+            rp->tiles[0] = rp1->tiles[0] = tiled ? 1.0f : 0.0f;
+            rp->tiles[1] = rp1->tiles[1] = eps;
+            rp->tiles[2] = rp1->tiles[2] = (float)G.tilesPerSide;
+        }
+        if (!tiled) { G.zeroReads = 0; }
         if (dispersive) {
             // Gravity is DERIVED so the wake's wavelength comes out physical: the shader's operator
             // returns alpha*k with k in rad/texel, so omega² = grav*alpha*k_texel must equal
@@ -27185,15 +27355,50 @@ namespace {
                 // zeros for the whole decay time of a source that never existed (46 s for the wake).
                 G.quietDecay = 0.0f;
                 G.sleeping   = false;
+                G.calmFrames = 0;
+                G.zeroReads  = 0;
+                G.lastSourceSec = g_simClock;
             } else if (nImp > 0) {
                 if (G.sleeping) { LOG::logline(">> [ripple] %s: source in the domain — WAKES", marker); }
                 G.quietDecay = 1.0f;
                 G.sleeping   = false;
+                G.calmFrames = 0;
+                G.zeroReads  = 0;
+                G.lastSourceSec = g_simClock;
             } else if (stepDecay < 0.99999f && !g_ripSleepOff) {
                 if (G.sleeping) {
                     parkRippleGrid(G);          // we transitioned it back to UAV above
                     cmdEndDebugMarker(g_live.pCmd);
                     return;
+                }
+                // MEASURED SLEEP (active tiles). The bound below is exact but assumes the SLOWEST
+                // damping in the field — 46 s for the wake grid, so a town with anyone stepping into the
+                // water every half-minute never sleeps. The tiled step COUNTS the tiles it left
+                // non-zero; zero means the finished field (tex[0]) is exactly zero, by the mask
+                // invariant, so there is nothing to zero and nothing to step. The count is read back a
+                // frame or more late, hence the calm-frame guard: only a read of a step taken after
+                // the last source may put the grid to sleep, and two in a row are required.
+                ++G.calmFrames;
+                // CALM FADE: exponential, reaching 1e-3 (ln 1000) of the field at the end of the ramp,
+                // per sub-step from that sub-step's own dt so it is frame-rate independent. The
+                // measured sleep below then finds nothing above the quiet threshold and parks.
+                if (dispersive && g_wakeCalmFade > 0.0f
+                    && g_simClock - G.lastSourceSec > (double)g_wakeCalmFade) {
+                    const float rate = 6.9078f / std::max(g_wakeCalmFadeLen, 0.05f);
+                    rp->tiles[3]  = 1.0f - std::exp(-rate * rp->wave[1]);
+                    rp1->tiles[3] = 1.0f - std::exp(-rate * rp1->wave[1]);
+                }
+                if (tiled && G.tiledLast && G.calmFrames > 6u && G.tileReadback->pCpuMappedAddress) {
+                    const uint32_t nz = ((const uint32_t*)G.tileReadback->pCpuMappedAddress)[3];
+                    G.zeroReads = (nz == 0u) ? G.zeroReads + 1u : 0u;
+                    if (G.zeroReads >= 2u) {
+                        G.sleeping = true;
+                        LOG::logline(">> [ripple] %s: no non-zero tile (measured, %.1f s after the last "
+                                     "source) — SLEEPS", marker, g_simClock - G.lastSourceSec);
+                        parkRippleGrid(G);
+                        cmdEndDebugMarker(g_live.pCmd);
+                        return;
+                    }
                 }
                 for (int s = 0; s < steps; ++s) { G.quietDecay *= stepDecay; }
                 if (G.quietDecay < kRippleSleepDecay) {
@@ -27204,8 +27409,8 @@ namespace {
                     rp->sim[3] = rp1->sim[3] = 0.0f;
                     steps = 2;
                     G.sleeping = true;
-                    LOG::logline(">> [ripple] %s: calm (decay %.1e since last source) — zeroed, SLEEPS",
-                                marker, (double)G.quietDecay);
+                    LOG::logline(">> [ripple] %s: calm (decay %.1e, %.1f s since last source) — zeroed, SLEEPS",
+                                marker, (double)G.quietDecay, g_simClock - G.lastSourceSec);
                 }
             }
         }
@@ -27230,6 +27435,33 @@ namespace {
         //
         // `steps` was resolved at the top of the function, before the origin was touched — see the
         // early-out there for why that ordering is load-bearing.
+        // The args buffer moves COPY_DEST (reset) -> UAV (build) -> INDIRECT_ARGUMENT (step, slope)
+        // -> COPY_SOURCE (readback). argsTo() is the only place that moves it; G.argsState is the truth.
+        auto argsTo = [&](ResourceState s) {
+            if (G.argsState == s) {
+                if (s == RESOURCE_STATE_UNORDERED_ACCESS) {
+                    BufferBarrier u = {}; u.pBuffer = G.tileArgs;
+                    u.mCurrentState = u.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 1, &u, 0, nullptr, 0, nullptr);
+                }
+                return;
+            }
+            BufferBarrier b = {}; b.pBuffer = G.tileArgs;
+            b.mCurrentState = G.argsState; b.mNewState = s;
+            cmdResourceBarrier(g_live.pCmd, 1, &b, 0, nullptr, 0, nullptr);
+            G.argsState = s;
+        };
+        // UAV barriers on the tile buffers between the passes that write and read them.
+        auto tileUavBarrier = [&]() {
+            BufferBarrier bb[5] = {};
+            Buffer* bufs[5] = { G.tileMask[0], G.tileMask[1], G.tileList, G.tileNormList, G.tileStats };
+            for (int i = 0; i < 5; ++i) {
+                bb[i].pBuffer = bufs[i];
+                bb[i].mCurrentState = bb[i].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            cmdResourceBarrier(g_live.pCmd, 5, bb, 0, nullptr, 0, nullptr);
+        };
+
         for (int s = 0; s < steps; ++s) {
             const uint32_t src = G.parity;
             TextureBarrier tb[2] = {};
@@ -27241,19 +27473,72 @@ namespace {
             tb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
 
-            cmdBindPipeline(g_live.pCmd, stepPipe);
-            cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
-            cmdDispatch(g_live.pCmd, stepGroups, stepGroups, 1);
+            if (tiled) {
+                // (1) Reset the counters: a copy, since Forge has no buffer clear.
+                argsTo(RESOURCE_STATE_COPY_DEST);
+                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                    G.tileArgs->mDx.pResource, 0, G.tileArgsReset->mDx.pResource, 0, sizeof(uint32_t) * 8);
+                argsTo(RESOURCE_STATE_UNORDERED_ACCESS);
+                tileUavBarrier();       // the previous step's mask writes, before the build reads them
+                // (2) Build both lists: one thread per tile.
+                const uint32_t tg = (G.tilesPerSide + 7u) / 8u;
+                cmdBindPipeline(g_live.pCmd, g_live.pRippleTilesPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
+                cmdDispatch(g_live.pCmd, tg, tg, 1);
+                tileUavBarrier();
+                // (2b) DEBUG: audit the lists against the texels, before the step changes them.
+                if (g_wakeTileCheck && g_live.pRippleCheckPipeline) {
+                    cmdBindPipeline(g_live.pCmd, g_live.pRippleCheckPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
+                    cmdDispatch(g_live.pCmd, G.tilesPerSide, G.tilesPerSide, 1);
+                    tileUavBarrier();
+                }
+                argsTo(RESOURCE_STATE_INDIRECT_ARGUMENT);
+                // (3) The step over the listed tiles. gWakeArgs is still bound as a UAV in this set,
+                // which is legal as long as nothing touches it — the step counts into gWakeStats.
+                cmdBindPipeline(g_live.pCmd, stepPipe);
+                cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DISPATCH, 1, G.tileArgs, 0, nullptr, 0);
+            } else {
+                cmdBindPipeline(g_live.pCmd, stepPipe);
+                cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
+                cmdDispatch(g_live.pCmd, stepGroups, stepGroups, 1);
+            }
 
             // The slope pass needs every height written, hence a full UAV barrier between.
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
             cmdBindPipeline(g_live.pCmd, g_live.pRippleNormalPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
-            cmdDispatch(g_live.pCmd, normGroups, normGroups, 1);
+            if (tiled) {
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DISPATCH, 1, G.tileArgs, sizeof(uint32_t) * 4, nullptr, 0);
+            } else {
+                cmdDispatch(g_live.pCmd, normGroups, normGroups, 1);
+            }
 
             G.parity = 1u - src;
         }
         if (steps > 0) { G.cleared = true; }
+
+        // Stage the last sub-step's counts for a read ONE FRAME LATE (pAplReadback's arrangement):
+        // readback[0] = tiles stepped, [3] = tiles left non-zero, [4] = 4 x slope tiles.
+        G.tiledLast = tiled;
+        if (tiled) {
+            argsTo(RESOURCE_STATE_COPY_SOURCE);
+            g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                G.tileReadback->mDx.pResource, 0, G.tileArgs->mDx.pResource, 0, sizeof(uint32_t) * 8);
+            BufferBarrier sb = {}; sb.pBuffer = G.tileStats;
+            sb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; sb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+            cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
+            g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                G.tileReadback->mDx.pResource, sizeof(uint32_t) * 3, G.tileStats->mDx.pResource, 0,
+                sizeof(uint32_t));
+            // readback[7] = audit violations (wakeTileCheck), args[7] being unused.
+            g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                G.tileReadback->mDx.pResource, sizeof(uint32_t) * 7, G.tileStats->mDx.pResource,
+                sizeof(uint32_t), sizeof(uint32_t));
+            sb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; sb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
+        }
 
         // Hand tex[0] to water.frag. The even sub-step count guarantees the finished field is there;
         // tex[1] stays a UAV scratch target and is never sampled.
@@ -34601,7 +34886,21 @@ void destroyHostWindow(Renderer* R);
                 // report from play.
                 std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
             }
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s wake=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
+            char wakeTilesText[48] = "full";
+            {
+                const RippleGrid& W = g_live.rippleWake;
+                if (W.tiledLast && W.tileReadback && W.tileReadback->pCpuMappedAddress) {
+                    const uint32_t* rb = (const uint32_t*)W.tileReadback->pCpuMappedAddress;
+                    if (rb[0] != 0xFFFFFFFFu) {
+                        int n = std::snprintf(wakeTilesText, sizeof(wakeTilesText), "%u/%u/%u",
+                                              rb[0], rb[3], W.tilesPerSide * W.tilesPerSide);
+                        if (g_wakeTileCheck && n > 0 && n < (int)sizeof(wakeTilesText)) {
+                            std::snprintf(wakeTilesText + n, sizeof(wakeTilesText) - n, " check=%u", rb[7]);
+                        }
+                    }
+                }
+            }
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -34641,6 +34940,9 @@ void destroyHostWindow(Renderer* R);
                          g_lastGpuPhaseMs[kGpuPhaseRippleSim],
                          !g_ripSimOn ? "off" : g_live.rippleFine.sleeping ? "sleep" : "awake",
                          !g_wakeOn   ? "off" : g_live.rippleWake.sleeping ? "sleep" : "awake",
+                         // tiles=<stepped>/<left non-zero>/<total> of the wake grid's last sub-step,
+                         // read a frame late; "full" = the whole grid stepped (knob off, or a clear).
+                         wakeTilesText,
                          // grasscrush=<ms>(<discs>) — G7. Three dispatches over a 512² field: two
                          // full-grid passes whose cost is fixed, and a scatter whose cost is
                          // proportional to the DISC COUNT in brackets beside it. A 0.00 with a

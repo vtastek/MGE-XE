@@ -1,0 +1,36 @@
+// mgeHost64 — the active-tile decision, shared by ripplewavetiles.comp (which acts on it) and
+// ripplewavecheck.comp (which audits it against the texels themselves). Model: ripplewavetiles.comp.fsl.
+#pragma once
+
+#include "ripplesim.srt.h"
+
+// Does tile T overlap the moving obstacle's bounds? The same test the pin makes per texel in
+// ripplewave.comp: texel coords inside [sb.xy, sb.zw], and only while a source is live.
+bool wakeTileInSource(int2 T, int nImp, float4 sb)
+{
+    if (nImp <= 0) { return false; }
+    float2 a = float2(T * 16);
+    float2 b = a + 15.0f;
+    return b.x >= sb.x && a.x <= sb.z && b.y >= sb.y && a.y <= sb.w;
+}
+
+// Does output tile T have to be stepped? Uses the MASKS only — that is the point of it.
+bool wakeTileNeeded(int2 T, int nT, int2 shift, int nImp, float4 sb)
+{
+    if (T.x < 0 || T.y < 0 || T.x >= nT || T.y >= nT) { return false; }
+    if (gWakeMaskNext[uint(T.y * nT + T.x)] != 0u) { return true; }
+
+    // >> on a signed int is an arithmetic shift, i.e. floor division by 16 for negatives too.
+    int2 lo  = T * 16 + shift - 10;
+    int2 hi  = lo + 35;
+    int2 tlo = max(lo >> 4, int2(0, 0));
+    int2 thi = min(hi >> 4, int2(nT - 1, nT - 1));
+    for (int ty = tlo.y; ty <= thi.y; ++ty)
+    {
+        for (int tx = tlo.x; tx <= thi.x; ++tx)
+        {
+            if (gWakeMaskPrev[uint(ty * nT + tx)] != 0u) { return true; }
+        }
+    }
+    return wakeTileInSource(T, nImp, sb);
+}

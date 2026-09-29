@@ -20,6 +20,17 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
 
     int  size = int(gRippleSimParams.sim.x);
     int2 id   = int2(did.xy);
+    // ACTIVE TILES: indirect over gWakeNormList, FOUR 8x8 groups per 16x16 tile (the list holds
+    // every step tile plus its one-tile ring, because a slope reads the neighbours' heights).
+    if (gRippleSimParams.tiles.x > 0.5f)
+    {
+        uint gi     = did.x >> 3u;
+        uint packed = gWakeNormList[gi >> 2u];
+        uint q      = gi & 3u;
+        id = int2(int(packed & 0xFFFFu), int(packed >> 16u)) * 16
+           + int2(int(q & 1u), int(q >> 1u)) * 8
+           + int2(int(did.x & 7u), int(did.y & 7u));
+    }
     // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
     if (id.x >= size || id.y >= size)
     {

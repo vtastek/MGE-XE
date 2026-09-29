@@ -100,6 +100,13 @@ STRUCT(RippleSimParams)
     // length() and a compare, and almost no texel is near any actor, so four compares in front of
     // the loop is what keeps the pin proportional to the disturbed area instead of to the grid.
     DATA(float4, srcBounds, None);
+    // ACTIVE TILES (ripplewave.comp + ripplenormal.comp + ripplewavetiles.comp; the others ignore it).
+    //   x = 1: this dispatch is INDIRECT over the tile list, 0: the whole grid
+    //   y = quiet threshold: a 16x16 tile whose max(|h|,|v|) is <= y is written as zeros, mask 0
+    //   z = tiles per side (grid / 16)
+    //   w = CALM FADE: this sub-step scales h and v by (1 - w). 0 (the memset default) = no fade; the
+    //       host raises it once the domain has had no source for g_wakeCalmFade seconds.
+    DATA(float4, tiles,     None);
     // Per impulse: xy = position in TEXEL coordinates of THIS frame's grid, z = radius (texels),
     // w = amplitude. Injected once at birth (the client flags births; see RippleSource::slot).
     // Shared by both grids — the same births drive each, at their own texel scale.
@@ -111,5 +118,18 @@ BEGIN_SRT(RippleSimSrtData)
         DECL_CBUFFER  (Persistent, CBUFFER(RippleSimParams), gRippleSimParams)
         DECL_RWTEXTURE(Persistent, RTex2D(float4), gRippleSimPrev)   // read-only this dispatch
         DECL_RWTEXTURE(Persistent, RWTex2D(float4), gRippleSimNext)  // written; RW for the normal pass
+        // ACTIVE TILES, one mask per ping-pong texture, bound the same way round as the textures.
+        // INVARIANT: mask[t] == 0 => tile t holds h = v = 0 exactly in that texture.
+        DECL_RWBUFFER (Persistent, RWBuffer(uint), gWakeMaskPrev)   // tiles², read
+        DECL_RWBUFFER (Persistent, RWBuffer(uint), gWakeMaskNext)   // tiles², written by the step
+        DECL_RWBUFFER (Persistent, RWBuffer(uint), gWakeTileList)   // step tiles, x | y << 16
+        DECL_RWBUFFER (Persistent, RWBuffer(uint), gWakeNormList)   // slope tiles (step list + 1 ring)
+        // [0..2] step IndirectDispatchArguments, [3] unused,
+        // [4..6] slope-pass IndirectDispatchArguments (4 groups of 8x8 per tile), [7] unused.
+        DECL_RWBUFFER (Persistent, RWBuffer(uint), gWakeArgs)
+        // [0] tiles the step left NON-ZERO. Its own buffer, not a slot in gWakeArgs: the step that
+        // counts runs while gWakeArgs is in INDIRECT_ARGUMENT state, where a UAV write is illegal.
+        // Zeroed by the build pass, read back a frame late (heartbeat + measured sleep).
+        DECL_RWBUFFER (Persistent, RWBuffer(uint), gWakeStats)
     END_SRT_SET(Persistent)
 END_SRT(RippleSimSrtData)

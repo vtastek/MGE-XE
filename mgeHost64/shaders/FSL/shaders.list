@@ -772,6 +772,18 @@
 #include "ripplenormal.comp.fsl"
 #end
 
+// Active tiles for ripplewave.comp: lists the wake grid's 16x16 tiles that can be non-zero after the
+// step, into indirect args for the step + slope passes. Same SRT. See ripplewavetiles.comp.fsl.
+#comp ripplewavetiles.comp
+#include "ripplewavetiles.comp.fsl"
+#end
+
+// Debug audit of that skip (knob wakeTileCheck): counts skipped tiles whose TEXELS say they had to
+// run. See ripplewavecheck.comp.fsl.
+#comp ripplewavecheck.comp
+#include "ripplewavecheck.comp.fsl"
+#end
+
 // W23: TILING CAUSTICS. A photon SCATTER (not a forward 1/|det J| map — see caustic.srt.h for why
 // the fold is the whole effect and only scattering gets it), then a resolve that normalises to a
 // mean of exactly 1.0 and clears the counter on its way out.
