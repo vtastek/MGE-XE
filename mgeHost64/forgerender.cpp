@@ -34601,7 +34601,7 @@ void destroyHostWindow(Renderer* R);
                 // report from play.
                 std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
             }
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s wake=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -34634,6 +34634,13 @@ void destroyHostWindow(Renderer* R);
                          // DISTURBED AREA, so this number is expected to move with swimmers and rain
                          // and to sit at its static floor on calm water.
                          g_lastGpuPhaseMs[kGpuPhaseCaustic],
+                         // ripple=<ms>(fine=.. wake=..) — both actor-wake grids' steps + slope passes.
+                         // `sleep` = parked by the exact calm bound; an awake wake grid is the ~4 ms
+                         // term on a 1660S, and it stays awake whenever any actor stands in water
+                         // within its 8192-unit domain.
+                         g_lastGpuPhaseMs[kGpuPhaseRippleSim],
+                         !g_ripSimOn ? "off" : g_live.rippleFine.sleeping ? "sleep" : "awake",
+                         !g_wakeOn   ? "off" : g_live.rippleWake.sleeping ? "sleep" : "awake",
                          // grasscrush=<ms>(<discs>) — G7. Three dispatches over a 512² field: two
                          // full-grid passes whose cost is fixed, and a scatter whose cost is
                          // proportional to the DISC COUNT in brackets beside it. A 0.00 with a
