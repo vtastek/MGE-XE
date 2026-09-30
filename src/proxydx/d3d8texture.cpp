@@ -13,6 +13,7 @@ ProxyTexLedger& proxyTexLedger() {
 }
 
 uint32_t g_proxyTexCapDim = 0;
+void (*g_onProxyTextureDestroyed)(void* realTexture) = nullptr;
 
 static UINT atLeast1(UINT v) { return v ? v : 1u; }   // a mip edge never reaches 0
 
@@ -108,6 +109,7 @@ ULONG _stdcall ProxyTexture::Release() {
     ULONG refcount = realTexture->Release();
     if (!refcount) {
         if (ledgerBytes) { ledgerAdjust(ledgerBytes, -1); }
+        if (g_onProxyTextureDestroyed) { g_onProxyTextureDestroyed(realTexture); }
         for (UINT l = 0; l < kMaxCapSkip; ++l) { std::free(capScratch[l]); }   // locked, never unlocked
         delete this;
         return 0;

@@ -70,6 +70,7 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
     static_assert(sizeof(void*) == sizeof(uint32_t), "key = pointer bits");
     const uint32_t* keys = reinterpret_cast<const uint32_t*>(shapes);
     s_visibleKeys.assign(keys, keys + count);
+    MGE::GeometryCache::pinVisibleShapes(shapes, count);   // alive until the build that reads them is waited
     s_visibleCallbackFired = true;
 }
 

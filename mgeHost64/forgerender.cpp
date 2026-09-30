@@ -34911,6 +34911,19 @@ void destroyHostWindow(Renderer* R);
                                              (unsigned long long)((g_arenaVB.total + g_arenaIB.total) >> 20),
                                              (unsigned long long)(g_meshBufBytes >> 20),
                                              s_settle < 3 ? "(settling) " : "", (long long)s_otherBase);
+                                // D3D12MA's own view: heap blocks it holds from the driver vs bytes in
+                                // live allocations. The gap is freed memory the allocator keeps because
+                                // a block still has a survivor in it — slack that counts as "other" above
+                                // and that no eviction of ours can hand back. (Forge's wrapper names the
+                                // two outputs the other way round: its "used" is the BLOCK bytes.)
+                                {
+                                    uint64_t blockB = 0, allocB = 0;
+                                    calculateMemoryUse(g_live.pRenderer, &blockB, &allocB);
+                                    LOG::logline(">> [forge-hb] mem allocator: blocks %llu MB, live allocations %llu MB,"
+                                                 " slack %lld MB",
+                                                 (unsigned long long)(blockB >> 20), (unsigned long long)(allocB >> 20),
+                                                 (long long)((int64_t)(blockB >> 20) - (int64_t)(allocB >> 20)));
+                                }
                                 if (s_settle >= 3 && otherMB > s_otherBase + (int64_t)g_memOtherDriftMB) {
                                     LOG::logline("!! [mem] unattributed VRAM GREW %lld MB past its baseline (%lld -> %lld MB,"
                                                  " envelope +%u) — not textures, not flip books, not geometry"

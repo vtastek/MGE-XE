@@ -469,6 +469,41 @@ namespace MGE::GeometryCache {
         std::mutex                                          g_texNameMx;
         std::unordered_set<std::string>                     g_texNamePool;
         std::unordered_map<IDirect3DTexture9*, const char*> g_textureNameMap;
+        // THE HOST MIRRORS MORROWIND (user, 2026-09-30: "host mirrors mw, so if mw stays about 1gb, we
+        // should stay about the same. we should not be growing unchecked"). The Forge feed used to
+        // release a texture only by AGE (600 frames unsampled, and never while the grid pinned it), so
+        // hopping cells kept every visited cell's textures for ten seconds and the host peaked at
+        // 2.9 GB of textures while Morrowind held 150 MB of its own. Morrowind's set is the truth: it
+        // frees a texture when the cells using it unload. So each interned name counts the live
+        // Morrowind D3D textures carrying it (normally one — NiSourceTextures are shared by file), and
+        // when the proxy reports the last one destroyed the name lands on g_texNamesDropped, which the
+        // feed drains and releases on the host. All under g_texNameMx.
+        std::unordered_map<const char*, uint32_t>           g_texNameLive;
+        std::vector<const char*>                            g_texNamesDropped;
+        // Declared AFTER the maps above, so it is destroyed BEFORE them: Morrowind can still release
+        // textures during process teardown, and the hook must be gone before the maps it touches are.
+        struct TexHookGuard { ~TexHookGuard() { g_onProxyTextureDestroyed = nullptr; } } g_texHookGuard;
+
+        // Caller holds g_texNameMx.
+        void texNameRef(const char* interned) { ++g_texNameLive[interned]; }
+        void texNameUnref(const char* interned) {
+            auto it = g_texNameLive.find(interned);
+            if (it == g_texNameLive.end()) { return; }
+            if (--it->second == 0) {
+                g_texNameLive.erase(it);
+                g_texNamesDropped.push_back(interned);
+            }
+        }
+
+        // g_onProxyTextureDestroyed target: runs on whichever thread released the texture (MAIN).
+        void onTextureDestroyed(void* real) {
+            std::lock_guard<std::mutex> lk(g_texNameMx);
+            auto it = g_textureNameMap.find(static_cast<IDirect3DTexture9*>(real));
+            if (it == g_textureNameMap.end()) { return; }   // never captured: not ours to mirror
+            const char* name = it->second;
+            g_textureNameMap.erase(it);   // the pointer may be recycled onto a new texture now
+            texNameUnref(name);
+        }
 
         void releaseEntry(CachedGeometry& e) {
             // S5b: released the entry's DX9 mirror VB slots + IB. The entry owns no GPU
@@ -528,8 +563,12 @@ namespace MGE::GeometryCache {
             auto it = g_textureNameMap.find(d3d);
             if (it == g_textureNameMap.end()) {
                 g_textureNameMap.emplace(d3d, interned);
+                texNameRef(interned);
             } else if (it->second != interned) {
-                it->second = interned;   // GPU pointer recycled onto a different source
+                // GPU pointer recycled onto a different source without us seeing the old one die.
+                texNameUnref(it->second);
+                it->second = interned;
+                texNameRef(interned);
             }
         }
 
@@ -3694,6 +3733,7 @@ namespace MGE::GeometryCache {
             purgeAll();
             LOG::logline(">> [gc] device re-created — geometry cache purged (stale D3D9 resources dropped)");
         }
+        g_onProxyTextureDestroyed = &onTextureDestroyed;   // the host-mirrors-Morrowind feed
         g_device = device;
     }
 
@@ -5936,6 +5976,56 @@ namespace MGE::GeometryCache {
         std::lock_guard<std::mutex> lk(g_texNameMx);
         auto it = g_textureNameMap.find(tex);
         return (it != g_textureNameMap.end()) ? it->second : nullptr;
+    }
+
+    // FIRST-SIGHT KEYS MUST OUTLIVE THE BUILD THAT READS THEM (AutoZip stress, 2026-09-30: AV at
+    // ensureLive's `geom->getModelData()`, 138 cell changes in). ensureLive derefs a first-sight key
+    // on the promise that it came from THIS frame's classify, so it is alive. But the produce worker
+    // runs the build asynchronously and is drained only at the NEXT frame's BeginScene(0) — after
+    // Morrowind's between-frame update, where Lua timers, scripts and cell changes free shapes. A
+    // first-sight build after a load runs 50-100 ms, long enough to straddle a teleport. Cached keys
+    // were always safe (g_geomRefs holds an engine ref); first-sight keys had nothing.
+    //
+    // So the classify set is referenced for exactly as long as a build can read it: pinned on MAIN
+    // when the classify hands it over, adopted by the worker job that consumes it at kick, and let go
+    // on MAIN once that job has been waited — every NI refcount touch on the main thread. A shape MW
+    // unloads meanwhile stays alive (detached) until then and is freed here instead. Pins never
+    // adopted (inline modes consume the set synchronously; a late callback's set is never built)
+    // are let go at the next classify, when no build can still be reading them.
+    namespace {
+        std::vector<NI::Pointer<NI::Object>> g_visiblePinsPending;   // MAIN only
+        std::vector<NI::Pointer<NI::Object>> g_visiblePinsHeld;      // MAIN only; owned by the job in flight
+    }
+
+    void pinVisibleShapes(void* const* shapes, int count) {
+        g_visiblePinsPending.clear();
+        g_visiblePinsPending.reserve((size_t)std::max(count, 0));
+        for (int i = 0; i < count; ++i) {
+            if (shapes[i]) { g_visiblePinsPending.emplace_back(static_cast<NI::Object*>(shapes[i])); }
+        }
+    }
+
+    void adoptVisiblePins() {
+        if (g_visiblePinsPending.empty()) { return; }
+        if (g_visiblePinsHeld.empty()) {
+            g_visiblePinsHeld.swap(g_visiblePinsPending);
+        } else {
+            for (auto& p : g_visiblePinsPending) { g_visiblePinsHeld.push_back(std::move(p)); }
+            g_visiblePinsPending.clear();
+        }
+    }
+
+    void releaseAdoptedPins() { g_visiblePinsHeld.clear(); }
+
+    void takeDroppedTextureNames(std::vector<const char*>& out) {
+        out.clear();
+        std::lock_guard<std::mutex> lk(g_texNameMx);
+        out.swap(g_texNamesDropped);
+    }
+
+    bool textureNameLive(const char* interned) {
+        std::lock_guard<std::mutex> lk(g_texNameMx);
+        return g_texNameLive.count(interned) != 0;
     }
 
 }

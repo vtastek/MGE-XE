@@ -716,6 +716,22 @@ namespace MGE::GeometryCache {
     // a consumer repopulates it incrementally from extractMaterial.
     const char* resolveTextureName(IDirect3DTexture9* tex);
 
+    // Engine references on the classify set, so a first-sight key stays alive for the async build that
+    // reads it (see the .cpp). All three are MAIN-thread only. pinVisibleShapes: at the classify
+    // hand-off (replaces the previous unadopted pins). adoptVisiblePins: when a produce job is kicked.
+    // releaseAdoptedPins: once that job has been waited.
+    void pinVisibleShapes(void* const* shapes, int count);
+    void adoptVisiblePins();
+    void releaseAdoptedPins();
+
+    // The host mirrors Morrowind: names (interned, SourceTexture::fileName spelling) whose LAST
+    // Morrowind D3D texture was destroyed since the previous call — Morrowind has let go of that file,
+    // so the host may too. Delivered once each. Only names the reverse map ever registered appear.
+    void takeDroppedTextureNames(std::vector<const char*>& out);
+    // Morrowind still holds a D3D texture registered under this interned name (a name dropped and
+    // re-created before the feed drained it must not be released).
+    bool textureNameLive(const char* interned);
+
     // ---- FP particle billboarding (torch flame, enchant sparks) --------------------
     // buildFPParticleQuads (run during the first-person walk) billboards each FP particle
     // system's live particles against the arm camera into camera-facing quads. MW's particle

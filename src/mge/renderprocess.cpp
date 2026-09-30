@@ -2770,6 +2770,18 @@ namespace {
         const bool gridMoved = interiorCell != s_cell || gx != s_gx || gy != s_gy || g_cellEpoch != s_epoch;
         const bool cacheGrew = cacheMap.size() != s_cacheSize && g_frame - s_scanFrame >= kGridPrefetchRescanFrames;
         if (dh && (gridMoved || cacheGrew)) {
+            // A CROSSING (user, 2026-09-30: "we can predict and load textures early in a relaxed way
+            // during cell crossing"). An exterior grid slide loads a new row of cells, but under the
+            // seam the cache fills only from what the camera sees, so the new row's names would reach
+            // this prefetch one glance at a time. Arm the post-load residency walk — budgeted (256
+            // captures a frame) and self-closing, exactly as a load does — so the whole new row is
+            // captured over the next frames and the rescans below (cacheGrew) queue its textures at
+            // the prefetch budget. A purge (same test with the epoch moved) arms it on its own.
+            const bool crossing = gridMoved && s_epoch == g_cellEpoch && !interiorCell && !s_cell
+                               && s_epoch != 0xFFFFFFFFu;
+            if (crossing) {
+                MGE::GeometryCache::armPostLoadWalk();
+            }
             s_cell = interiorCell; s_gx = gx; s_gy = gy; s_epoch = g_cellEpoch;
             s_cacheSize = cacheMap.size();
             s_scanFrame = g_frame;
@@ -2915,6 +2927,106 @@ namespace {
     // THIS frame's texture flush, which the host takes after this frame's geometry releases.
     constexpr std::uint32_t kTexEvictPeriodFrames = 30;
     constexpr std::uint32_t kMaxTexEvictPerPass   = 128;
+
+    // A part may still NAME a slot just released, in a SlotInfo whose fast path would hand it back
+    // unchecked — and the slot is about to be reused for another texture. Forget the cached value, so
+    // that part re-resolves by name if it ever draws again. (No epoch bump: only the holders of a
+    // released slot re-resolve, not every cached slot in the scene.) g_keySlot is produce-owned.
+    void forgetReleasedSlots(const std::vector<std::uint8_t>& gone) {
+        for (auto& kv : g_keySlot) {
+            SlotInfo& si = kv.second;
+            if (si.baseSlot  < IPC::kMaxTextures && gone[si.baseSlot])  { si.baseNamePtr  = nullptr; si.baseSlot  = 0; }
+            if (si.ovSlot    < IPC::kMaxTextures && gone[si.ovSlot])    { si.ovNamePtr    = nullptr; si.ovSlot    = 0; }
+            if (si.paramSlot < IPC::kMaxTextures && gone[si.paramSlot]) { si.paramNamePtr = nullptr; si.paramSlot = 0; }
+        }
+    }
+
+    // THE HOST MIRRORS MORROWIND (see g_texNameLive in scenegraph_geometry_cache.cpp). Release every
+    // texture Morrowind itself let go of since the last produce — and its _paramh companion, which
+    // exists only because its base does — so the host holds what Morrowind holds, at full resolution,
+    // instead of everything seen in the last 600 frames. It overrides the grid pin: a name Morrowind
+    // has freed is not in any grid it will draw. evictStaleTextures' age rule stays as the backstop
+    // for names the reverse map never saw. Same produce context and same release protocol (cold bit,
+    // free list, SlotInfo holders forgotten) as evictStaleTextures.
+    std::vector<const char*> g_mwDroppedNames;   // produce-owned: drained, not yet released
+    std::uint64_t            g_texMirrorReleases = 0;
+    std::uint64_t            g_texMirrorBytes = 0;
+    void releaseMorrowindDroppedTextures() {
+        static std::vector<const char*> s_new;
+        MGE::GeometryCache::takeDroppedTextureNames(s_new);
+        g_mwDroppedNames.insert(g_mwDroppedNames.end(), s_new.begin(), s_new.end());
+        if (g_mwDroppedNames.empty()) {
+            return;
+        }
+        // NO wait on the geometry release backlog, unlike evictStaleTextures. That wait keeps a departed
+        // key's host shadow-caster record from sampling a slot after its texture left — but the host
+        // puts DEFAULT WHITE back in a released slot (and retires the old texture only once no frame in
+        // flight can reach it), so the worst case is a gone object's ghost shadow drawing white-cut for
+        // the frames until its own release ships, a ghost that exists either way. What the wait cost
+        // was measured by AutoZip: fast cell changes kept the backlog non-empty (15403 releases queued
+        // at 64 per flush), so NOTHING was released and the host held 4-5 GB of textures.
+        // Normalised candidates, decided BEFORE taking the residency lock (textureNameLive takes the
+        // name-map lock; the two are never nested). A name Morrowind re-created before we got here is
+        // live again and stays.
+        static std::vector<std::string> s_cands;
+        s_cands.clear();
+        for (const char* p : g_mwDroppedNames) {
+            if (MGE::GeometryCache::textureNameLive(p)) { continue; }
+            std::string n = normalizeTextureName(p);
+            if (n.empty()) { continue; }
+            std::string stem = n;
+            const std::size_t dot = stem.find_last_of('.');
+            const std::size_t sep = stem.find_last_of('\\');
+            if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) { stem.erase(dot); }
+            s_cands.push_back(std::move(n));
+            if (!stem.empty()) {
+                s_cands.push_back(stem + "_paramh.dds");
+                s_cands.push_back(stem + "_paramh_np.dds");
+            }
+        }
+        g_mwDroppedNames.clear();
+        static std::vector<std::uint8_t> s_gone;
+        s_gone.assign(IPC::kMaxTextures, 0u);
+        std::uint32_t released = 0;
+        std::uint64_t bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            if (g_slotName.size() != IPC::kMaxTextures) {
+                return;
+            }
+            for (const std::string& n : s_cands) {
+                g_gridTexPins.erase(n);
+                const auto it = g_texSlot.find(n);
+                if (it == g_texSlot.end()) { continue; }
+                const std::uint32_t s = it->second;
+                if (s == 0) { g_texSlot.erase(it); continue; }   // a cached miss: forget it too
+                if (IPC::isFlipSlot(s) || s >= IPC::kMaxTextures || g_slotName[s] != n) { continue; }
+                const std::uint32_t cold = coldBit(s);   // before the age resets below
+                g_texSlot.erase(it);
+                g_slotName[s].clear();
+                g_slotLastUsed[s] = 0;
+                bytes += g_slotBytes[s];
+                g_slotBytes[s] = 0;
+                g_texFreeSlots.push_back(s);
+                const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease | cold, 0u, 0u };
+                stageTexUpload(rel, nullptr, 0u);   // a failed stage only delays the host's free
+                s_gone[s] = 1u;
+                ++released;
+            }
+            g_texMirrorReleases += released;
+            g_texMirrorBytes += bytes;
+        }
+        if (released) {
+            forgetReleasedSlots(s_gone);
+            static std::uint32_t s_logThrottle = 0;
+            if ((s_logThrottle++ % 16) == 0) {
+                LOG::logline("-- [tex-mirror] Morrowind dropped them: released %u slots (%.1f MB) | session"
+                             " %llu slots, %.0f MB", released, (double)bytes / (1024.0 * 1024.0),
+                             (unsigned long long)g_texMirrorReleases, (double)g_texMirrorBytes / (1024.0 * 1024.0));
+            }
+        }
+    }
+
     void evictStaleTextures() {
         static bool s_envRead = false;
         if (!s_envRead) {
@@ -2997,18 +3109,7 @@ namespace {
             g_texEvictions += released;
             g_texEvictedBytes += bytes;
         }
-        // An outer-ring part may still NAME a slot just released, in a SlotInfo whose fast path would
-        // hand it back unchecked — and the slot is about to be reused for another texture. Forget the
-        // cached value, so that part re-resolves by name if it ever draws again. (No epoch bump: only
-        // the holders of a released slot re-resolve, not every cached slot in the scene.)
-        if (released) {
-            for (auto& kv : g_keySlot) {
-                SlotInfo& si = kv.second;
-                if (si.baseSlot  < IPC::kMaxTextures && s_gone[si.baseSlot])  { si.baseNamePtr  = nullptr; si.baseSlot  = 0; }
-                if (si.ovSlot    < IPC::kMaxTextures && s_gone[si.ovSlot])    { si.ovNamePtr    = nullptr; si.ovSlot    = 0; }
-                if (si.paramSlot < IPC::kMaxTextures && s_gone[si.paramSlot]) { si.paramNamePtr = nullptr; si.paramSlot = 0; }
-            }
-        }
+        if (released) { forgetReleasedSlots(s_gone); }
         if (released) {
             LOG::logline("-- [tex-evict] released %u slots (%.1f MB of DDS); %u stale slots held by"
                          " live parts", released, (double)bytes / (1024.0 * 1024.0), heldStale);
@@ -6552,6 +6653,7 @@ namespace RenderProcess {
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
         // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
+        releaseMorrowindDroppedTextures();   // mirror first: what Morrowind freed goes now
         evictStaleTextures();   // after the geometry flush (see its comment), before the tex flush
         const std::uint32_t texCount = g_texPendingCount;          // snapshot (flush clears it)
         const std::size_t   texBytes = g_texPendingBytes;
@@ -7762,6 +7864,7 @@ namespace RenderProcess {
         }
         // buildOnly (mode 3): run buildOnlyBody (park, no RPC) instead of kickoffBody.
         void kick(IDirect3DDevice9* device, bool buildOnly = false) {
+            MGE::GeometryCache::adoptVisiblePins();   // this job's classify set stays alive until wait()
             {
                 std::lock_guard<std::mutex> lk(m_mx);
                 m_device = device;
@@ -7771,8 +7874,11 @@ namespace RenderProcess {
             m_cvJob.notify_one();
         }
         void wait() {
-            std::unique_lock<std::mutex> lk(m_mx);
-            m_cvDone.wait(lk, [this] { return !m_hasJob; });
+            {
+                std::unique_lock<std::mutex> lk(m_mx);
+                m_cvDone.wait(lk, [this] { return !m_hasJob; });
+            }
+            MGE::GeometryCache::releaseAdoptedPins();   // main thread, job done: nothing reads them now
         }
         void stop() {
             if (!m_thread.joinable()) return;

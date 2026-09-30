@@ -32,6 +32,12 @@ struct ProxyTexLedger {
 };
 ProxyTexLedger& proxyTexLedger();
 
+// Called from ProxyTexture::Release when Morrowind drops its LAST reference to a texture, with the
+// real D3D9 texture pointer (a key only — the texture is already gone). The Forge feed hangs its
+// "host mirrors Morrowind" texture release on it (GeometryCache::onTextureDestroyed). Null = nobody
+// listening. A plain function pointer keeps the proxy free of the mge headers.
+extern void (*g_onProxyTextureDestroyed)(void* realTexture);
+
 // Largest level-0 edge Morrowind's own mip-mapped MANAGED textures are created at; 0 = off. Armed
 // at device creation, only under the Forge takeover (d3d8texture.cpp).
 extern uint32_t g_proxyTexCapDim;
