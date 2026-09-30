@@ -4,6 +4,10 @@
 # anything leaked, backed up, went white or fell over.
 # Usage: forge-zip-run.sh [delay=12] [save=ibodragonstareast360.ess] [target=500] [seed=1]
 #                         [timeout=1800] [clientEnv="NAME=v,NAME=v"] [trace] [farChance=0.4] [settle=20]
+#                         [mode=zip|hop] [hops=10] [dwell=4]
+#
+# mode=hop is the DOOR HOP: `hops` round trips exterior -> "Seyda Neen, Census and Excise Office" ->
+# the same exterior spot, `dwell` real seconds each side; MWSE.log logs each leg's positionCell ms.
 #
 # THE MEASUREMENT — trends, not events: a stress run passes when the last heartbeats look like the
 # first ones.
@@ -23,6 +27,9 @@ CLIENTENV="${6:-}"
 TRACE="${7:-}"
 FARCHANCE="${8:-0.4}"
 SETTLE="${9:-20}"
+MODE="${10:-zip}"
+HOPS="${11:-10}"
+DWELL="${12:-4}"
 CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP"
 
 MW="/mnt/c/mgem/morrowind64"
@@ -51,18 +58,19 @@ restore() {
 }
 trap restore EXIT
 
-python3 - "$ILCFG" "$SAVE" "$AZCFG" "$DELAY" "$TARGET" "$SEED" "$FARCHANCE" "$SETTLE" <<'PY'
+python3 - "$ILCFG" "$SAVE" "$AZCFG" "$DELAY" "$TARGET" "$SEED" "$FARCHANCE" "$SETTLE" "$MODE" "$HOPS" "$DWELL" <<'PY'
 import json, sys
-il, save, az, delay, target, seed, far, settle = sys.argv[1:9]
+il, save, az, delay, target, seed, far, settle, mode, hops, dwell = sys.argv[1:12]
 with open(il) as f: cfg = json.load(f)
 cfg["continue"] = False          # else the mod loads the NEWEST save, not ours
 cfg["overrideFile"] = save
 with open(il, "w") as f: json.dump(cfg, f, indent=2)
 with open(az, "w") as f:
     json.dump({"enabled": True, "delay": float(delay), "target": int(target), "seed": int(seed),
-               "farChance": float(far), "settle": float(settle)}, f, indent=2)
+               "farChance": float(far), "settle": float(settle), "mode": mode, "hops": int(hops),
+               "dwell": float(dwell)}, f, indent=2)
 PY
-echo "[zip] pinned save=$SAVE | delay=${DELAY}s target=$TARGET seed=$SEED farChance=$FARCHANCE settle=${SETTLE}s"
+echo "[zip] pinned save=$SAVE | mode=$MODE delay=${DELAY}s target=$TARGET seed=$SEED farChance=$FARCHANCE settle=${SETTLE}s hops=$HOPS dwell=${DWELL}s"
 
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1
 for _ in $(seq 1 20); do
@@ -122,7 +130,7 @@ done
 
 echo
 echo "=== autozip (MWSE.log) ==="
-grep -E "\[autozip\] (armed|ZIP|SETTLED|!!)" "$MWSELOG" 2>/dev/null || echo "  !! no [autozip] summary lines"
+grep -E "\[autozip\] (armed|ZIP|HOP|hop |SETTLED|!!)" "$MWSELOG" 2>/dev/null || echo "  !! no [autozip] summary lines"
 grep -iE "error|traceback" "$MWSELOG" 2>/dev/null | grep -v "\[autozip\]" | head -10
 
 echo

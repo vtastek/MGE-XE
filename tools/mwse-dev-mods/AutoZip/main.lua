@@ -16,9 +16,15 @@
 -- exit. DEFAULT OFF: it takes the controls away and teleports the player around the map.
 --   enabled, delay (real s before the first leg), target (cell changes), seed,
 --   speed (glide u/s), farChance (0..1 per leg), pause (real s between legs), settle (real s at end).
+--
+-- mode = "hop": the DOOR HOP instead (user: "I like fast load of last cell, interior<->exterior").
+-- `hops` round trips of: exterior spot -> `interior` (dwell s) -> back to the SAME exterior spot
+-- (dwell s). Each leg is logged with the real seconds positionCell took, so the return trip's cost
+-- can be compared across builds; mgeXE.log carries the texture/geometry side.
 
 local defaults = {
     enabled = false,
+    mode = "zip",
     delay = 12.0,
     target = 500,
     seed = 1,
@@ -26,6 +32,9 @@ local defaults = {
     farChance = 0.4,
     pause = 0.5,
     settle = 20.0,
+    hops = 10,
+    dwell = 4.0,
+    interior = "Seyda Neen, Census and Excise Office",
 }
 
 local cfg = mwse.loadConfig("AutoZip", defaults)
@@ -165,9 +174,75 @@ local function begin()
     nextLeg()
 end
 
+-- ---- DOOR HOP mode ------------------------------------------------------------------------------
+local hopHome, hopHomeRot, hopInPos = nil, nil, nil
+local hopsDone = 0
+
+local function hopLeg(inside)
+    if not running then return end
+    local t = os.clock()
+    local ok, err
+    if inside then
+        ok, err = pcall(tes3.positionCell, { reference = tes3.player, cell = cfg.interior, position = hopInPos,
+                                             suppressFader = true, teleportCompanions = false })
+    else
+        ok, err = pcall(tes3.positionCell, { reference = tes3.player, position = hopHome, orientation = hopHomeRot,
+                                             suppressFader = true, teleportCompanions = false })
+    end
+    local cpu = os.clock() - t
+    if not ok then
+        log("!! positionCell (%s) failed: %s", inside and "in" or "out", tostring(err))
+        finish("positionCell failed")
+        return
+    end
+    if not inside then hopsDone = hopsDone + 1 end
+    log("hop %d %s: positionCell %.0f ms cpu -> %s", hopsDone + (inside and 1 or 0), inside and "IN " or "OUT",
+        cpu * 1000, tes3.player.cell and tes3.player.cell.editorName or "?")
+    if not inside and hopsDone >= cfg.hops then
+        finish("hops done")
+        return
+    end
+    timer.start({ type = timer.real, duration = math.max(cfg.dwell, 0.001), iterations = 1,
+        callback = function() hopLeg(not inside) end })
+end
+
+local function beginHop()
+    if tes3.player.cell.isInterior then
+        log("!! player is in an interior - start from an exterior save")
+        return
+    end
+    local cell = tes3.getCell({ id = cfg.interior })
+    if not cell then
+        log("!! interior '%s' not found", cfg.interior)
+        return
+    end
+    -- Land on the first reference in the room (a spot inside it), lifted clear of the floor.
+    hopInPos = { 0, 0, 0 }
+    for ref in cell:iterateReferences() do
+        local p = ref.position
+        hopInPos = { p.x, p.y, p.z + 64 }
+        break
+    end
+    hopHome = tes3.player.position:copy()
+    hopHomeRot = tes3.player.orientation:copy()
+    tes3.runLegacyScript({ command = "tgm" })
+    hopsDone = 0
+    t0 = os.time()
+    running = true
+    event.register("simulate", onSimulate)   -- finish() unregisters it; nothing else runs in it here
+    log("HOP START: %d round trips to '%s' (land at %.0f,%.0f,%.0f), dwell %.1fs", cfg.hops, cfg.interior,
+        hopInPos[1], hopInPos[2], hopInPos[3], cfg.dwell)
+    hopLeg(true)
+end
+
 local function onLoaded()
     if not cfg.enabled then
         log("disabled (enabled=false) - the player will not be moved")
+        return
+    end
+    if cfg.mode == "hop" then
+        log("armed (hop): delay=%.1fs hops=%d dwell=%.1fs interior='%s'", cfg.delay, cfg.hops, cfg.dwell, cfg.interior)
+        timer.start({ type = timer.real, duration = math.max(cfg.delay, 0.001), iterations = 1, callback = beginHop })
         return
     end
     log("armed: delay=%.1fs target=%d seed=%d", cfg.delay, cfg.target, cfg.seed)

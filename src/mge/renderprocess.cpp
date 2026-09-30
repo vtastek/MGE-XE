@@ -1066,6 +1066,9 @@ namespace {
     std::uint64_t                             g_texFreshStreams = 0;   // session totals
     std::uint64_t                             g_texInPlaceStreams = 0; // no fresh slot free: old path
     std::uint32_t                             g_texStreamBudgetMB = 16;
+    // The g_frame value of a load's first produced build: first sights then load their FULL file, no
+    // placeholder (see texBookkeepingRelease's neighbour comment, "FIRST FRAME AFTER A LOAD").
+    std::uint32_t                             g_texSyncFrame = 0xFFFFFFFFu;
     std::uint64_t                             g_texPlaceholders = 0;  // session totals
     std::uint64_t                             g_texDeferredData = 0;
     std::uint64_t                             g_texStreamed = 0;
@@ -2229,7 +2232,7 @@ namespace {
         // in as that copy now and streams its full file later; a _paramh that exists is deferred with
         // nothing to show. Both skip the full read here, which is the whole point.
         bool deferred = false;
-        if (g_texStreamBudgetMB != 0) {
+        if (g_texStreamBudgetMB != 0 && g_frame != g_texSyncFrame) {   // a load's first build: full files
             // The LOD library carries the PBR companions too since 2026-09-20, so a _paramh can have
             // a stand-in like any base map — that is the difference between PBR being THERE at low
             // resolution and PBR switching on a frame later. Bakes made before that have none, and a
@@ -3040,6 +3043,15 @@ namespace {
     // the post-load window + grid prefetch refill what the new cell uses into fresh blocks.
     // Flip-book arrays stay (session-resident, one descriptor each). Produce context, like the purge.
     // MGE_TEX_BOOKKEEP=0 turns it off (A/B).
+    //
+    // KEEP THE LAST LOCATION (user: "I like fast load of last cell, interior<->exterior"). Morrowind
+    // itself keeps the exterior loaded across an interior visit (the mirror releases ~nothing on the
+    // way in), so a release-all here was the ONLY thing throwing it away — and the way back out then
+    // re-streamed it through placeholders, visibly low-res for several frames. Kept: every slot used
+    // within g_texEvictAgeFrames (the place being LEFT) and every name kept at the previous load (the
+    // place before it — for an interior hop, the exterior). Two locations, bounded; the next load
+    // drops whichever of them is no longer one of the last two.
+    std::unordered_set<std::string> g_texKeptLastLoad;   // produce-owned
     void texBookkeepingRelease(const char* why) {
         static int s_on = -1;
         if (s_on < 0) {
@@ -3051,17 +3063,27 @@ namespace {
         if (!s_on || !g_texVec) {
             return;
         }
-        std::uint32_t released = 0;
-        std::uint64_t bytes = 0;
+        std::uint32_t released = 0, kept = 0;
+        std::uint64_t bytes = 0, keptBytes = 0;
+        std::unordered_set<std::string> keepNow;   // the place being left -> next load's "previous"
         {
             std::lock_guard<std::mutex> lk(g_texResidencyMx);
             if (g_slotName.size() != IPC::kMaxTextures) {
                 return;
             }
             const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
+            const std::uint32_t hotAge = g_texEvictAgeFrames ? g_texEvictAgeFrames : 600u;
             for (std::uint32_t s = 1; s < g_nextTexSlot && s < cap; ++s) {
                 if (g_slotName[s].empty()) { continue; }   // free, or a placeholder awaiting retire
+                const bool hot = g_frame - g_slotLastUsed[s] < hotAge;
+                if (hot || g_texKeptLastLoad.count(g_slotName[s])) {
+                    if (hot) { keepNow.insert(g_slotName[s]); }
+                    ++kept;
+                    keptBytes += g_slotBytes[s];
+                    continue;
+                }
                 const std::uint32_t cold = coldBit(s);
+                g_texSlot.erase(g_slotName[s]);
                 g_slotName[s].clear();
                 // g_slotLastUsed KEPT: this slot may have been drawn last frame, and its reuse must
                 // still read hot (host waits the frames in flight) — zeroing it would make it look cold.
@@ -3072,20 +3094,27 @@ namespace {
                 stageTexUpload(rel, nullptr, 0u);
                 ++released;
             }
-            // Every name but the flip books' encoded slots (and their cached misses) goes; a cached
-            // miss is cheap to re-probe and the new cell may have files the old one lacked.
+            // Cached misses go too (cheap to re-probe; the new cell may have files the old one
+            // lacked). Released names were erased above; kept and flip-book names stay.
             for (auto it = g_texSlot.begin(); it != g_texSlot.end();) {
-                if (IPC::isFlipSlot(it->second)) { ++it; } else { it = g_texSlot.erase(it); }
+                if (it->second == 0) { it = g_texSlot.erase(it); } else { ++it; }
             }
-            g_texStreamQueue.clear();   // their slots were just released
-            ++g_texEpoch;               // every cached slot re-resolves by name
+            ++g_texEpoch;   // every cached slot re-resolves by name (kept ones find themselves again)
         }
+        g_texKeptLastLoad.swap(keepNow);
         g_capTexMemo.clear();
         g_gridTexQueue.clear();
-        g_mwDroppedNames.clear();
-        LOG::logline("-- [tex-bookkeep] %s: released all %u streamed slots (%.0f MB); the new cell refills"
-                     " them into fresh heap blocks", why, released, (double)bytes / (1024.0 * 1024.0));
+        LOG::logline("-- [tex-bookkeep] %s: released %u streamed slots (%.0f MB), kept %u (%.0f MB) — the"
+                     " place left and the one before it", why, released, (double)bytes / (1024.0 * 1024.0),
+                     kept, (double)keptBytes / (1024.0 * 1024.0));
     }
+
+    // FIRST FRAME AFTER A LOAD: SYNCHRONOUS (user: "first frame being late is acceptable and it hides
+    // the issues"). First-sight streaming shows a DL placeholder and ships the full file over the next
+    // frames — right mid-play, wrong on the first frame of a new place, where it reads as several
+    // frames of low-res on arrival. On the load's first produced build, first sights take the full
+    // file at once: that one frame is late (hidden by the load), every later frame is sharp.
+    // (g_texSyncFrame is declared with the streaming globals; set in checkCellEpochAndPurge.)
 
     void evictStaleTextures() {
         static bool s_envRead = false;
@@ -6531,6 +6560,7 @@ namespace RenderProcess {
             LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d reloaded=%d first=%d cached=%u",
                          g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
                          (int)reloaded, (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
+            g_texSyncFrame = g_frame;   // this build's first sights load full files (see g_texSyncFrame)
             if (!firstEval) {
                 MGE::GeometryCache::purgeAll();
                 // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
