@@ -322,9 +322,12 @@ namespace IPC {
 		*        process's value; set by the host when the frame's fence value is reached), or null. Optional.
 		* @return Whether the host renderer initialized successfully (blocking).
 		*/
+		// outFramebufferHandle1 / outFrameEventHandle1 (P3): slot 1 of the host's shared RT + event
+		// pair; the two above are slot 0's. The RenderFrame reply's rtSlot says which one a frame used.
 		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
 			std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle,
-			HANDLE* outFrameFenceHandle = nullptr, HANDLE* outFrameEventHandle = nullptr);
+			HANDLE* outFrameFenceHandle = nullptr, HANDLE* outFrameEventHandle = nullptr,
+			HANDLE* outFramebufferHandle1 = nullptr, HANDLE* outFrameEventHandle1 = nullptr);
 
 		/**
 		* @brief Present-seam spike: render one frame into shared buffer targetIndex.
@@ -399,8 +402,9 @@ namespace IPC {
 		// frame's submit. Since the host stopped fence-waiting its own frame, the completion no
 		// longer implies the GPU has finished — the caller must wait this value on the imported
 		// timeline semaphore before reading the shared RT. 0 ⇒ no sync object available.
+		// outRtSlot (P3): which of the host's two shared RTs (and frame events) this frame used.
 		bool renderSceneFinish(double* outRenderMs = nullptr, HostFrameTimings* outTimings = nullptr,
-			std::uint64_t* outFrameFenceValue = nullptr);
+			std::uint64_t* outFrameFenceValue = nullptr, std::uint32_t* outRtSlot = nullptr);
 
 		/**
 		* @brief M1b: upload a batch of static opaque meshes to the Forge host.

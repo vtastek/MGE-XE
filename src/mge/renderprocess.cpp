@@ -40,6 +40,10 @@
 #include <unordered_set>
 #include <vector>
 
+namespace RenderProcess {
+    void dropPendingCopy();   // 1.5-ahead parked copy (defined with g_pendingCopy); used by lazyInit
+}
+
 namespace {
     // Seam ALLOCATION size. Set at bring-up to ceiling render-scale x backbuffer (the host's
     // Forge render target + the imported VkImage + g_mainTex are all created at THIS size).
@@ -112,6 +116,14 @@ namespace {
     // host frame thus overlaps the WHOLE MW frame, not just scene 0. World image lags
     // input by one frame (UI stays current).
     bool   g_frameAheadLive = true;    // on by default; numpad-* flips live (A/B)
+    // 1.5-ahead (tasks/forge-pipeline-depth.md P4). On a park-fired frame the collect does the
+    // finish RPC only — it waits host CPU, not GPU — and parks {fence, rtSlot} in g_pendingCopy;
+    // the RT copy (the host-GPU wait) moves to the blit point. The next park fire therefore goes
+    // out while the host GPU is still drawing the previous frame, so the host records N+1 under
+    // GPU N instead of leaving the GPU idle for its whole setup+cull+record. What is displayed, and
+    // when, is unchanged: frame N still reaches g_mainTex before this MW frame's blit.
+    // numpad-* cycles off -> 1-ahead -> 1.5-ahead; MGE_COPY_AT_BLIT=0|1 sets it at seam init.
+    bool   g_copyAtBlit = true;
     // Client produce (buildGeometryDrawLists + flush + RPC-start, D3D9-free after Tier 1a) on a
     // fresh dedicated worker. NUMPAD8 cycles 3 modes. (S5a: every mode was additionally gated on
     // !UseRenderThread — the legacy MGE render thread owned the device lock and forced a
@@ -186,6 +198,7 @@ namespace {
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
     struct Accum { double feed, geom, build, render, host, overlap, copy, evwait, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN;
+                   unsigned atBlitN;   // pipe frames whose RT copy ran at the blit (1.5-ahead)
                    double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; double bKeys;
                    double maxBuild, bCaptures; };   // Phase 0: build-split sub-probe (+ Stage 0 spike observability)
     Accum g_hb = {};
@@ -340,6 +353,7 @@ namespace {
         // timings — the composite path must wait on THIS frame's value, and re-reading the shared
         // Parameters later would hand it whatever the next frame has since written.
         std::uint64_t earlyFenceValue;
+        std::uint32_t earlyRtSlot;   // P3: ...and which of the host's two RTs it rendered into
         double tEarlyFinish;
         unsigned frame;
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
@@ -359,8 +373,10 @@ namespace {
     // stashDeferredFinish() moves it here; doDeferredFinish() consumes it. Main thread only.
     KickState g_pendingFinish = {};
 
-    // Host-RPC serialisation gate. There is ONE shared host RT (g_importImg), so the host must not
-    // begin frame N until the client has finished frame N-1 and copied that RT out. With the kick
+    // Host-RPC serialisation gate. The host must not begin frame N until the client has finished
+    // frame N-1 and copied its RT out. (Since P3 the host alternates between TWO shared RTs, so N
+    // itself only overwrites N-2's. This gate is mode 2's and still copies N-1 first; the 1.5-ahead
+    // copy-at-blit is park-only — see g_copyAtBlit — and park frames never arm it.) With the kick
     // moved ahead of the finish, the worker can reach renderSceneKickoff before main has done
     // either — so the worker blocks here until main signals. In practice main's finish+copy runs
     // under the worker's ~3.5ms build and the gate is already open when the worker arrives (wait
@@ -1082,10 +1098,12 @@ namespace {
     VkQueue          g_queue  = VK_NULL_HANDLE;
     uint32_t         g_qFamily = 0;
 
-    HANDLE           g_hostHandle = nullptr;     // Forge RT shared NT handle (we own it)
+    // P3: the host renders into a PAIR of shared RTs, one per host frame slot, so it can draw frame
+    // N+1 while we still copy N. Each frame's finish reply names its slot (rtSlot); we copy from it.
+    HANDLE           g_hostHandle[2] = {};       // Forge RT shared NT handles (we own them)
     VkExternalMemoryHandleTypeFlagBits g_htype = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
-    VkImage          g_importImg = VK_NULL_HANDLE;  // imported host RT (owned)
-    VkDeviceMemory   g_importMem = VK_NULL_HANDLE;  // imported external memory (owned)
+    VkImage          g_importImg[2] = {};        // imported host RTs (owned)
+    VkDeviceMemory   g_importMem[2] = {};        // imported external memory (owned)
 
     IDirect3DTexture9* g_mainTex = nullptr;      // DXVK D3D9 RT texture; copy dst + blit src
     VkImage            g_dstImg = VK_NULL_HANDLE;   // its backing VkImage (borrowed)
@@ -1108,7 +1126,9 @@ namespace {
     // A manual-reset event the HOST resets and re-arms (SetEventOnCompletion) with every frame's
     // fence signal; we only ever WAIT it, on the CPU, before the RT copy. g_frameEventOk ⇒ we told
     // the host clientSyncsOnFence = 2. Never used while g_frameSemOk (the GPU wait is strictly better).
-    HANDLE      g_frameEvent   = nullptr;         // duplicated host event handle (we own it)
+    // One per host RT slot (P3): the host re-arms only the slot it is about to draw into, so the
+    // event we wait for frame N is never reset by the arming of N+1.
+    HANDLE      g_frameEvent[2] = {};             // duplicated host event handles (we own them)
     bool        g_frameEventOk = false;
 
     HMODULE g_vulkanDll = nullptr;
@@ -1276,6 +1296,16 @@ namespace {
             return;
         }
 
+        // MGE_TIER1_SEM=0: skip the import, so a Windows run takes the EVENT handoff — the Wine/Proton
+        // path — and it can be exercised (and A/B'd) without the Linux box.
+        {
+            char v[4] = {};
+            if (GetEnvironmentVariableA("MGE_TIER1_SEM", v, sizeof(v)) > 0 && v[0] == '0') {
+                LOG::logline(">> [seam][tier1] MGE_TIER1_SEM=0 — semaphore import skipped (event handoff test)");
+                return;
+            }
+        }
+
         // Wine/Proton (through GE-Proton 11-7 at least) cannot import a D3D12 fence owned by another
         // process: win32u logs "fixme: d3d12 fence from other process" and then faults inside its own
         // Unix side, taking Morrowind down with it. The call never returns an error we could handle,
@@ -1335,8 +1365,8 @@ namespace {
                      "Tier 1 must take the double-RT branch");
     }
 
-    // Import the host's shared NT handle as a VkImage on DXVK's device.
-    bool importHostImage() {
+    // Import the host's shared NT handle of RT slot i as a VkImage on DXVK's device.
+    bool importHostImage(unsigned i) {
         VkExternalMemoryImageCreateInfo extImg = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
         extImg.handleTypes = g_htype;
         VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -1351,17 +1381,17 @@ namespace {
         ici.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vk.CreateImage(g_dev, &ici, nullptr, &g_importImg) != VK_SUCCESS) {
-            LOG::logline("!! [seam] vkCreateImage (imported host RT) failed");
+        if (vk.CreateImage(g_dev, &ici, nullptr, &g_importImg[i]) != VK_SUCCESS) {
+            LOG::logline("!! [seam] vkCreateImage (imported host RT %u) failed", i);
             return false;
         }
 
         VkMemoryRequirements mr = {};
-        vk.GetImageMemoryRequirements(g_dev, g_importImg, &mr);
+        vk.GetImageMemoryRequirements(g_dev, g_importImg[i], &mr);
 
         VkMemoryWin32HandlePropertiesKHR whp = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
         uint32_t handleTypeBits = mr.memoryTypeBits;
-        if (vk.GetMemoryWin32HandlePropertiesKHR(g_dev, g_htype, g_hostHandle, &whp) == VK_SUCCESS) {
+        if (vk.GetMemoryWin32HandlePropertiesKHR(g_dev, g_htype, g_hostHandle[i], &whp) == VK_SUCCESS) {
             handleTypeBits &= whp.memoryTypeBits;
         }
         uint32_t typeIdx = pickMemoryType(handleTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1374,22 +1404,22 @@ namespace {
         }
 
         VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
-        ded.image = g_importImg;
+        ded.image = g_importImg[i];
         VkImportMemoryWin32HandleInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
         imp.pNext      = &ded;
         imp.handleType = g_htype;
-        imp.handle     = g_hostHandle;
+        imp.handle     = g_hostHandle[i];
         VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         mai.pNext           = &imp;
         mai.allocationSize  = mr.size;
         mai.memoryTypeIndex = typeIdx;
-        VkResult r = vk.AllocateMemory(g_dev, &mai, nullptr, &g_importMem);
+        VkResult r = vk.AllocateMemory(g_dev, &mai, nullptr, &g_importMem[i]);
         if (r != VK_SUCCESS) {
-            LOG::logline("!! [seam] *** vkAllocateMemory (import) FAILED VkResult=%d *** (handle type %d not importable on this GPU)", (int)r, (int)g_htype);
+            LOG::logline("!! [seam] *** vkAllocateMemory (import %u) FAILED VkResult=%d *** (handle type %d not importable on this GPU)", i, (int)r, (int)g_htype);
             return false;
         }
-        if (vk.BindImageMemory(g_dev, g_importImg, g_importMem, 0) != VK_SUCCESS) {
-            LOG::logline("!! [seam] vkBindImageMemory (imported host RT) failed");
+        if (vk.BindImageMemory(g_dev, g_importImg[i], g_importMem[i], 0) != VK_SUCCESS) {
+            LOG::logline("!! [seam] vkBindImageMemory (imported host RT %u) failed", i);
             return false;
         }
         return true;
@@ -1483,15 +1513,19 @@ namespace {
             g_frameSemOk = false;
             if (g_fence)     { vk.DestroyFence(g_dev, g_fence, nullptr); g_fence = VK_NULL_HANDLE; }
             if (g_cmdPool)   { vk.DestroyCommandPool(g_dev, g_cmdPool, nullptr); g_cmdPool = VK_NULL_HANDLE; g_cmd = VK_NULL_HANDLE; }
-            if (g_importImg) { vk.DestroyImage(g_dev, g_importImg, nullptr); g_importImg = VK_NULL_HANDLE; }
-            if (g_importMem) { vk.FreeMemory(g_dev, g_importMem, nullptr); g_importMem = VK_NULL_HANDLE; }
+            for (unsigned i = 0; i < 2; ++i) {
+                if (g_importImg[i]) { vk.DestroyImage(g_dev, g_importImg[i], nullptr); g_importImg[i] = VK_NULL_HANDLE; }
+                if (g_importMem[i]) { vk.FreeMemory(g_dev, g_importMem[i], nullptr); g_importMem[i] = VK_NULL_HANDLE; }
+            }
         }
         if (g_mainTex)     { g_mainTex->Release(); g_mainTex = nullptr; }
         g_mainTexValid = false;
         g_dstImg = VK_NULL_HANDLE;
-        if (g_hostHandle)  { CloseHandle(g_hostHandle); g_hostHandle = nullptr; }
+        for (unsigned i = 0; i < 2; ++i) {
+            if (g_hostHandle[i]) { CloseHandle(g_hostHandle[i]); g_hostHandle[i] = nullptr; }
+            if (g_frameEvent[i]) { CloseHandle(g_frameEvent[i]); g_frameEvent[i] = nullptr; }
+        }
         if (g_fenceHandle) { CloseHandle(g_fenceHandle); g_fenceHandle = nullptr; }
-        if (g_frameEvent)  { CloseHandle(g_frameEvent); g_frameEvent = nullptr; }
         g_frameEventOk = false;
         if (g_vki)         { g_vki->Release(); g_vki = nullptr; }
         g_inst = VK_NULL_HANDLE; g_phys = VK_NULL_HANDLE; g_dev = VK_NULL_HANDLE; g_queue = VK_NULL_HANDLE;
@@ -1560,6 +1594,7 @@ namespace {
         if (g_initOk) {
             g_initOk = false;                  // a failed re-init must report the seam down, not stale-up
             resetResidencyForReinit();
+            RenderProcess::dropPendingCopy();  // its fence/slot name the OLD host's frame
         }
         if (FAILED(device->QueryInterface(__uuidof(ID3D9VkInteropDevice), (void**)&g_vki)) || !g_vki) {
             LOG::logline("!! [seam] main device is not DXVK (no ID3D9VkInteropDevice) — seam disabled");
@@ -1628,23 +1663,29 @@ namespace {
 
         // Host brings up Forge + creates the shared RT; returns the NT handle already
         // duplicated into THIS process.
-        HANDLE hostHandle = nullptr;
+        HANDLE hostHandle[2] = {};
         HANDLE hostFence = nullptr;
-        HANDLE hostEvent = nullptr;
+        HANDLE hostEvent[2] = {};
         // MSAA: Configuration.AALevel is the D3DMULTISAMPLE value (0/2/4/8); map 0 -> 1 sample.
         const std::uint32_t sampleCount = Configuration.AALevel > 0 ? (std::uint32_t)Configuration.AALevel : 1u;
         // AF: Configuration.AnisoLevel (0 = off, else max anisotropy) — host sampler (Phase 2).
         const std::uint32_t anisoLevel = (std::uint32_t)Configuration.AnisoLevel;
-        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr, &hostHandle, &hostFence, &hostEvent) || hostHandle == nullptr) {
-            if (hostEvent) { CloseHandle(hostEvent); }
-            LOG::logline("!! [seam] renderInit RPC failed or no shared handle; seam disabled");
+        const bool initOk = g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr,
+                                                         &hostHandle[0], &hostFence, &hostEvent[0],
+                                                         &hostHandle[1], &hostEvent[1]);
+        // Adopt everything we were handed first, so releaseAll() closes it on any failure below.
+        for (unsigned i = 0; i < 2; ++i) {
+            g_hostHandle[i] = hostHandle[i];
+            g_frameEvent[i] = hostEvent[i];   // may be null; only used if the semaphore import fails
+        }
+        g_fenceHandle = hostFence;   // may be null; probeSharedFenceSemaphore reports either way
+        if (!initOk || hostHandle[0] == nullptr || hostHandle[1] == nullptr) {
+            LOG::logline("!! [seam] renderInit RPC failed or no shared RT pair (%p %p); seam disabled",
+                         hostHandle[0], hostHandle[1]);
             releaseAll();
             return;
         }
-        g_hostHandle = hostHandle;
-        g_fenceHandle = hostFence;   // may be null; probeSharedFenceSemaphore reports either way
-        g_frameEvent  = hostEvent;   // may be null; only adopted if the semaphore import fails
-        LOG::logline(">> [seam] host shared-RT NT handle (this process) = %p", hostHandle);
+        LOG::logline(">> [seam] host shared-RT NT handles (this process) = %p %p", hostHandle[0], hostHandle[1]);
 
         // Cross-vendor: pick the first external handle type the GPU can import.
         const VkExternalMemoryHandleTypeFlagBits candidates[] = {
@@ -1662,7 +1703,7 @@ namespace {
         }
         LOG::logline(">> [seam] importing host RT as external handle type %d", (int)g_htype);
 
-        if (!importHostImage()) {
+        if (!importHostImage(0) || !importHostImage(1)) {
             releaseAll();
             return;
         }
@@ -1683,7 +1724,8 @@ namespace {
         // No semaphore ⇒ fall back to the host's frame EVENT: a CPU wait before the copy instead of
         // a GPU one, but it still frees the host from settling its own frame. Needs the fence too —
         // the event is only ever set by that fence's SetEventOnCompletion.
-        g_frameEventOk = !g_frameSemOk && g_frameEvent != nullptr && g_fenceHandle != nullptr;
+        g_frameEventOk = !g_frameSemOk && g_frameEvent[0] != nullptr && g_frameEvent[1] != nullptr
+                      && g_fenceHandle != nullptr;
         {   // MGE_TIER1_EVENT=0: force the old blocking contract, for A/B against the event handoff.
             char v[4] = {};
             if (g_frameEventOk && GetEnvironmentVariableA("MGE_TIER1_EVENT", v, sizeof(v)) > 0 && v[0] == '0') {
@@ -1696,6 +1738,15 @@ namespace {
                      g_frameSemOk   ? "ENABLED (client GPU-waits the shared fence before each RT copy)"
                      : g_frameEventOk ? "ENABLED via EVENT (client CPU-waits the host's frame event before each RT copy)"
                                       : "DISABLED (no semaphore, no event — host keeps its own fence wait)");
+        {   // MGE_COPY_AT_BLIT=0|1: the harness's switch for the 1-ahead vs 1.5-ahead A/B (numpad-*
+            // cycles it live). Read here so every seam bring-up starts from the environment's choice.
+            char v[4] = {};
+            if (GetEnvironmentVariableA("MGE_COPY_AT_BLIT", v, sizeof(v)) > 0) {
+                g_copyAtBlit = (v[0] != '0');
+                LOG::logline(">> [seam] MGE_COPY_AT_BLIT=%c — RT copy %s", v[0],
+                             g_copyAtBlit ? "at the blit (1.5-ahead)" : "at the collect (1-ahead)");
+            }
+        }
 
         g_initOk = true;
         LOG::logline(">> [seam] DXVK Vulkan-interop seam ready (%ux%u). F11 toggles the composite.", g_w, g_h);
@@ -1726,7 +1777,11 @@ namespace {
     // keeps its old end-of-frame fence wait — the reply then means "GPU-complete" exactly as before
     // and this copy is safe with no wait at all. That is the fallback for a DXVK build where step
     // 0a's import fails; it costs the Tier 1 win, not correctness.
-    bool copyHostRtToDst(std::uint64_t hostFenceValue) {
+    //
+    // rtSlot (P3): which of the host's two shared RTs this frame rendered into (the finish reply's
+    // rtSlot) — the image copied, and in event mode the event waited.
+    bool copyHostRtToDst(std::uint64_t hostFenceValue, std::uint32_t rtSlot) {
+        const unsigned slot = rtSlot & 1u;
         // Spike attribution (rare 12ms "Forge RT copy" with host already finished): the outer
         // zone can't say WHICH of the three main-thread blockers stalled — the DXVK flush (drains
         // MW's whole pending D3D9 batch), the submit-queue lock (contends DXVK's submit thread),
@@ -1767,7 +1822,7 @@ namespace {
         // the composite samples exactly this region. Outside it the host RT is the (transparent)
         // clear and is never sampled.
         region.extent         = { g_rw, g_rh, 1 };
-        vk.CmdCopyImage(g_cmd, g_importImg, VK_IMAGE_LAYOUT_GENERAL,
+        vk.CmdCopyImage(g_cmd, g_importImg[slot], VK_IMAGE_LAYOUT_GENERAL,
                         g_dstImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
         // dst: TRANSFER_DST -> DXVK resting layout (so DXVK's tracking stays valid)
@@ -1804,14 +1859,14 @@ namespace {
         // Tier 1 EVENT handoff: no semaphore to put on the submit, so hold the submit itself until
         // the host's frame event says its fence reached this frame's value. Placed after recording
         // so the record overlaps the host's GPU tail. The event is manual-reset and only the host
-        // resets it (before the Signal of the NEXT frame, which cannot happen until we kick it off),
-        // so a set event here always vouches for THIS frame — or for a later-still one if the host
-        // skipped its signal, which is the same "last completed frame" the semaphore path would
-        // copy. A timeout copies anyway: a torn frame beats a hung game; it is logged.
+        // resets it — slot `slot`'s event only when it arms the NEXT frame in this slot (N+2), which
+        // cannot happen until we have copied this one and kicked N+2 off — so a set event here
+        // always vouches for THIS frame. A timeout copies anyway: a torn frame beats a hung game;
+        // it is logged.
         const double tcEv0 = nowMs();
         if (g_frameEventOk && waitValue != 0) {
             MGE_ZoneScopedN("RTcopy: frame event wait");
-            const DWORD w = WaitForSingleObject(g_frameEvent, 2000);
+            const DWORD w = WaitForSingleObject(g_frameEvent[slot], 2000);
             if (w != WAIT_OBJECT_0) {
                 static unsigned s_evTimeouts = 0;
                 if (s_evTimeouts++ < 8) {
@@ -2805,9 +2860,11 @@ namespace {
             g_kick.earlyHostMs      = 0.0;
             g_kick.earlyHostTimings = {};
             g_kick.earlyFenceValue  = 0;
+            g_kick.earlyRtSlot      = 0;
             g_kick.earlyOk          = g_client->renderSceneFinish(&g_kick.earlyHostMs,
                                                                   &g_kick.earlyHostTimings,
-                                                                  &g_kick.earlyFenceValue);
+                                                                  &g_kick.earlyFenceValue,
+                                                                  &g_kick.earlyRtSlot);
             g_kick.tEarlyFinish     = nowMs();
         }
         LOG::logline("-- [seam] geometry staging at %u KB mid-walk — draining to host",
@@ -5257,9 +5314,15 @@ namespace RenderProcess {
         // Numpad *: frame-ahead pipelining live A/B. Takes effect at the
         // next kickoff; a pending deferred frame still collects normally (the collect keys
         // on g_kick.deferFinish, not this flag), so the toggle can never wedge the window.
+        // Cycles OFF -> 1-ahead -> 1.5-ahead (copy at blit) -> OFF. A copy already parked when
+        // g_copyAtBlit drops still drains at the blit or a backstop (drainPendingCopy keys on
+        // g_pendingCopy.valid, not this flag).
         if (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) {
-            g_frameAheadLive = !g_frameAheadLive;
-            LOG::logline(">> [seam] frame-ahead pipelining %s", g_frameAheadLive ? "ON" : "OFF");
+            if (!g_frameAheadLive)  { g_frameAheadLive = true; g_copyAtBlit = false; }
+            else if (!g_copyAtBlit) { g_copyAtBlit = true; }
+            else                    { g_frameAheadLive = false; }
+            LOG::logline(">> [seam] frame-ahead pipelining %s",
+                         !g_frameAheadLive ? "OFF" : g_copyAtBlit ? "1.5-ahead (copy at blit)" : "1-ahead");
         }
         // (The NUMPAD8 produce-worker mode cycle lived here — a bring-up knob from before PARK
         // became the shipping default. Deleted 2026-08-02: one stray keypress cycled the mode to
@@ -5296,17 +5359,26 @@ namespace RenderProcess {
     // "no composite this frame" failure behaviour.
     struct FinishResult {
         bool consumed;      // a pending / early-finished frame existed
-        bool ok;            // finish AND copy both succeeded
+        bool ok;            // finish AND copy both succeeded (finish only, when copyDeferred)
+        bool copyDeferred;  // 1.5-ahead: finished, copy parked in g_pendingCopy (fence/rtSlot below)
         double hostMs, overlap, tWait0, tRender, tCopy;
+        std::uint64_t frameFence;
+        std::uint32_t rtSlot;
     };
+    bool drainPendingCopy();   // fwd (defined after accumFrameStats)
     // ks = the kickoff state being finished: g_kick for a same-frame (fused/async) finish,
     // g_pendingFinish for a frame-ahead deferred finish — by then the worker owns g_kick.
-    FinishResult finishAndCopy(KickState& ks) {
+    // deferCopy (1.5-ahead): stop after the finish RPC and hand back {frameFence, rtSlot} for the
+    // caller to park; g_mainTex is left holding the previous frame until drainPendingCopy.
+    FinishResult finishAndCopy(KickState& ks, bool deferCopy = false) {
         FinishResult r = {};
         const bool earlyFinished = ks.rpcEarlyFinished;   // mid-walk drain closed the window
         if (!ks.rpcPending && !earlyFinished) {
             return r;
         }
+        // A parked copy is always of an OLDER frame than this one: land it first, so g_mainTex is
+        // never overwritten backwards and its RT is read before the host's next use of that slot.
+        drainPendingCopy();
         ks.rpcPending       = false;
         ks.rpcEarlyFinished = false;
         r.consumed = true;
@@ -5322,15 +5394,17 @@ namespace RenderProcess {
         // Tier 1: the shared frame-fence value for the frame we are about to copy. The RPC reply no
         // longer implies the host's GPU is done, so this is what copyHostRtToDst waits on.
         std::uint64_t frameFence = 0;
+        std::uint32_t rtSlot = 0;   // P3: the host RT (and frame event) this frame used
         if (earlyFinished) {
             r.ok     = ks.earlyOk;
             r.hostMs = ks.earlyHostMs;
             hostT    = ks.earlyHostTimings;   // captured at the mid-walk drain, not re-read here
             frameFence = ks.earlyFenceValue;  // ...and neither is the fence value (same reason)
+            rtSlot     = ks.earlyRtSlot;      // ...nor the slot
         } else {
             MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
             markMainPhase(MP_FINISH_COPY);   // main is now blocked on the host IPC finish
-            r.ok = g_client->renderSceneFinish(&r.hostMs, &hostT, &frameFence);
+            r.ok = g_client->renderSceneFinish(&r.hostMs, &hostT, &frameFence, &rtSlot);
         }
         r.tRender = nowMs();
         // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
@@ -5385,11 +5459,18 @@ namespace RenderProcess {
             g_mainTexValid = false;
             return r;
         }
+        if (deferCopy) {
+            r.copyDeferred = true;
+            r.frameFence   = frameFence;
+            r.rtSlot       = rtSlot;
+            r.tCopy        = r.tRender;   // restamped with the copy's own duration when it drains
+            return r;
+        }
 
         bool copyOk;
         {
             MGE_ZoneScopedN("Forge RT copy");
-            copyOk = copyHostRtToDst(frameFence);
+            copyOk = copyHostRtToDst(frameFence, rtSlot);
         }
         if (!copyOk) {
             static bool logged = false;
@@ -5549,12 +5630,12 @@ namespace RenderProcess {
             // window-guard refusals (must stay 0 — nonzero means an unaudited RPC site
             // fired inside the now frame-long async window).
             LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f build=%.2f render=%.2f[host=%.2f] "
-                         "overlap=%.2f copy=%.2f[evw=%.2f] blit=%.2f dt=%.2f mwstart=%.2f early=%u pipe=%u refuse=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
+                         "overlap=%.2f copy=%.2f[evw=%.2f] blit=%.2f dt=%.2f mwstart=%.2f early=%u pipe=%u(atblit=%u) refuse=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
                          g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n, g_hb.build / g_hb.n,
                          g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
                          g_hb.copy / g_hb.n, g_hb.evwait / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n,
                          g_hb.mwstart / g_hb.n, g_hb.earlyN,
-                         g_hb.pipeN, g_client ? g_client->windowRefusals() : 0u,
+                         g_hb.pipeN, g_hb.atBlitN, g_client ? g_client->windowRefusals() : 0u,
                          g_hb.captured / g_hb.n,
                          g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
@@ -5882,6 +5963,53 @@ namespace RenderProcess {
                          ks.texCount, (unsigned)(ks.texBytes >> 10),
                          ks.dtPresent);
         }
+    }
+
+    // 1.5-ahead: a finished host frame whose RT copy waits for the blit point (see g_copyAtBlit).
+    // At most one, and always the newest finished frame: set only by the park collect, drained
+    // before any later finish consumes a newer frame (finishAndCopy). Its host RT slot is safe until
+    // the host records the frame after next, which needs a finish first — so the drain always wins.
+    // Main thread only (the copy is D3D9/DXVK work).
+    struct PendingCopy {
+        bool          valid = false;
+        std::uint64_t frameFence = 0;
+        std::uint32_t rtSlot = 0;
+        KickState     ks = {};      // the kick it finished, for the [hb] accounting at the copy
+        FinishResult  fr = {};
+    };
+    PendingCopy g_pendingCopy;
+    void dropPendingCopy() { g_pendingCopy = PendingCopy{}; }
+
+    // Copy the parked frame into g_mainTex. Called at the blit (its home) and by every backstop:
+    // the next finish, collectDeferredFinish (load / reset / non-early / menu-freeze frames), and
+    // Present when no UI scene blitted. No-op when nothing is parked. Returns false on a failed copy.
+    bool drainPendingCopy() {
+        if (!g_pendingCopy.valid) {
+            return true;
+        }
+        g_pendingCopy.valid = false;
+        if (!g_initOk) {
+            return false;   // seam torn down under it: nothing to copy into
+        }
+        MGE_ZoneScopedN("Forge RT copy (at blit)");
+        const double t0 = nowMs();
+        const bool ok = copyHostRtToDst(g_pendingCopy.frameFence, g_pendingCopy.rtSlot);
+        const double copyMs = nowMs() - t0;
+        if (!ok) {
+            static bool logged = false;
+            if (!logged) { LOG::logline("!! [seam] copyHostRtToDst failed (deferred copy)"); logged = true; }
+            g_mainTexValid = false;
+            return false;
+        }
+        g_mainTexValid = true;
+        // The [hb] copy bucket is tCopy - tRender: restamp it to the copy's own wall time, so feed and
+        // copy mean what they mean in 1-ahead (the MW work between finish and copy is not the copy).
+        FinishResult fr = g_pendingCopy.fr;
+        fr.tCopy = fr.tRender + copyMs;
+        ++g_hb.atBlitN;
+        accumFrameStats(g_pendingCopy.ks, fr, fr.tCopy, true, g_lastBlitMs);
+        g_lastBlitMs = 0.0;
+        return true;
     }
 
     // Cell-change shadow eviction (see g_cellEpoch): bump the epoch on any load-door
@@ -7380,7 +7508,7 @@ namespace RenderProcess {
     };
     ProduceWorker g_produceWorker;
 
-    void doDeferredFinish();      // fwd (defined below); Phase 0 deferred wait
+    void doDeferredFinish(bool allowCopyDefer = false);   // fwd (defined below); Phase 0 deferred wait
     void stashDeferredFinish();   // fwd (defined below); move g_kick's finish state to the holder
 
     // Drain an in-flight async (mode 2) produce. Idempotent + cheap when none is pending, so it can
@@ -7654,6 +7782,9 @@ namespace RenderProcess {
 
     void onFramePresented() {
         ++g_frameSerial;
+        // Present backstop for a copy the collect parked when no UI scene came to blit it (the
+        // race menu's extra scene, a frame with no main view). Never leave it across the boundary.
+        drainPendingCopy();
     }
 
     void noteEnginePresentReturn() {
@@ -7721,7 +7852,7 @@ namespace RenderProcess {
         // nothing deferred (priming frames), so the mode==3 arm is harmless in steady state.
         if (g_produceMode == 3 || g_kick.parkFired || g_pendingFinish.parkFired) {
             stashDeferredFinish();
-            doDeferredFinish();
+            doDeferredFinish(/*allowCopyDefer=*/true);   // 1.5-ahead: the copy waits for the blit
             g_kick.parkFired = g_pendingFinish.parkFired = false;   // consumed — reset the keyed state
         }
     }
@@ -7730,7 +7861,11 @@ namespace RenderProcess {
     // does a D3D9 RT copy. Shared by collectDeferredFinish and onStage0CompositeKickoff. No-op unless
     // a deferred finish is pending; consumes g_kick's N-1 state, so it MUST run before kickoffBody
     // resets g_kick for the new frame.
-    void doDeferredFinish() {
+    //
+    // allowCopyDefer: only the frame-start collect passes true. A park-fired frame then finishes
+    // here but copies at the blit (1.5-ahead, g_copyAtBlit). Every other caller is a backstop or a
+    // non-park path, which must leave g_mainTex current before it returns.
+    void doDeferredFinish(bool allowCopyDefer) {
         markMainPhase(MP_DEFERRED_FINISH);
         if (!finishDeferred()) {
             // Nothing to release, but the worker may be parked on the gate (armed unconditionally
@@ -7740,7 +7875,10 @@ namespace RenderProcess {
         }
         MGE_ZoneScopedN("Forge deferred finish");
         g_pendingFinish.deferFinish = false;
-        const FinishResult fr = finishAndCopy(g_pendingFinish);
+        // Park frames only: they arm no finish gate (the gate is mode 2's, and it still means "the
+        // copy is done"), and their next kick is the frame-start fire, which the RT pair makes safe.
+        const bool deferCopy = allowCopyDefer && g_copyAtBlit && g_pendingFinish.parkFired;
+        const FinishResult fr = finishAndCopy(g_pendingFinish, deferCopy);
         // The shared host RT is released the moment finishAndCopy returns (success or not) — the
         // copy is the last thing that reads it. Let the worker issue frame N's kickoff now.
         openFinishGate();
@@ -7750,6 +7888,15 @@ namespace RenderProcess {
             // path; ownership gates release via g_initOk/ServerLost as before.
             LOG::logline("!! [pipe] deferred finish failed (host dead?) — composite skipped until recovery");
             g_lastBlitMs = 0.0;
+            return;
+        }
+        if (fr.copyDeferred) {
+            // [hb] accounting happens at the copy, where the frame's figures are complete.
+            g_pendingCopy.valid      = true;
+            g_pendingCopy.frameFence = fr.frameFence;
+            g_pendingCopy.rtSlot     = fr.rtSlot;
+            g_pendingCopy.ks         = g_pendingFinish;
+            g_pendingCopy.fr         = fr;
             return;
         }
         accumFrameStats(g_pendingFinish, fr, nowMs(), true, g_lastBlitMs);
@@ -7768,10 +7915,17 @@ namespace RenderProcess {
         waitProduce();
         stashDeferredFinish();
         doDeferredFinish();
+        // A copy the collect parked (1.5-ahead) lands here on every path that will not reach the
+        // blit this frame as a park frame: load, reset, non-early and menu-freeze frames.
+        drainPendingCopy();
     }
 
     void onFrameAheadBlit(IDirect3DDevice9* device) {
         markMainPhase(MP_BLIT);
+        // 1.5-ahead: the collect finished the previous host frame but left its RT copy for here, so
+        // the host could start the next frame while its GPU was still drawing this one. Copy it now
+        // (the wait for the host GPU lands here, under MW's frame instead of ahead of the fire).
+        drainPendingCopy();
         // EndScene(0) composite point on a deferred frame: no finish, no IPC, no wait —
         // just lay the PREVIOUS host frame (still valid in g_mainTex; the composite
         // never reads the shared RT directly) over MW's backbuffer. Skipped while
@@ -7803,6 +7957,10 @@ namespace RenderProcess {
         // overwritten by the composite, so MGE suppresses them. F11 off (or a dead host / failed
         // seam → g_initOk false) releases every suppression and MW renders vanilla.
         return g_initOk && g_enabled;
+    }
+
+    bool parkFiresLater() {
+        return forgeOwnsFrame() && g_produceMode == 3;
     }
 
     IDirect3DTexture9* sunDX9Texture() {
@@ -8336,6 +8494,7 @@ namespace RenderProcess {
         }
         if (g_hostZoneOpen) { MGE_TracyHostFrameEnd(g_hostZoneCtx); g_hostZoneOpen = false; }
         g_kick = KickState{};
+        dropPendingCopy();   // a parked copy has nothing to copy into once this releases
         releaseAll();
         g_geomVec.reset();
         g_drawVec.reset();
@@ -8492,6 +8651,7 @@ void DrawForgeDevPanel() {
     ImGui::Text("Seam A/B");
     logCheck("Forge composite (F11)", g_enabled, "composite");
     logCheck("Frame-ahead pipelining (numpad *)", g_frameAheadLive, "frame-ahead pipelining");
+    logCheck("  RT copy at blit: 1.5-ahead (numpad *)", g_copyAtBlit, "RT copy at blit (1.5-ahead)");
     logCheck("FP arm suppression (numpad /)", g_fpSuppressLive, "FP suppression (FP1b)");
 
     // Live render-scale (supersampling). The host renders into a g_rw x g_rh sub-rect of the fixed

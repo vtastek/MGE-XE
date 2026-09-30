@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # Forge automated perf harness: launch minimized (auto-loads test scene) -> poll host log for N new
 # 'gpu split' heartbeats -> verify no device-removal -> kill both procs -> report the last N splits.
-# Usage: forge-perf-run.sh [samples=5] [timeout=180] [save.ess] [renderScale] [hostKnobs]
+# Usage: forge-perf-run.sh [samples=5] [timeout=180] [save.ess] [renderScale] [hostKnobs] [trace] [clientEnv]
+#
+# clientEnv (7th arg) = comma-separated NAME=VALUE pairs set in the game's environment, for client
+# arms that are env-driven (e.g. MGE_TIER1_SEM=0 forces the event handoff on Windows). The names in
+# CLIENT_ENV_NAMES below are always cleared first, so a stale user variable cannot label the arm.
+#
+# trace (6th arg, any non-empty value) = MGE_FRAME_TRACE=1 for both processes, without an env-var
+# prefix on the command line (a prefix makes Claude Code's permission check prompt every run).
+# Empty strings skip the args before it: forge-perf-run.sh 8 300 vseydaneen.ess "" "" trace
 #
 # hostKnobs (5th arg) is passed through as MGE_HOST_KNOBS="name=value,name=value" and applied by the
 # host at startup (ForgeRender::applyEnvOverrides). It exists because every look knob is a dev-panel
@@ -37,6 +45,9 @@ TIMEOUT="${2:-180}"
 SAVE="${3:-}"
 SCALE="${4:-}"
 KNOBS="${5:-}"
+if [ -n "${6:-}" ]; then MGE_FRAME_TRACE=1; fi
+CLIENTENV="${7:-}"
+CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT"
 LOG="$DIR/mgeHost64.log"
 CFG="$DIR/Data Files/MWSE/config/instant load.json"
 CFGBAK="$(mktemp)"
@@ -170,6 +181,15 @@ else
   ENVSET="${ENVSET}Remove-Item Env:MGE_EXACT_POS -ErrorAction SilentlyContinue; "
 fi
 
+# Frame timeline trace (src/ipc/frametrace.h), both processes: MGE_FRAME_TRACE=1 from the caller's env.
+# Dumps land beside Morrowind.exe; render them with mgexe-devkit/tools/frametrace-{summary,html}.py.
+if [ -n "${MGE_FRAME_TRACE:-}" ]; then
+  echo "[harness] MGE_FRAME_TRACE=$MGE_FRAME_TRACE"
+  ENVSET="${ENVSET}\$env:MGE_FRAME_TRACE='$MGE_FRAME_TRACE'; "
+else
+  ENVSET="${ENVSET}Remove-Item Env:MGE_FRAME_TRACE -ErrorAction SilentlyContinue; "
+fi
+
 # ALWAYS written, even when empty — a stale MGE_HOST_KNOBS left in the user environment would ride
 # along in every run exactly the way MGE_RDOC did for three days, and the arm would be mislabelled.
 if [ -n "$KNOBS" ]; then
@@ -177,6 +197,16 @@ if [ -n "$KNOBS" ]; then
   ENVSET="${ENVSET}\$env:MGE_HOST_KNOBS='$KNOBS'; "
 else
   ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
+fi
+for n in $CLIENT_ENV_NAMES; do
+  ENVSET="${ENVSET}Remove-Item Env:$n -ErrorAction SilentlyContinue; "
+done
+if [ -n "$CLIENTENV" ]; then
+  echo "[harness] client env = $CLIENTENV"
+  IFS=',' read -r -a _pairs <<< "$CLIENTENV"
+  for p in "${_pairs[@]}"; do
+    ENVSET="${ENVSET}\$env:${p%%=*}='${p#*=}'; "
+  done
 fi
 powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle Minimized" >/dev/null 2>&1
 

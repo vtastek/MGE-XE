@@ -29,11 +29,13 @@
 #include "NIPoint4.h"
 #include "NIProperty.h"
 #include "NIRTTIDefines.h"
+#include "NITimeController.h"
 
 // se::memory::genJumpUnprotected — the prologue patch. MWSE-provided, which is
 // what keeps the detour inside PRIME DIRECTIVE 6.
 #include "MemoryUtil.h"
 
+#include <cmath>
 #include <unordered_map>
 #include <vector>
 
@@ -147,6 +149,61 @@ inline const NI::Point4* cullingPlane(NI::Camera* cam, int i) {
 inline uint32_t* usedPlanesMask(NI::Camera* cam) {
     auto* base = reinterpret_cast<char*>(&cam->cullingPlanes[0]);
     return reinterpret_cast<uint32_t*>(base + sizeof(NI::Point4) * kCullingPlanes);
+}
+
+// ---------------------------------------------------------------------------
+// Park-mode lead band (see setFeedLead in the header)
+// ---------------------------------------------------------------------------
+// The lead is the ANGLE the side planes are rotated outward. Base covers the onset of a turn
+// (no history yet); gain x the last inter-classify rotation predicts the next one, which is
+// exactly the camera change between this bake and its fire. Capped so a teleport's "rotation"
+// cannot turn the band into the whole sphere.
+constexpr float kLeadBaseDeg = 3.0f;
+constexpr float kLeadGain    = 1.5f;
+constexpr float kLeadMaxDeg  = 30.0f;
+
+bool  g_feedLeadOn = false;
+float g_leadSin    = 0.0f;                  // sin(lead) for the running classify; 0 = no band
+bool  g_sidePlane[kCullingPlanes] = {};     // planes the lead widens (not near/far)
+float g_leadEye[3] = {};
+float g_prevDir[3] = {};
+bool  g_prevDirValid = false;
+// True while the traversal is below a node that is outside the REAL frustum but inside the lead
+// band: everything under it is band-only too (a child's bound lies inside its parent's).
+bool  g_inLeadBand = false;
+// Parallel to g_pending: 1 = band-only leaf — fed to the sink, never displayed.
+std::vector<uint8_t> g_pendingLead;
+
+// Per classify: the lead angle from the camera's rotation since the previous classify, and
+// which culling planes are side planes. Side planes are found geometrically rather than by
+// index — Gamebryo's plane order is not something this file should have to assume: near/far
+// normals are (anti)parallel to the view direction, side normals are at most sin(fov/2) off it
+// (0.966 at the 150-degree maximum FOV), so |n.dir| < 0.999 separates them with room to spare.
+void computeLead(NI::Camera* cam) {
+    const NI::Point3& d = cam->worldDirection;
+    float rotDeg = 0.0f;
+    if (g_prevDirValid) {
+        float c = d.x * g_prevDir[0] + d.y * g_prevDir[1] + d.z * g_prevDir[2];
+        c = c > 1.0f ? 1.0f : (c < -1.0f ? -1.0f : c);
+        rotDeg = std::acos(c) * 57.2957795f;
+    }
+    g_prevDir[0] = d.x; g_prevDir[1] = d.y; g_prevDir[2] = d.z;
+    g_prevDirValid = true;
+
+    g_leadSin = 0.0f;
+    g_stats.leadDeg = 0.0f;
+    if (!g_feedLeadOn) return;
+    float lead = kLeadBaseDeg + kLeadGain * rotDeg;
+    if (lead > kLeadMaxDeg) lead = kLeadMaxDeg;
+    g_leadSin = std::sin(lead * 0.0174532925f);
+    g_stats.leadDeg = lead;
+    const NI::Point3& e = cam->worldTransform.translation;
+    g_leadEye[0] = e.x; g_leadEye[1] = e.y; g_leadEye[2] = e.z;
+    for (int i = 0; i < kCullingPlanes; ++i) {
+        const NI::Point4* p = cullingPlane(cam, i);
+        const float nd = p->x * d.x + p->y * d.y + p->z * d.z;
+        g_sidePlane[i] = std::fabs(nd) < 0.999f;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +452,13 @@ void __fastcall cullShowBody(NI::AVObject* self, void* /*edx*/, NI::Camera* came
     IgnoreBitGuard guard(mask);
 
     const float boundRadius = self->worldBoundRadius;
+    // Park-mode lead (deferring classify only; g_leadSin is 0 otherwise, so every other caller
+    // runs the engine's loop unchanged). A bound OUTSIDE a real side plane but within
+    // dist*sin(lead) of it is inside that plane rotated outward by `lead` (dist*sin bounds the
+    // rotated plane's distance from above, so the test only ever keeps MORE): it is band-only.
+    const bool leading = g_deferring && g_leadSin > 0.0f;
+    bool inBand = leading && g_inLeadBand;
+    float leadSlack = -1.0f;   // lazily computed: one sqrt per node, only when a side plane needs it
     for (int i = kCullingPlanes - 1; i >= 0; --i) {
         const uint32_t bit = 1u << (i & 0x1F);
         const int word = i >> 5;
@@ -406,6 +470,18 @@ void __fastcall cullShowBody(NI::AVObject* self, void* /*edx*/, NI::Camera* came
                       + plane->z * self->worldBoundOrigin.z
                       - plane->w;
         if (d <= -boundRadius) {
+            if (leading && g_sidePlane[i]) {
+                if (leadSlack < 0.0f) {
+                    const float dx = self->worldBoundOrigin.x - g_leadEye[0];
+                    const float dy = self->worldBoundOrigin.y - g_leadEye[1];
+                    const float dz = self->worldBoundOrigin.z - g_leadEye[2];
+                    leadSlack = std::sqrt(dx * dx + dy * dy + dz * dz) * g_leadSin;
+                }
+                if (d > -boundRadius - leadSlack) {
+                    inBand = true;   // outside the real plane, inside the widened one
+                    continue;
+                }
+            }
             if (g_deferring) ++g_stats.frustumCulled;
             return;
         }
@@ -419,12 +495,43 @@ void __fastcall cullShowBody(NI::AVObject* self, void* /*edx*/, NI::Camera* came
         // through to display(), which recurses into children and re-enters this
         // body through the detour — that recursion IS the traversal.
         if (self->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+            // MORPH APPLY. A NiGeomMorpherController's weights advance in the normal controller
+            // update, but it writes the blended vertices only from onPreDisplay — i.e. from the
+            // engine's display of the shape, which the owned-display skip (and the lead band)
+            // withholds. So every morphing shape the host owns froze at its last displayed pose:
+            // the Ogrim's face (clannfear_daddy.nif, Tri DaddyHead_0), un-freezing for one pose
+            // whenever a menu let the engine display it. Apply here, at collection, so this
+            // frame's capture reads the moved verts. Harmless for a leaf the engine still draws:
+            // onPreDisplay rewrites the same blend from the same weights. NPC heads are the special
+            // case driveHeadMorphs() handles (their weights need update() on headMorphTiming too).
+            if (g_skipOwnedOpaque || g_skipOwnedAlpha) {
+                for (NI::TimeController* c = self->controllers; c; c = c->nextController) {
+                    if (c->isOfType(NI::RTTIStaticPtr::NiGeomMorpherController)) {
+                        c->vTable.asController->onPreDisplay(c);
+                    }
+                }
+            }
             g_pending.push_back(self);
+            g_pendingLead.push_back(inBand ? 1 : 0);
             ++g_stats.deferred;
+            if (inBand) ++g_stats.leadFed;
             return;
         }
     }
 
+    if (inBand) {
+        // A band-only object that is not a node (particles, lines, ...) would be DRAWN by the
+        // engine right here — the deferring traversal displays non-TriBasedGeom leaves directly.
+        // The band must never add an engine draw, so it stops at them.
+        if (!self->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return;
+    }
+    if (inBand && !g_inLeadBand) {
+        // Everything below this node is band-only too; restore on the way out.
+        g_inLeadBand = true;
+        self->vTable.asAVObject->display(self, camera);
+        g_inLeadBand = false;
+        return;
+    }
     self->vTable.asAVObject->display(self, camera);
 }
 
@@ -436,15 +543,24 @@ void beginFrame(int ownedFlags) {
     if (Configuration.LogDistantPipeline) {
         static unsigned s_n = 0;
         static uint32_t s_missed = 0;
+        static uint64_t s_leadFed = 0;
+        static float    s_leadMax = 0.0f;
         s_missed += g_stats.missedDisplays;
+        s_leadFed += g_stats.leadFed;
+        if (g_stats.leadDeg > s_leadMax) s_leadMax = g_stats.leadDeg;
         if (++s_n % 300 == 0) {
             LOG::logline("-- [enginecull] deferred=%u fed=%u displayed=%u skipOpaque=%u skipAlpha=%u "
-                         "nodes=%u appCulled=%u frustumCulled=%u missedDisplays=%u/300",
+                         "nodes=%u appCulled=%u frustumCulled=%u missedDisplays=%u/300 "
+                         "| park lead: %s last=%u leaves @ %.1f deg, avg=%.1f leaves, max lead %.1f deg",
                          g_stats.deferred, g_stats.fed, g_stats.displayed,
                          g_stats.ownedOpaqueSkipped, g_stats.ownedAlphaSkipped,
                          g_stats.recursiveCalls, g_stats.appCulled, g_stats.frustumCulled,
-                         s_missed);
+                         s_missed, g_feedLeadOn ? "ON" : "off",
+                         g_stats.leadFed, (double)g_stats.leadDeg,
+                         (double)s_leadFed / 300.0, (double)s_leadMax);
             s_missed = 0;
+            s_leadFed = 0;
+            s_leadMax = 0.0f;
         }
     }
 
@@ -454,6 +570,7 @@ void beginFrame(int ownedFlags) {
     // this whole design exists to avoid.
     g_displayPending = false;
     g_pending.clear();
+    g_pendingLead.clear();
     g_mainCamFires = 0;
 
     g_skipOwnedOpaque = (ownedFlags & kOwnedOpaque) != 0;
@@ -496,6 +613,7 @@ void abandonDeferred() {
     ++g_stats.missedDisplays;
     g_displayPending = false;
     g_pending.clear();
+    g_pendingLead.clear();
 }
 
 Coverage classifyCoverage(NI::AVObject* obj) {
@@ -522,7 +640,10 @@ void invalidateCoverageCache() {
 // asymmetry is why every doubtful case in classifyUncached returns EngineDraws.
 void displayDeferred() {
     const bool skipping = g_skipOwnedOpaque || g_skipOwnedAlpha;
-    for (NI::AVObject* shape : g_pending) {
+    for (size_t i = 0; i < g_pending.size(); ++i) {
+        NI::AVObject* shape = g_pending[i];
+        // Park-mode lead band: fed to the host, never an engine draw (see setFeedLead).
+        if (i < g_pendingLead.size() && g_pendingLead[i]) continue;
         if (skipping) {
             const Coverage c = classifyCoverage(shape);
             if (g_skipOwnedOpaque && c == Coverage::OpaqueRedundant) {
@@ -538,6 +659,7 @@ void displayDeferred() {
         shape->vTable.asAVObject->display(shape, g_deferCamera);
     }
     g_pending.clear();
+    g_pendingLead.clear();
 }
 
 // The early classify: run the traversal at BeginScene(0) instead of waiting for
@@ -585,14 +707,23 @@ int classifyNow(void* cameraIn) {
     }
 
     g_pending.clear();
+    g_pendingLead.clear();
+    computeLead(mainCamera);
+    g_inLeadBand = false;
     {
         DeferGuard defer(mainCamera);
         cullShowBody(g_topLevelRoot, nullptr, mainCamera);
     }
+    g_inLeadBand = false;
+    g_leadSin = 0.0f;   // the lead belongs to this classify only — every other CullShow is the engine's
 
     fireVisibleGeomFeed();
     g_displayPending = true;
     return 0;
+}
+
+void setFeedLead(bool on) {
+    g_feedLeadOn = on;
 }
 
 void setVisibleGeomCallback(FnVisibleGeom cb) {

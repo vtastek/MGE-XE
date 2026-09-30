@@ -477,7 +477,8 @@ namespace IPC {
 
 	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
 		std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle,
-		HANDLE* outFrameFenceHandle, HANDLE* outFrameEventHandle) {
+		HANDLE* outFrameFenceHandle, HANDLE* outFrameEventHandle,
+		HANDLE* outFramebufferHandle1, HANDLE* outFrameEventHandle1) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderInitParams;
@@ -493,6 +494,8 @@ namespace IPC {
 		params.framebufferHandle = nullptr;
 		params.frameFenceHandle = nullptr;
 		params.frameEventHandle = nullptr;
+		params.framebufferHandle1 = nullptr;
+		params.frameEventHandle1 = nullptr;
 		params.ok = false;
 		if (!beginRpc(Command::RenderInit)) {
 			return false;
@@ -510,6 +513,12 @@ namespace IPC {
 		}
 		if (params.ok && outFrameEventHandle) {
 			*outFrameEventHandle = static_cast<HANDLE>(params.frameEventHandle);
+		}
+		if (params.ok && outFramebufferHandle1) {
+			*outFramebufferHandle1 = static_cast<HANDLE>(params.framebufferHandle1);
+		}
+		if (params.ok && outFrameEventHandle1) {
+			*outFrameEventHandle1 = static_cast<HANDLE>(params.frameEventHandle1);
 		}
 		return params.ok;
 	}
@@ -686,7 +695,7 @@ namespace IPC {
 	}
 
 	bool Client::renderSceneFinish(double* outRenderMs, HostFrameTimings* outTimings,
-		std::uint64_t* outFrameFenceValue) {
+		std::uint64_t* outFrameFenceValue, std::uint32_t* outRtSlot) {
 		// ALWAYS drop the window guard, even on failure — a stale guard would refuse
 		// every subsequent RPC forever (fail-loud, not fail-dead).
 		m_frameWindowOpen = false;
@@ -696,6 +705,9 @@ namespace IPC {
 			// caller holding the PREVIOUS frame's value, which it would then wait on and treat as
 			// proof that THIS frame is drawn.
 			*outFrameFenceValue = 0;
+		}
+		if (outRtSlot) {
+			*outRtSlot = 0;
 		}
 		if (waitForCompletion() != WakeReason::Complete) {
 			return false;
@@ -710,6 +722,9 @@ namespace IPC {
 		}
 		if (outFrameFenceValue) {
 			*outFrameFenceValue = params.frameFenceValue;
+		}
+		if (outRtSlot) {
+			*outRtSlot = params.rtSlot & 1u;   // masked: it indexes a 2-entry array on this side
 		}
 		return params.bytesWritten > 0;
 	}

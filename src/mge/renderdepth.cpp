@@ -118,6 +118,7 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
         MGE_ZoneScopedN("earlyClassifyMainScene");
         MGE_SCOPED_TIMER("earlyClassifyMainScene");
         MGE::EngineCull::beginFrame(ownedFlags);
+        MGE::EngineCull::setFeedLead(RenderProcess::parkFiresLater());
         rc = MGE::EngineCull::classifyNow(worldCamera);
     }
     QueryPerformanceCounter(&ecT1);

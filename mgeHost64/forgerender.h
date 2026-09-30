@@ -78,9 +78,10 @@ namespace ForgeRender {
     struct NearRef { float x, y, z; int cellX, cellY; };
     void setNearRefs(const NearRef* refs, unsigned count, unsigned version);
 
-    // The exported NT shared-RT handle — valid in the HOST process. Null until a
-    // successful init(). The IPC server DuplicateHandles this into MW's process.
-    void* sharedHandle();
+    // The exported NT shared-RT handle of frame slot `slot` (0/1) — valid in the HOST process. Null
+    // until a successful init(). The IPC server DuplicateHandles both into MW's process. The host
+    // renders frame N into slot (N & 1)'s RT so the client can still copy N while N+1 is drawn.
+    void* sharedHandle(unsigned slot);
 
     // Tier 1 (tasks/forge-host-gpu-lane.md): the exported NT handle of the SHARED, monotonic
     // D3D12 fence the host signals on each frame submit — valid in the HOST process, null until
@@ -93,8 +94,12 @@ namespace ForgeRender {
     // Tier 1 EVENT handoff: a manual-reset Win32 event (host-process handle) the host sets, via
     // SetEventOnCompletion, when the shared fence reaches the frame's value. For clients that cannot
     // import the fence as a semaphore (Wine/Proton): they CPU-wait this before the RT copy. Null
-    // when the host has no shared fence.
-    void* frameEventHandle();
+    // when the host has no shared fence. One per frame slot, paired with that slot's RT.
+    void* frameEventHandle(unsigned slot);
+
+    // The frame slot (RT + event) the frame just rendered used. The server puts it in the
+    // RenderFrame reply (bridge.h rtSlot).
+    unsigned lastRtSlot();
 
     // Tier 1: the value signalled on that shared fence for the frame renderScene just submitted.
     // Monotonic, one increment per submitted frame. The server puts it in the RenderFrame reply so

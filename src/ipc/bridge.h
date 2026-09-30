@@ -313,6 +313,14 @@ namespace IPC {
         // The client never resets it — the host does. Null ⇒ unavailable. Appended after
         // frameFenceHandle so every existing field offset is unchanged.
         OUT HANDLE32 frameEventHandle;
+
+        // Pipeline depth P3 (tasks/forge-pipeline-depth.md): the host renders into a PAIR of shared
+        // RTs and a pair of frame events, one per frame slot, so frame N+1 can be drawn while the
+        // client still has to copy N. framebufferHandle / frameEventHandle above are slot 0's; these
+        // are slot 1's (client-process values, null ⇒ unavailable). The reply's rtSlot says which
+        // pair a frame used. Appended at the end: rebuild and deploy both binaries together.
+        OUT HANDLE32 framebufferHandle1;
+        OUT HANDLE32 frameEventHandle1;
     };
 
     // Dev overlay input snapshot forwarded client -> host each frame (Stage 2). Mouse is in host
@@ -669,6 +677,12 @@ namespace IPC {
         // no sync object and must not overlap. Appended at the end so every existing OUT offset is
         // unchanged; uint64 because a D3D12 fence value is 64-bit and the wire is layout-shared.
         OUT std::uint64_t frameFenceValue;
+
+        // Pipeline depth P3: the shared-RT slot (0/1) this frame rendered into — and, in event mode,
+        // whose frame event (renderInit's frameEventHandle / frameEventHandle1) signals it. The
+        // client copies from THAT RT. Slot = host frame serial & 1; the RT of frame N is reused by
+        // N+2, whose kick the client only sends after its copy of N completes. Appended at the end.
+        OUT std::uint32_t rtSlot;
     };
 
     // M1b geometry upload. blob = a byte VecId holding partCount packed parts

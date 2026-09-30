@@ -427,6 +427,8 @@ namespace IPC {
 		params.framebufferHandle = nullptr;   // reused as the shared-RT NT handle (client-process value)
 		params.frameFenceHandle = nullptr;    // Tier 1 shared frame fence (client-process value)
 		params.frameEventHandle = nullptr;    // Tier 1 frame-complete event (client-process value)
+		params.framebufferHandle1 = nullptr;  // P3: slot 1's shared RT ...
+		params.frameEventHandle1 = nullptr;   // ... and its frame event
 		params.ok = false;
 
 		if (!ForgeRender::init(params.width, params.height, params.sampleCount, params.anisoLevel)) {
@@ -437,18 +439,23 @@ namespace IPC {
 		g_spikeWidth = params.width;
 		g_spikeHeight = params.height;
 
-		HANDLE hostHandle = static_cast<HANDLE>(ForgeRender::sharedHandle());
-		if (hostHandle == nullptr) {
+		// P3: the shared RT is a pair, one per host frame slot; both are required.
+		HANDLE hostHandle = static_cast<HANDLE>(ForgeRender::sharedHandle(0));
+		HANDLE hostHandle1 = static_cast<HANDLE>(ForgeRender::sharedHandle(1));
+		if (hostHandle == nullptr || hostHandle1 == nullptr) {
 			LOG::logline("!! [seam] ForgeRender produced no shared handle");
 			ForgeRender::shutdown();
 			return;
 		}
 
-		// Duplicate the host's NT shared-RT handle into the client (MW) process, so
-		// MW's D3D9Ex can ingest it directly as pSharedHandle (same cross-process
+		// Duplicate the host's NT shared-RT handles into the client (MW) process, so
+		// MW's D3D9Ex can ingest them directly as pSharedHandle (same cross-process
 		// mechanism Vec::init / the old A-path used).
 		HANDLE clientHandle = INVALID_HANDLE_VALUE;
+		HANDLE clientHandle1 = INVALID_HANDLE_VALUE;
 		if (!DuplicateHandle(GetCurrentProcess(), hostHandle, m_clientProcess, &clientHandle,
+				0, FALSE, DUPLICATE_SAME_ACCESS)
+			|| !DuplicateHandle(GetCurrentProcess(), hostHandle1, m_clientProcess, &clientHandle1,
 				0, FALSE, DUPLICATE_SAME_ACCESS)) {
 			LOG::winerror("[seam] failed to duplicate shared-RT handle to client");
 			ForgeRender::shutdown();
@@ -467,15 +474,19 @@ namespace IPC {
 				clientFence = nullptr;
 			}
 		}
-		// ...and the frame-complete event (the CPU handoff for clients that cannot import the fence).
-		// Same best-effort rule. SYNCHRONIZE is all the client needs — it only ever waits it.
-		HANDLE clientEvent = nullptr;
-		HANDLE hostEvent = static_cast<HANDLE>(ForgeRender::frameEventHandle());
-		if (hostEvent != nullptr) {
-			if (!DuplicateHandle(GetCurrentProcess(), hostEvent, m_clientProcess, &clientEvent,
-					SYNCHRONIZE, FALSE, 0)) {
-				LOG::winerror("[seam] failed to duplicate frame event handle to client");
-				clientEvent = nullptr;
+		// ...and the frame-complete events (the CPU handoff for clients that cannot import the fence),
+		// one per slot. Same best-effort rule. SYNCHRONIZE is all the client needs — it only ever
+		// waits them.
+		HANDLE clientEvent[2] = { nullptr, nullptr };
+		HANDLE hostEvent[2] = { nullptr, nullptr };
+		for (unsigned s = 0; s < 2; ++s) {
+			hostEvent[s] = static_cast<HANDLE>(ForgeRender::frameEventHandle(s));
+			if (hostEvent[s] != nullptr) {
+				if (!DuplicateHandle(GetCurrentProcess(), hostEvent[s], m_clientProcess, &clientEvent[s],
+						SYNCHRONIZE, FALSE, 0)) {
+					LOG::winerror("[seam] failed to duplicate frame event handle to client");
+					clientEvent[s] = nullptr;
+				}
 			}
 		}
 
@@ -483,13 +494,17 @@ namespace IPC {
 #pragma warning(disable: 4244 4302 4311)
 		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
 		params.frameFenceHandle = static_cast<HANDLE32>(clientFence);
-		params.frameEventHandle = static_cast<HANDLE32>(clientEvent);
+		params.frameEventHandle = static_cast<HANDLE32>(clientEvent[0]);
+		params.framebufferHandle1 = static_cast<HANDLE32>(clientHandle1);
+		params.frameEventHandle1 = static_cast<HANDLE32>(clientEvent[1]);
 #pragma warning(pop)
 		params.ok = true;
-		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT, host handle %p -> client %p) sceneReady=%d",
-			params.width, params.height, hostHandle, clientHandle, (int)ForgeRender::sceneReady());
+		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT pair, host handles %p %p -> client %p %p) sceneReady=%d",
+			params.width, params.height, hostHandle, hostHandle1, clientHandle, clientHandle1,
+			(int)ForgeRender::sceneReady());
 		LOG::logline(">> [seam] shared frame fence: host %p -> client %p", hostFence, clientFence);
-		LOG::logline(">> [seam] frame event: host %p -> client %p", hostEvent, clientEvent);
+		LOG::logline(">> [seam] frame events: host %p %p -> client %p %p",
+			hostEvent[0], hostEvent[1], clientEvent[0], clientEvent[1]);
 		LOG::flush();
 	}
 
@@ -508,6 +523,7 @@ namespace IPC {
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		params.frameFenceValue = 0;
+		params.rtSlot = 0;
 		// Clear the timing block too: renderScene can bail early (the !ok return below) without
 		// ever reaching fillFrameTimings, and a stale block would plot the last GOOD frame's
 		// numbers on a frame that never rendered — a lie that reads as a healthy flat line.
@@ -747,6 +763,8 @@ namespace IPC {
 		// (it increments per submit) and MUST reach the client, because it is now the only thing
 		// standing between the client's RT copy and a half-drawn frame.
 		params.frameFenceValue = ForgeRender::lastFrameFenceValue();
+		// P3: which RT of the pair (and which frame event) this frame used — the client copies THAT.
+		params.rtSlot = ForgeRender::lastRtSlot();
 		s_lastExit = t1;
 	}
 

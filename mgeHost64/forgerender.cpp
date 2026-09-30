@@ -442,6 +442,19 @@ extern void platformExitFontSystem();
 extern void platformExitUserInterface();
 extern "C" void uiSetExternalInput(float x, float y, float wheel, bool l, bool r, bool m, bool enabled);
 
+// ─── DESCRIPTOR WRITES UNDER A FRAME IN FLIGHT (tasks/forge-pipeline-depth.md P4) ────────────────
+// With the client 1.5-ahead, the host records frame N+1 while its GPU still executes N. A descriptor
+// written now lands in a heap slot N may be reading — the SRT descriptors are STATIC (D3D12 root
+// signature 1.1 default): changing one before the frames that bound it retire is undefined, and a
+// torn read is a device removal. There are ~100 write sites, most of them lazy one-shot builds, so
+// instead of auditing each for "can this run mid-flight" every call in this file goes through a
+// guard that WAITS for any submitted-but-unfinished frame first and names its line in the log. The
+// write is then always safe; the cost is visible (the overlap lost on that frame) and attributable.
+// At depth 1 nothing is ever in flight at a write, so the guard is a pair of fence reads.
+namespace ForgeRender { void descWriteGuard(int line); }
+#define updateDescriptorSet(R_, i_, set_, n_, d_) \
+    (ForgeRender::descWriteGuard(__LINE__), ::updateDescriptorSet((R_), (i_), (set_), (n_), (d_)))
+
 namespace {
     const char* kAppName = "mgeHost64";
 
@@ -566,6 +579,25 @@ namespace {
 
         std::printf("[forge] initLog...\n");
         initLog(kAppName, DEFAULT_LOG_LEVEL);
+#if defined(ENABLE_LOGGING)
+        // ⚠ FORGE'S OWN FILE SINK NEVER OPENS. initLog adds "<appName>.log" = mgeHost64.log, which
+        // LOG::open (main.cpp) already holds, so the open fails silently and every LOGF — including
+        // the D3D12 debug layer's InfoQueue messages (Forge's DebugMessageCallback) — went only to
+        // stdout, which a CREATE_NO_WINDOW host does not have. A validation run therefore reported
+        // "0 D3D12 messages" whether or not there were any. Forward WARN/ERR into our log, where
+        // the harness greps (`!! [forge-log]`). INFO stays out: it is per-resource chatter.
+        addLogCallback("mgeHost64-forward", eWARNING | eERROR, nullptr,
+            [](void*, const char* msg) {
+                char line[1024];
+                std::snprintf(line, sizeof(line), "%s", msg);
+                for (size_t n = std::strlen(line); n && (line[n - 1] == '\n' || line[n - 1] == '\r'); --n) {
+                    line[n - 1] = 0;
+                }
+                LOG::logline("!! [forge-log] %s", line);
+            },
+            [](void*) {},    // close: nothing to release (and Forge calls it unguarded on a duplicate id)
+            nullptr);
+#endif
 
         // FORGE_DEBUG turns on The Forge's internal ASSERTs, which on Windows pop a MODAL
         // MessageBox ("Display more asserts? Yes/No") that FREEZES this headless host mid-frame
@@ -2115,6 +2147,17 @@ namespace {
     // flight while frame N+1 records, so it has to be at least as deep as the back buffers it
     // presents into.
     constexpr uint32_t kHostWndRing = 2;
+
+    // ─── FRAME SLOTS (tasks/forge-pipeline-depth.md) ────────────────────────────────────────────
+    // The host keeps up to kFrameSlots frames in flight. Frame serial F records into slot F & 1, and
+    // everything a frame's GPU work owns until its fence signals lives per slot: the command pool
+    // and lists, the fence, the timestamp pool, the Hi-Z prologue's objects, and every readback
+    // lane. Recording frame F waits only slot (F & 1)'s own fence, i.e. frame F-2.
+    constexpr uint32_t kFrameSlots = 2;
+    // Every per-frame readback is ONE GPU_TO_CPU buffer of kFrameSlots lanes of kRbLane bytes: the
+    // frame recording in slot s copies into lane s (rbLaneOff), and the CPU reads the lane of the
+    // freshest SETTLED frame (rbLane). One stride for all of them, so a copy site needs no size.
+    constexpr uint64_t kRbLane = 256;
     CmdPool*     g_pHostWndPool[kHostWndRing]  = {};
     Cmd*         g_pHostWndCmd[kHostWndRing]   = {};
     Fence*       g_pHostWndFence[kHostWndRing] = {};
@@ -2452,7 +2495,8 @@ namespace {
         Buffer*        tileReadback  = nullptr;
         uint32_t       tilesPerSide  = 0;
         bool           tilesReady    = false;
-        bool           tiledLast     = false;   // last advance ran tiled: the readback is ours
+        // Per frame slot: the last advance recorded in that slot ran tiled, so its readback lane is ours.
+        bool           tiledSlot[kFrameSlots] = {};
         ResourceState  argsState     = RESOURCE_STATE_UNORDERED_ACCESS;
         // Measured sleep: frames since a source was in the domain, and consecutive readbacks that
         // saw zero non-zero tiles. See the sleep block in advanceRippleGrid.
@@ -2488,14 +2532,26 @@ namespace {
         Shader*         pShader = nullptr;
         RenderTarget*   pRT = nullptr;
         Pipeline*       pPipeline = nullptr;
-        CmdPool*        pCmdPool = nullptr;
+        CmdPool*        pCmdPool[kFrameSlots] = {};
+        // The list being recorded: pCmdA[recSlot], then pCmdB[recSlot] after the O1 split. Outside
+        // renderScene it is pCmdA of the last recorded slot (the between-frames sync paths use it).
         Cmd*            pCmd = nullptr;
-        Cmd*            pCmdB = nullptr;   // O1 split-submit chunk B (same pool; A closes before B opens)
-        Fence*          pFence = nullptr;
-        QueryPool*      pGpuQueryPool = nullptr;   // GPU timestamp pool (per-phase 4ms breakdown)
+        Cmd*            pCmdA[kFrameSlots] = {};
+        Cmd*            pCmdB[kFrameSlots] = {};   // O1 split-submit chunk B (same pool; A closes before B opens)
+        Fence*          pFence[kFrameSlots] = {};
+        QueryPool*      pGpuQueryPool[kFrameSlots] = {};   // GPU timestamp pool (per-phase 4ms breakdown)
+        uint32_t        recSlot = 0;               // slot of the frame being / last recorded
         double          gpuTickFreq = 0.0;         // timestamp ticks/sec (getTimestampFrequency)
         ID3D12Resource* pSharedRes = nullptr;   // owned by pRT (released on removeRenderTarget)
-        HANDLE          ntHandle = nullptr;     // host-process NT shared handle
+        // Pipeline depth P3: the shared RT is a PAIR, one per frame slot, so frame N+1 can draw into
+        // one while the client still copies N out of the other. pRT / pSharedRes / hFrameEvent above
+        // and below are the RECORDING slot's (beginFrameSlot points them); these own the pair. Both
+        // are created in COMMON, the between-frames handoff state, so every frame's first barrier
+        // is COMMON -> RENDER_TARGET with no per-RT "first use" special case.
+        RenderTarget*   pRTs[kFrameSlots] = {};
+        ID3D12Resource* pSharedResS[kFrameSlots] = {};
+        HANDLE          ntHandles[kFrameSlots] = {};   // host-process NT shared handles, one per RT
+        HANDLE          hFrameEvents[kFrameSlots] = {};
         // Tier 1 (tasks/forge-host-gpu-lane.md): a SHARED, monotonic D3D12 fence signalled on the
         // frame submit, exported as an NT handle for the client to import as a Vulkan semaphore.
         // Once renderScene stops fence-waiting its own frame, the RPC reply no longer implies
@@ -2508,7 +2564,8 @@ namespace {
         // semaphore): a MANUAL-reset Win32 event, duplicated into the client, that
         // SetEventOnCompletion sets when pSharedFence reaches the frame's value. The client only
         // WAITS it; the host is the only side that resets it (see armFrameEvent). Created
-        // signalled, meaning "no registration outstanding".
+        // signalled, meaning "no registration outstanding". One per slot (hFrameEvents); this is
+        // the recording slot's, so arming frame N+1 never resets the event the client waits for N.
         HANDLE          hFrameEvent = nullptr;
         // Tier 1: between-frames GPU work (arena grow-by-copy) gets its OWN pool/cmd/fence, following
         // the pHizCmdPool precedent. It used to borrow the frame loop's pCmdPool/pCmd/pFence and
@@ -3088,10 +3145,11 @@ namespace {
         Pipeline*      pHizPipelineFirst = nullptr;
         Pipeline*      pHizPipeline = nullptr;
         DescriptorSet* pHizSet = nullptr;          // HizSrtData Persistent, maxSets = hizMips (set i = mip i)
-        CmdPool*       pHizCmdPool = nullptr;      // own pool/cmd/fence — never blocks the main submit
-        Cmd*           pHizCmd = nullptr;
-        Fence*         pHizFence = nullptr;
-        QueryPool*     pHizQueryPool = nullptr;    // 1-entry timestamp (prologue GPU ms, read next frame)
+        // Own pool/cmd/fence — never blocks the main submit. Per frame slot, like the frame's own.
+        CmdPool*       pHizCmdPool[kFrameSlots] = {};
+        Cmd*           pHizCmd[kFrameSlots] = {};
+        Fence*         pHizFence[kFrameSlots] = {};
+        QueryPool*     pHizQueryPool[kFrameSlots] = {};   // 1-entry timestamp (prologue GPU ms, read two frames on)
         uint32_t       hizMips = 0;                // 1 + floor(log2(max(w,h)))
         bool           hizReady = false;           // creation failure => prologue disabled, frame unaffected
         // --- Stage B (M1) GPU statics cull (B2 = COUNT-only validation) ------------------------
@@ -3831,6 +3889,127 @@ namespace {
     };
     LiveRenderer g_live;
 
+    // Every slot's Hi-Z prologue objects exist. The prologue runs only if both slots have them.
+    bool hizObjectsReady() {
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            if (!g_live.pHizCmdPool[s] || !g_live.pHizCmd[s] || !g_live.pHizFence[s]) { return false; }
+        }
+        return true;
+    }
+    // The slot whose readback lanes hold the freshest SETTLED frame (set by settleSlot).
+    uint32_t g_readSlot = 0;
+    // Readback lanes (see kRbLane). rbLaneOff: where the frame recording NOW copies to.
+    // rbLane: the CPU view of the freshest settled frame's lane, null when the buffer is.
+    inline uint64_t rbLaneOff() { return (uint64_t)g_live.recSlot * kRbLane; }
+    inline const void* rbLane(const Buffer* b) {
+        return (b && b->pCpuMappedAddress)
+             ? (const uint8_t*)b->pCpuMappedAddress + (uint64_t)g_readSlot * kRbLane : nullptr;
+    }
+
+    // ─── FRAMEBUF: per-frame CPU data reaches the GPU through the queue ─────────────────────────
+    // tasks/forge-pipeline-depth.md P2. A buffer the CPU rewrites every frame used to be ONE
+    // persistent-mapped upload-heap buffer the GPU read in place. With two frames in flight the CPU
+    // would be writing frame N+1's values into bytes GPU frame N is still reading.
+    //
+    // A converted buffer's `Buffer*` is GPU_ONLY, held in GENERIC_READ between copies — the state an
+    // upload-heap buffer is always in — so every set, bind and barrier-free read that worked before
+    // works unchanged. Next to it is a CPU SHADOW in plain memory, the only thing the CPU touches.
+    // The shadow is ONE copy with the old persistent semantics (a field written once at init, or
+    // only when it changes, keeps its value; two CPU staging slots would hand the GPU a two-frames-
+    // old value there), and it is cached memory, so reading it back no longer reads write-combined
+    // upload memory. frameSubmit() memcpys each dirty range into this slot's upload ring and puts a
+    // ring -> GPU copy cmd FIRST in the submit: queue-ordered after every earlier frame, before
+    // this chunk's draws.
+    //
+    // Access: fbw(b) writes and marks the whole buffer dirty; fbwRange(b, off, n) marks only
+    // [off, off+n); fbr(b) reads. All three return the base of the buffer. On a buffer that is NOT
+    // registered they return pCpuMappedAddress, so an access site can move before its buffer does.
+    // A site still dereferencing pCpuMappedAddress on a converted buffer gets null and crashes on
+    // the spot — the failure wanted, instead of a silent race.
+    struct FrameBuf {
+        Buffer*     gpu = nullptr;
+        uint8_t*    shadow = nullptr;
+        uint64_t    size = 0;
+        uint64_t    dirtyLo = UINT64_MAX, dirtyHi = 0;   // [lo, hi) not yet copied to gpu
+        char        name[40] = {};
+        // The state the GPU buffer rests in between copies: the creator's mStartState, or
+        // GENERIC_READ for a converted upload-heap buffer (which was always in GENERIC_READ). NOT
+        // GENERIC_READ across the board: with pCullInstBuf resting in GENERIC_READ instead of its
+        // SHADER_RESOURCE, both culls that read it ran slower (cull 0.73 -> 0.90 ms, skyvis +0.4).
+        ResourceState state = RESOURCE_STATE_GENERIC_READ;
+    };
+    std::unordered_map<const Buffer*, FrameBuf> g_frameBufs;
+    // THE P2 ORACLE (knob frameBufVerify). At the end of every frame, copy each FrameBuf's GPU
+    // buffer back right after its upload and compare it byte for byte with the shadow as it stood
+    // at that flush. It needs no scene to be deterministic: the CPU's own bytes are the reference,
+    // and a write site that bypassed fbw/fbwRange (or marked too little) shows as a mismatch.
+    bool g_frameBufVerify = false;
+
+    inline FrameBuf* frameBufOf(const Buffer* b) {
+        if (!b || g_frameBufs.empty()) { return nullptr; }
+        auto it = g_frameBufs.find(b);
+        return (it == g_frameBufs.end()) ? nullptr : &it->second;
+    }
+    inline void* fbwRange(Buffer* b, uint64_t off, uint64_t bytes) {
+        if (FrameBuf* f = frameBufOf(b)) {
+            if (off < f->size) {
+                const uint64_t hi = (bytes >= f->size - off) ? f->size : off + bytes;
+                if (off < f->dirtyLo) { f->dirtyLo = off; }
+                if (hi > f->dirtyHi)  { f->dirtyHi = hi; }
+            }
+            return f->shadow;
+        }
+        return b ? b->pCpuMappedAddress : nullptr;
+    }
+    inline void* fbw(Buffer* b) { return fbwRange(b, 0, UINT64_MAX); }
+    // Write pointer for a loop whose written range the caller marks ONCE with fbwRange, right before
+    // or right after the loop (the big per-draw buffers: the used prefix instead of the whole
+    // window). Never across a submit — the verify oracle is what catches a range marked short.
+    inline void* fbwPre(Buffer* b) {
+        if (FrameBuf* f = frameBufOf(b)) { return f->shadow; }
+        return b ? b->pCpuMappedAddress : nullptr;
+    }
+    inline const void* fbr(const Buffer* b) {
+        if (const FrameBuf* f = frameBufOf(b)) { return f->shadow; }
+        return b ? b->pCpuMappedAddress : nullptr;
+    }
+
+    // Creates the buffer `d` describes as a FrameBuf instead: same size/descriptors/format, GPU_ONLY,
+    // plus a shadow holding pData's bytes (zeros without it). Same call shape as
+    // addResource(&d, nullptr) — a creation site converts by changing that one call.
+    //
+    // The GPU copy gets its initial bytes from the resource loader here, and the buffer starts
+    // CLEAN. The loader's queue is not ordered against a frame in flight, which is fine for a buffer
+    // nothing can be reading yet — and it keeps one-time contents (a multi-MB instance list, every
+    // zero-initialised window) out of the per-frame ring, which never shrinks.
+    bool addFrameBuf(BufferLoadDesc* d) {
+        FrameBuf f;
+        f.size = d->mDesc.mSize;
+        std::snprintf(f.name, sizeof(f.name), "%s", d->mDesc.pName ? d->mDesc.pName : "?");
+        f.shadow = (uint8_t*)_aligned_malloc((size_t)f.size, 64);
+        if (!f.shadow) { *d->ppBuffer = nullptr; return false; }
+        if (d->pData) { std::memcpy(f.shadow, d->pData, (size_t)f.size); }
+        else          { std::memset(f.shadow, 0, (size_t)f.size); }
+
+        // Only a buffer that was ALREADY GPU_ONLY keeps its creator's state: an upload-heap desc's
+        // mStartState was never honoured (Forge forces GENERIC_READ there), so it means nothing.
+        f.state = (d->mDesc.mMemoryUsage == RESOURCE_MEMORY_USAGE_GPU_ONLY
+                   && d->mDesc.mStartState != RESOURCE_STATE_UNDEFINED) ? d->mDesc.mStartState
+                                                                       : RESOURCE_STATE_GENERIC_READ;
+        BufferLoadDesc g = *d;
+        g.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        g.mDesc.mFlags = (BufferCreationFlags)(g.mDesc.mFlags & ~BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT);
+        g.mDesc.mStartState = f.state;
+        g.pData = f.shadow;
+        addResource(&g, nullptr);
+        waitForAllResourceLoads();
+        Buffer* b = *d->ppBuffer;
+        if (!b) { _aligned_free(f.shadow); return false; }
+        f.gpu = b;
+        g_frameBufs[b] = f;   // clean: gpu == shadow already
+        return true;
+    }
+
     // The `[rect]` line, factored out because TWO places have to be able to emit it (M1 4b).
     //
     // ⚠ THE BACKEND'S NAME IS ON IT, and it is not decoration: at scale 1.0 an absent upscaler and a
@@ -4271,6 +4450,12 @@ namespace {
            // cull and the caustic maps. Had no bracket: a 1660S frame trace found a 4.5 ms span with no
            // pass in it exactly there, and this is the only GPU work recorded in it.
            kGpuPhaseRippleSim,
+           // P2 FrameBuf uploads (tasks/forge-pipeline-depth.md): the ring -> GPU copies that run in
+           // their own cmd list FIRST in chunk A's submit and chunk B's. Two indices because they are
+           // two non-contiguous pairs. CopyA sits BEFORE the kGpuPhaseFrame bracket opens; CopyB
+           // inside it, between the chunks.
+           kGpuPhaseFbCopyA,
+           kGpuPhaseFbCopyB,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -6727,8 +6912,8 @@ namespace {
     {
         if (view < 0 || view > 1) { return; }
         Buffer* b = g_live.pSkyViewCbv[view];
-        if (!b || !b->pCpuMappedAddress) { return; }
-        float* v = (float*)b->pCpuMappedAddress;
+        if (!b || !fbr(b)) { return; }
+        float* v = (float*)fbw(b);
         std::memcpy(v, invVP, 16 * sizeof(float));
         // ⚠ S2 DELETED 36 FLOATS FROM THIS STRUCT — the nine cooked Hosek coefficients and the
         // model's radiance term. A closed form has to be handed its configuration; a LUT does not,
@@ -6777,8 +6962,8 @@ namespace {
     }
 
     void publishSkyAmbientSH(const float* fd, bool exterior) {
-        if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
-        float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        if (!g_live.pShadowMaskParamsCbv || !fbr(g_live.pShadowMaskParamsCbv)) { return; }
+        float* mp = (float*)fbw(g_live.pShadowMaskParamsCbv);
         // Unconditionally, and BEFORE the SH's early-out below: the AO lanes have their own gate and
         // must not inherit the SH's. (The SH's inactive path zeroes only skyParams.x now.)
         publishSkyAO(mp, exterior);
@@ -9377,7 +9562,7 @@ namespace {
             cb.mDesc.pName = "aoParamsCbv";
             cb.pData = nullptr;
             cb.ppBuffer = &g_live.pAOParamsCbv;
-            addResource(&cb, nullptr);
+            addFrameBuf(&cb);
 
             // gAOUpParams: the half-res chain's OWN cbuffer (invViewProj + full dims + half dims +
             // upscale knobs). Separate from pAOParamsCbv on purpose — see the g_live declaration.
@@ -9385,7 +9570,7 @@ namespace {
             ub.mDesc.mSize = 256;                                   // >= sizeof(AOUpParams) (112B)
             ub.mDesc.pName = "aoUpParamsCbv";
             ub.ppBuffer = &g_live.pAOUpCbv;
-            addResource(&ub, nullptr);
+            addFrameBuf(&ub);
 
             // SUN shadow (Phase A/C): the MSM moments ATLAS (colour RGBA16_UNORM) + its own reverse-Z
             // depth, both kSunAtlasW x kSunShadowRes — kSunCascades square tiles side by side. The
@@ -9440,7 +9625,7 @@ namespace {
                     sbp.mDesc.pName = "sunBlurParamsCbv";
                     sbp.pData = nullptr;
                     sbp.ppBuffer = &g_live.pSunBlurParamsCbv[d];
-                    addResource(&sbp, nullptr);
+                    addFrameBuf(&sbp);
                 }
 
                 RenderTargetDesc smdd = {};
@@ -9500,7 +9685,7 @@ namespace {
                     sp.mDesc.pName = "skyVisParamsCbv";
                     sp.pData = nullptr;
                     sp.ppBuffer = &g_live.pSkyVisParamsCbv;
-                    addResource(&sp, nullptr);
+                    addFrameBuf(&sp);
                     waitForAllResourceLoads();
 
                     ShaderLoadDesc vsd = {};
@@ -9543,7 +9728,7 @@ namespace {
                     sfc.mDesc.pName = "sunFrameCbv";
                     sfc.pData = nullptr;
                     sfc.ppBuffer = &g_live.pSunFrameCbv[c];
-                    addResource(&sfc, nullptr);
+                    addFrameBuf(&sfc);
                 }
             }
 
@@ -9582,7 +9767,7 @@ namespace {
                 shp.mDesc.pName = "skyHeightParamsCbv";
                 shp.pData = nullptr;
                 shp.ppBuffer = &g_live.pSkyHeightParamsCbv;
-                addResource(&shp, nullptr);
+                addFrameBuf(&shp);
 
                 // Stage B's raster gFrameData: a full copy of the live one with viewProj replaced by
                 // the top-down ortho. A COPY, not a fresh struct — skyheight_statics.frag reads
@@ -9597,11 +9782,11 @@ namespace {
                 shf.mDesc.pName = "skyHeightFrameCbv";
                 shf.pData = nullptr;
                 shf.ppBuffer = &g_live.pSkyHeightFrameCbv;
-                addResource(&shf, nullptr);
+                addFrameBuf(&shf);
                 for (uint32_t d = 0; d < 32; ++d) {
                     shf.mDesc.pName = "svmFrameCbv";
                     shf.ppBuffer = &g_live.pSvmFrameCbv[d];
-                    addResource(&shf, nullptr);
+                    addFrameBuf(&shf);
                 }
 
                 // LONG-RANGE sun occlusion: 1024² R16F = 2 MB, derived from the map above. A plain
@@ -9628,7 +9813,7 @@ namespace {
                 sop.mDesc.pName = "sunOccParamsCbv";
                 sop.pData = nullptr;
                 sop.ppBuffer = &g_live.pSunOccParamsCbv;
-                addResource(&sop, nullptr);
+                addFrameBuf(&sop);
 
                 // H1 — the MIN-PYRAMID over the height map above (a conservative occluder field;
                 // see skyheightmin.srt.h). 2048² R16F with the FULL mip chain ~= 11 MB. A plain
@@ -9732,7 +9917,7 @@ namespace {
                     apc.mDesc.pName = "atmosParamsCbv";
                     apc.pData = nullptr;
                     apc.ppBuffer = &g_live.pAtmosParamsCbv;
-                    addResource(&apc, nullptr);
+                    addFrameBuf(&apc);
 
                     BufferLoadDesc aso = {};
                     aso.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -9748,7 +9933,7 @@ namespace {
                     BufferLoadDesc asr = {};
                     asr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                     asr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    asr.mDesc.mSize        = (uint64_t)sizeof(uint32_t) * kAtmosShUints;
+                    asr.mDesc.mSize        = kRbLane * kFrameSlots;   // one lane per frame slot
                     asr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                     asr.mDesc.pName        = "atmosShReadback";
                     asr.ppBuffer           = &g_live.pAtmosShReadback;
@@ -9826,7 +10011,7 @@ namespace {
                 fc.mDesc.pName = "shadowFaceCbv";
                 fc.pData = nullptr;
                 fc.ppBuffer = &g_live.pShadowFaceCbv[f];
-                addResource(&fc, nullptr);
+                addFrameBuf(&fc);
             }
 
             BufferLoadDesc sp = {};
@@ -9837,7 +10022,7 @@ namespace {
             sp.mDesc.pName = "shadowMaskParamsCbv";
             sp.pData = nullptr;
             sp.ppBuffer = &g_live.pShadowMaskParamsCbv;
-            addResource(&sp, nullptr);
+            addFrameBuf(&sp);
             // (First-person shadow reception reuses THIS pShadowMaskParamsCbv directly — the arm
             // path needs no invViewProj, so there's no second FP params cbuffer.)
 
@@ -9851,7 +10036,7 @@ namespace {
             sw.mDesc.pName = "shadowWorldsCbv";
             sw.pData = nullptr;
             sw.ppBuffer = &g_live.pShadowWorldsBuf;
-            addResource(&sw, nullptr);
+            addFrameBuf(&sw);
 
             BufferLoadDesc si = {};
             si.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -9861,7 +10046,7 @@ namespace {
             si.mDesc.pName = "instanceVBShadow";
             si.pData = nullptr;
             si.ppBuffer = &g_live.pShadowInstanceBuf;
-            addResource(&si, nullptr);
+            addFrameBuf(&si);
 
             waitForAllResourceLoads();
             if (!g_live.pShadowAtlas || !g_live.pShadowAtlasDyn || !g_live.pShadowMask
@@ -9869,10 +10054,10 @@ namespace {
                 || !g_live.pShadowWorldsBuf || !g_live.pShadowInstanceBuf) {
                 std::printf("[forge][shadow] resource alloc FAILED — shadows disabled\n");
             } else {
-                std::memset(g_live.pShadowMaskParamsCbv->pCpuMappedAddress, 0, kShadowParamsBytes);
+                std::memset(fbw(g_live.pShadowMaskParamsCbv), 0, kShadowParamsBytes);
                 // Shadow instance VB: [0] = identity DrawIndex (firstInstance=k reads its own
                 // matrix), [1] texAlpha per gather, material/overlay lanes stay 0 (depth-only).
-                uint32_t* sinst = (uint32_t*)g_live.pShadowInstanceBuf->pCpuMappedAddress;
+                uint32_t* sinst = (uint32_t*)fbw(g_live.pShadowInstanceBuf);
                 for (uint32_t k = 0; k < kShadowWorldMatrices; ++k) {
                     sinst[k * kStaticInstU32 + 0] = k;   // DrawIndex → gBatch[k] = shadow world window[k]
                     for (uint32_t j = 1; j < kStaticInstU32; ++j) { sinst[k * kStaticInstU32 + j] = 0; }
@@ -10314,7 +10499,7 @@ namespace {
         fb.mDesc.pName = "frameCbv";
         fb.pData = nullptr;
         fb.ppBuffer = &g_live.pFrameCbv;
-        addResource(&fb, nullptr);
+        addFrameBuf(&fb);
 
         // Tier 3a: gLights cbuffer, persistent-mapped (kLightCbvBytes ~6.4KB < 64KB CBV max).
         BufferLoadDesc lb = {};
@@ -10325,7 +10510,7 @@ namespace {
         lb.mDesc.pName = "lightCbv";
         lb.pData = nullptr;
         lb.ppBuffer = &g_live.pLightCbv;
-        addResource(&lb, nullptr);
+        addFrameBuf(&lb);
 
         // World buffers: ONE exactly-64KB cbuffer per batch (a valid full CBV — a single
         // >64KB uniform buffer removes the device). Each holds kBatchSize float4x4.
@@ -10338,7 +10523,7 @@ namespace {
             wb.mDesc.pName = "worldBatchCbv";
             wb.pData = nullptr;
             wb.ppBuffer = &g_live.pWorldsBuf[b];
-            addResource(&wb, nullptr);
+            addFrameBuf(&wb);
             if (b == 0) {
                 // Probe the BufferDesc fields that decide CBV-vs-SRV + element layout — the
                 // fields that distinguish this 64KB UNIFORM_BUFFER (CBV) workaround from the
@@ -10367,7 +10552,7 @@ namespace {
             ib.mDesc.pName = "instanceVB";
             ib.pData = nullptr;
             ib.ppBuffer = &g_live.pInstanceBuf[b];
-            addResource(&ib, nullptr);
+            addFrameBuf(&ib);
         }
 
         // Per-frame indirect-args buffer (GPU-driven draws). One IndirectDrawIndexArguments
@@ -10382,7 +10567,7 @@ namespace {
             ad.mDesc.pName = "indirectArgs";
             ad.pData = nullptr;
             ad.ppBuffer = &g_live.pIndirectArgs;
-            addResource(&ad, nullptr);
+            addFrameBuf(&ad);
         }
 
         waitForAllResourceLoads();
@@ -10391,16 +10576,16 @@ namespace {
             return false;
         }
         // Zero the light cbuffer so a frame with no lightBlob (lightParams.x = 0) does nothing.
-        std::memset(g_live.pLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
+        std::memset(fbw(g_live.pLightCbv), 0, kLightCbvBytes);
         // WV2: gReflWaterClip = pass-all (0,0,0,1) in the MAIN frame cbuffer (float index 64..67).
         // Only pReflectFrameCbvGeo overwrites it with the real below-water plane; every other path
         // (main/viewer/probe) leaves this identity so distantland.vert/statics.vert never clip. Set once.
         {
-            float* dp = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* dp = (float*)fbw(g_live.pFrameCbv);
             dp[64] = 0.0f; dp[65] = 0.0f; dp[66] = 0.0f; dp[67] = 1.0f;
         }
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
-            uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[b]->pCpuMappedAddress;
+            uint32_t* inst = (uint32_t*)fbw(g_live.pInstanceBuf[b]);
             for (uint32_t i = 0; i < kBatchSize; ++i) {
                 inst[i * kStaticInstU32 + 0] = i;   // [0] identity (DrawIndex)
                 for (uint32_t k = 1; k < kStaticInstU32; ++k)
@@ -10457,10 +10642,10 @@ namespace {
             ub.mDesc.pName         = "uvAnimTable";
             ub.pData               = nullptr;
             ub.ppBuffer            = &g_live.pUVAnimBuf;
-            addResource(&ub, nullptr);
+            addFrameBuf(&ub);
             waitForAllResourceLoads();
             if (g_live.pUVAnimBuf) {
-                std::memset(g_live.pUVAnimBuf->pCpuMappedAddress, 0, (size_t)kMaxUVAnim * 16);
+                std::memset(fbw(g_live.pUVAnimBuf), 0, (size_t)kMaxUVAnim * 16);
             } else {
                 std::printf("[forge] gUVAnim table alloc FAILED — UV animation disabled (base UVs)\n");
             }
@@ -10482,10 +10667,10 @@ namespace {
             sb.mDesc.pName         = "alphaStageTable";
             sb.pData               = nullptr;
             sb.ppBuffer            = &g_live.pAlphaStagesBuf;
-            addResource(&sb, nullptr);
+            addFrameBuf(&sb);
             waitForAllResourceLoads();
             if (g_live.pAlphaStagesBuf) {
-                std::memset(g_live.pAlphaStagesBuf->pCpuMappedAddress, 0, (size_t)kMaxAlphaDraws * 16);
+                std::memset(fbw(g_live.pAlphaStagesBuf), 0, (size_t)kMaxAlphaDraws * 16);
             } else {
                 std::printf("[forge] gAlphaStages table alloc FAILED — captured alpha stays base-map only\n");
             }
@@ -11193,7 +11378,7 @@ namespace {
                 bb.mDesc.pName = "boneWindowCbv";
                 bb.pData = nullptr;
                 bb.ppBuffer = &g_live.pBonesBuf[b];
-                addResource(&bb, nullptr);
+                addFrameBuf(&bb);
             }
             // Skinned instance buffer: kMaxSkinned uint3 { Base, texAlpha, matAlphaBits }, one entry
             // per drawn part (indexed by skinnedDrawn via firstInstance). CPU-mapped, written per
@@ -11210,7 +11395,7 @@ namespace {
                 sib.mDesc.pName = "instanceVBSkin";
                 sib.pData = nullptr;
                 sib.ppBuffer = &g_live.pInstanceBufSkin;
-                addResource(&sib, nullptr);
+                addFrameBuf(&sib);
             }
 
             waitForAllResourceLoads();
@@ -11459,7 +11644,7 @@ namespace {
             mwb.mDesc.pName = "mmWorldsCbv";
             mwb.pData = nullptr;
             mwb.ppBuffer = &g_live.pMMWorldsBuf;
-            addResource(&mwb, nullptr);
+            addFrameBuf(&mwb);
 
             // Per-draw instance VB: kMaxMultiMap entries of kMMInstU32 uint32 (indexed by
             // multiMapDrawn via firstInstance). CPU-mapped, written per frame in the MM loop.
@@ -11471,7 +11656,7 @@ namespace {
             mib.mDesc.pName = "instanceVBMM";
             mib.pData = nullptr;
             mib.ppBuffer = &g_live.pInstanceBufMM;
-            addResource(&mib, nullptr);
+            addFrameBuf(&mib);
 
             waitForAllResourceLoads();
             if (!g_live.pMMWorldsBuf || !g_live.pInstanceBufMM) {
@@ -11551,7 +11736,7 @@ namespace {
                 maw.mDesc.pName        = "mmAlphaWorldsCbv";
                 maw.pData              = nullptr;
                 maw.ppBuffer           = &g_live.pMMAlphaWorldsBuf;
-                addResource(&maw, nullptr);
+                addFrameBuf(&maw);
 
                 BufferLoadDesc mai = {};
                 mai.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -11561,7 +11746,7 @@ namespace {
                 mai.mDesc.pName        = "instanceVBMMAlpha";
                 mai.pData              = nullptr;
                 mai.ppBuffer           = &g_live.pInstanceBufMMAlpha;
-                addResource(&mai, nullptr);
+                addFrameBuf(&mai);
 
                 waitForAllResourceLoads();
                 if (!g_live.pMMAlphaWorldsBuf || !g_live.pInstanceBufMMAlpha) {
@@ -11687,7 +11872,7 @@ namespace {
             swb.mDesc.pName = "skyWorldsCbv";
             swb.pData = nullptr;
             swb.ppBuffer = &g_live.pSkyWorldsBuf;
-            addResource(&swb, nullptr);
+            addFrameBuf(&swb);
 
             BufferLoadDesc sib = {};
             sib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -11697,7 +11882,7 @@ namespace {
             sib.mDesc.pName = "instanceVBSky";
             sib.pData = nullptr;
             sib.ppBuffer = &g_live.pSkyInstanceBuf;
-            addResource(&sib, nullptr);
+            addFrameBuf(&sib);
 
             waitForAllResourceLoads();
             if (!g_live.pSkyWorldsBuf || !g_live.pSkyInstanceBuf) {
@@ -11717,7 +11902,7 @@ namespace {
                 svb.mDesc.pName = v ? "skyViewCbvReflect" : "skyViewCbvMain";
                 svb.pData = nullptr;
                 svb.ppBuffer = &g_live.pSkyViewCbv[v];
-                addResource(&svb, nullptr);
+                addFrameBuf(&svb);
             }
 
             waitForAllResourceLoads();
@@ -11725,8 +11910,8 @@ namespace {
             // radiance.w = 0 as a black sky, so a frame that draws before the first publish paints
             // black rather than whatever the allocator left behind.
             for (int v = 0; v < 2; ++v) {
-                if (g_live.pSkyViewCbv[v] && g_live.pSkyViewCbv[v]->pCpuMappedAddress) {
-                    std::memset(g_live.pSkyViewCbv[v]->pCpuMappedAddress, 0, 512);
+                if (g_live.pSkyViewCbv[v] && fbr(g_live.pSkyViewCbv[v])) {
+                    std::memset(fbw(g_live.pSkyViewCbv[v]), 0, 512);
                 }
             }
 
@@ -11824,7 +12009,7 @@ namespace {
             dvb.mDesc.pName = "debugLineVB";
             dvb.pData = nullptr;
             dvb.ppBuffer = &g_live.pDebugLineVB;
-            addResource(&dvb, nullptr);
+            addFrameBuf(&dvb);
             waitForAllResourceLoads();
             if (!g_live.pDebugLineVB) {
                 return false;
@@ -12240,7 +12425,7 @@ namespace {
                     rcb.mDesc.mSize        = 256;   // cbuffer alignment, not sizeof(ResolveParams)
                     rcb.mDesc.pName        = "resolveParams";
                     rcb.ppBuffer           = &g_live.pResolveParamsCbv;
-                    addResource(&rcb, nullptr);
+                    addFrameBuf(&rcb);
                 }
                 if (!g_live.pResolvePipeline || !g_live.pResolveSet || !g_live.pResolveParamsCbv) {
                     std::printf("[forge] custom resolve unavailable (%s) — hardware ResolveSubresource\n",
@@ -12523,7 +12708,7 @@ namespace {
                 bp.mDesc.pName        = "bloomParamsCbv";
                 bp.pData              = nullptr;
                 bp.ppBuffer           = &g_live.pBloomParamsCbv[s];
-                addResource(&bp, nullptr);
+                addFrameBuf(&bp);
             }
 
             // The prefilter is SAMPLE_COUNT-variant because it IS the MSAA resolve and Tex2DMS needs
@@ -12793,7 +12978,7 @@ namespace {
             awb.mDesc.pName = "alphaWorldsCbv";
             awb.pData = nullptr;
             awb.ppBuffer = &g_live.pAlphaWorldsBuf;
-            addResource(&awb, nullptr);
+            addFrameBuf(&awb);
 
             BufferLoadDesc aib = {};
             aib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -12803,7 +12988,7 @@ namespace {
             aib.mDesc.pName = "instanceVBAlpha";
             aib.pData = nullptr;
             aib.ppBuffer = &g_live.pAlphaInstanceBuf;
-            addResource(&aib, nullptr);
+            addFrameBuf(&aib);
 
             // AT3 captured-alpha VB/IB: single-buffered, persistent-mapped, CPU_TO_GPU — the client
             // refills them (memcpy in renderScene) each frame from its VB/IB Lock-copy of MW's
@@ -12817,7 +13002,7 @@ namespace {
             cvb.mDesc.pName = "capAlphaVB";
             cvb.pData = nullptr;
             cvb.ppBuffer = &g_live.pCapAlphaVB;
-            addResource(&cvb, nullptr);
+            addFrameBuf(&cvb);
 
             BufferLoadDesc cib = {};
             cib.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
@@ -12827,7 +13012,7 @@ namespace {
             cib.mDesc.pName = "capAlphaIB";
             cib.pData = nullptr;
             cib.ppBuffer = &g_live.pCapAlphaIB;
-            addResource(&cib, nullptr);
+            addFrameBuf(&cib);
 
             waitForAllResourceLoads();
             if (!g_live.pAlphaWorldsBuf || !g_live.pAlphaInstanceBuf
@@ -12923,7 +13108,7 @@ namespace {
             wwb.mDesc.pName = "waterWorldsCbv";
             wwb.pData = nullptr;
             wwb.ppBuffer = &g_live.pWaterWorldsBuf;
-            addResource(&wwb, nullptr);
+            addFrameBuf(&wwb);
 
             BufferLoadDesc wib = {};
             wib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -12933,7 +13118,7 @@ namespace {
             wib.mDesc.pName = "instanceVBWater";
             wib.pData = nullptr;
             wib.ppBuffer = &g_live.pWaterInstanceBuf;
-            addResource(&wib, nullptr);
+            addFrameBuf(&wib);
 
             waitForAllResourceLoads();
             if (!g_live.pRefractColor || !g_live.pWaterWorldsBuf || !g_live.pWaterInstanceBuf) {
@@ -12942,7 +13127,7 @@ namespace {
             }
             // Fill the per-draw instance VB once: DrawIndex[level] = level (selects gBatch.worlds[level]).
             {
-                uint32_t* wi = (uint32_t*)g_live.pWaterInstanceBuf->pCpuMappedAddress;
+                uint32_t* wi = (uint32_t*)fbw(g_live.pWaterInstanceBuf);
                 for (uint32_t i = 0; i < kMaxWaterLevels; ++i) { wi[i] = i; }
             }
 
@@ -13077,7 +13262,7 @@ namespace {
             rfb.mDesc.pName = "reflectFrameCbv";
             rfb.pData = nullptr;
             rfb.ppBuffer = &g_live.pReflectFrameCbv;
-            addResource(&rfb, nullptr);
+            addFrameBuf(&rfb);
 
             // WV2 reflect-GEO frame cbuffer: the water-plane mirror matrix + the below-water clip plane
             // (the sky cbuffer above uses the camera-plane mirror with a pass-all clip). Own buffer so
@@ -13090,7 +13275,7 @@ namespace {
             rfg.mDesc.pName = "reflectFrameCbvGeo";
             rfg.pData = nullptr;
             rfg.ppBuffer = &g_live.pReflectFrameCbvGeo;
-            addResource(&rfg, nullptr);
+            addFrameBuf(&rfg);
 
             // Reflect sky gBatch window + instance VB (own copies; the reflect pass fills + draws them
             // BEFORE the main sky pass, so they must be decoupled from pSkyWorldsBuf/pSkyInstanceBuf).
@@ -13102,7 +13287,7 @@ namespace {
             rsw.mDesc.pName = "reflectSkyWorldsCbv";
             rsw.pData = nullptr;
             rsw.ppBuffer = &g_live.pReflectSkyWorldsBuf;
-            addResource(&rsw, nullptr);
+            addFrameBuf(&rsw);
 
             BufferLoadDesc rsi = {};
             rsi.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -13112,7 +13297,7 @@ namespace {
             rsi.mDesc.pName = "instanceVBReflectSky";
             rsi.pData = nullptr;
             rsi.ppBuffer = &g_live.pReflectSkyInstanceBuf;
-            addResource(&rsi, nullptr);
+            addFrameBuf(&rsi);
 
             waitForAllResourceLoads();
             if (!g_live.pReflectColor || !g_live.pReflectDepth || !g_live.pReflectFrameCbv
@@ -13922,7 +14107,7 @@ namespace {
                     mcb.mDesc.mSize        = 256;   // cbuffer alignment, not sizeof(MvParams) (160)
                     mcb.mDesc.pName        = "mvParams";
                     mcb.ppBuffer           = &g_live.pMvParamsCbv;
-                    addResource(&mcb, nullptr);
+                    addFrameBuf(&mcb);
 
                     BufferLoadDesc msb = {};
                     msb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -13949,14 +14134,14 @@ namespace {
                     mrb.ppBuffer           = &g_live.pMvStatsReset;
                     addResource(&mrb, nullptr);
                     waitForAllResourceLoads();
-                    if (g_live.pMvStatsReset && g_live.pMvStatsReset->pCpuMappedAddress) {
-                        std::memcpy(g_live.pMvStatsReset->pCpuMappedAddress, kMvReset, sizeof(kMvReset));
+                    if (g_live.pMvStatsReset && fbr(g_live.pMvStatsReset)) {
+                        std::memcpy(fbw(g_live.pMvStatsReset), kMvReset, sizeof(kMvReset));
                     }
 
                     BufferLoadDesc mrr = {};
                     mrr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                     mrr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    mrr.mDesc.mSize        = sizeof(uint32_t) * 5;
+                    mrr.mDesc.mSize        = kRbLane * kFrameSlots;
                     mrr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                     mrr.mDesc.pName        = "mvStatsReadback";
                     mrr.ppBuffer           = &g_live.pMvStatsReadback;
@@ -14234,7 +14419,7 @@ namespace {
                         ovpb.mDesc.mSize        = 256;   // 2 matrices + 2 float4 = 160 B, rounded up
                         ovpb.mDesc.pName        = "objVelParams";
                         ovpb.ppBuffer           = &g_live.pObjVelParamsCbv;
-                        addResource(&ovpb, nullptr);
+                        addFrameBuf(&ovpb);
 
                         BufferLoadDesc ovbb = {};
                         ovbb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -14243,7 +14428,7 @@ namespace {
                         ovbb.mDesc.mSize        = (uint64_t)kObjVelBatch * 64ull * 2ull;   // worlds + prevWorlds
                         ovbb.mDesc.pName        = "objVelBatch";
                         ovbb.ppBuffer           = &g_live.pObjVelBatchCbv;
-                        addResource(&ovbb, nullptr);
+                        addFrameBuf(&ovbb);
 
                         BufferLoadDesc ovib = {};
                         ovib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -14252,7 +14437,7 @@ namespace {
                         ovib.mDesc.mSize        = (uint64_t)kObjVelBatch * sizeof(uint32_t);
                         ovib.mDesc.pName        = "objVelInstanceVB";
                         ovib.ppBuffer           = &g_live.pObjVelInstanceBuf;
-                        addResource(&ovib, nullptr);
+                        addFrameBuf(&ovib);
 
                         // MB-1b: the two bone windows + the skinned instance stream. Created in
                         // the SAME block as the rigid batch so the descriptor set is written once,
@@ -14266,10 +14451,10 @@ namespace {
                         ovbn.mDesc.mSize        = (uint64_t)kObjVelBones * 64ull;   // exactly the 64 KB CBV cap
                         ovbn.mDesc.pName        = "objVelBonesCur";
                         ovbn.ppBuffer           = &g_live.pObjVelBonesCurCbv;
-                        addResource(&ovbn, nullptr);
+                        addFrameBuf(&ovbn);
                         ovbn.mDesc.pName        = "objVelBonesPrev";
                         ovbn.ppBuffer           = &g_live.pObjVelBonesPrevCbv;
-                        addResource(&ovbn, nullptr);
+                        addFrameBuf(&ovbn);
 
                         BufferLoadDesc ovsi = {};
                         ovsi.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -14278,7 +14463,7 @@ namespace {
                         ovsi.mDesc.mSize        = (uint64_t)kObjVelSkinned * sizeof(uint32_t);
                         ovsi.mDesc.pName        = "objVelSkinInstanceVB";
                         ovsi.ppBuffer           = &g_live.pObjVelSkinInstanceBuf;
-                        addResource(&ovsi, nullptr);
+                        addFrameBuf(&ovsi);
 
                         // ═══ MB-1d: THE FIRST-PERSON MIRROR OF ALL FOUR ═══════════════════════
                         // Same descriptors, same sizes, same names + "FP". The sizes are the
@@ -14290,23 +14475,23 @@ namespace {
                         BufferLoadDesc ovpbF = ovpb;
                         ovpbF.mDesc.pName = "objVelParamsFP";
                         ovpbF.ppBuffer    = &g_live.pObjVelParamsCbvFP;
-                        addResource(&ovpbF, nullptr);
+                        addFrameBuf(&ovpbF);
 
                         BufferLoadDesc ovbbF = ovbb;
                         ovbbF.mDesc.pName = "objVelBatchFP";
                         ovbbF.ppBuffer    = &g_live.pObjVelBatchCbvFP;
-                        addResource(&ovbbF, nullptr);
+                        addFrameBuf(&ovbbF);
 
                         ovbn.mDesc.pName        = "objVelBonesCurFP";
                         ovbn.ppBuffer           = &g_live.pObjVelBonesCurCbvFP;
-                        addResource(&ovbn, nullptr);
+                        addFrameBuf(&ovbn);
                         ovbn.mDesc.pName        = "objVelBonesPrevFP";
                         ovbn.ppBuffer           = &g_live.pObjVelBonesPrevCbvFP;
-                        addResource(&ovbn, nullptr);
+                        addFrameBuf(&ovbn);
 
                         ovsi.mDesc.pName        = "objVelSkinInstanceVBFP";
                         ovsi.ppBuffer           = &g_live.pObjVelSkinInstanceBufFP;
-                        addResource(&ovsi, nullptr);
+                        addFrameBuf(&ovsi);
 
                         BufferLoadDesc ovf = {};
                         ovf.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -14334,14 +14519,14 @@ namespace {
                         BufferLoadDesc ovfb = {};
                         ovfb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                         ovfb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                        ovfb.mDesc.mSize        = sizeof(uint32_t);
+                        ovfb.mDesc.mSize        = kRbLane * kFrameSlots;
                         ovfb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                         ovfb.mDesc.pName        = "objVelFragsReadback";
                         ovfb.ppBuffer           = &g_live.pObjVelFragsReadback;
                         addResource(&ovfb, nullptr);
                         waitForAllResourceLoads();
-                        if (g_live.pObjVelFragsReset && g_live.pObjVelFragsReset->pCpuMappedAddress) {
-                            std::memcpy(g_live.pObjVelFragsReset->pCpuMappedAddress,
+                        if (g_live.pObjVelFragsReset && fbr(g_live.pObjVelFragsReset)) {
+                            std::memcpy(fbw(g_live.pObjVelFragsReset),
                                         &kFragReset, sizeof(kFragReset));
                         }
                     }
@@ -14352,9 +14537,9 @@ namespace {
                         // firstInstance = k, so instance k reads gObjVelBatch[k] — the same trick
                         // pShadowInstanceBuf uses, and the reason this buffer never has to be
                         // touched again at record time.
-                        uint32_t* oinst = (uint32_t*)g_live.pObjVelInstanceBuf->pCpuMappedAddress;
+                        uint32_t* oinst = (uint32_t*)fbw(g_live.pObjVelInstanceBuf);
                         for (uint32_t k = 0; k < kObjVelBatch; ++k) { oinst[k] = k; }
-                        std::memset(g_live.pObjVelParamsCbv->pCpuMappedAddress, 0, 256);
+                        std::memset(fbw(g_live.pObjVelParamsCbv), 0, 256);
 
                         DescriptorData ovd[8] = {};
                         ovd[0].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelParams);
@@ -14423,7 +14608,7 @@ namespace {
                         // bone windows is exactly the kind of "it is never read" that stops being
                         // true the moment the skinned FP pipeline binds the same table.
                         if (g_live.pObjVelParamsCbvFP && g_live.pObjVelBatchCbvFP) {
-                            std::memset(g_live.pObjVelParamsCbvFP->pCpuMappedAddress, 0, 256);
+                            std::memset(fbw(g_live.pObjVelParamsCbvFP), 0, 256);
                             ovd[0].ppBuffers = &g_live.pObjVelParamsCbvFP;
                             ovd[1].ppBuffers = &g_live.pObjVelBatchCbvFP;
                             if (ovdHaveBones && g_live.pObjVelBonesCurCbvFP
@@ -14490,7 +14675,7 @@ namespace {
                         fcb.mDesc.mSize        = 256;
                         fcb.mDesc.pName        = "mvFieldStatsParams";
                         fcb.ppBuffer           = &g_live.pMvFsParamsCbv;
-                        addResource(&fcb, nullptr);
+                        addFrameBuf(&fcb);
 
                         BufferLoadDesc fsb = {};
                         fsb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -14526,15 +14711,15 @@ namespace {
                         BufferLoadDesc frr = {};
                         frr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                         frr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                        frr.mDesc.mSize        = sizeof(uint32_t) * 7;
+                        frr.mDesc.mSize        = kRbLane * kFrameSlots;
                         frr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                         frr.mDesc.pName        = "mvFieldStatsReadback";
                         frr.ppBuffer           = &g_live.pMvFsReadback;
                         addResource(&frr, nullptr);
                         waitForAllResourceLoads();
 
-                        if (g_live.pMvFsReset && g_live.pMvFsReset->pCpuMappedAddress) {
-                            std::memcpy(g_live.pMvFsReset->pCpuMappedAddress, kFsReset, sizeof(kFsReset));
+                        if (g_live.pMvFsReset && fbr(g_live.pMvFsReset)) {
+                            std::memcpy(fbw(g_live.pMvFsReset), kFsReset, sizeof(kFsReset));
                         }
                     }
                     if (g_live.pMvFsSet && g_live.pMvFsParamsCbv && g_live.pMvFsStats
@@ -14650,7 +14835,8 @@ namespace {
                     addPipeline(R, &apd, &g_live.pAplPipeline);
                 }
                 if (g_live.pAplPipeline) {
-                    DescriptorSetDesc aset = SRT_SET_DESC(AplSrtData, PerBatch, 1, 0);
+                    // One instance per frame slot: gAplColor is the slot's shared RT (P3).
+                    DescriptorSetDesc aset = SRT_SET_DESC(AplSrtData, PerBatch, kFrameSlots, 0);
                     addDescriptorSet(R, &aset, &g_live.pAplSet);
 
                     BufferLoadDesc acb = {};
@@ -14660,7 +14846,7 @@ namespace {
                     acb.mDesc.mSize         = 256;   // cbuffer alignment, not sizeof(AplParams)
                     acb.mDesc.pName         = "aplParams";
                     acb.ppBuffer            = &g_live.pAplParamsCbv;
-                    addResource(&acb, nullptr);
+                    addFrameBuf(&acb);
 
                     BufferLoadDesc aob = {};
                     aob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -14679,7 +14865,7 @@ namespace {
                     BufferLoadDesc arb = {};
                     arb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                     arb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    arb.mDesc.mSize        = 96;   // 24 uints — total / land / water
+                    arb.mDesc.mSize        = kRbLane * kFrameSlots;   // lanes of 24 uints — total / land / water
                     arb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                     arb.mDesc.pName        = "aplReadback";
                     arb.ppBuffer           = &g_live.pAplReadback;
@@ -15082,7 +15268,10 @@ namespace {
                 // single-sample, and has existed since init(). The old "MSAA colour when AA is on"
                 // branch went with the move: pSceneColor now carries scene-referred values whenever
                 // fp16 is on, and averaging those would break every APL number ever recorded.
-                Texture* aplSrc = g_live.pRT->pTexture;
+                // ...and since P3 that is a PAIR: instance s binds slot s's RT, and the dispatch
+                // binds instance recSlot. The other three descriptors are the same in both.
+                for (uint32_t s = 0; s < kFrameSlots; ++s) {
+                Texture* aplSrc = g_live.pRTs[s]->pTexture;
                 DescriptorData d[4] = {};
                 d[0].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplParams);
                 d[0].ppBuffers = &g_live.pAplParamsCbv;
@@ -15098,7 +15287,8 @@ namespace {
                 d[2].ppTextures = &g_live.pLinearDepth;
                 d[3].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplOut);
                 d[3].ppBuffers = &g_live.pAplOut;
-                updateDescriptorSet(R, 0, g_live.pAplSet, 4, d);
+                updateDescriptorSet(R, s, g_live.pAplSet, 4, d);
+                }
             }
             // ─── MB-2: THE MOTION BLUR FILTER (tasks/forge-postprocess.md) ───────────────────────
             // Built HERE, immediately BEFORE the resolve's set instances, and the ordering is forced
@@ -15184,7 +15374,7 @@ namespace {
                 mcb.mDesc.mSize        = 256;   // four float4s; 256 B = min CBV
                 mcb.mDesc.pName        = "motionBlurParams";
                 mcb.ppBuffer           = &g_live.pMbParamsCbv;
-                addResource(&mcb, nullptr);
+                addFrameBuf(&mcb);
 
                 // The gather's statistics, and its reset/readback staging pair.
                 static const uint32_t kMbReset[4] = { 0u, 0u, 0u, 0u };
@@ -15214,15 +15404,15 @@ namespace {
                 BufferLoadDesc mrr = {};
                 mrr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                 mrr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                mrr.mDesc.mSize        = sizeof(kMbReset);
+                mrr.mDesc.mSize        = kRbLane * kFrameSlots;
                 mrr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                 mrr.mDesc.pName        = "mbStatsReadback";
                 mrr.ppBuffer           = &g_live.pMbStatsReadback;
                 addResource(&mrr, nullptr);
                 waitForAllResourceLoads();
 
-                if (g_live.pMbStatsReset && g_live.pMbStatsReset->pCpuMappedAddress) {
-                    std::memcpy(g_live.pMbStatsReset->pCpuMappedAddress, kMbReset, sizeof(kMbReset));
+                if (g_live.pMbStatsReset && fbr(g_live.pMbStatsReset)) {
+                    std::memcpy(fbw(g_live.pMbStatsReset), kMbReset, sizeof(kMbReset));
                 }
 
                 ShaderLoadDesc mts = {};
@@ -15694,8 +15884,14 @@ namespace {
             qd.pName = "GpuPhaseTimestamps";
             qd.mType = QUERY_TYPE_TIMESTAMP;
             qd.mQueryCount = kGpuPhaseCount;
-            initQueryPool(R, &qd, &g_live.pGpuQueryPool);
-            if (g_live.pGpuQueryPool) {
+            for (uint32_t s = 0; s < kFrameSlots; ++s) { initQueryPool(R, &qd, &g_live.pGpuQueryPool[s]); }
+            // Both or neither: the phase brackets test only the slot they record into.
+            if (!g_live.pGpuQueryPool[0] || !g_live.pGpuQueryPool[1]) {
+                for (uint32_t s = 0; s < kFrameSlots; ++s) {
+                    if (g_live.pGpuQueryPool[s]) { exitQueryPool(R, g_live.pGpuQueryPool[s]); g_live.pGpuQueryPool[s] = nullptr; }
+                }
+            }
+            if (g_live.pGpuQueryPool[0]) {
                 getTimestampFrequency(g_live.pQueue, &g_live.gpuTickFreq);
                 std::printf("[forge] GPU timestamp pool ready (%u phases, freq=%.0f ticks/s)\n",
                             (unsigned)kGpuPhaseCount, g_live.gpuTickFreq);
@@ -15766,22 +15962,24 @@ namespace {
                     d[2].mUAVMipSlice = (uint16_t)m;
                     updateDescriptorSet(R, m, g_live.pHizSet, 3, d);
                 }
-                CmdPoolDesc hp = {};
-                hp.pQueue = g_live.pQueue;
-                initCmdPool(R, &hp, &g_live.pHizCmdPool);
-                CmdDesc hc = {};
-                hc.pPool = g_live.pHizCmdPool;
-                initCmd(R, &hc, &g_live.pHizCmd);
-                initFence(R, &g_live.pHizFence);
-                QueryPoolDesc hq = {};
-                hq.pName = "HizPrologueTimestamp";
-                hq.mType = QUERY_TYPE_TIMESTAMP;
-                hq.mQueryCount = 1;
-                initQueryPool(R, &hq, &g_live.pHizQueryPool);   // null => timing stays 0, still runs
+                for (uint32_t s = 0; s < kFrameSlots; ++s) {
+                    CmdPoolDesc hp = {};
+                    hp.pQueue = g_live.pQueue;
+                    initCmdPool(R, &hp, &g_live.pHizCmdPool[s]);
+                    CmdDesc hc = {};
+                    hc.pPool = g_live.pHizCmdPool[s];
+                    initCmd(R, &hc, &g_live.pHizCmd[s]);
+                    initFence(R, &g_live.pHizFence[s]);
+                    QueryPoolDesc hq = {};
+                    hq.pName = "HizPrologueTimestamp";
+                    hq.mType = QUERY_TYPE_TIMESTAMP;
+                    hq.mQueryCount = 1;
+                    initQueryPool(R, &hq, &g_live.pHizQueryPool[s]);   // null => timing stays 0, still runs
+                }
             }
             g_live.hizMips = mips;
             g_live.hizReady = g_live.pHiz && g_live.pHizPipelineFirst && g_live.pHizPipeline
-                           && g_live.pHizSet && g_live.pHizCmdPool && g_live.pHizCmd && g_live.pHizFence;
+                           && g_live.pHizSet && hizObjectsReady();
             std::printf("[forge] Hi-Z prologue %s (%ux%u, %u mips)\n",
                         g_live.hizReady ? "ready" : "DISABLED (resource/shader/pipeline create failed)",
                         width, height, mips);
@@ -15805,7 +16003,7 @@ namespace {
             fpb.mDesc.pName = "fpFrameCbv";
             fpb.pData = nullptr;
             fpb.ppBuffer = &g_live.pFPFrameCbv;
-            addResource(&fpb, nullptr);
+            addFrameBuf(&fpb);
 
             BufferLoadDesc flb = {};
             flb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -15815,7 +16013,7 @@ namespace {
             flb.mDesc.pName = "fpLightCbv";
             flb.pData = nullptr;
             flb.ppBuffer = &g_live.pFPLightCbv;
-            addResource(&flb, nullptr);
+            addFrameBuf(&flb);
 
             // Phase C: baked distant-light cbuffer (same LightData layout as gLights/pLightCbv).
             BufferLoadDesc dlb = {};
@@ -15826,7 +16024,7 @@ namespace {
             dlb.mDesc.pName = "distLightCbv";
             dlb.pData = nullptr;
             dlb.ppBuffer = &g_live.pDistLightCbv;
-            addResource(&dlb, nullptr);
+            addFrameBuf(&dlb);
 
             BufferLoadDesc fwb = {};
             fwb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -15836,7 +16034,7 @@ namespace {
             fwb.mDesc.pName = "fpWorldsCbv";
             fwb.pData = nullptr;
             fwb.ppBuffer = &g_live.pFPWorldsBuf;
-            addResource(&fwb, nullptr);
+            addFrameBuf(&fwb);
 
             BufferLoadDesc fib = {};
             fib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -15846,7 +16044,7 @@ namespace {
             fib.mDesc.pName = "instanceVBFP";
             fib.pData = nullptr;
             fib.ppBuffer = &g_live.pFPInstanceBuf;
-            addResource(&fib, nullptr);
+            addFrameBuf(&fib);
 
             // FP1e: the FP multi-map world window + per-draw instance VB. kBatchBytes (a full
             // 64KB CBV) like every other gBatch binding in this file — the list is capped at
@@ -15860,7 +16058,7 @@ namespace {
             fmw.mDesc.pName = "fpMMWorldsCbv";
             fmw.pData = nullptr;
             fmw.ppBuffer = &g_live.pFPMMWorldsBuf;
-            addResource(&fmw, nullptr);
+            addFrameBuf(&fmw);
 
             BufferLoadDesc fmi = {};
             fmi.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -15870,7 +16068,7 @@ namespace {
             fmi.mDesc.pName = "instanceVBFPMM";
             fmi.pData = nullptr;
             fmi.ppBuffer = &g_live.pFPInstanceBufMM;
-            addResource(&fmi, nullptr);
+            addFrameBuf(&fmi);
 
             BufferLoadDesc fbb = {};
             fbb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -15880,7 +16078,7 @@ namespace {
             fbb.mDesc.pName = "fpBonesCbv";
             fbb.pData = nullptr;
             fbb.ppBuffer = &g_live.pFPBonesBuf;
-            addResource(&fbb, nullptr);
+            addFrameBuf(&fbb);
 
             BufferLoadDesc fsb = {};
             fsb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -15890,7 +16088,7 @@ namespace {
             fsb.mDesc.pName = "instanceVBFPSkin";
             fsb.pData = nullptr;
             fsb.ppBuffer = &g_live.pFPInstanceBufSkin;
-            addResource(&fsb, nullptr);
+            addFrameBuf(&fsb);
 
             TextureDesc md = {};
             md.mWidth = 1; md.mHeight = 1; md.mDepth = 1;
@@ -15911,7 +16109,7 @@ namespace {
                 && g_live.pFPMMWorldsBuf && g_live.pFPInstanceBufMM
                 && g_live.pFPMaskAllLit;
             if (fpBufsOk) {
-                std::memset(g_live.pFPLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
+                std::memset(fbw(g_live.pFPLightCbv), 0, kLightCbvBytes);
 
                 DescriptorSetDesc fpfDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
                 addDescriptorSet(R, &fpfDesc, &g_live.pPerFrameSetFP);
@@ -16072,7 +16270,7 @@ namespace {
 
                 // Phase C: bind the baked distant-light cbuffer to its PerDraw set (same gLights slot).
                 if (g_live.pDistLightCbv && g_live.pPerLightsSetDist) {
-                    std::memset(g_live.pDistLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
+                    std::memset(fbw(g_live.pDistLightCbv), 0, kLightCbvBytes);
                     DescriptorData dlp[2] = {};
                     dlp[0].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
                     dlp[0].ppBuffers = &g_live.pDistLightCbv;
@@ -16453,7 +16651,7 @@ namespace {
                                   | ((uint32_t)TinyImageFormat_FloatToHalfAsUint(sv - 1.0f) << 16);
         const uint32_t id = narrow ? ++g_uvAnimNarrowCount                  // 1..255
                                    : kUVAnimNarrowMax + (++g_uvAnimCount);  // 256..
-        float* tbl = (float*)g_live.pUVAnimBuf->pCpuMappedAddress;
+        float* tbl = (float*)fbw(g_live.pUVAnimBuf);
         tbl[(size_t)id * 4 + 0] = du;
         tbl[(size_t)id * 4 + 1] = dv;
         tbl[(size_t)id * 4 + 2] = (float)w.setIndex;
@@ -16681,10 +16879,10 @@ namespace {
     // bracketed with these therefore reads 0.00 in `rec split`, and that is not a bug to chase.
     void gpuPhaseBeginG(uint32_t i) {
         g_gpuPhaseIssued[i] = true;
-        if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+        if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, qp, &q); }
     }
     void gpuPhaseEndG(uint32_t i) {
-        if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+        if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, qp, &q); }
     }
     // CPU-side per-phase RECORD ms (breaks down g_lastRecMs): the same gpuPhaseBegin/End
     // brackets also capture hostNowMs() deltas — CPU cost of RECORDING each phase's commands
@@ -16755,13 +16953,12 @@ namespace {
     // until renderScene (its own fence). Safe between frames." That grounds is gone: a frame may be
     // executing right now, and it can still reach the old resource through the bindless table.
     //
-    // The hold is short and needs no per-entry bookkeeping. These paths run between frames on the
-    // IPC-service thread, so anything pushed here was pushed while some already-submitted frame may
-    // still be in flight — and the very next settleFrameFence waits the frame fence, which (single
-    // queue, in-order) proves EVERY submission up to that point has retired. So the drain is simply
-    // "after that wait", and nothing can be pushed between the wait and the next submit (renderScene
-    // owns the thread across that span).
-    std::vector<Texture*> g_texRetire;
+    // Each entry carries the serial of the newest frame that could still reach it (g_frameSerial at
+    // park time: the frame being recorded, or the last one submitted). It is freed once that frame
+    // has retired on the GPU (g_completedSerial, advanced by settleSlot). With two frames in flight
+    // "after the next fence wait" is no longer enough: that wait proves only the OLDER frame done.
+    template <class T> struct Retired { T* p; uint64_t serial; };
+    std::vector<Retired<Texture>> g_texRetire;
     // Same mechanism, same fence, for per-mesh GEOMETRY (the dynamic ring and the static
     // skinned/MM VB+IB). Eviction used to free arena suballocations ONLY, on the grounds that
     // destroying a live ID3D12Resource an in-flight frame might still reference is a different
@@ -16771,12 +16968,34 @@ namespace {
     // pins ~4.2 GB of committed VRAM — the +3679 MB `vram-stream: geometry` that crosses the DXGI
     // budget and collapses the frame into driver paging. Parking answers the hazard directly
     // instead of paying for it in evicted-to-system-RAM bytes.
-    std::vector<Buffer*>  g_bufRetire;
-    // True once a frame has been submitted on g_live.pFence, so the top-of-frame settle knows there
-    // is a previous frame to read back at all. getFenceStatus's NOTSUBMITTED would answer this too,
-    // but only until the first wait — after that the fence is "submitted" forever, and the readback
-    // block needs a stable "is there an N-1" rather than a first-frame-only guard.
-    bool      g_framePending  = false;
+    std::vector<Retired<Buffer>> g_bufRetire;
+    // ...and arena suballocations, which own no resource but whose BYTES an in-flight frame may still
+    // be reading: released to the allocator only once that frame retired, or an upload could reuse
+    // the range under it.
+    struct RetiredRange { uint64_t vbOff, vbBytes, ibOff, ibBytes, serial; };
+    std::vector<RetiredRange> g_arenaRetire;
+
+    // ─── FRAME SLOT STATE ───────────────────────────────────────────────────────────────────────
+    // g_frameSerial counts RECORDED frames (beginFrameSlot); frame F records into slot F & 1.
+    // g_completedSerial: every frame serial <= this has retired on the GPU.
+    uint64_t  g_frameSerial     = 0;
+    uint64_t  g_completedSerial = 0;
+    // What one slot holds: the frame last submitted in it, whether its readbacks are still to be
+    // drained, and the per-frame facts the drain needs about THAT frame. Snapshotted at submit
+    // (snapshotFrameSlot), so a drain never reads a live latch a later frame has since rewritten.
+    struct FrameSlotState {
+        uint64_t serial = 0;             // frame serial submitted in this slot (0 = never)
+        bool     pending = false;        // submitted, readbacks not yet drained
+        uint64_t sharedFenceValue = 0;   // the frame's shared-fence value (its frame-trace id)
+        bool     phaseIssued[kGpuPhaseCount] = {};
+        bool     atmosShArmed = false;
+        bool     reflGpuCullRan = false;
+        uint32_t reflCpuCull = 0;        // the frame's own CPU mirror-cull count (H2a parity)
+        bool     aplSplitRan = false;
+        bool     mbRan = false;
+        uint64_t mbPixels = 0;
+    };
+    FrameSlotState g_slot[kFrameSlots];
     // Skinned-loop record probe: splits the per-part CPU cost of the skinned colour loop into
     // data-prep (palette + instance memcpy — reads the IPC blob, so page-faults under memory
     // pressure surface HERE) vs command-recording (bindVB/IB + draw — the ONLY part a skinned
@@ -17625,11 +17844,10 @@ namespace {
                                          // lane ran" are different claims and only the second one
                                          // makes the numbers beside it mean anything.
     uint32_t g_lastReflGpuCullCount = 0; // Σ numSubsets from the GPU lane (readback, 1 frame late)
-    // The CPU cull's count for THE FRAME THE READBACK DESCRIBES. Not g_liveLastInstRefl read at the
-    // settle point: settleFrameFence runs AFTER this frame's dlReflectGeoCull, so that variable
-    // already holds frame N while the readback holds frame N-1. Comparing them would report a
-    // MISMATCH every time the camera moved and a MATCH whenever it did not — an instrument that
-    // measures camera motion. This is latched one settle behind, so the two describe the same frame.
+    // The CPU cull's count for THE FRAME THE READBACK DESCRIBES: that frame's slot snapshot, set by
+    // drainSlot. Not the live g_liveLastInstRefl, which may already describe a later frame —
+    // comparing that would report a MISMATCH every time the camera moved and a MATCH whenever it did
+    // not, an instrument that measures camera motion.
     uint32_t g_reflCpuCullPrev = 0;
     uint32_t g_reflCullMatchFrames = 0;   // consecutive settles where the two agreed
     uint32_t g_reflCullMismatches  = 0;   // ...and where they did not. A single one kills the lane.
@@ -23126,6 +23344,9 @@ namespace {
             // stall latch says something external to every pass is costing up to 2.1 ms in 43-71% of
             // frames. Whether the split helps or hurts is now measurable rather than assumed.
             { "splitSubmit",         &g_splitSubmit         },
+            // P2's oracle (tasks/forge-pipeline-depth.md): read every FrameBuf back after its
+            // upload and compare it with the CPU shadow. A dev cost, off by default.
+            { "frameBufVerify",      &g_frameBufVerify      },
             // M1 4d. ⚠ jitterForce IS A MEASUREMENT, NOT A SETTING: it bypasses the producer gate
             // in jitterAmp() so M1 step 1's isolation test — jitter alone, no upscaler, the image
             // must shimmer sub-pixel while the atmos/gate rows do not move — stays runnable in a
@@ -26548,9 +26769,10 @@ namespace {
         // changed the shape in between. Credited in the branch that actually frees, so a slot
         // charged to one bucket cannot be credited to another.
         if (m.inArena) {
-            // Arena parts own no D3D12 resources — just free the suballocations.
-            g_arenaVB.release(m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire));
-            g_arenaIB.release(m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t));
+            // Arena parts own no D3D12 resources — the suballocations are PARKED (g_arenaRetire)
+            // until every frame that could still read them has retired.
+            g_arenaRetire.push_back({ m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire),
+                                      m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t), g_frameSerial });
             m.inArena = false;
             m.vbOff = m.ibOff = 0;
             g_geoArena.destroyedBytes += (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire)
@@ -26559,10 +26781,10 @@ namespace {
         } else if (m.dynamic) {
             // PARKED, not destroyed: this runs on the IPC-service thread between frames, and a
             // submitted frame may still be reading the ring entry it is not currently writing.
-            // g_bufRetire is freed only after the frame fence proves every submission retired.
+            // g_bufRetire is freed only once every frame that could reach it has retired.
             for (uint32_t r = 0; r < kGeomRing; ++r) {
-                if (m.dynVb[r]) { g_bufRetire.push_back(m.dynVb[r]); m.dynVb[r] = nullptr; }
-                if (m.dynIb[r]) { g_bufRetire.push_back(m.dynIb[r]); m.dynIb[r] = nullptr; }
+                if (m.dynVb[r]) { g_bufRetire.push_back({ m.dynVb[r], g_frameSerial }); m.dynVb[r] = nullptr; }
+                if (m.dynIb[r]) { g_bufRetire.push_back({ m.dynIb[r], g_frameSerial }); m.dynIb[r] = nullptr; }
             }
             m.vb = m.ib = nullptr;   // were aliases into the ring
             if (g_dynamicCount) { --g_dynamicCount; }
@@ -26570,8 +26792,8 @@ namespace {
         } else {
             // PARKED for the same reason as the ring above — an in-flight frame can still hold
             // these in a recorded bindVB/bindIB.
-            if (m.vb) { g_bufRetire.push_back(m.vb); m.vb = nullptr; }
-            if (m.ib) { g_bufRetire.push_back(m.ib); m.ib = nullptr; }
+            if (m.vb) { g_bufRetire.push_back({ m.vb, g_frameSerial }); m.vb = nullptr; }
+            if (m.ib) { g_bufRetire.push_back({ m.ib, g_frameSerial }); m.ib = nullptr; }
             g_geoStatic.destroyedBytes += m.bufBytes; ++g_geoStatic.destroys;
         }
         // Hand the budget back EXACTLY what this slot took (m.bufBytes, recorded at alloc), not what
@@ -26591,6 +26813,266 @@ namespace {
         m.uvAnimId = 0;
     }
 
+    // Free everything parked by frames up to and including `upTo` (UINT64_MAX = all of it, for
+    // teardown, whose callers have already idled the queue).
+    void drainRetired(uint64_t upTo) {
+        auto drain = [upTo](auto& list, auto&& release) {
+            size_t keep = 0;
+            for (size_t i = 0; i < list.size(); ++i) {
+                if (list[i].serial <= upTo) { release(list[i]); }
+                else                        { list[keep++] = list[i]; }
+            }
+            list.resize(keep);
+        };
+        drain(g_texRetire, [](const Retired<Texture>& r) { removeResource(r.p); });
+        drain(g_bufRetire, [](const Retired<Buffer>& r) { removeResource(r.p); });
+        drain(g_arenaRetire, [](const RetiredRange& r) {
+            g_arenaVB.release(r.vbOff, r.vbBytes);
+            g_arenaIB.release(r.ibOff, r.ibBytes);
+        });
+    }
+
+    // ─── FRAMEBUF FLUSH (see FrameBuf) ──────────────────────────────────────────────────────────
+    // Per slot: an upload ring the dirty ranges are memcpy'd into, and the copy cmds. Both are
+    // reused once the slot's previous frame has retired (fbSlotReset from beginFrameSlot). The
+    // between-frames sync paths append to recSlot's and wait for their own submit, as they always
+    // did for the frame pool they borrow.
+    constexpr uint32_t kFbCmds = 8;
+    struct FbSlot {
+        Buffer*  ring = nullptr;
+        uint64_t cap = 0, used = 0;
+        CmdPool* pool = nullptr;
+        Cmd*     cmd[kFbCmds] = {};
+        uint32_t cmdUsed = 0;
+        // frameBufVerify: the frame-end readback of every FrameBuf, and the shadow bytes it must equal.
+        Buffer*              vRb = nullptr;
+        uint64_t             vCap = 0;
+        std::vector<uint8_t> vSnap;
+        std::vector<std::pair<const FrameBuf*, uint64_t>> vList;   // buffer, offset in vRb/vSnap
+        bool                 vArmed = false;
+    };
+    FbSlot g_fbSlot[kFrameSlots];
+    // Heartbeat: bytes and copies this frame (reset by beginFrameSlot), verify totals (session).
+    uint64_t g_fbBytesFrame = 0, g_fbCopiesFrame = 0, g_fbBytesLast = 0, g_fbCopiesLast = 0;
+    uint64_t g_fbVerifyFrames = 0, g_fbVerifyBad = 0;
+
+    void fbSlotReset(uint32_t s) {
+        FbSlot& fs = g_fbSlot[s];
+        fs.used = 0;
+        if (fs.pool && fs.cmdUsed) { resetCmdPool(g_live.pRenderer, fs.pool); }
+        fs.cmdUsed = 0;
+    }
+
+    // A CPU_TO_GPU buffer of at least `bytes`; the old one is parked on this frame's serial (an
+    // earlier chunk of it may still be copying from it).
+    bool fbGrow(Buffer** pp, uint64_t* cap, uint64_t bytes, ResourceMemoryUsage usage, const char* name) {
+        uint64_t n = (*cap > 0) ? *cap : (4ull << 20);
+        while (n < bytes) { n *= 2; }
+        BufferLoadDesc d = {};
+        d.mDesc.mMemoryUsage = usage;
+        d.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT | BUFFER_CREATION_FLAG_NO_DESCRIPTOR_VIEW_CREATION;
+        d.mDesc.mSize = n;
+        d.mDesc.pName = name;
+        Buffer* nb = nullptr;
+        d.ppBuffer = &nb;
+        addResource(&d, nullptr);
+        if (!nb || !nb->pCpuMappedAddress) {
+            if (nb) { removeResource(nb); }
+            return false;
+        }
+        if (*pp) { g_bufRetire.push_back({ *pp, g_frameSerial }); }
+        *pp = nb;
+        *cap = n;
+        return true;
+    }
+
+    // Records the copies for everything dirtied since the last flush into a fresh cmd of recSlot,
+    // or returns null when nothing is dirty. frameEnd: also arm the verify readback. phase: the GPU
+    // phase index the copies are timed under (a frame's chunk flush), or kGpuPhaseCount for none.
+    Cmd* recordFrameBufFlush(bool frameEnd, uint32_t phase) {
+        Renderer* R = g_live.pRenderer;
+        const bool verify = frameEnd && g_frameBufVerify;
+        uint64_t need = 0;
+        uint32_t count = 0;
+        for (auto& kv : g_frameBufs) {
+            const FrameBuf& f = kv.second;
+            if (f.dirtyHi > f.dirtyLo) { need += (f.dirtyHi - f.dirtyLo + 15u) & ~15ull; ++count; }
+        }
+        if (count == 0 && !verify) { return nullptr; }
+
+        FbSlot& fs = g_fbSlot[g_live.recSlot];
+        if (!fs.pool) {
+            CmdPoolDesc pd = {};
+            pd.pQueue = g_live.pQueue;
+            initCmdPool(R, &pd, &fs.pool);
+            CmdDesc cd = {};
+            cd.pPool = fs.pool;
+            for (uint32_t i = 0; i < kFbCmds; ++i) { initCmd(R, &cd, &fs.cmd[i]); }
+        }
+        if (fs.cmdUsed >= kFbCmds) {
+            // Only a burst of between-frames submits gets here; each of those waits for itself, so
+            // the queue is idle of this slot's copies and both the pool and the ring can restart.
+            waitQueueIdle(g_live.pQueue);
+            fbSlotReset(g_live.recSlot);
+        }
+        if (need > 0 && fs.used + need > fs.cap) {
+            // A fresh ring at least this frame's whole usage so far; the old one is parked.
+            if (!fbGrow(&fs.ring, &fs.cap, fs.used + need, RESOURCE_MEMORY_USAGE_CPU_TO_GPU, "frameBufRing")) {
+                LOG::logline("!! [framebuf] upload ring alloc FAILED (%llu bytes) — frame data NOT delivered",
+                             (unsigned long long)(fs.used + need));
+                return nullptr;
+            }
+            fs.used = 0;
+        }
+
+        Cmd* c = fs.cmd[fs.cmdUsed++];
+        beginCmd(c);
+        ID3D12GraphicsCommandList* cl = c->mDx.pCmdList;
+        QueryPool* qp = (phase < kGpuPhaseCount) ? g_live.pGpuQueryPool[g_live.recSlot] : nullptr;
+        if (qp) {
+            QueryDesc q = {}; q.mIndex = phase;
+            cmdBeginQuery(c, qp, &q);
+            g_gpuPhaseIssued[phase] = true;
+        }
+        std::vector<BufferBarrier> bb;
+        bb.reserve(count);
+        for (auto& kv : g_frameBufs) {
+            const FrameBuf& f = kv.second;
+            if (f.dirtyHi > f.dirtyLo) {
+                BufferBarrier b = {};
+                b.pBuffer = f.gpu;
+                b.mCurrentState = f.state;
+                b.mNewState = RESOURCE_STATE_COPY_DEST;
+                bb.push_back(b);
+            }
+        }
+        if (!bb.empty()) { cmdResourceBarrier(c, (uint32_t)bb.size(), bb.data(), 0, nullptr, 0, nullptr); }
+        uint8_t* ringCpu = fs.ring ? (uint8_t*)fs.ring->pCpuMappedAddress : nullptr;
+        for (auto& kv : g_frameBufs) {
+            FrameBuf& f = kv.second;
+            if (f.dirtyHi <= f.dirtyLo) { continue; }
+            const uint64_t n = f.dirtyHi - f.dirtyLo;
+            std::memcpy(ringCpu + fs.used, f.shadow + f.dirtyLo, (size_t)n);
+            cl->CopyBufferRegion(f.gpu->mDx.pResource, f.dirtyLo, fs.ring->mDx.pResource, fs.used, n);
+            fs.used += (n + 15u) & ~15ull;
+            g_fbBytesFrame += n;
+            ++g_fbCopiesFrame;
+            f.dirtyLo = UINT64_MAX;
+            f.dirtyHi = 0;
+        }
+        for (BufferBarrier& b : bb) {
+            b.mNewState = b.mCurrentState;   // back to the buffer's own resting state
+            b.mCurrentState = RESOURCE_STATE_COPY_DEST;
+        }
+        if (!bb.empty()) { cmdResourceBarrier(c, (uint32_t)bb.size(), bb.data(), 0, nullptr, 0, nullptr); }
+        if (qp) { QueryDesc q = {}; q.mIndex = phase; cmdEndQuery(c, qp, &q); }
+
+        if (verify) {
+            uint64_t total = 0;
+            for (auto& kv : g_frameBufs) { total += (kv.second.size + 15u) & ~15ull; }
+            if (total > fs.vCap && !fbGrow(&fs.vRb, &fs.vCap, total, RESOURCE_MEMORY_USAGE_GPU_TO_CPU, "frameBufVerifyRb")) {
+                LOG::logline("!! [framebuf] verify readback alloc FAILED — verify skipped");
+            } else {
+                // GENERIC_READ includes COPY_SOURCE; a buffer resting in another state is moved to
+                // COPY_SOURCE and back. The snapshot is the shadow NOW, which is exactly what the
+                // copies above just delivered.
+                fs.vSnap.resize((size_t)total);
+                fs.vList.clear();
+                uint64_t off = 0;
+                for (auto& kv : g_frameBufs) {
+                    const FrameBuf& f = kv.second;
+                    const bool toSrc = (f.state & RESOURCE_STATE_COPY_SOURCE) == 0;
+                    BufferBarrier vb = {};
+                    vb.pBuffer = f.gpu;
+                    vb.mCurrentState = f.state;
+                    vb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+                    if (toSrc) { cmdResourceBarrier(c, 1, &vb, 0, nullptr, 0, nullptr); }
+                    cl->CopyBufferRegion(fs.vRb->mDx.pResource, off, f.gpu->mDx.pResource, 0, f.size);
+                    if (toSrc) {
+                        vb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                        vb.mNewState = f.state;
+                        cmdResourceBarrier(c, 1, &vb, 0, nullptr, 0, nullptr);
+                    }
+                    std::memcpy(fs.vSnap.data() + off, f.shadow, (size_t)f.size);
+                    fs.vList.push_back({ &f, off });
+                    off += (f.size + 15u) & ~15ull;
+                }
+                fs.vArmed = true;
+            }
+        }
+        endCmd(c);
+        return c;
+    }
+
+    // queueSubmit on the frame queue, with the FrameBuf copies (if any) first. Every submit that
+    // may read a FrameBuf goes through here. frameEnd = the frame's last submit (arms verify).
+    void frameSubmit(QueueSubmitDesc* d, bool frameEnd = false, uint32_t phase = kGpuPhaseCount) {
+        Cmd* f = recordFrameBufFlush(frameEnd, phase);
+        if (!f) { queueSubmit(g_live.pQueue, d); return; }
+        Cmd* cmds[8] = {};
+        ASSERT(d->mCmdCount < 8);
+        cmds[0] = f;
+        for (uint32_t i = 0; i < d->mCmdCount; ++i) { cmds[i + 1] = d->ppCmds[i]; }
+        QueueSubmitDesc s = *d;
+        s.mCmdCount = d->mCmdCount + 1;
+        s.ppCmds = cmds;
+        queueSubmit(g_live.pQueue, &s);
+    }
+
+    // Slot s's frame has retired: compare its verify readback, if one was armed.
+    void fbVerifyDrain(uint32_t s) {
+        FbSlot& fs = g_fbSlot[s];
+        if (!fs.vArmed) { return; }
+        fs.vArmed = false;
+        const uint8_t* rb = (const uint8_t*)fs.vRb->pCpuMappedAddress;
+        ++g_fbVerifyFrames;
+        static uint32_t s_logged = 0;
+        for (const auto& e : fs.vList) {
+            const FrameBuf& f = *e.first;
+            const uint8_t* a = rb + e.second;
+            const uint8_t* b = fs.vSnap.data() + e.second;
+            if (std::memcmp(a, b, (size_t)f.size) == 0) { continue; }
+            ++g_fbVerifyBad;
+            if (s_logged < 32) {
+                ++s_logged;
+                uint64_t lo = 0, hi = f.size;
+                while (lo < f.size && a[lo] == b[lo]) { ++lo; }
+                while (hi > lo && a[hi - 1] == b[hi - 1]) { --hi; }
+                LOG::logline("!! [framebuf] VERIFY MISMATCH '%s' bytes [%llu, %llu) of %llu — GPU copy != CPU shadow",
+                             f.name, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)f.size);
+            }
+        }
+    }
+
+    // removeResource for a buffer that may be a FrameBuf. Callers own the GPU-idle guarantee, as
+    // they did for the removeResource this replaces.
+    void removeFrameBuf(Buffer* b) {
+        if (!b) { return; }
+        auto it = g_frameBufs.find(b);
+        if (it != g_frameBufs.end()) {
+            for (FbSlot& fs : g_fbSlot) { fs.vArmed = false; }   // its entry in vList would dangle
+            _aligned_free(it->second.shadow);
+            g_frameBufs.erase(it);
+        }
+        removeResource(b);
+    }
+
+    void fbShutdown(Renderer* R) {
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            FbSlot& fs = g_fbSlot[s];
+            for (uint32_t i = 0; i < kFbCmds; ++i) { if (fs.cmd[i]) { exitCmd(R, fs.cmd[i]); } }
+            if (fs.pool) { exitCmdPool(R, fs.pool); }
+            if (fs.ring) { removeResource(fs.ring); }
+            if (fs.vRb)  { removeResource(fs.vRb); }
+            fs = FbSlot{};
+        }
+        for (auto& kv : g_frameBufs) {
+            _aligned_free(kv.second.shadow);
+            removeResource(kv.second.gpu);
+        }
+        g_frameBufs.clear();
+    }
+
     void freeMeshStore() {
         if (g_meshes) {
             for (uint32_t i = 0; i < g_meshHigh; ++i) {
@@ -26598,11 +27080,10 @@ namespace {
                     releaseMeshBuffers(g_meshes[i]);
                 }
             }
-            // Teardown: releaseMeshBuffers PARKS into g_bufRetire, and there is no next frame to
-            // drain it — free here or the whole store leaks past shutdown. Callers have already
-            // waited the frame fence (shutdown()) or never submitted anything, so this is safe.
-            for (Buffer* b : g_bufRetire) { removeResource(b); }
-            g_bufRetire.clear();
+            // Teardown: releaseMeshBuffers PARKS into the retire lists, and there is no next frame
+            // to drain them — free here or the whole store leaks past shutdown. Callers have already
+            // waited the frame fences (shutdown()) or never submitted anything, so this is safe.
+            drainRetired(UINT64_MAX);
             tf_free(g_meshes);
         }
         g_meshes   = nullptr;
@@ -26657,7 +27138,7 @@ namespace {
             pb.mDesc.mSize        = sizeof(RippleSimParams);
             pb.mDesc.pName        = name;
             pb.ppBuffer           = &G.cbv[i];
-            addResource(&pb, nullptr);
+            addFrameBuf(&pb);
         }
 
         // (2b) ACTIVE TILES. One uint per 16x16 tile for each mask and list; 8 uints of args. Tiny
@@ -26698,7 +27179,7 @@ namespace {
             BufferLoadDesc rr = {};
             rr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
             rr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            rr.mDesc.mSize        = sizeof(uint32_t) * 8u;
+            rr.mDesc.mSize        = kRbLane * kFrameSlots;
             rr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
             rr.mDesc.pName        = "rippleTileReadback";
             rr.ppBuffer           = &G.tileReadback;
@@ -26718,7 +27199,7 @@ namespace {
             static const uint32_t kReset[8] = { 0u, 1u, 1u, 0u, 0u, 1u, 1u, 0u };
             std::memcpy(G.tileArgsReset->pCpuMappedAddress, kReset, sizeof(kReset));
             if (G.tileReadback->pCpuMappedAddress) {
-                std::memset(G.tileReadback->pCpuMappedAddress, 0xFF, sizeof(kReset));   // "no read yet"
+                std::memset(G.tileReadback->pCpuMappedAddress, 0xFF, kRbLane * kFrameSlots);   // "no read yet"
             }
         } else {
             LOG::logline("!! [ripple] %s active-tile buffers FAILED — this grid steps the whole domain", tag);
@@ -26864,7 +27345,7 @@ namespace {
             pb.mDesc.mSize        = sizeof(CausticParams);
             pb.mDesc.pName        = nm;
             pb.ppBuffer           = &g_live.pCausticCbv[i];
-            addResource(&pb, nullptr);
+            addFrameBuf(&pb);
         }
 
         waitForAllResourceLoads();
@@ -27171,8 +27652,8 @@ namespace {
         // BOTH buffers are written NOW, before any dispatch is recorded. [0] drives the first
         // sub-step (scroll + this frame's births), [1] the second (inert). See the declaration for
         // why this cannot be one buffer mutated between cmdDispatch calls.
-        RippleSimParams* rp  = (RippleSimParams*)G.cbv[0]->pCpuMappedAddress;
-        RippleSimParams* rp1 = (RippleSimParams*)G.cbv[1]->pCpuMappedAddress;
+        RippleSimParams* rp  = (RippleSimParams*)fbw(G.cbv[0]);
+        RippleSimParams* rp1 = (RippleSimParams*)fbw(G.cbv[1]);
         std::memset(rp,  0, sizeof(*rp));
         std::memset(rp1, 0, sizeof(*rp1));
         rp->sim[0] = rp1->sim[0] = (float)G.grid;
@@ -27422,8 +27903,8 @@ namespace {
                     rp->tiles[3]  = 1.0f - std::exp(-rate * rp->wave[1]);
                     rp1->tiles[3] = 1.0f - std::exp(-rate * rp1->wave[1]);
                 }
-                if (tiled && G.tiledLast && G.calmFrames > 6u && G.tileReadback->pCpuMappedAddress) {
-                    const uint32_t nz = ((const uint32_t*)G.tileReadback->pCpuMappedAddress)[3];
+                if (tiled && G.tiledSlot[g_readSlot] && G.calmFrames > 6u && G.tileReadback->pCpuMappedAddress) {
+                    const uint32_t nz = ((const uint32_t*)rbLane(G.tileReadback))[3];
                     G.zeroReads = (nz == 0u) ? G.zeroReads + 1u : 0u;
                     if (G.zeroReads >= 2u) {
                         G.sleeping = true;
@@ -27559,20 +28040,20 @@ namespace {
 
         // Stage the last sub-step's counts for a read ONE FRAME LATE (pAplReadback's arrangement):
         // readback[0] = tiles stepped, [3] = tiles left non-zero, [4] = 4 x slope tiles.
-        G.tiledLast = tiled;
+        G.tiledSlot[g_live.recSlot] = tiled;
         if (tiled) {
             argsTo(RESOURCE_STATE_COPY_SOURCE);
             g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                G.tileReadback->mDx.pResource, 0, G.tileArgs->mDx.pResource, 0, sizeof(uint32_t) * 8);
+                G.tileReadback->mDx.pResource, rbLaneOff(), G.tileArgs->mDx.pResource, 0, sizeof(uint32_t) * 8);
             BufferBarrier sb = {}; sb.pBuffer = G.tileStats;
             sb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; sb.mNewState = RESOURCE_STATE_COPY_SOURCE;
             cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
             g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                G.tileReadback->mDx.pResource, sizeof(uint32_t) * 3, G.tileStats->mDx.pResource, 0,
+                G.tileReadback->mDx.pResource, rbLaneOff() + sizeof(uint32_t) * 3, G.tileStats->mDx.pResource, 0,
                 sizeof(uint32_t));
             // readback[7] = audit violations (wakeTileCheck), args[7] being unused.
             g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                G.tileReadback->mDx.pResource, sizeof(uint32_t) * 7, G.tileStats->mDx.pResource,
+                G.tileReadback->mDx.pResource, rbLaneOff() + sizeof(uint32_t) * 7, G.tileStats->mDx.pResource,
                 sizeof(uint32_t), sizeof(uint32_t));
             sb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; sb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
             cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
@@ -27705,7 +28186,7 @@ namespace {
             cb.mDesc.mSize         = (uint64_t)kMaxGrassCrushers * 32;
             cb.mDesc.pName         = "grassCrushers";
             cb.ppBuffer            = &g_live.pGrassCrushersBuf;
-            addResource(&cb, nullptr);
+            addFrameBuf(&cb);
         }
 
         {
@@ -27716,7 +28197,7 @@ namespace {
             pb.mDesc.mSize        = sizeof(GrassCrushParams);
             pb.mDesc.pName        = "grassCrushParams";
             pb.ppBuffer           = &g_live.pGrassCrushCbv;
-            addResource(&pb, nullptr);
+            addFrameBuf(&pb);
         }
 
         waitForAllResourceLoads();
@@ -27834,8 +28315,8 @@ namespace {
         // advanceRippleGrid's early-out documents, since the scroll that compensates for camera
         // motion is applied BY the dispatch.
         if (!exterior || !g_drawGrass) { parkGrassCrushField(); return; }
-        if (!g_live.pGrassCrushCbv || !g_live.pGrassCrushCbv->pCpuMappedAddress
-            || !g_live.pGrassCrushersBuf || !g_live.pGrassCrushersBuf->pCpuMappedAddress) {
+        if (!g_live.pGrassCrushCbv || !fbr(g_live.pGrassCrushCbv)
+            || !g_live.pGrassCrushersBuf || !fbr(g_live.pGrassCrushersBuf)) {
             parkGrassCrushField();
             return;
         }
@@ -27897,7 +28378,7 @@ namespace {
         // missing imprint is most obvious. Double cover in third person is harmless — `min` is
         // idempotent.
         {
-            float* cb = (float*)g_live.pGrassCrushersBuf->pCpuMappedAddress;
+            float* cb = (float*)fbw(g_live.pGrassCrushersBuf);
             // Only THIS frame's harvest counts — see g_grassCrushHarvestFrame.
             uint32_t n = (g_grassCrushHarvestFrame == g_renderFrame)
                        ? (uint32_t)(g_grassCrushers.size() / 8) : 0u;
@@ -27918,7 +28399,7 @@ namespace {
         }
 
         {
-            GrassCrushParams* p = (GrassCrushParams*)g_live.pGrassCrushCbv->pCpuMappedAddress;
+            GrassCrushParams* p = (GrassCrushParams*)fbw(g_live.pGrassCrushCbv);
             std::memset(p, 0, sizeof(*p));
             p->domain[0] = newOX;
             p->domain[1] = newOY;
@@ -28062,7 +28543,7 @@ namespace {
         pb.mDesc.mSize        = kFroxelParamsBytes;
         pb.mDesc.pName        = "froxelParams";
         pb.ppBuffer           = &g_live.pFroxelParamsCbv;
-        addResource(&pb, nullptr);
+        addFrameBuf(&pb);
 
         waitForAllResourceLoads();
         if (!g_live.pFroxelMask || !g_live.pFroxelParamsCbv) {
@@ -28128,7 +28609,7 @@ namespace {
             pbn.mDesc.mSize        = kFroxelParamsBytes;
             pbn.mDesc.pName        = "froxelParamsNear";
             pbn.ppBuffer           = &g_live.pFroxelParamsCbvNear;
-            addResource(&pbn, nullptr);
+            addFrameBuf(&pbn);
 
             waitForAllResourceLoads();
             if (g_live.pFroxelMaskNear && g_live.pFroxelParamsCbvNear) {
@@ -28726,8 +29207,8 @@ namespace {
             char jsonPath[MAX_PATH] = {};
             std::snprintf(jsonPath, sizeof(jsonPath), "hdrdump\\mge_%04u.json", s_next);
             if (FILE* jf = std::fopen(jsonPath, "w")) {
-                const float* fdr = (g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress)
-                                 ? (const float*)g_live.pFrameCbv->pCpuMappedAddress : nullptr;
+                const float* fdr = (g_live.pFrameCbv && fbr(g_live.pFrameCbv))
+                                 ? (const float*)fbr(g_live.pFrameCbv) : nullptr;
                 std::fprintf(jf, "{\n  \"exr\": \"mge_%04u.exr\",\n  \"render\": [%u, %u],\n", s_next, W, H);
                 std::fprintf(jf, "  \"viewProjConvention\": \"row-vector clip=[x y z 1]*M, pos relative to eyeAbs\",\n");
                 std::fprintf(jf, "  \"viewProj\": [");
@@ -29085,23 +29566,29 @@ void destroyHostWindow(Renderer* R);
         clearVal.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         clearVal.Color[3] = 0.0f;   // transparent bg: alpha = coverage mask for the alpha-blend composite
 
-        std::printf("[forge] live CreateCommittedResource (SHARED)...\n");
-        HRESULT hr = pDevice->CreateCommittedResource(
-            &heapProps, D3D12_HEAP_FLAG_SHARED, &resDesc,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, &clearVal, IID_PPV_ARGS(&g_live.pSharedRes));
-        if (FAILED(hr) || !g_live.pSharedRes) {
-            std::printf("[forge] live CreateCommittedResource FAILED 0x%08lX\n", (unsigned long)hr);
-            shutdown();
-            return false;
+        // One per frame slot (P3). Created in COMMON — the state every frame hands the RT back in —
+        // so the first frame in each slot takes the same COMMON -> RENDER_TARGET barrier as every
+        // later one. (A single RT created RENDER_TARGET used to skip that barrier on firstFrame;
+        // with two, the second RT's first use is frame 1, when firstFrame is already false.)
+        HRESULT hr = S_OK;
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            std::printf("[forge] live CreateCommittedResource (SHARED, slot %u)...\n", s);
+            hr = pDevice->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_SHARED, &resDesc,
+                D3D12_RESOURCE_STATE_COMMON, &clearVal, IID_PPV_ARGS(&g_live.pSharedResS[s]));
+            if (FAILED(hr) || !g_live.pSharedResS[s]) {
+                std::printf("[forge] live CreateCommittedResource FAILED 0x%08lX\n", (unsigned long)hr);
+                shutdown();
+                return false;
+            }
+            hr = pDevice->CreateSharedHandle(g_live.pSharedResS[s], nullptr, GENERIC_ALL, nullptr, &g_live.ntHandles[s]);
+            if (FAILED(hr) || !g_live.ntHandles[s]) {
+                std::printf("[forge] live CreateSharedHandle FAILED 0x%08lX\n", (unsigned long)hr);
+                shutdown();
+                return false;
+            }
+            std::printf("[forge] live shared NT handle[%u] = %p\n", s, (void*)g_live.ntHandles[s]);
         }
-
-        hr = pDevice->CreateSharedHandle(g_live.pSharedRes, nullptr, GENERIC_ALL, nullptr, &g_live.ntHandle);
-        if (FAILED(hr) || !g_live.ntHandle) {
-            std::printf("[forge] live CreateSharedHandle FAILED 0x%08lX\n", (unsigned long)hr);
-            shutdown();
-            return false;
-        }
-        std::printf("[forge] live shared NT handle = %p\n", (void*)g_live.ntHandle);
 
         // Tier 1 probe/mechanism: a SHARED monotonic fence alongside the shared RT. D3D12_FENCE_FLAG_SHARED
         // is required for CreateSharedHandle, and the client imports the NT handle as a Vulkan TIMELINE
@@ -29121,8 +29608,11 @@ void destroyHostWindow(Renderer* R);
             std::printf("[forge] live shared FENCE NT handle = %p\n", (void*)g_live.ntFenceHandle);
             // The event handoff rides on the same fence, so it only exists alongside it. Manual
             // reset, initially SIGNALLED = "no SetEventOnCompletion registration outstanding".
-            g_live.hFrameEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-            std::printf("[forge] live shared frame EVENT = %p\n", (void*)g_live.hFrameEvent);
+            for (uint32_t s = 0; s < kFrameSlots; ++s) {
+                g_live.hFrameEvents[s] = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+                std::printf("[forge] live shared frame EVENT[%u] = %p\n", s, (void*)g_live.hFrameEvents[s]);
+            }
+            g_live.hFrameEvent = g_live.hFrameEvents[0];
         }
         g_live.sharedFenceValue = 0;
         g_frameEventBroken = false;
@@ -29135,15 +29625,19 @@ void destroyHostWindow(Renderer* R);
         rtDesc.mMipLevels = 1;
         rtDesc.mSampleCount = SAMPLE_COUNT_1;
         rtDesc.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
-        rtDesc.mStartState = RESOURCE_STATE_RENDER_TARGET;
+        rtDesc.mStartState = RESOURCE_STATE_COMMON;   // informational: Forge adopts, never creates, a native RT
         rtDesc.mClearValue.r = 0.0f;
         rtDesc.mClearValue.g = 0.0f;
         rtDesc.mClearValue.b = 0.0f;
         rtDesc.mClearValue.a = 0.0f;   // transparent bg: alpha = coverage mask for the composite
         rtDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-        rtDesc.pNativeHandle = (void*)g_live.pSharedRes;
-        rtDesc.pName = "liveSharedRT";
-        addRenderTarget(R, &rtDesc, &g_live.pRT);
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            rtDesc.pNativeHandle = (void*)g_live.pSharedResS[s];
+            rtDesc.pName = s ? "liveSharedRT1" : "liveSharedRT0";
+            addRenderTarget(R, &rtDesc, &g_live.pRTs[s]);
+        }
+        g_live.pRT        = g_live.pRTs[0];
+        g_live.pSharedRes = g_live.pSharedResS[0];
 
         // Decide the SCENE colour format now — before any render target or pipeline is built, since
         // both bake it in. See the sceneColorFormat declaration for which resources have to follow it
@@ -29214,14 +29708,18 @@ void destroyHostWindow(Renderer* R);
             return false;
         }
 
-        CmdPoolDesc cmdPoolDesc = {};
-        cmdPoolDesc.pQueue = g_live.pQueue;
-        initCmdPool(R, &cmdPoolDesc, &g_live.pCmdPool);
-        CmdDesc cmdDesc = {};
-        cmdDesc.pPool = g_live.pCmdPool;
-        initCmd(R, &cmdDesc, &g_live.pCmd);
-        initCmd(R, &cmdDesc, &g_live.pCmdB);   // O1: chunk-B cmd for the intra-frame split-submit
-        initFence(R, &g_live.pFence);
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            CmdPoolDesc cmdPoolDesc = {};
+            cmdPoolDesc.pQueue = g_live.pQueue;
+            initCmdPool(R, &cmdPoolDesc, &g_live.pCmdPool[s]);
+            CmdDesc cmdDesc = {};
+            cmdDesc.pPool = g_live.pCmdPool[s];
+            initCmd(R, &cmdDesc, &g_live.pCmdA[s]);
+            initCmd(R, &cmdDesc, &g_live.pCmdB[s]);   // O1: chunk-B cmd for the intra-frame split-submit
+            initFence(R, &g_live.pFence[s]);
+        }
+        g_live.recSlot = 0;
+        g_live.pCmd = g_live.pCmdA[0];
         // Tier 1: separate pool/cmd/fence for between-frames GPU work (see pAuxCmdPool). Own pool is
         // the point — a shared allocator cannot be reset while the frame it recorded is in flight.
         CmdPoolDesc auxPoolDesc = {};
@@ -29698,16 +30196,22 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
-    void* sharedHandle() {
-        return (void*)g_live.ntHandle;
+    void* sharedHandle(unsigned slot) {
+        return slot < kFrameSlots ? (void*)g_live.ntHandles[slot] : nullptr;
     }
 
     void* sharedFenceHandle() {
         return (void*)g_live.ntFenceHandle;
     }
 
-    void* frameEventHandle() {
-        return (void*)g_live.hFrameEvent;
+    void* frameEventHandle(unsigned slot) {
+        return slot < kFrameSlots ? (void*)g_live.hFrameEvents[slot] : nullptr;
+    }
+
+    // The slot whose RT (and event) the last delivered frame used. recSlot is the slot of the frame
+    // last recorded — by renderScene, or by the triangle path, which takes the next slot the same way.
+    unsigned lastRtSlot() {
+        return g_live.recSlot;
     }
 
     // 0 when the host has no shared fence — the client reads that as "no sync object, don't
@@ -29862,10 +30366,11 @@ void destroyHostWindow(Renderer* R);
         return g_live.pOpaquePipeline != nullptr;
     }
 
-    // Tier 1 top-of-frame settle. Defined just above renderScene (that is where it belongs); declared
-    // here because every path that wants the frame's cmd pool / fence for itself must call it first,
-    // and renderFrame below is the one such path that precedes the definition.
-    void settleFrameFence(Renderer* R);
+    // Frame-slot settles. Defined just above renderScene (that is where they belong); declared here
+    // because every path that wants the frame's cmd pool / fence for itself must settle first, and
+    // renderFrame below is the one such path that precedes the definition.
+    void settleAllFrames(Renderer* R);
+    void beginFrameSlot(Renderer* R);
 
     bool renderFrame(unsigned frameIndex) {
         if (!g_live.pRenderer || !g_live.pPipeline) {
@@ -29875,16 +30380,21 @@ void destroyHostWindow(Renderer* R);
 
         // Tier 1: the bring-up triangle path shares the frame's cmd pool and fence, and the server
         // chooses between it and renderScene per frame — so a renderScene frame may still be
-        // executing when we get here. Settle it before resetting the allocator. This path keeps its
-        // own end-of-frame wait below, so its reply still implies GPU-complete.
-        settleFrameFence(R);
-        resetCmdPool(R, g_live.pCmdPool);
+        // executing when we get here. Settle both slots before resetting the allocator. This path
+        // keeps its own end-of-frame wait below, so its reply still implies GPU-complete.
+        settleAllFrames(R);
+        // ...and it takes the NEXT slot, exactly like a scene frame (P4). It used to draw into
+        // recSlot's RT — the last scene frame's — which is the RT a 1.5-ahead client has not copied
+        // yet (the copy runs at its blit point, after this kick). The next slot's previous user was
+        // copied before the client kicked this frame, the same guarantee a scene frame relies on.
+        beginFrameSlot(R);
+        const uint32_t s = g_live.recSlot;
+        resetCmdPool(R, g_live.pCmdPool[s]);
         beginCmd(g_live.pCmd);
 
-        // Steady state between frames is COMMON (handed off to D3D9). Transition
-        // back to RENDER_TARGET for the draw — except the very first frame, which
-        // the resource was created in RENDER_TARGET state for.
-        if (!g_live.firstFrame) {
+        // Steady state between frames is COMMON (handed off to D3D9) — and both shared RTs are
+        // created in COMMON too (P3), so this transition holds on every frame, the first included.
+        {
             RenderTargetBarrier toRT = {};
             toRT.pRenderTarget = g_live.pRT;
             toRT.mCurrentState = RESOURCE_STATE_COMMON;
@@ -29914,10 +30424,14 @@ void destroyHostWindow(Renderer* R);
         QueueSubmitDesc submitDesc = {};
         submitDesc.mCmdCount = 1;
         submitDesc.ppCmds = &g_live.pCmd;
-        submitDesc.pSignalFence = g_live.pFence;
+        submitDesc.pSignalFence = g_live.pFence[s];
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
-        waitForFences(R, 1, &g_live.pFence);
+        waitForFences(R, 1, &g_live.pFence[s]);
+        // Retired already (waited above) and nothing to read back: the slot records the serial so
+        // retirements parked on it free at the next drain, and stays not-pending.
+        g_slot[s].serial  = g_frameSerial;
+        g_slot[s].pending = false;
 
         g_live.firstFrame = false;
         (void)frameIndex;
@@ -31100,11 +31614,11 @@ void destroyHostWindow(Renderer* R);
             std::printf("[forge] scene-probe: motion vectors NOT READY - nothing to report\n");
             return;
         }
-        if (!g_live.pMvStatsReadback || !g_live.pMvStatsReadback->pCpuMappedAddress) {
+        if (!g_live.pMvStatsReadback || !fbr(g_live.pMvStatsReadback)) {
             std::printf("[forge] scene-probe: mv stats readback unavailable\n");
             return;
         }
-        const uint32_t* st = (const uint32_t*)g_live.pMvStatsReadback->pCpuMappedAddress;
+        const uint32_t* st = (const uint32_t*)rbLane(g_live.pMvStatsReadback);
         const uint32_t total = st[3];
         if (total == 0u) {
             std::printf("[forge] scene-probe: mv stats EMPTY (the dispatch never ran)\n");
@@ -31387,17 +31901,17 @@ void destroyHostWindow(Renderer* R);
         cl->ResourceBarrier(2, post);
     }
 
-    // Tier 1: settle the PREVIOUS frame and drain everything that was only readable once its fence
-    // signalled. Called from the TOP of renderScene (and from every between-frames path that needs
-    // the frame's cmd pool / fence for itself), never from the end of a frame.
+    // Frame slots: settle a slot and drain everything that was only readable once its frame's fence
+    // signalled. beginFrameSlot (top of renderScene) settles the slot about to be recorded — frame
+    // F-2 when recording F — and, without blocking, the other slot if its frame is already done.
+    // settleAllFrames settles both, for the between-frames paths that use the frame's objects.
     //
-    // Ordering here is load-bearing and easy to break silently: pGpuQueryPool is SINGLE-buffered
-    // (one pool, kGpuPhaseCount slots) and so are the three readback buffers, so N-1's values must
-    // be read AFTER N-1's fence and BEFORE frame N records into the same pool. That is exactly this
-    // spot and nowhere else. No ring is needed as long as it stays here.
+    // Each slot has its own timestamp pool and its own readback lanes, so a drain only has to run
+    // before THAT slot records again, which beginFrameSlot guarantees. Drains run oldest frame
+    // first, so every "last" value ends on the freshest settled frame (g_readSlot).
     //
-    // Everything this fills is therefore one frame stale by construction. That is a diagnostic cost
-    // only, EXCEPT for g_lastGpuMs — see below.
+    // Everything this fills is therefore at least one frame stale by construction. That is a
+    // diagnostic cost only, EXCEPT for g_lastGpuMs — see below.
     // Frame trace: one GPU phase's timestamps as a span on the QPC axis. Calibrated per call against
     // the graphics queue (GetClockCalibration: a GPU tick and the QPC at the same instant), so GPU
     // clock drift over a long session never skews the boxes. Only runs with MGE_FRAME_TRACE=1.
@@ -31419,18 +31933,19 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseHizMip0, "hiz mip0" }, { kGpuPhaseReLinear, "relin" }, { kGpuPhaseApl, "apl" },
             { kGpuPhaseGrassDepth, "grass depth" }, { kGpuPhaseGrassColor, "grass" }, { kGpuPhaseSkyVis, "skyvis" },
             { kGpuPhaseSkyVisScreen, "skyvis screen" }, { kGpuPhaseRippleSim, "ripple sim" },
+            { kGpuPhaseFbCopyA, "fb copy A" }, { kGpuPhaseFbCopyB, "fb copy B" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
         return "?";
     }
-    void traceGpuPhase(uint32_t i, uint64_t b, uint64_t e) {
+    void traceGpuPhase(uint32_t i, uint64_t b, uint64_t e, uint64_t fv) {
         static uint64_t s_calFrame = ~0ull;
         static UINT64 s_gpuTs = 0, s_cpuTs = 0;
         static double s_qpcFreq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
         static bool s_calOk = false;
-        if (s_calFrame != g_live.sharedFenceValue) {   // once per settled frame
-            s_calFrame = g_live.sharedFenceValue;
+        if (s_calFrame != fv) {   // once per settled frame
+            s_calFrame = fv;
             s_calOk = g_live.pQueue && g_live.pQueue->mDx.pQueue
                    && SUCCEEDED(g_live.pQueue->mDx.pQueue->GetClockCalibration(&s_gpuTs, &s_cpuTs));
         }
@@ -31439,49 +31954,49 @@ void destroyHostWindow(Renderer* R);
         const double t0 = base + ((double)(int64_t)(b - s_gpuTs) / g_live.gpuTickFreq) * 1000.0;
         const double t1 = base + ((double)(int64_t)(e - s_gpuTs) / g_live.gpuTickFreq) * 1000.0;
         FrameTrace::span(i == kGpuPhaseFrame ? "host GPU frame" : "host GPU", traceGpuPhaseName(i), t0, t1,
-                         (int64_t)g_live.sharedFenceValue);
+                         (int64_t)fv);
     }
 
-    void settleFrameFence(Renderer* R) {
-        if (!g_live.pFence) { return; }
-        const double tFence0 = hostNowMs();
-        FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
-        getFenceStatus(R, g_live.pFence, &fs);
-        // Still executing = the previous frame outlived everything we did after submitting it. That
-        // is the GOAL state (a saturated GPU), not a fault; counted so "the overlap is working" and
-        // "something is wedged" stay distinguishable. Mirrors the Hi-Z prologue's g_hizOverruns.
-        // Only meaningful in overlap mode. In the fail-safe blocking mode this is called immediately
-        // after the submit, where INCOMPLETE is the normal state and counting it would report a
-        // 100% overrun rate that means nothing.
-        if (fs == FENCE_STATUS_INCOMPLETE && g_clientSyncsOnFence) { ++g_frameOverruns; }
-        waitForFences(R, 1, &g_live.pFence);
-        g_lastGpuWaitMs = hostNowMs() - tFence0;
-        FrameTrace::span("host CPU", "settle wait", traceQpc(tFence0), traceQpc(tFence0 + g_lastGpuWaitMs),
-                         (int64_t)g_live.sharedFenceValue);
-        // Every submission up to this point has now retired, so anything the between-frames paths
-        // parked is safe to free (see g_texRetire). Drained before the g_framePending early-out:
-        // a load burst can queue retirements on a frame that never submitted.
-        if (!g_texRetire.empty()) {
-            for (Texture* t : g_texRetire) { removeResource(t); }
-            g_texRetire.clear();
-        }
-        if (!g_bufRetire.empty()) {
-            for (Buffer* b : g_bufRetire) { removeResource(b); }
-            g_bufRetire.clear();
-        }
-        if (!g_framePending) { return; }   // nothing submitted yet ⇒ nothing to read back
-        g_framePending = false;
+    uint32_t liveReflInstCount();   // g_liveLastInstRefl, declared with the DL globals below
+
+    // Record, at submit, what the drain of this frame will need to know about it (FrameSlotState).
+    void snapshotFrameSlot() {
+        FrameSlotState& ss = g_slot[g_live.recSlot];
+        ss.serial           = g_frameSerial;
+        ss.pending          = true;
+        ss.sharedFenceValue = g_live.sharedFenceValue;
+        std::memcpy(ss.phaseIssued, g_gpuPhaseIssued, sizeof(ss.phaseIssued));
+        ss.atmosShArmed     = g_atmosShArmed;
+        ss.reflGpuCullRan   = g_reflGpuCullRan;
+        ss.reflCpuCull      = liveReflInstCount();
+        ss.aplSplitRan      = g_aplSplitRan;
+        ss.mbRan            = g_lastMbRan;
+        ss.mbPixels         = g_lastMbPixels;
+    }
+
+    // Slot s's frame has retired on the GPU: free what was parked up to it, and read back what it
+    // staged (only once — `pending`).
+    void drainSlot(Renderer* R, uint32_t s) {
+        FrameSlotState& ss = g_slot[s];
+        if (ss.serial > g_completedSerial) { g_completedSerial = ss.serial; }
+        // Runs whether or not a frame is pending: a load burst can park retirements on a frame that
+        // never submitted.
+        drainRetired(g_completedSerial);
+        fbVerifyDrain(s);
+        if (!ss.pending) { return; }   // nothing submitted in this slot since its last drain
+        ss.pending = false;
+        g_readSlot = s;
 
         // GPU per-phase breakdown: read back the timestamps (valid now the fence has signalled).
-        if (g_live.pGpuQueryPool && g_live.gpuTickFreq > 0.0) {
+        if (g_live.pGpuQueryPool[s] && g_live.gpuTickFreq > 0.0) {
             for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
                 // A phase that recorded nothing this frame reads 0.00, not whatever it last cost.
-                if (!g_gpuPhaseIssued[i]) { g_lastGpuPhaseMs[i] = 0.0; continue; }
+                if (!ss.phaseIssued[i]) { g_lastGpuPhaseMs[i] = 0.0; continue; }
                 QueryData qd = {};
-                getQueryData(R, g_live.pGpuQueryPool, i, &qd);
+                getQueryData(R, g_live.pGpuQueryPool[s], i, &qd);
                 const uint64_t b = qd.mBeginTimestamp, e = qd.mEndTimestamp;
                 g_lastGpuPhaseMs[i] = (e > b) ? ((double)(e - b) / g_live.gpuTickFreq) * 1000.0 : 0.0;
-                if (FrameTrace::enabled() && e > b) { traceGpuPhase(i, b, e); }
+                if (FrameTrace::enabled() && e > b) { traceGpuPhase(i, b, e, ss.sharedFenceValue); }
             }
         }
         // THE ONE THAT IS NOT COSMETIC. g_lastGpuMs used to be `hostNowMs() - tRec1`, i.e. the CPU's
@@ -31537,9 +32052,9 @@ void destroyHostWindow(Renderer* R);
         // ⚠ ONE FRAME OF LATENCY, BUDGETED. The frame renders with the ambient measured from the
         // previous frame's LUTs. The sun moves ~0.004 degrees per frame and the exposure servo's time
         // constant is far longer, so nothing downstream can resolve it.
-        if (g_atmosShArmed && g_live.pAtmosShReadback
-            && g_live.pAtmosShReadback->pCpuMappedAddress) {
-            const uint32_t* ar = (const uint32_t*)g_live.pAtmosShReadback->pCpuMappedAddress;
+        if (ss.atmosShArmed && g_live.pAtmosShReadback
+            && fbr(g_live.pAtmosShReadback)) {
+            const uint32_t* ar = (const uint32_t*)rbLane(g_live.pAtmosShReadback);
             g_atmosShLastRan = ar[kAtmosShRan];
             // Decoded ONCE, here, into a held copy. skyPhysicalMeasure runs at a completely
             // different point in the frame and reading the GPU_TO_CPU buffer there would race the
@@ -31603,8 +32118,8 @@ void destroyHostWindow(Renderer* R);
 
         // Stage B (B2): GPU cull counters. [0] = frustum survivors (compare to the CPU cull's
         // g_liveLastInst in the heartbeat — they MUST match); [1] = M2 Hi-Z-occluded.
-        if (g_live.pCullCountReadback && g_live.pCullCountReadback->pCpuMappedAddress) {
-            const uint32_t* rb = (const uint32_t*)g_live.pCullCountReadback->pCpuMappedAddress;
+        if (g_live.pCullCountReadback && fbr(g_live.pCullCountReadback)) {
+            const uint32_t* rb = (const uint32_t*)rbLane(g_live.pCullCountReadback);
             g_lastGpuCullCount = rb[0];
             g_lastGpuOccluded  = rb[1];
         }
@@ -31612,25 +32127,23 @@ void destroyHostWindow(Renderer* R);
         // acceptance. [0] = Σ numSubsets over the frustum survivors — exactly what the CPU cull's
         // ring fill totals into g_liveLastInstRefl.
         //
-        // ⚠ THE COMPARISON IS AGAINST THE PREVIOUS SETTLE'S CPU COUNT, not this frame's. See
-        // g_reflCpuCullPrev: settleFrameFence runs after dlReflectGeoCull, so the live variable is
-        // one frame ahead of the readback and comparing them straight would have built an instrument
-        // that reports on camera motion instead of on the cull rule.
+        // ⚠ THE COMPARISON IS AGAINST THE CPU COUNT OF THE FRAME THE READBACK DESCRIBES — the slot's
+        // snapshot, published as g_reflCpuCullPrev for the heartbeat. The live g_liveLastInstRefl
+        // may already describe a later frame, and comparing it would build an instrument that
+        // reports on camera motion instead of on the cull rule.
         //
         // Counted rather than latched: one MISMATCH anywhere in a session is disqualifying, and a
         // single-frame flag would be overwritten by the next agreeing frame before anyone read it.
+        g_reflCpuCullPrev = ss.reflCpuCull;
         if (g_live.reflCullReady && g_live.pReflCullReadback
-            && g_live.pReflCullReadback->pCpuMappedAddress) {
-            const uint32_t* rb = (const uint32_t*)g_live.pReflCullReadback->pCpuMappedAddress;
+            && fbr(g_live.pReflCullReadback)) {
+            const uint32_t* rb = (const uint32_t*)rbLane(g_live.pReflCullReadback);
             g_lastReflGpuCullCount = rb[0];
             g_lastReflHeightOccluded = rb[1];   // H2b: subsets the height march rejected
             // Only meaningful in the VERIFY arm — with the lane driving the draw the CPU walk is
-            // skipped and g_reflCpuCullPrev is a stale 0, which would read as a permanent mismatch.
-            // ⚠ g_reflGpuCullRan IS READ HERE ONE FRAME LATE ON PURPOSE, and that is correct rather
-            // than a bug to tidy: settleFrameFence runs BEFORE this frame's cull phase clears it, so
-            // it still holds the answer for the frame the readback describes. Zeroing it earlier
-            // would make this gate ask about the wrong frame.
-            if (g_reflCullVerify && !g_reflGpuCull && g_reflGpuCullRan) {
+            // skipped and the CPU count is a stale 0, which would read as a permanent mismatch.
+            // Whether the lane RAN is also that frame's snapshot, not the live flag.
+            if (g_reflCullVerify && !g_reflGpuCull && ss.reflGpuCullRan) {
                 if (g_lastReflGpuCullCount == g_reflCpuCullPrev) { ++g_reflCullMatchFrames; }
                 else                                             { ++g_reflCullMismatches; }
             }
@@ -31641,8 +32154,8 @@ void destroyHostWindow(Renderer* R);
         // cullscatter drops rows past its kMaxInst guard with a bare `continue`, so at the ceiling
         // the field just thins, which looks exactly like the density knob or like that hillside
         // having less grass on it. Once per session — a full ring stays full for many frames.
-        if (g_live.pGrassCullReadback && g_live.pGrassCullReadback->pCpuMappedAddress) {
-            g_grassLastSurvivors = *(const uint32_t*)g_live.pGrassCullReadback->pCpuMappedAddress;
+        if (g_live.pGrassCullReadback && fbr(g_live.pGrassCullReadback)) {
+            g_grassLastSurvivors = *(const uint32_t*)rbLane(g_live.pGrassCullReadback);
             if (g_grassLastSurvivors > kGrassMaxInst && !g_grassOverflowSeen) {
                 g_grassOverflowSeen = true;
                 std::printf("[forge][grass] ring OVERFLOW: %u survivors > %u rows — blades are being "
@@ -31662,8 +32175,8 @@ void destroyHostWindow(Renderer* R);
         // the camera path's kLiveMaxInst row budget. Past that, cullscan hands out offsets the scatter
         // never fills, so the tail of the map silently loses its occluders: shading that is subtly
         // wrong in a way nobody would think to look for. Say it out loud instead, once per rebuild.
-        if (g_live.pSkyCullReadback && g_live.pSkyCullReadback->pCpuMappedAddress) {
-            const uint32_t n = *(const uint32_t*)g_live.pSkyCullReadback->pCpuMappedAddress;
+        if (g_live.pSkyCullReadback && fbr(g_live.pSkyCullReadback)) {
+            const uint32_t n = *(const uint32_t*)rbLane(g_live.pSkyCullReadback);
             if (n != g_skyHeightLastInst) {
                 g_skyHeightLastInst = n;
                 if (n > kSkyStaticsRowCap) {
@@ -31679,8 +32192,8 @@ void destroyHostWindow(Renderer* R);
         // camera turns (a town square and an open coast are different scenes for this question).
         for (uint32_t v = 0; v < 2u; ++v) {
             if (g_live.occProbeReady && g_live.pOccProbeReadback[v]
-                && g_live.pOccProbeReadback[v]->pCpuMappedAddress) {
-                const uint32_t* rb = (const uint32_t*)g_live.pOccProbeReadback[v]->pCpuMappedAddress;
+                && fbr(g_live.pOccProbeReadback[v])) {
+                const uint32_t* rb = (const uint32_t*)rbLane(g_live.pOccProbeReadback[v]);
                 g_occProbeTested[v]   = rb[0];
                 g_occProbeRejected[v] = rb[1];
                 g_occProbeRejMin[v]   = rb[2];
@@ -31691,8 +32204,8 @@ void destroyHostWindow(Renderer* R);
         // reading them here makes it 2. Still a veto-only input, and the manager keys on the test id
         // rather than assuming freshness, so the extra frame is tolerated by construction.
         if (g_live.shadowLightCullReady && g_live.pLightOccReadback
-            && g_live.pLightOccReadback->pCpuMappedAddress) {
-            g_lightOccludedBits = *(const uint32_t*)g_live.pLightOccReadback->pCpuMappedAddress;
+            && fbr(g_live.pLightOccReadback)) {
+            g_lightOccludedBits = *(const uint32_t*)rbLane(g_live.pLightOccReadback);
             g_lightOccValid     = true;
         }
         // APL instrument: mean RGB + mean log-luma of the frame that just finished — one frame late,
@@ -31707,17 +32220,17 @@ void destroyHostWindow(Renderer* R);
         // through a new door. Guarded here rather than in the servo because this is the site that
         // knows the reading is empty.
         const uint32_t aplCounted =
-            (g_live.pAplReadback && g_live.pAplReadback->pCpuMappedAddress)
-                ? ((const uint32_t*)g_live.pAplReadback->pCpuMappedAddress)[7] : 0u;
-        if (g_live.pAplReadback && g_live.pAplReadback->pCpuMappedAddress && aplCounted > 0u) {
-            const float* a = (const float*)g_live.pAplReadback->pCpuMappedAddress;
+            (g_live.pAplReadback && fbr(g_live.pAplReadback))
+                ? ((const uint32_t*)rbLane(g_live.pAplReadback))[7] : 0u;
+        if (g_live.pAplReadback && fbr(g_live.pAplReadback) && aplCounted > 0u) {
+            const float* a = (const float*)rbLane(g_live.pAplReadback);
             for (int i = 0; i < 4; ++i) {
                 g_lastApl[i]   = a[i];
                 g_aplAccum[i] += (double)a[i];
             }
             // S3a percentiles: uints [4..6], NOT asuint'd — they are display levels 0..255, so they
             // are read as integers and averaged as such over the heartbeat window.
-            const uint32_t* pu = (const uint32_t*)g_live.pAplReadback->pCpuMappedAddress;
+            const uint32_t* pu = (const uint32_t*)rbLane(g_live.pAplReadback);
             for (int i = 0; i < 3; ++i) {
                 g_lastAplPct[i]  = (float)pu[4 + i];
                 g_aplPctAccum[i] += (double)pu[4 + i];
@@ -31748,7 +32261,7 @@ void destroyHostWindow(Renderer* R);
             // water; the run has to RESET here rather than accumulate, or switching the meter off
             // would silently switch the reflection off with it.
             g_aplWaterSamplesLast = nWater;
-            if (!g_aplSplitRan)      { g_reflDryFrames = 0u; }
+            if (!ss.aplSplitRan)     { g_reflDryFrames = 0u; }
             else if (nWater > 0u)    { g_reflDryFrames = 0u; }
             else if (g_reflDryFrames < 0xFFFFu) { ++g_reflDryFrames; }
             g_aplLandFrac += (double)nLand / (double)aplCounted;
@@ -31763,6 +32276,99 @@ void destroyHostWindow(Renderer* R);
         // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
         if (g_lastGpuMs > 30.0) {
             dlLogGpuSlow(g_lastGpuMs, g_lastRecMs, g_lastDrawn);
+        }
+    }
+
+    // Settle slot s. block=false only drains a frame that has ALREADY finished (returns false and
+    // does nothing otherwise); block=true waits for it.
+    bool settleSlot(Renderer* R, uint32_t s, bool block) {
+        Fence* f = g_live.pFence[s];
+        if (!f) { return false; }
+        FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
+        getFenceStatus(R, f, &fs);
+        if (fs == FENCE_STATUS_INCOMPLETE) {
+            if (!block) { return false; }
+            // Still executing = the frame outlived everything we did after submitting it. That is
+            // the GOAL state (a saturated GPU), not a fault; counted so "the overlap is working" and
+            // "something is wedged" stay distinguishable. Mirrors the Hi-Z prologue's g_hizOverruns.
+            // Only meaningful in overlap mode. In the fail-safe blocking mode the wait comes right
+            // after the submit, where INCOMPLETE is the normal state and counting it would report a
+            // 100% overrun rate that means nothing.
+            if (g_clientSyncsOnFence) { ++g_frameOverruns; }
+            const double t0 = hostNowMs();
+            waitForFences(R, 1, &f);
+            const double waited = hostNowMs() - t0;
+            g_lastGpuWaitMs += waited;
+            FrameTrace::span("host CPU", "settle wait", traceQpc(t0), traceQpc(t0 + waited),
+                             (int64_t)g_slot[s].sharedFenceValue);
+        }
+        drainSlot(R, s);
+        return true;
+    }
+
+    // Top of renderScene: take the slot frame F (= g_frameSerial + 1) records into. Its previous
+    // frame, F-2, must have retired before the pool, lists and lanes are reused — the only wait on
+    // the frame path. Frame F-1, in the other slot, is drained too if it has already finished, so
+    // whatever it measured reaches this frame; it is never waited for.
+    void beginFrameSlot(Renderer* R) {
+        const uint32_t s = (uint32_t)((g_frameSerial + 1u) % kFrameSlots);
+        g_lastGpuWaitMs = 0.0;
+        settleSlot(R, s, /*block*/true);          // F-2: older, drained first
+        settleSlot(R, s ^ 1u, /*block*/false);    // F-1: only if already done
+        fbSlotReset(s);                           // F-2's FrameBuf copies are done with the ring
+        g_fbBytesLast = g_fbBytesFrame;   g_fbBytesFrame = 0;
+        g_fbCopiesLast = g_fbCopiesFrame; g_fbCopiesFrame = 0;
+        ++g_frameSerial;
+        g_live.recSlot = s;
+        g_live.pCmd = g_live.pCmdA[s];
+        // P3: this frame delivers into slot s's shared RT and arms slot s's event. Their previous
+        // user, F-2, was copied by the client before it kicked F — so neither is still being read.
+        g_live.pRT         = g_live.pRTs[s];
+        g_live.pSharedRes  = g_live.pSharedResS[s];
+        g_live.hFrameEvent = g_live.hFrameEvents[s];
+    }
+
+    // Every frame retired and drained, oldest first. For the between-frames paths that use the
+    // frame's own pool/list/fence (they then use slot recSlot's), for the fail-safe blocking mode,
+    // and for anything that must see the GPU idle of frame work.
+    void settleAllFrames(Renderer* R) {
+        const uint32_t older = (g_slot[0].serial <= g_slot[1].serial) ? 0u : 1u;
+        g_lastGpuWaitMs = 0.0;
+        settleSlot(R, older, /*block*/true);
+        settleSlot(R, older ^ 1u, /*block*/true);
+    }
+
+    // See the note at the updateDescriptorSet macro (top of file). A bare fence WAIT, not a settle:
+    // a drain here could land mid-record and swap the readback lane half way through a frame. The
+    // slot's own settle drains it as usual later. Chunk A of the frame being recorded carries no
+    // fence and is not covered — a same-frame write after chunk A is submitted predates P4.
+    uint64_t g_descWaits = 0;      // writes that had to wait (lifetime)
+    double   g_descWaitMs = 0.0;   // ...and the time they spent waiting
+    void descWriteGuard(int line) {
+        Renderer* R = g_live.pRenderer;
+        if (!R) { return; }
+        double waited = -1.0;
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            Fence* fs[2] = { g_live.pFence[s], g_live.pHizFence[s] };
+            for (Fence* f : fs) {
+                if (!f) { continue; }
+                FenceStatus st = FENCE_STATUS_NOTSUBMITTED;
+                getFenceStatus(R, f, &st);
+                if (st != FENCE_STATUS_INCOMPLETE) { continue; }
+                const double t0 = hostNowMs();
+                waitForFences(R, 1, &f);
+                waited = (waited < 0.0 ? 0.0 : waited) + (hostNowMs() - t0);
+            }
+        }
+        if (waited < 0.0) { return; }
+        ++g_descWaits;
+        g_descWaitMs += waited;
+        static std::unordered_map<int, uint32_t> s_byLine;
+        const uint32_t n = ++s_byLine[line];
+        if (n <= 3u || (n & 255u) == 0u) {
+            LOG::logline("!! [descwait] updateDescriptorSet at forgerender.cpp:%d waited %.2f ms for a frame"
+                         " in flight (this line x%u; all lines x%llu, %.1f ms total)", line, waited, n,
+                         (unsigned long long)g_descWaits, g_descWaitMs);
         }
     }
 
@@ -32039,13 +32645,13 @@ void destroyHostWindow(Renderer* R);
             // (2) Build worlds[0..5] (camera-relative, eye-snapped per level), worlds[6]=packed params,
             // worlds[7]=invVP. The absolute eye for snapping = gFrameData.lodEye (fcbv float 56..58),
             // valid across null-lighting frames (same source the AO block uses for the eye).
-            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float* fcbv = (const float*)fbr(g_live.pFrameCbv);
             const float eyeAbsX = fcbv[56], eyeAbsY = fcbv[57], eyeAbsZ = fcbv[58];
             const float waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
             const bool  underwater    = waterParams && waterParams[7] > 0.5f;
             const float waterZ = waterMeshZ(waterLevelAbs, underwater);   // camera-avoidance snap only
 
-            uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
+            uint8_t* wbuf = (uint8_t*)fbw(g_live.pWaterWorldsBuf);
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const float cell = g_waterLevels[k].cellSize;
                 const float snap = 2.0f * cell;
@@ -32249,8 +32855,8 @@ void destroyHostWindow(Renderer* R);
                 for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }  // identity guard
             }
             // AO knobs are now dev-overlay sliders (g_ao*); the per-frame upload reads them live.
-            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-            float* ap = (float*)g_live.pAOParamsCbv->pCpuMappedAddress;
+            const float* fcbv = (const float*)fbr(g_live.pFrameCbv);
+            float* ap = (float*)fbw(g_live.pAOParamsCbv);
             // Both the AO pass and the blur run at HALF when the toggle is on, so the one
             // screenParams lane serves both — that is why it can live in the shared struct.
             const uint32_t aoW = aoHalf ? ((g_live.width  + 1u) / 2u) : g_live.width;
@@ -32320,7 +32926,7 @@ void destroyHostWindow(Renderer* R);
             if (aoHalf) {
                 // The half-res chain's own cbuffer: full AND half dims, which is exactly why it is
                 // not in the shared AOParams/BlurParams layout.
-                float* up = (float*)g_live.pAOUpCbv->pCpuMappedAddress;
+                float* up = (float*)fbw(g_live.pAOUpCbv);
                 std::memcpy(up, invVP, 16 * sizeof(float));
                 up[16] = (float)g_live.width;  up[17] = (float)g_live.height;
                 up[18] = 1.0f / (float)g_live.width; up[19] = 1.0f / (float)g_live.height;
@@ -33073,11 +33679,11 @@ void destroyHostWindow(Renderer* R);
             }
             s_wfTraceWas = g_waterFogTrace;
 
-            if (s_wfTrace && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress
+            if (s_wfTrace && g_live.pFrameCbv && fbr(g_live.pFrameCbv)
                           && g_live.pShadowMaskParamsCbv
-                          && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-                const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-                const float* sp = (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+                          && fbr(g_live.pShadowMaskParamsCbv)) {
+                const float* fd = (const float*)fbr(g_live.pFrameCbv);
+                const float* sp = (const float*)fbr(g_live.pShadowMaskParamsCbv);
 
                 // The centre-pixel ray, by waterfill.frag's own arithmetic. The upload is row-major
                 // and HLSL reads it column-major, so the shader's mul(M, v) is v * M_row here — do
@@ -33298,12 +33904,13 @@ void destroyHostWindow(Renderer* R);
                     uint32_t window = 0, base = 0;
                     if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
                     window = packWin;
-                    uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
+                    uint8_t* dst = (uint8_t*)fbwRange(g_live.pBonesBuf[window], (uint64_t)base * 64, (uint64_t)bones * 64);
                     std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
                     const bool     blended = skinIsBlended(item);
                     const uint32_t inst    = preDrawn;
                     ++preDrawn;   // the instance slot is CONSUMED whether or not we draw
-                    uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
+                    uint32_t* sinst = (uint32_t*)fbwRange(g_live.pInstanceBufSkin,
+                                                          (uint64_t)inst * kSkinInstU32 * 4, kSkinInstU32 * 4);
                     sinst[inst * kSkinInstU32 + 0] = base;
                     sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
                                                    | (blended ? kSkinBlendBit : 0u);
@@ -33419,10 +34026,10 @@ void destroyHostWindow(Renderer* R);
                     if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
                     const uint32_t idx = preDrawnMM;
 
-                    uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
+                    uint8_t* dst = (uint8_t*)fbwRange(g_live.pMMWorldsBuf, (uint64_t)idx * 64, 64);
                     std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
-                    uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
+                    uint32_t* inst = (uint32_t*)fbwRange(g_live.pInstanceBufMM, (uint64_t)idx * kMMInstU32 * 4, kMMInstU32 * 4);
                     uint32_t* e = inst + (size_t)idx * kMMInstU32;
                     const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
                     float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
@@ -33647,31 +34254,39 @@ void destroyHostWindow(Renderer* R);
             g_hizValid = false;   // no FRESH full pyramid this frame -> next frame's test passes through
         }
         if (g_live.hizReady && g_hizPrologue && hizMip0Filled) {
-            // Settle the PREVIOUS prologue first (no-op if never submitted). Still-incomplete
-            // here means it overran MW's whole inter-frame window — count it (expect ~never).
+            // This frame's slot's prologue objects. Their previous user is the prologue of frame
+            // F-2 (same slot), which the queue ran before frame F-1 — so the wait below is for a
+            // prologue that is already done in practice, and never serialises on the frame in flight.
+            const uint32_t hs = g_live.recSlot;
+            CmdPool*   hp = g_live.pHizCmdPool[hs];
+            Cmd*       hc = g_live.pHizCmd[hs];
+            Fence*     hf = g_live.pHizFence[hs];
+            QueryPool* hq = g_live.pHizQueryPool[hs];
+            // Settle that prologue first (no-op if never submitted). Still-incomplete here means
+            // it overran MW's whole inter-frame window — count it (expect ~never).
             FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
-            getFenceStatus(R, g_live.pHizFence, &fs);
+            getFenceStatus(R, hf, &fs);
             if (fs == FENCE_STATUS_INCOMPLETE) {
                 ++g_hizOverruns;
             }
-            waitForFences(R, 1, &g_live.pHizFence);
-            // Last prologue's GPU time (its resolve is valid now the fence has signalled).
-            if (g_live.pHizQueryPool && g_live.gpuTickFreq > 0.0 && fs != FENCE_STATUS_NOTSUBMITTED) {
+            waitForFences(R, 1, &hf);
+            // That prologue's GPU time (its resolve is valid now the fence has signalled).
+            if (hq && g_live.gpuTickFreq > 0.0 && fs != FENCE_STATUS_NOTSUBMITTED) {
                 QueryData qd = {};
-                getQueryData(R, g_live.pHizQueryPool, 0, &qd);
+                getQueryData(R, hq, 0, &qd);
                 if (qd.mEndTimestamp > qd.mBeginTimestamp) {
                     g_lastHizGpuMs = ((double)(qd.mEndTimestamp - qd.mBeginTimestamp) / g_live.gpuTickFreq) * 1000.0;
                 }
             }
 
-            resetCmdPool(R, g_live.pHizCmdPool);
-            beginCmd(g_live.pHizCmd);
-            if (g_live.pHizQueryPool) {
+            resetCmdPool(R, hp);
+            beginCmd(hc);
+            if (hq) {
                 QueryDesc q = {};
                 q.mIndex = 0;
-                cmdBeginQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
+                cmdBeginQuery(hc, hq, &q);
             }
-            cmdBeginDebugMarker(g_live.pHizCmd, 0.3f, 0.8f, 0.8f, "HI-Z PROLOGUE (reduce mips 1..N)");
+            cmdBeginDebugMarker(hc, 0.3f, 0.8f, 0.8f, "HI-Z PROLOGUE (reduce mips 1..N)");
             // Mip 0 is already filled (main cmd, colour->water seam). Bracket pHiz SR -> UAV, then
             // per mip a UAV barrier (current==new==UNORDERED_ACCESS lowers to a true D3D12 UAV
             // barrier — same trick as the cull block's uavBarrier lambda) + the 2x2 MIN reduce.
@@ -33681,9 +34296,9 @@ void destroyHostWindow(Renderer* R);
                 tb.pTexture = g_live.pHiz;
                 tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                cmdResourceBarrier(hc, 0, nullptr, 1, &tb, 0, nullptr);
             }
-            cmdBindPipeline(g_live.pHizCmd, g_live.pHizPipeline);
+            cmdBindPipeline(hc, g_live.pHizPipeline);
             // Reduce over the FULL allocation (matches the alloc-covering mip-0 fill above) so the
             // whole pyramid — including the far-cleared border — is conservatively valid at any
             // render scale. hizMips was computed from the allocation size, so the loop bound fits.
@@ -33693,32 +34308,32 @@ void destroyHostWindow(Renderer* R);
                 tb.pTexture = g_live.pHiz;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                cmdResourceBarrier(hc, 0, nullptr, 1, &tb, 0, nullptr);
                 mw = (mw > 1u) ? (mw >> 1) : 1u;
                 mh = (mh > 1u) ? (mh >> 1) : 1u;
-                cmdBindDescriptorSet(g_live.pHizCmd, m, g_live.pHizSet);
-                cmdDispatch(g_live.pHizCmd, (mw + 7u) / 8u, (mh + 7u) / 8u, 1);
+                cmdBindDescriptorSet(hc, m, g_live.pHizSet);
+                cmdDispatch(hc, (mw + 7u) / 8u, (mh + 7u) / 8u, 1);
             }
             {
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pHiz;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                cmdResourceBarrier(hc, 0, nullptr, 1, &tb, 0, nullptr);
             }
-            cmdEndDebugMarker(g_live.pHizCmd);
-            if (g_live.pHizQueryPool) {
+            cmdEndDebugMarker(hc);
+            if (hq) {
                 QueryDesc q = {};
                 q.mIndex = 0;
-                cmdEndQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
-                cmdResolveQuery(g_live.pHizCmd, g_live.pHizQueryPool, 0, 1);
+                cmdEndQuery(hc, hq, &q);
+                cmdResolveQuery(hc, hq, 0, 1);
             }
-            endCmd(g_live.pHizCmd);
+            endCmd(hc);
 
             QueueSubmitDesc hizSubmit = {};
             hizSubmit.mCmdCount = 1;
-            hizSubmit.ppCmds = &g_live.pHizCmd;
-            hizSubmit.pSignalFence = g_live.pHizFence;
+            hizSubmit.ppCmds = &hc;
+            hizSubmit.pSignalFence = hf;
             hizSubmit.mSubmitDone = true;
             queueSubmit(g_live.pQueue, &hizSubmit);
             // NO fence wait — return to the client now; the GPU builds the pyramid under MW's frame.
@@ -33728,7 +34343,7 @@ void destroyHostWindow(Renderer* R);
             // same source the water/AO blocks read). Next frame's CullParams fill reprojects
             // instance spheres with exactly this matrix.
             std::memcpy(g_hizVP, rzViewProj, sizeof(g_hizVP));
-            const float* hizFcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float* hizFcbv = (const float*)fbr(g_live.pFrameCbv);
             g_hizEye[0] = hizFcbv[56]; g_hizEye[1] = hizFcbv[57]; g_hizEye[2] = hizFcbv[58];
             g_hizValid = true;
         }
@@ -33812,7 +34427,7 @@ void destroyHostWindow(Renderer* R);
             // it synthesizes sun/ambient — these are the values to copy into its defaults so it lights
             // the world the way the game does (else the viewer's contrast is its own invention).
             {
-                const float* lf = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+                const float* lf = (const float*)fbr(g_live.pFrameCbv);
                 // S3a — THE RATIO, on the line that already carries the two colours it is made of,
                 // and made of exactly those lanes rather than of a second copy. These are POST-GAIN:
                 // the CAL gains were folded in at the decode site, so this is what the frame renders
@@ -34334,6 +34949,17 @@ void destroyHostWindow(Renderer* R);
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
                          g_lastGpuOccluded);
+            // P2 FrameBuf traffic: what the last whole frame copied shadow -> ring -> GPU. With
+            // frameBufVerify on, `verify` counts frame-end readbacks compared and buffers that differed.
+            if (!g_frameBufs.empty()) {
+                LOG::logline(">> [forge-hb] framebuf: bufs=%zu copied=%.1fKB in %llu copies/frame | gpu copyA=%.3f copyB=%.3f ms | ring=%.1fMB | verify %s frames=%llu bad=%llu",
+                             g_frameBufs.size(), (double)g_fbBytesLast / 1024.0,
+                             (unsigned long long)g_fbCopiesLast,
+                             g_lastGpuPhaseMs[kGpuPhaseFbCopyA], g_lastGpuPhaseMs[kGpuPhaseFbCopyB],
+                             (double)(g_fbSlot[0].cap + g_fbSlot[1].cap) / (1024.0 * 1024.0),
+                             g_frameBufVerify ? "ON" : "off",
+                             (unsigned long long)g_fbVerifyFrames, (unsigned long long)g_fbVerifyBad);
+            }
             // M1 jitter, ONLY when armed (tasks/forge-upscale.md). Its own line rather than a field
             // on the one above, so the fixed-format split stays fixed-format and so the line's mere
             // PRESENCE says the lane is live. "Is the jitter actually moving" is otherwise
@@ -34391,9 +35017,11 @@ void destroyHostWindow(Renderer* R);
             // moving, and avgTaps says which: more of the screen in motion, or the same motion
             // gone faster. maxLen is the longest streak in delivered px — if it sits pinned at K
             // the clamp is binding and the streaks are being cut short.
-            if (g_lastMbRan && g_live.pMbStatsReadback
-                && g_live.pMbStatsReadback->pCpuMappedAddress && g_lastMbPixels > 0u) {
-                const uint32_t* ms = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
+            // The lane and its "ran" / pixel count both describe the freshest SETTLED frame.
+            const FrameSlotState& mbSlot = g_slot[g_readSlot];
+            if (mbSlot.mbRan && g_live.pMbStatsReadback
+                && fbr(g_live.pMbStatsReadback) && mbSlot.mbPixels > 0u) {
+                const uint32_t* ms = (const uint32_t*)rbLane(g_live.pMbStatsReadback);
                 float mlen = 0.0f;
                 std::memcpy(&mlen, &ms[2], sizeof(float));
                 // ⚠⚠ TWO PERCENTAGES, AND THEIR **RATIO** IS THE TILING TEST. `searched` is what the
@@ -34412,9 +35040,9 @@ void destroyHostWindow(Renderer* R);
                              " pinned at the cap means the clamp is cutting streaks short, and since"
                              " MB-2l the fix is mbTileReach, NOT a coarser K;"
                              " maxLen/avgTaps is the TAP SPACING and beads mean raise mbMaxTaps]",
-                             100.0 * (double)ms[0] / (double)g_lastMbPixels,
-                             100.0 * (double)ms[3] / (double)g_lastMbPixels,
-                             (unsigned long long)g_lastMbPixels,
+                             100.0 * (double)ms[0] / (double)mbSlot.mbPixels,
+                             100.0 * (double)ms[3] / (double)mbSlot.mbPixels,
+                             (unsigned long long)mbSlot.mbPixels,
                              ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
                              (double)mlen, g_lastMbK, g_lastMbReach,
                              g_lastMbK * g_lastMbReach,
@@ -34668,8 +35296,8 @@ void destroyHostWindow(Renderer* R);
                 // ⚠ THE DEPTH TEST, MEASURED RATHER THAN ASSUMED. frags = fragments that survived
                 // and wrote. Run again with objVelDepthTest=0: if the count does not change, the
                 // test is inert and occluded movers are painting over what is in front of them.
-                if (g_live.pObjVelFragsReadback && g_live.pObjVelFragsReadback->pCpuMappedAddress) {
-                    const uint32_t fr = *(const uint32_t*)g_live.pObjVelFragsReadback->pCpuMappedAddress;
+                if (g_live.pObjVelFragsReadback && fbr(g_live.pObjVelFragsReadback)) {
+                    const uint32_t fr = *(const uint32_t*)rbLane(g_live.pObjVelFragsReadback);
                     static const char* const kDepthModeName[4] = { "OFF", "GEQUAL", "NEVER", "ALWAYS" };
                     LOG::logline(">> [forge-hb] objvel frags: depthMode=%s survived=%u px  "
                                  "[NEVER must give 0 — anything else means the DepthStateDesc never "
@@ -34691,8 +35319,8 @@ void destroyHostWindow(Renderer* R);
                 // must read **0.000%**, and for three weeks it did not, because the host cleared
                 // opts.y after computing it (fixed in MB-2 step 0). It is also the only readout that
                 // can see the ~1e-3 px residue MB-2's gather would smear a still frame with.
-                if (g_live.pMvFsReadback && g_live.pMvFsReadback->pCpuMappedAddress) {
-                    const uint32_t* fs = (const uint32_t*)g_live.pMvFsReadback->pCpuMappedAddress;
+                if (g_live.pMvFsReadback && fbr(g_live.pMvFsReadback)) {
+                    const uint32_t* fs = (const uint32_t*)rbLane(g_live.pMvFsReadback);
                     const uint32_t tot = fs[3];
                     if (tot > 0u) {
                         float fmx = 0.0f, fmn = 0.0f;
@@ -34766,8 +35394,8 @@ void destroyHostWindow(Renderer* R);
                 // PURE ROTATION there is legitimately no still pixel, so min is large and still% is
                 // 0 — that is correct, not a fault. Translating, min is the smallest true motion in
                 // frame (distant geometry), which is small but not zero.
-                if (g_live.pMvStatsReadback && g_live.pMvStatsReadback->pCpuMappedAddress) {
-                    const uint32_t* st = (const uint32_t*)g_live.pMvStatsReadback->pCpuMappedAddress;
+                if (g_live.pMvStatsReadback && fbr(g_live.pMvStatsReadback)) {
+                    const uint32_t* st = (const uint32_t*)rbLane(g_live.pMvStatsReadback);
                     const uint32_t total = st[3];
                     if (total > 0u) {
                         float mx = 0.0f, mn = 0.0f;
@@ -34928,8 +35556,8 @@ void destroyHostWindow(Renderer* R);
             // = the whole grid stepped (knob off, or a clear).
             auto tilesText = [](const RippleGrid& W, char* out, size_t cap) {
                 std::snprintf(out, cap, "full");
-                if (!W.tiledLast || !W.tileReadback || !W.tileReadback->pCpuMappedAddress) { return; }
-                const uint32_t* rb = (const uint32_t*)W.tileReadback->pCpuMappedAddress;
+                if (!W.tiledSlot[g_readSlot] || !W.tileReadback || !W.tileReadback->pCpuMappedAddress) { return; }
+                const uint32_t* rb = (const uint32_t*)rbLane(W.tileReadback);
                 if (rb[0] == 0xFFFFFFFFu) { return; }
                 int n = std::snprintf(out, cap, "%u/%u/%u", rb[0], rb[3], W.tilesPerSide * W.tilesPerSide);
                 if (g_wakeTileCheck && n > 0 && n < (int)cap) {
@@ -35541,6 +36169,9 @@ void destroyHostWindow(Renderer* R);
         if (!g_live.pDepth) {
             return false;
         }
+        // Take this frame's slot BEFORE anything below writes per-frame data: waits the slot's
+        // previous frame (F-2) and drains whatever has finished. Every return past here submits.
+        beginFrameSlot(R);
         ++g_renderFrame;   // drives the dynamic-promote consecutive-frame streak in uploadGeometry
         // ─── THE RENDER-FRAME INTERVAL, IN MILLISECONDS ─────────────────────────────────────────
         // MB-2 needs this to convert a PER-FRAME motion vector into a PER-SECOND velocity. The
@@ -35634,12 +36265,12 @@ void destroyHostWindow(Renderer* R);
         // viewProj → the persistent-mapped frame cbuffer. world[i] → window (i/kBatchSize)
         // at local slot (i%kBatchSize): byte offset (i/kBatchSize)*kBatchBytes + (i%kBatchSize)*64.
         // Index i aligns with the draw loop below (batch+local select the same matrix).
-        std::memcpy(g_live.pFrameCbv->pCpuMappedAddress, rzViewProj, 16 * sizeof(float));
+        std::memcpy(fbw(g_live.pFrameCbv), rzViewProj, 16 * sizeof(float));
         // Tier 1 lighting block (6 × float4 = 24 floats) right after viewProj. gFrameData layout:
         // viewProj(64B) | sunDir | sunCol | ambCol | fogColNear | fogParams | eyePos. The pFrameCbv
         // is 256B (min CBV), so 64 + 96 = 160B fits. Null lighting leaves the prior values.
         if (lighting) {
-            std::memcpy((uint8_t*)g_live.pFrameCbv->pCpuMappedAddress + 16 * sizeof(float),
+            std::memcpy((uint8_t*)fbw(g_live.pFrameCbv) + 16 * sizeof(float),
                         lighting, 24 * sizeof(float));
             // STEP 5 — THE AUTHORED LIGHT COLOURS. sunCol (20..22) and ambCol (24..26) are MW's
             // weather-interpolated display-referred values, and this memcpy is their ONE write site,
@@ -35659,7 +36290,7 @@ void destroyHostWindow(Renderer* R);
             // See the algebra note on g_linearScene — that is the effect abot's Darkening exists to
             // cancel, and it is why abot has to come off and be re-baselined BEFORE this is measured.
             {
-                float* fdc = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+                float* fdc = (float*)fbw(g_live.pFrameCbv);
                 // W7a — BEFORE the decode, and that ordering is load-bearing: MW applied its blend
                 // to AUTHORED display-referred values, so the inverse is only exact on the same
                 // side of the transfer function. Undo it after a decode and the linear-space
@@ -35785,7 +36416,7 @@ void destroyHostWindow(Renderer* R);
             // STALE lodEye — the water plane then sits at a constant camera-relative height and
             // "follows the eye". Write it here from realEye so it's live regardless of exterior.
             {
-                float* fd56 = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+                float* fd56 = (float*)fbw(g_live.pFrameCbv);
                 // .w = permission for waterfill.frag to run ABOVE water (see g_waterFillAbove).
                 // Exterior-gated: indoors, painting fog over every uncovered pixel would cover
                 // whatever MW still owns there. dlCullAndBuild rewrites this whole float4 in
@@ -35831,7 +36462,7 @@ void destroyHostWindow(Renderer* R);
             }
             // C2: lighting[28..31] = MW's current interpolated ZENITH sky colour. The scene-probe
             // passes only 24 floats, so guard on the null-lighting path.
-            float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* fd = (float*)fbw(g_live.pFrameCbv);
             // ⚠ S2j: IT NO LONGER RIDES FrameData. Its one shader reader (sky.frag's vColSource==3
             // dome, dead since SK4) is deleted, and skyZenith.xyz carries the fog's haze target now —
             // written after skyPhysicalMeasure below. Its one remaining reader is the legacy SH
@@ -36227,7 +36858,7 @@ void destroyHostWindow(Renderer* R);
         // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
         // 3=AO, 4=bent normal (both sample gAO at SV_Position * debugParams.yz = invScreen).
         {
-            float* dp = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* dp = (float*)fbw(g_live.pFrameCbv);
             dp[40] = (float)g_debugMode;
             dp[41] = 1.0f / (float)g_live.width;    // invScreen.x (F12 AO/bent-normal gAO sample)
             dp[42] = 1.0f / (float)g_live.height;   // invScreen.y
@@ -36352,7 +36983,7 @@ void destroyHostWindow(Renderer* R);
             if (nL > kMaxPointLights) { nL = kMaxPointLights; }
             const uint32_t haveLights = lightBytes / (uint32_t)sizeof(IPC::PointLightWire);
             if (nL > haveLights) { nL = haveLights; }
-            uint8_t* lc = (uint8_t*)g_live.pLightCbv->pCpuMappedAddress;
+            uint8_t* lc = (uint8_t*)fbw(g_live.pLightCbv);
             ((float*)lc)[0] = (float)nL;   // lightParams.x = count
             // lightParams.y = point-light reach in RADII. The frag drives attenuation to zero
             // here. Slaved to the shadow test range and clamped strictly inside it, so the lit
@@ -36626,7 +37257,7 @@ void destroyHostWindow(Renderer* R);
                 nfZ[0] = 0.0f; nfZ[1] = 0.0f; nfZ[2] = 0.0f; nfZ[3] = 0.0f;
                 g_live.froxelNearActive = false;
                 if (g_live.froxelReady && g_useFroxelNear && nL > 0u && g_live.pFroxelParamsCbvNear) {
-                    const float* mfd    = (const float*)g_live.pFrameCbv->pCpuMappedAddress;  // viewProj @ [0..15]
+                    const float* mfd    = (const float*)fbr(g_live.pFrameCbv);  // viewProj @ [0..15]
                     const float  reachK = ((float*)lc)[1];                                    // == lightParams.y
                     // Near radial range: d0 = a small floor; d1 = the DL handoff (mfd[51]=nearViewRange)
                     // where the distant grid takes over, floored to cover interiors (where mfd[51] can be
@@ -36643,7 +37274,7 @@ void destroyHostWindow(Renderer* R);
                     const float logd0  = std::log(d0);
                     const float invLog = 1.0f / std::max(std::log(d1 / d0), 1e-4f);
 
-                    float* fp = (float*)g_live.pFroxelParamsCbvNear->pCpuMappedAddress;
+                    float* fp = (float*)fbw(g_live.pFroxelParamsCbvNear);
                     std::memcpy(fp, mfd, 16 * sizeof(float));   // [0..15] = gFrameData.viewProj (rzViewProj)
                     fp[16] = (float)tilesX;       fp[17] = (float)tilesY;       fp[18] = (float)nz;   fp[19] = (float)nL;
                     fp[20] = (float)g_live.width; fp[21] = (float)g_live.height; fp[22] = (float)tile; fp[23] = (float)numWords;
@@ -36976,8 +37607,8 @@ void destroyHostWindow(Renderer* R);
         // and more than one pass now reconstructs world position from them — the point-light mask,
         // and volfog.frag. Written UNCONDITIONALLY: leaving it inside the shadowReady gate below
         // silently coupled every future consumer to the point-light shadow system being up.
-        if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-            float* cp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
+            float* cp = (float*)fbw(g_live.pShadowMaskParamsCbv);
             float  camInvVP[16];
             if (!invert4x4(rzViewProj, camInvVP)) {
                 for (int k = 0; k < 16; ++k) { camInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
@@ -37278,11 +37909,11 @@ void destroyHostWindow(Renderer* R);
                     // the way waterFogPlaneRelZ() spells it — so this counts what the shader counts.
                     uint32_t nUnder = 0, nTouch = 0;
                     {
-                        const float* lcv = (g_live.pLightCbv && g_live.pLightCbv->pCpuMappedAddress)
-                                               ? (const float*)g_live.pLightCbv->pCpuMappedAddress
+                        const float* lcv = (g_live.pLightCbv && fbr(g_live.pLightCbv))
+                                               ? (const float*)fbr(g_live.pLightCbv)
                                                : nullptr;
-                        const float* fcv = (g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress)
-                                               ? (const float*)g_live.pFrameCbv->pCpuMappedAddress
+                        const float* fcv = (g_live.pFrameCbv && fbr(g_live.pFrameCbv))
+                                               ? (const float*)fbr(g_live.pFrameCbv)
                                                : nullptr;
                         const bool haveWater = (waterEnabled != 0) && waterParams != nullptr;
                         if (lcv && fcv && haveWater) {
@@ -37326,14 +37957,14 @@ void destroyHostWindow(Renderer* R);
         // would make exterior ambient depend on the sun map being up. g_dlExterior is this frame's
         // client isExterior (dlSetFrameEye, called above with the same lighting block), and it is the
         // only gate: interiors publish strength 0 and every receiver early-outs.
-        publishSkyAmbientSH((const float*)g_live.pFrameCbv->pCpuMappedAddress, g_dlExterior);
+        publishSkyAmbientSH((const float*)fbr(g_live.pFrameCbv), g_dlExterior);
         // G1: the grass lanes of the same cbuffer, from the same place and for the same reason — the
         // wind clock and the fade band are per-frame quantities that no other pass owns, and hanging
         // them off the grass DRAW would leave the sun-caster pass reading last frame's wind (which is
         // exactly how a shadow detaches from its blade). g_uvAnimSimT is MW's raw simulation seconds,
         // frozen in menus like the rest of the sim clock; publishGrassParams does the 2*pi wrap.
-        if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-            publishGrassParams((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress, g_uvAnimSimT);
+        if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
+            publishGrassParams((float*)fbw(g_live.pShadowMaskParamsCbv), g_uvAnimSimT);
         }
         // Panel readout. The gate is one float and disarms every receiver silently, so say out loud
         // whether it fired and what sky is being projected — a DC that moves with the weather is the
@@ -37393,7 +38024,7 @@ void destroyHostWindow(Renderer* R);
             // where addResource/addPipeline are legal). shadowReady ⇒ buildOpaquePath already made pHiz,
             // so gCullHiz binds the real pyramid. Non-fatal: a failure leaves the veto disabled.
             if (!g_live.pShadowLightCullPipeline) { createShadowLightCullResources(R); }
-            float* lc = (float*)g_live.pLightCbv->pCpuMappedAddress;
+            float* lc = (float*)fbw(g_live.pLightCbv);
             const uint32_t nL    = g_lastLightCount;
             const uint32_t frame = g_renderFrame;
 
@@ -37495,7 +38126,7 @@ void destroyHostWindow(Renderer* R);
                 g_casterEpoch = frame;
             }
 
-            float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+            float* mp = (float*)fbw(g_live.pShadowMaskParamsCbv);
             // (floats 0..19 — invViewProj + screen — are written unconditionally above.)
 
             // C4a: pre-walk this frame's skinned parts BEFORE dirty-marking (scheduling runs before
@@ -38154,8 +38785,8 @@ void destroyHostWindow(Renderer* R);
                               return a.slot < b.slot;
                           });
                 const uint32_t dynBase = kShadowWorldMatrices - (uint32_t)g_dynMoverCasters.size();
-                uint8_t*  dwd  = (uint8_t*)g_live.pShadowWorldsBuf->pCpuMappedAddress;
-                uint32_t* dins = (uint32_t*)g_live.pShadowInstanceBuf->pCpuMappedAddress;
+                uint8_t*  dwd  = (uint8_t*)fbw(g_live.pShadowWorldsBuf);
+                uint32_t* dins = (uint32_t*)fbw(g_live.pShadowInstanceBuf);
                 for (uint32_t j = 0; j < (uint32_t)g_dynMoverCasters.size(); ++j) {
                     DynMoverCaster& dm = g_dynMoverCasters[j];
                     dm.matIdx = dynBase + j;
@@ -38267,8 +38898,8 @@ void destroyHostWindow(Renderer* R);
             // tightest correct sphere: a shadow only lands where the mask tests). Inactive slots write
             // radius 0 (the shader skips them). g_lightOccTestId keys next frame's keyed consumption.
             // spheres[] ride IN the cbuffer at float 24 (after hizVP@0 / hizParams@16 / hizEyeDelta@20).
-            if (g_live.pLightHizCbv && g_live.pLightHizCbv->pCpuMappedAddress) {
-                float* sph = (float*)g_live.pLightHizCbv->pCpuMappedAddress + 24;
+            if (g_live.pLightHizCbv && fbr(g_live.pLightHizCbv)) {
+                float* sph = (float*)fbw(g_live.pLightHizCbv) + 24;
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                     const ShadowSlot& sl = g_shadowSlots[s];
                     const bool on = sl.valid && sl.activeThisFrame;
@@ -38298,7 +38929,7 @@ void destroyHostWindow(Renderer* R);
             // writes (the fast direction). Byte-identical: nothing writes pFrameCbv between here and
             // the last consumer (the atlasDbg lanes are patched after, straight to the mapping).
             alignas(16) uint8_t frameCbvCache[512];
-            std::memcpy(frameCbvCache, g_live.pFrameCbv->pCpuMappedAddress, 512);
+            std::memcpy(frameCbvCache, fbr(g_live.pFrameCbv), 512);
             uint32_t nMustR = 0, nStaleR = 0;
             // C4b lever 1 — pack dirty slots (priority order) into the 1024-matrix caster pool by
             // prefix sum of each slot's ACTUAL gather size, instead of 4 flat kShadowMaxCasters
@@ -38307,8 +38938,8 @@ void destroyHostWindow(Renderer* R);
             // is SKIPPED this frame (stays dirty; being must/oldest it's first in line at the
             // empty pool next frame) while smaller slots behind it still pack.
             uint32_t usedMats = 0;
-            uint8_t*  swd  = (uint8_t*)g_live.pShadowWorldsBuf->pCpuMappedAddress;
-            uint32_t* sins = (uint32_t*)g_live.pShadowInstanceBuf->pCpuMappedAddress;
+            uint8_t*  swd  = (uint8_t*)fbw(g_live.pShadowWorldsBuf);
+            uint32_t* sins = (uint32_t*)fbw(g_live.pShadowInstanceBuf);
             for (uint32_t di = 0; di < (uint32_t)dirty.size(); ++di) {
                 const uint32_t s = dirty[di];   // ≤ kMaxShadowLights jobs; face CBVs are per-slot (s*6)
                 ShadowSlot& sl = g_shadowSlots[s];
@@ -38524,7 +39155,7 @@ void destroyHostWindow(Renderer* R);
                 const float nearZ = kShadowNearZ;
                 const float farZ  = (reach > nearZ + 1.0f) ? reach : nearZ + 1.0f;
                 for (uint32_t f = 0; f < 6; ++f) {
-                    uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[s * 6 + f]->pCpuMappedAddress;
+                    uint8_t* fc = (uint8_t*)fbw(g_live.pShadowFaceCbv[s * 6 + f]);
                     std::memcpy(fc, frameCbvCache, 512);   // cached src (see frameCbvCache)
                     float faceVP[16];
                     buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP, sl.faceUvScale);
@@ -38568,7 +39199,7 @@ void destroyHostWindow(Renderer* R);
                     const float nearZ = kShadowNearZ;
                     const float farZ  = (reach > nearZ + 1.0f) ? reach : nearZ + 1.0f;
                     for (uint32_t f = 0; f < 6; ++f) {
-                        uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[s * 6 + f]->pCpuMappedAddress;
+                        uint8_t* fc = (uint8_t*)fbw(g_live.pShadowFaceCbv[s * 6 + f]);
                         std::memcpy(fc, frameCbvCache, 512);   // cached src (see frameCbvCache)
                         float faceVP[16];
                         // The dyn tile shares the static tile's block AND its frustum — same uvScale, or
@@ -38841,7 +39472,7 @@ void destroyHostWindow(Renderer* R);
             // Mirror the masks into gFrameData.atlasDbg for the F12 mode-11/12 shadow-atlas debug view
             // (shadowatlasview.frag: .x active, .y dyn, .z re-rendered-this-frame, .w valid/cached).
             {
-                float* fdb = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+                float* fdb = (float*)fbw(g_live.pFrameCbv);
                 reinterpret_cast<uint32_t*>(fdb)[72] = activeBits;
                 reinterpret_cast<uint32_t*>(fdb)[73] = dynBits;
                 reinterpret_cast<uint32_t*>(fdb)[74] = staticReBits;   // atlasDbg.z: static tile re-rendered this frame
@@ -38922,15 +39553,20 @@ void destroyHostWindow(Renderer* R);
         const double tDrawMemcpy0 = hostNowMs();
         g_lastSetupShadowMgrMs = tDrawMemcpy0 - tShadowMgr0;
         for (uint32_t b = 0; b < kSetupBlkCount; ++b) { g_lastSetupBlkMs[b] = g_setupBlkMs[b]; }
+        for (uint32_t b = 0; b * kBatchSize < count; ++b) {   // the used prefix of each window
+            const uint64_t n = std::min<uint64_t>(count - b * kBatchSize, kBatchSize);
+            fbwRange(g_live.pWorldsBuf[b], 0, n * 64);
+            fbwRange(g_live.pInstanceBuf[b], 0, n * kStaticInstU32 * sizeof(uint32_t));
+        }
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
-            uint8_t* dst = (uint8_t*)g_live.pWorldsBuf[batch]->pCpuMappedAddress;
+            uint8_t* dst = (uint8_t*)fbwPre(g_live.pWorldsBuf[batch]);
             std::memcpy(dst + (size_t)local * 64, items[i].world, 64);
             // Per-draw texIndex + alpha-test ref + vColSource packed into instance slot [1]; [0]
             // stays the identity DrawIndex set at creation. Tier 2b material rgb in slots [2..10]
             // (float). Unloaded/unknown slots fall back to 0 (white texture).
-            uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
+            uint32_t* inst = (uint32_t*)fbwPre(g_live.pInstanceBuf[batch]);
             const uint32_t texAlphaPacked = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource, items[i].clampMode);
             // NiUVController takeover: word [0] = local DrawIndex (low 16) | UV-anim table id
             // (bits 16+, 0 = none). Was the creation-time identity; id 0 writes the identical
@@ -38986,7 +39622,7 @@ void destroyHostWindow(Renderer* R);
         // pReflectFrameCbvGeo; the reflect PASS then only records the draws (gated by g_reflGeoReady).
         // Runs AFTER dlLiveCullAndBuild so fcbvR already has this frame's DL fields (lodEye) + init done.
         {
-            const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float* fcbvR = (const float*)fbr(g_live.pFrameCbv);
             const float  eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
             const float  waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
             const bool   underwater = waterParams && waterParams[7] > 0.5f;
@@ -39105,26 +39741,26 @@ void destroyHostWindow(Renderer* R);
         float fpRzSaved[16] = {};
         bool  fpRzValid = false;
         if (fpActive) {
-            std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress,
-                        g_live.pFrameCbv->pCpuMappedAddress, 512);
+            std::memcpy(fbw(g_live.pFPFrameCbv),
+                        fbr(g_live.pFrameCbv), 512);
             float fpRz[16];
             applyProjFixups(fpRz, fp->viewProj);
-            std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress, fpRz, 16 * sizeof(float));
+            std::memcpy(fbw(g_live.pFPFrameCbv), fpRz, 16 * sizeof(float));
             std::memcpy(fpRzSaved, fpRz, sizeof(fpRzSaved));
             fpRzValid = true;
             // FP direct-atlas shadow flag (alphaShadowParams.y, float index 125). 1 → opaque.frag's
             // FP path samples the cube atlas; 0 → it would read the (wrong-for-arms) screen mask.
-            ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[125] = fpWantShadow ? 1.0f : 0.0f;
+            ((float*)fbw(g_live.pFPFrameCbv))[125] = fpWantShadow ? 1.0f : 0.0f;
             // ...and the unconditional FP flag (index 126), which is what the AO read keys on. Not
             // the same question as [125]: the arms are never in the world Z-prepass, so they have no
             // gAO of their own whether or not they are receiving shadows this frame.
-            ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[126] = 1.0f;
+            ((float*)fbw(g_live.pFPFrameCbv))[126] = 1.0f;
             // ...and no handover plane (lodParams.z): the arms are MW's near scene but not in MW's
             // camera, so the world camera's reach plane means nothing in their projection.
-            ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[50] = 0.0f;
-            std::memcpy(g_live.pFPLightCbv->pCpuMappedAddress,
-                        g_live.pLightCbv->pCpuMappedAddress, kLightCbvBytes);
-            float* flc = (float*)g_live.pFPLightCbv->pCpuMappedAddress;
+            ((float*)fbw(g_live.pFPFrameCbv))[50] = 0.0f;
+            std::memcpy(fbw(g_live.pFPLightCbv),
+                        fbr(g_live.pLightCbv), kLightCbvBytes);
+            float* flc = (float*)fbw(g_live.pFPLightCbv);
             if (!fpWantShadow) {
                 for (uint32_t i = 0; i < g_lastLightCount; ++i) {
                     flc[4 + i * 12 + 11] = 0.0f;   // lights[i*3+2].w = shadow slot + 1 → none
@@ -39136,23 +39772,11 @@ void destroyHostWindow(Renderer* R);
             flc[4 + kMaxPointLights * 3 * 4] = 0.0f;
         }
 
-        // ===================== Tier 1: settle the PREVIOUS frame HERE =====================
-        // This wait used to sit immediately after THIS frame's submit. That held the host CPU — and
-        // so the RPC reply, and so the client — until the GPU had fully drained, leaving the GPU
-        // idle across the reply, the client's RT copy + blit, MW's remaining frame work, the next
-        // kickoff's IPC and the next frame's setup/cull. Waiting the PREVIOUS frame's fence here
-        // keeps the invariant that actually matters (the host never touches a GPU-visible buffer
-        // while the GPU is reading it: the pool, cmd and per-frame cbuffers we are about to reset
-        // and refill all belong to the frame we just settled) while letting frame N's GPU work
-        // overlap all of the above. Nothing per-frame therefore needs double-buffering.
-        //
-        // What DOES change is the meaning of the RPC reply: it no longer implies "GPU-complete", so
-        // the client's RT copy needs a sync object of its own — the shared D3D12 fence signalled
-        // after the submit below, which the client imports as a Vulkan timeline semaphore. Step 1
-        // must never ship without that (see ipc/server.cpp renderFrame). tasks/forge-host-gpu-lane.md.
-        settleFrameFence(R);
-
-        resetCmdPool(R, g_live.pCmdPool);
+        // The slot's settle ran at the TOP of renderScene (beginFrameSlot), so this frame's pool is
+        // free to reset. The RPC reply does not imply "GPU-complete": the client's RT copy waits the
+        // shared D3D12 fence signalled after the submit below (see ipc/server.cpp renderFrame,
+        // tasks/forge-host-gpu-lane.md).
+        resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
         beginCmd(g_live.pCmd);
         const double tRec0 = hostNowMs();   // start of CPU command recording
         g_lastSetupMs = tCull0 - tEntry;    // hot-reload check + cbuffers + per-draw memcpy loop
@@ -39166,9 +39790,8 @@ void destroyHostWindow(Renderer* R);
         // Accumulated (+=) because ReflGeo opens twice; copied out after endCmd.
         double cpuPhaseT0[kGpuPhaseCount]  = {};
         double cpuPhaseAcc[kGpuPhaseCount] = {};
-        // Cleared HERE and not earlier: settleFrameFence above has already read frame N-1's
-        // timestamps, and it had to see N-1's issue flags to do it. Clearing before that call
-        // would zero every phase in the very readback that needs them.
+        // Cleared at the start of recording. The drain reads each frame's issue flags from its
+        // slot snapshot (snapshotFrameSlot), never from these live ones.
         for (uint32_t i = 0; i < kGpuPhaseCount; ++i) { g_gpuPhaseIssued[i] = false; }
         // G1f: and the grass-prepass latch, for the same reason and in the same place. A stale true
         // here would make drawGrass pick the CMP_EQUAL pipeline on a frame whose prepass never ran,
@@ -39178,10 +39801,10 @@ void destroyHostWindow(Renderer* R);
         auto gpuPhaseBegin = [&](uint32_t i) {
             cpuPhaseT0[i] = hostNowMs();
             g_gpuPhaseIssued[i] = true;
-            if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+            if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, qp, &q); }
         };
         auto gpuPhaseEnd = [&](uint32_t i) {
-            if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+            if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, qp, &q); }
             cpuPhaseAcc[i] += hostNowMs() - cpuPhaseT0[i];
         };
         // Whole-frame GPU execution timer (beginCmd..resolve). Compared to the submit->fence wall clock
@@ -39294,7 +39917,7 @@ void destroyHostWindow(Renderer* R);
 
             // readback gCullCount[0..1]: UAV -> COPY_SOURCE, copy to readback, COPY_SOURCE -> UAV
             bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
-            cl->CopyBufferRegion(g_live.pCullCountReadback->mDx.pResource, 0,
+            cl->CopyBufferRegion(g_live.pCullCountReadback->mDx.pResource, rbLaneOff(),
                                  g_live.pCullCountBuf->mDx.pResource, 0, 2 * sizeof(uint32_t));
             bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
@@ -39313,8 +39936,8 @@ void destroyHostWindow(Renderer* R);
             };
             // Fill gCullParams (LightCullParams: hizVP @0, hizParams @16, hizEyeDelta @20) directly
             // from the prev-frame pyramid state — NOT the DL cull cbuffer (quiet on interior frames).
-            if (g_live.pLightHizCbv && g_live.pLightHizCbv->pCpuMappedAddress) {
-                float* cp = (float*)g_live.pLightHizCbv->pCpuMappedAddress;
+            if (g_live.pLightHizCbv && fbr(g_live.pLightHizCbv)) {
+                float* cp = (float*)fbw(g_live.pLightHizCbv);
                 std::memcpy(cp, g_hizVP, 16 * sizeof(float));                               // hizVP
                 const float dEx = g_eyeAbsShadow[0] - g_hizEye[0];
                 const float dEy = g_eyeAbsShadow[1] - g_hizEye[1];
@@ -39337,7 +39960,7 @@ void destroyHostWindow(Renderer* R);
             cmdEndDebugMarker(g_live.pCmd);
             // readback gLightOccBits[0]: UAV -> COPY_SOURCE, copy to readback, -> UAV
             bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
-            cl2->CopyBufferRegion(g_live.pLightOccReadback->mDx.pResource, 0,
+            cl2->CopyBufferRegion(g_live.pLightOccReadback->mDx.pResource, rbLaneOff(),
                                   g_live.pLightOccBits->mDx.pResource, 0, sizeof(uint32_t));
             bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
@@ -39594,8 +40217,8 @@ void destroyHostWindow(Renderer* R);
             // only written on the armed path is a lane that goes stale the first time somebody
             // unticks a checkbox, which for a MULTIPLIER on sunlight is a brightness error on every
             // submerged surface.
-            if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-                float* sp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+            if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
+                float* sp = (float*)fbw(g_live.pShadowMaskParamsCbv);
                 // EYE-RELATIVE, like every other spatial anchor the water frags consume: the frame
                 // is camera-relative and forming an absolute coordinate in the shader would spend
                 // precision only to subtract it again.
@@ -39633,7 +40256,7 @@ void destroyHostWindow(Renderer* R);
               // ── (0) THE STATIC TILING MAP's parameter block. Unchanged from W23 apart from the
               // two lanes that now say which slice group it owns — base 0, span CAUSTIC_SLICES,
               // which is what it always implicitly was.
-              float* cp = (float*)g_live.pCausticCbv[kCausticSetStatic]->pCpuMappedAddress;
+              float* cp = (float*)fbw(g_live.pCausticCbv[kCausticSetStatic]);
               if (cp) {
                 // WRAPPED HOST-SIDE, in double, exactly like the water field's time: hostNowMs() is
                 // steady_clock-since-BOOT, so seconds is ~1e5-1e6 and a float32 cast quantises it
@@ -39698,7 +40321,7 @@ void destroyHostWindow(Renderer* R);
               // two layers drift apart in exactly the ways nobody looks for.
               auto fillDyn = [&](uint32_t set, const float* depths, uint32_t span, uint32_t base,
                                  float upt, int stride, int off, float slopeGain, uint32_t fieldGrid) {
-                  float* d = (float*)g_live.pCausticCbv[set]->pCpuMappedAddress;
+                  float* d = (float*)fbw(g_live.pCausticCbv[set]);
                   if (!d) { return; }
                   d[0] = 0.0f; d[1] = 0.0f;
                   // W29 — cfg.z, the sub-beam count. The static block writes the same lane from
@@ -39783,7 +40406,7 @@ void destroyHostWindow(Renderer* R);
               // from the layout constants, so the fifth static slice moved them without an edit.
               const bool dynAny = ripArmed || wakeArmed;
               if (dynAny) {
-                  float* d = (float*)g_live.pCausticCbv[kCausticSetDynResolve]->pCpuMappedAddress;
+                  float* d = (float*)fbw(g_live.pCausticCbv[kCausticSetDynResolve]);
                   if (d) {
                       std::memset(d, 0, sizeof(CausticParams));
                       d[3]  = 1.0f;                                  // cfg.w — EMA off
@@ -39941,8 +40564,8 @@ void destroyHostWindow(Renderer* R);
             gpuPhaseEnd(kGpuPhaseGrassCrush);
             // UNCONDITIONALLY, armed or not — see publishGrassCrushParams for why a lane only the
             // armed path maintains is a lane that goes stale the first time a checkbox moves.
-            if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-                publishGrassCrushParams((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress);
+            if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
+                publishGrassCrushParams((float*)fbw(g_live.pShadowMaskParamsCbv));
             }
         }
 
@@ -39977,15 +40600,15 @@ void destroyHostWindow(Renderer* R);
         // Color target: the internal scene target when there is one (resolved into pRT at the end),
         // else the shared pRT directly. The scene target is left in RENDER_TARGET between frames
         // (transitioned back after the resolve), so it needs no begin barrier — only the direct
-        // pRT path transitions COMMON (steady state) -> RENDER_TARGET (first frame it was
-        // created RENDER_TARGET). Depth was created DEPTH_WRITE and stays there.
+        // pRT path transitions COMMON -> RENDER_TARGET (every frame: both shared RTs are created
+        // in COMMON). Depth was created DEPTH_WRITE and stays there.
         //
         // ⚠ ASKS FOR THE TARGET, NOT FOR THE SAMPLE COUNT (M0, tasks/forge-upscale.md). This read
         // `(sampleCount > 1) ? pSceneColor : pRT` while MSAA was the only reason a scene target
         // existed. Scene-referred is now a second, independent reason, so the question "where does
         // the frame get built" has exactly one honest form and it is this one.
         RenderTarget* colorTarget = g_live.pSceneColor ? g_live.pSceneColor : g_live.pRT;
-        if (!g_live.pSceneColor && !g_live.firstFrame) {
+        if (!g_live.pSceneColor) {
             RenderTargetBarrier toRT = {};
             toRT.pRenderTarget = g_live.pRT;
             toRT.mCurrentState = RESOURCE_STATE_COMMON;
@@ -40085,7 +40708,8 @@ void destroyHostWindow(Renderer* R);
         // Fill the indirect-args buffer in group order. firstInstance=local → the per-instance
         // Base attr reads pInstanceBuf[batch][local].x = local → gBatch.worlds[local] (+ texIndex).
         IndirectDrawIndexArguments* args =
-            (IndirectDrawIndexArguments*)g_live.pIndirectArgs->pCpuMappedAddress;
+            (IndirectDrawIndexArguments*)fbwRange(g_live.pIndirectArgs, 0,
+                                                  (uint64_t)running * sizeof(IndirectDrawIndexArguments));
         uint32_t cursor[2][2][kMaxBatches];
         std::memcpy(cursor, groupOff, sizeof(cursor));
         for (const ArenaTmp& t : s_arena) {
@@ -40131,16 +40755,16 @@ void destroyHostWindow(Renderer* R);
         // bones/MM/water/alpha/FP buffers; pFrameCbv/pLightCbv are only READ below.
         Cmd*   pCmdChunkA = g_live.pCmd;
         double tSubmitA   = 0.0;
-        const bool splitSubmit = g_splitSubmit && g_live.pCmdB != nullptr;
+        const bool splitSubmit = g_splitSubmit && g_live.pCmdB[g_live.recSlot] != nullptr;
         if (splitSubmit) {
             endCmd(g_live.pCmd);
             QueueSubmitDesc submitA = {};
             submitA.mCmdCount = 1;
             submitA.ppCmds = &pCmdChunkA;
             submitA.mSubmitDone = true;   // no signal fence — chunk B's fence covers both
-            queueSubmit(g_live.pQueue, &submitA);
+            frameSubmit(&submitA, /*frameEnd*/false, kGpuPhaseFbCopyA);
             tSubmitA = hostNowMs();
-            g_live.pCmd = g_live.pCmdB;   // everything below (incl. drawDevUI) records into B
+            g_live.pCmd = g_live.pCmdB[g_live.recSlot];   // everything below (incl. drawDevUI) records into B
             beginCmd(g_live.pCmd);
         }
 
@@ -40186,7 +40810,7 @@ void destroyHostWindow(Renderer* R);
             gpuPhaseEnd(kGpuPhaseReflGeo);
         }
         if (reflectOn) {
-            const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float* fcbvR = (const float*)fbr(g_live.pFrameCbv);
             const float eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
             const float waterLevelAbs = waterParams[0];
             const bool  underwaterR = waterParams[7] > 0.5f;
@@ -40245,8 +40869,8 @@ void destroyHostWindow(Renderer* R);
             // Reflect frame cbuffer = a copy of the main frame data (identical lighting/fog/skyParams/
             // skyZenith, incl. gReflWaterClip = pass-all) with ONLY the viewProj replaced by the mirror
             // matrix. 288B covers through skyZenith (float 68..71) so the reflected dome gradient matches.
-            std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, fcbvR, 288);
-            std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, mirrorVP, 64);
+            std::memcpy(fbw(g_live.pReflectFrameCbv), fcbvR, 288);
+            std::memcpy(fbw(g_live.pReflectFrameCbv), mirrorVP, 64);
             // P2 — the MIRROR's gSkyView, from the mirror matrix, at the ONE place that matrix
             // exists. Reconstructing a ray from inv(mirrorVP) returns the direction in REAL world
             // space of whatever is drawn at that pixel: mirrorVP maps p -> (p*Mirror)*VP, so its
@@ -40395,7 +41019,7 @@ void destroyHostWindow(Renderer* R);
                     }
                     if (want != curReflSky) { cmdBindPipeline(g_live.pCmd, want); curReflSky = want; }
 
-                    uint8_t* dst = (uint8_t*)g_live.pReflectSkyWorldsBuf->pCpuMappedAddress;
+                    uint8_t* dst = (uint8_t*)fbw(g_live.pReflectSkyWorldsBuf);
                     std::memcpy(dst + (size_t)idx * 64, it.world, 64);
                     // WT2 sun-disc fix: the client faces the sun to the MAIN camera, so after the mirror
                     // (M = flip world-z) it faces the REFLECTED camera while we view from the main camera
@@ -40408,7 +41032,7 @@ void destroyHostWindow(Renderer* R);
                         w[6]  = -w[6];    // +Y basis z
                         w[10] = -w[10];   // +Z basis z
                     }
-                    uint32_t* inst = (uint32_t*)g_live.pReflectSkyInstanceBuf->pCpuMappedAddress;
+                    uint32_t* inst = (uint32_t*)fbw(g_live.pReflectSkyInstanceBuf);
                     inst[idx * kStaticInstU32 + 0] = idx;
                     inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
                     float* finst = (float*)inst;
@@ -40760,10 +41384,10 @@ void destroyHostWindow(Renderer* R);
                     curSkyPipe = want;
                 }
 
-                uint8_t* dst = (uint8_t*)g_live.pSkyWorldsBuf->pCpuMappedAddress;
+                uint8_t* dst = (uint8_t*)fbw(g_live.pSkyWorldsBuf);
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
-                uint32_t* inst = (uint32_t*)g_live.pSkyInstanceBuf->pCpuMappedAddress;
+                uint32_t* inst = (uint32_t*)fbw(g_live.pSkyInstanceBuf);
                 inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
                 inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
                 // SK2 FFP modulation: material diffuse rgb in slots [2..4] (TEXCOORD3) and the
@@ -40996,13 +41620,14 @@ void destroyHostWindow(Renderer* R);
                 uint32_t base = 0;
                 if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { ++skinPackDropped; continue; }
                 const uint32_t window = packWin;
-                uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
+                uint8_t* dst = (uint8_t*)fbwRange(g_live.pBonesBuf[window], (uint64_t)base * 64, (uint64_t)bones * 64);
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
 
                 const bool     blended = skinIsBlended(item);
                 const uint32_t inst    = skinnedDrawn;
                 ++skinnedDrawn;   // the instance slot is CONSUMED whether or not we draw here
-                uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
+                uint32_t* sinst = (uint32_t*)fbwRange(g_live.pInstanceBufSkin,
+                                                      (uint64_t)inst * kSkinInstU32 * 4, kSkinInstU32 * 4);
                 sinst[inst * kSkinInstU32 + 0] = base;
                 sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
                                                | (blended ? kSkinBlendBit : 0u);
@@ -41142,10 +41767,10 @@ void destroyHostWindow(Renderer* R);
                 }
                 const uint32_t idx = multiMapDrawn;
 
-                uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
+                uint8_t* dst = (uint8_t*)fbwRange(g_live.pMMWorldsBuf, (uint64_t)idx * 64, 64);
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
-                uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
+                uint32_t* inst = (uint32_t*)fbwRange(g_live.pInstanceBufMM, (uint64_t)idx * kMMInstU32 * 4, kMMInstU32 * 4);
                 uint32_t* e = inst + (size_t)idx * kMMInstU32;
                 const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
                 float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
@@ -41240,11 +41865,11 @@ void destroyHostWindow(Renderer* R);
         if ((g_debugLightBoxes || g_debugRangeSpheres) && g_live.pDebugLinePipeline
             && g_live.pDebugLineVB) {
             struct DbgV { float p[3]; float c[4]; };
-            DbgV* dv = (DbgV*)g_live.pDebugLineVB->pCpuMappedAddress;
+            DbgV* dv = (DbgV*)fbw(g_live.pDebugLineVB);
             uint32_t vcount = 0;
 
             if (g_debugLightBoxes && g_live.pLightCbv && g_lastLightCount) {
-                const float* lc = (const float*)g_live.pLightCbv->pCpuMappedAddress;
+                const float* lc = (const float*)fbr(g_live.pLightCbv);
                 const uint32_t nBox = (g_lastLightCount < IPC::kMaxPointLights)
                                       ? g_lastLightCount : IPC::kMaxPointLights;
                 static const int edges[12][2] = { {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7},
@@ -41495,16 +42120,16 @@ void destroyHostWindow(Renderer* R);
             // two partition the frame with no gap — and per-object vectors for them are M2. The one
             // to watch is the water surface, which is large, world-static, and would reconstruct well
             // if it had its own depth here.
-            if (mvActive && g_live.pMvParamsCbv && g_live.pMvParamsCbv->pCpuMappedAddress) {
-                float* mp = (float*)g_live.pMvParamsCbv->pCpuMappedAddress;
+            if (mvActive && g_live.pMvParamsCbv && fbr(g_live.pMvParamsCbv)) {
+                float* mp = (float*)fbw(g_live.pMvParamsCbv);
                 // [0..15] invViewProj — COPIED from the gShadowParams lane rather than inverted
                 // again here (apl.srt.h's reason: a second inversion proves its own arithmetic and
                 // says nothing about whether the matrix reaching the dispatch is the one the DEPTH
                 // BUFFER was rasterised with). Identity if that buffer is somehow unavailable, which
                 // with opts.x below is a frame of zero vectors rather than a garbage field.
                 const float* sp = (g_live.pShadowMaskParamsCbv
-                                   && g_live.pShadowMaskParamsCbv->pCpuMappedAddress)
-                                      ? (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress
+                                   && fbr(g_live.pShadowMaskParamsCbv))
+                                      ? (const float*)fbr(g_live.pShadowMaskParamsCbv)
                                       : nullptr;
                 for (int i = 0; i < 16; ++i) { mp[i] = sp ? sp[i] : ((i % 5 == 0) ? 1.0f : 0.0f); }
 
@@ -41849,7 +42474,7 @@ void destroyHostWindow(Renderer* R);
                     uint32_t ovSkipCap = 0, ovSkipPair = 0, ovSkipKind = 0, ovSkipStatic = 0, ovStill = 0;
                     uint32_t ovDrawnMM = 0, ovExaminedMM = 0;
 
-                    float* obatch = (float*)g_live.pObjVelBatchCbv->pCpuMappedAddress;
+                    float* obatch = (float*)fbw(g_live.pObjVelBatchCbv);
                     for (uint32_t i = 0; i < count && s_objVel.size() < kObjVelBatch; ++i) {
                         const IPC::DrawItemWire& it = items[i];
                         // Stencil-portal helpers are not surfaces. The mask is an invisible quad
@@ -42116,9 +42741,9 @@ void destroyHostWindow(Renderer* R);
                              ovsStill = 0, ovsUsed = 0;
                     if (g_live.objVelSkinReady && g_objVelSkinnedLane
                         && skinnedBlob && skinnedCount && skinnedBytes) {
-                        float* curBones  = (float*)g_live.pObjVelBonesCurCbv->pCpuMappedAddress;
-                        float* prevBones = (float*)g_live.pObjVelBonesPrevCbv->pCpuMappedAddress;
-                        uint32_t* sinst  = (uint32_t*)g_live.pObjVelSkinInstanceBuf->pCpuMappedAddress;
+                        float* curBones  = (float*)fbw(g_live.pObjVelBonesCurCbv);
+                        float* prevBones = (float*)fbw(g_live.pObjVelBonesPrevCbv);
+                        uint32_t* sinst  = (uint32_t*)fbw(g_live.pObjVelSkinInstanceBuf);
                         // ⚠ PARITY, because this walk WRITES the retention while READING last
                         // frame's out of it. One array would have each part overwrite its own
                         // history a few hundred bytes before the read that needed it — every actor
@@ -42332,7 +42957,7 @@ void destroyHostWindow(Renderer* R);
                     }
 
                     if (!s_objVel.empty() || !s_objVelSkin.empty()) {
-                        float* op = (float*)g_live.pObjVelParamsCbv->pCpuMappedAddress;
+                        float* op = (float*)fbw(g_live.pObjVelParamsCbv);
                         // [0..15] viewProj — the SAME rzViewProj the colour pass drew with, so the
                         // GEQUAL test below is comparing like with like.
                         std::memcpy(op, rzViewProj, 64);
@@ -42340,7 +42965,7 @@ void destroyHostWindow(Renderer* R);
                         // rather than rebuilt. Two derivations of "last frame's camera" is two places
                         // for the origin fold-in to go wrong, and a disagreement would show as movers
                         // whose velocity is offset from the static field by a constant.
-                        const float* mp = (const float*)g_live.pMvParamsCbv->pCpuMappedAddress;
+                        const float* mp = (const float*)fbr(g_live.pMvParamsCbv);
                         std::memcpy(op + 16, mp + 16, 64);
                         op[32] = (float)g_live.width;
                         op[33] = (float)g_live.height;
@@ -42484,7 +43109,7 @@ void destroyHostWindow(Renderer* R);
                             ofb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                             cmdResourceBarrier(g_live.pCmd, 1, &ofb, 0, nullptr, 0, nullptr);
                             g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                                g_live.pObjVelFragsReadback->mDx.pResource, 0,
+                                g_live.pObjVelFragsReadback->mDx.pResource, rbLaneOff(),
                                 g_live.pObjVelFrags->mDx.pResource, 0, sizeof(uint32_t));
                             ofb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                             ofb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -42539,8 +43164,8 @@ void destroyHostWindow(Renderer* R);
                 // [[feedback_isolation_lever_killed_its_own_subject]] in an instrument rather than in
                 // a renderer. These statistics belong to the FIELD, not to either of its two
                 // producers, so they run whenever the field was built.
-                if (g_live.mvFsReady && g_live.pMvFsParamsCbv->pCpuMappedAddress) {
-                    float* fp = (float*)g_live.pMvFsParamsCbv->pCpuMappedAddress;
+                if (g_live.mvFsReady && fbr(g_live.pMvFsParamsCbv)) {
+                    float* fp = (float*)fbw(g_live.pMvFsParamsCbv);
                     fp[0] = (float)g_live.width;  fp[1] = (float)g_live.height;
                     // z = THIS FRAME'S PARKED FLAG, echoed back out in slot [6]. The readback is
                     // consumed a frame or more later, so the flag has to travel WITH the numbers or
@@ -42570,7 +43195,7 @@ void destroyHostWindow(Renderer* R);
                     fb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                     cmdResourceBarrier(g_live.pCmd, 1, &fb, 0, nullptr, 0, nullptr);
                     g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                        g_live.pMvFsReadback->mDx.pResource, 0,
+                        g_live.pMvFsReadback->mDx.pResource, rbLaneOff(),
                         g_live.pMvFsStats->mDx.pResource, 0, sizeof(uint32_t) * 7);
                     fb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                     fb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -42584,8 +43209,8 @@ void destroyHostWindow(Renderer* R);
                     // acceptance test needs a latch rather than a bigger sample.
                     //
                     // Six loads off a persistently-mapped pointer, every frame the pass runs.
-                    if (g_live.pMvFsReadback->pCpuMappedAddress) {
-                        const uint32_t* pf = (const uint32_t*)g_live.pMvFsReadback->pCpuMappedAddress;
+                    if (fbr(g_live.pMvFsReadback)) {
+                        const uint32_t* pf = (const uint32_t*)rbLane(g_live.pMvFsReadback);
                         if (pf[6] == 1u && pf[3] > 0u) {
                             g_mvParkedNonzeroPct = 100.0 * (double)pf[5] / (double)pf[3];
                             std::memcpy(&g_mvParkedMaxPx, &pf[0], sizeof(float));
@@ -42604,7 +43229,7 @@ void destroyHostWindow(Renderer* R);
                     sb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                     cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
                     g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                        g_live.pMvStatsReadback->mDx.pResource, 0,
+                        g_live.pMvStatsReadback->mDx.pResource, rbLaneOff(),
                         g_live.pMvStats->mDx.pResource, 0, sizeof(uint32_t) * 5);
                     sb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                     sb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -42756,10 +43381,10 @@ void destroyHostWindow(Renderer* R);
                 if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
                 const uint32_t idx = mmAlphaDrawn;
 
-                uint8_t* dst = (uint8_t*)g_live.pMMAlphaWorldsBuf->pCpuMappedAddress;
+                uint8_t* dst = (uint8_t*)fbw(g_live.pMMAlphaWorldsBuf);
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
-                uint32_t* inst = (uint32_t*)g_live.pInstanceBufMMAlpha->pCpuMappedAddress;
+                uint32_t* inst = (uint32_t*)fbw(g_live.pInstanceBufMMAlpha);
                 uint32_t* e = inst + (size_t)idx * kMMInstU32;
                 const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
                 float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
@@ -42805,10 +43430,10 @@ void destroyHostWindow(Renderer* R);
             if (capVertsAvail > IPC::kMaxCapturedAlphaVerts)   capVertsAvail = IPC::kMaxCapturedAlphaVerts;
             if (capIdxAvail   > IPC::kMaxCapturedAlphaIndices) capIdxAvail   = IPC::kMaxCapturedAlphaIndices;
             const uint8_t* blob = (const uint8_t*)capturedAlphaBlob;
-            std::memcpy(g_live.pCapAlphaVB->pCpuMappedAddress, blob,
+            std::memcpy(fbwRange(g_live.pCapAlphaVB, 0, (uint64_t)capVertsAvail * sizeof(IPC::GeomVertexWire)), blob,
                         (size_t)capVertsAvail * sizeof(IPC::GeomVertexWire));
             if (capIdxAvail) {
-                std::memcpy(g_live.pCapAlphaIB->pCpuMappedAddress, blob + capturedVertBytes,
+                std::memcpy(fbwRange(g_live.pCapAlphaIB, 0, (uint64_t)capIdxAvail * sizeof(uint16_t)), blob + capturedVertBytes,
                             (size_t)capIdxAvail * sizeof(uint16_t));
             }
         }
@@ -43008,10 +43633,10 @@ void destroyHostWindow(Renderer* R);
                                                      : g_live.pAlphaPrepassPipelineBack);
                 }
 
-                uint8_t* dst = (uint8_t*)g_live.pAlphaWorldsBuf->pCpuMappedAddress;
+                uint8_t* dst = (uint8_t*)fbwRange(g_live.pAlphaWorldsBuf, (uint64_t)idx * 64, 64);
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
-                uint32_t* inst = (uint32_t*)g_live.pAlphaInstanceBuf->pCpuMappedAddress;
+                uint32_t* inst = (uint32_t*)fbwRange(g_live.pAlphaInstanceBuf, (uint64_t)idx * kStaticInstU32 * 4, kStaticInstU32 * 4);
                 // NiUVController takeover: cached alpha-BLENDED meshes (waterfalls, scrolling
                 // glows) carry key tracks too — their engine reships are gated off client-side,
                 // so without an id here they would freeze. Captured items have no mesh slot.
@@ -43059,7 +43684,7 @@ void destroyHostWindow(Renderer* R);
                 // EVERY item (0 for cached blends, which are single-map by construction) so a stale
                 // entry from an earlier frame can never leak a texture into an unrelated draw.
                 if (g_live.pAlphaStagesBuf) {
-                    uint32_t* stg = (uint32_t*)g_live.pAlphaStagesBuf->pCpuMappedAddress;
+                    uint32_t* stg = (uint32_t*)fbwRange(g_live.pAlphaStagesBuf, (uint64_t)idx * 16, 16);
                     const uint32_t n = (it.stageCount < 3u) ? it.stageCount : 3u;
                     stg[idx * 4u + 0u] = it.stages[0];
                     stg[idx * 4u + 1u] = it.stages[1];
@@ -43222,9 +43847,9 @@ void destroyHostWindow(Renderer* R);
                     if (!meshVb || !meshIb) { ++fpSkipBuf; continue; }
                     const uint32_t idx = fpRigidDrawn;
 
-                    uint8_t* wdst = (uint8_t*)g_live.pFPWorldsBuf->pCpuMappedAddress;
+                    uint8_t* wdst = (uint8_t*)fbwRange(g_live.pFPWorldsBuf, (uint64_t)idx * 64, 64);
                     std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
-                    uint32_t* inst = (uint32_t*)g_live.pFPInstanceBuf->pCpuMappedAddress;
+                    uint32_t* inst = (uint32_t*)fbwRange(g_live.pFPInstanceBuf, (uint64_t)idx * kStaticInstU32 * 4, kStaticInstU32 * 4);
                     inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
                     inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
                     float* finst = (float*)inst;
@@ -43277,9 +43902,10 @@ void destroyHostWindow(Renderer* R);
                     uint32_t fpWin = 0, base = 0;
                     if (!skinPackNext(bones, 1u, fpWin, fpPackCur, base)) { ++fpSkipBones; continue; }
                     fpBonesUsed = fpPackCur;   // running high-water of the ONE FP bone window
-                    uint8_t* bdst = (uint8_t*)g_live.pFPBonesBuf->pCpuMappedAddress;
+                    uint8_t* bdst = (uint8_t*)fbwRange(g_live.pFPBonesBuf, (uint64_t)base * 64, (uint64_t)bones * 64);
                     std::memcpy(bdst + (size_t)base * 64, palette, (size_t)bones * 64);
-                    uint32_t* sinst = (uint32_t*)g_live.pFPInstanceBufSkin->pCpuMappedAddress;
+                    uint32_t* sinst = (uint32_t*)fbwRange(g_live.pFPInstanceBufSkin,
+                                                          (uint64_t)fpSkinnedDrawn * kSkinInstU32 * 4, kSkinInstU32 * 4);
                     sinst[fpSkinnedDrawn * kSkinInstU32 + 0] = base;
                     // No blend bit on the FP path: these draws pair skinned.vert with opaque.frag,
                     // which reads OverlayIndex as a terrain-decal bindless slot. FP blended parts
@@ -43324,10 +43950,10 @@ void destroyHostWindow(Renderer* R);
                     if (!mm.vb || !mm.ib) { ++fpSkipBuf; continue; }
                     const uint32_t idx = fpMMDrawn;
 
-                    uint8_t* mdst = (uint8_t*)g_live.pFPMMWorldsBuf->pCpuMappedAddress;
+                    uint8_t* mdst = (uint8_t*)fbwRange(g_live.pFPMMWorldsBuf, (uint64_t)idx * 64, 64);
                     std::memcpy(mdst + (size_t)idx * 64, it.world, 64);
 
-                    uint32_t* minst = (uint32_t*)g_live.pFPInstanceBufMM->pCpuMappedAddress;
+                    uint32_t* minst = (uint32_t*)fbwRange(g_live.pFPInstanceBufMM, (uint64_t)idx * kMMInstU32 * 4, kMMInstU32 * 4);
                     uint32_t* e = minst + (size_t)idx * kMMInstU32;
                     const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
                     float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
@@ -43548,9 +44174,9 @@ void destroyHostWindow(Renderer* R);
                         want = g_live.pAlphaPipeline;
                     }
 
-                    uint8_t* wdst = (uint8_t*)g_live.pAlphaWorldsBuf->pCpuMappedAddress;
+                    uint8_t* wdst = (uint8_t*)fbwRange(g_live.pAlphaWorldsBuf, (uint64_t)idx * 64, 64);
                     std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
-                    uint32_t* inst = (uint32_t*)g_live.pAlphaInstanceBuf->pCpuMappedAddress;
+                    uint32_t* inst = (uint32_t*)fbwRange(g_live.pAlphaInstanceBuf, (uint64_t)idx * kStaticInstU32 * 4, kStaticInstU32 * 4);
                     inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
                     inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
                     float* finst = (float*)inst;
@@ -43570,7 +44196,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
                     // AT3 multi-stage — same table, tail indices (see the main alpha loop).
                     if (g_live.pAlphaStagesBuf) {
-                        uint32_t* stg = (uint32_t*)g_live.pAlphaStagesBuf->pCpuMappedAddress;
+                        uint32_t* stg = (uint32_t*)fbwRange(g_live.pAlphaStagesBuf, (uint64_t)idx * 16, 16);
                         const uint32_t n = (it.stageCount < 3u) ? it.stageCount : 3u;
                         stg[idx * 4u + 0u] = it.stages[0];
                         stg[idx * 4u + 1u] = it.stages[1];
@@ -43620,8 +44246,8 @@ void destroyHostWindow(Renderer* R);
             // client-side (`e.d3dDark || e.d3dDetail || e.d3dGlow`) and host-side (the fill loops
             // above skip `m.multimap`), FP needs only the two strides the objvel PSOs already have.
             if (g_objVelFPLane && g_live.objVelFPReady && g_live.objVelReady && g_objVelEnable
-                && g_lastMvRan && g_live.pObjVelBatchCbvFP->pCpuMappedAddress
-                && g_live.pObjVelParamsCbvFP->pCpuMappedAddress
+                && g_lastMvRan && fbr(g_live.pObjVelBatchCbvFP)
+                && fbr(g_live.pObjVelParamsCbvFP)
                 && g_fpPrevViewProjFrame != 0 && g_fpPrevViewProjFrame + 1u == g_renderFrame) {
                 // ⚠ GATED ON g_lastMvRan, NOT MERELY ON THE PIPELINES. This lane OVERWRITES pixels
                 // in pMotionVectors; if the camera pass did not run this frame the texture holds an
@@ -43637,7 +44263,7 @@ void destroyHostWindow(Renderer* R);
                 gpuPhaseBegin(kGpuPhaseObjVelFP);
 
                 // ─── THE FP CAMERA PAIR ─────────────────────────────────────────────────────────
-                float* ofp = (float*)g_live.pObjVelParamsCbvFP->pCpuMappedAddress;
+                float* ofp = (float*)fbw(g_live.pObjVelParamsCbvFP);
                 // [0..15] THIS frame's arm viewProj — the same fpRz the arms were rasterised with,
                 // so the GEQUAL test below compares like with like.
                 std::memcpy(ofp, fpRzSaved, 64);
@@ -43747,7 +44373,7 @@ void destroyHostWindow(Renderer* R);
                 // and switch this lane off while looking like a filter. The cost argument that
                 // justifies the world lane's filter does not exist here either — 8 rigid parts
                 // against a cap of 128 — and the still-snap below makes a motionless part free.
-                float* fbatch = (float*)g_live.pObjVelBatchCbvFP->pCpuMappedAddress;
+                float* fbatch = (float*)fbw(g_live.pObjVelBatchCbvFP);
                 if (fp->drawBlob && fp->drawCount && fp->drawBytes) {
                     const uint32_t haveFPV = fp->drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
                     uint32_t nFPV = (fp->drawCount < haveFPV) ? fp->drawCount : haveFPV;
@@ -44019,9 +44645,9 @@ void destroyHostWindow(Renderer* R);
                     && g_live.pObjVelBonesCurCbvFP && g_live.pObjVelBonesPrevCbvFP
                     && g_live.pObjVelSkinInstanceBufFP
                     && fp->skinnedBlob && fp->skinnedCount && fp->skinnedBytes) {
-                    float* curBones  = (float*)g_live.pObjVelBonesCurCbvFP->pCpuMappedAddress;
-                    float* prevBones = (float*)g_live.pObjVelBonesPrevCbvFP->pCpuMappedAddress;
-                    uint32_t* sinst  = (uint32_t*)g_live.pObjVelSkinInstanceBufFP->pCpuMappedAddress;
+                    float* curBones  = (float*)fbw(g_live.pObjVelBonesCurCbvFP);
+                    float* prevBones = (float*)fbw(g_live.pObjVelBonesPrevCbvFP);
+                    uint32_t* sinst  = (uint32_t*)fbw(g_live.pObjVelSkinInstanceBufFP);
                     // Parity, because this walk WRITES the retention while READING last frame's out
                     // of it — MB-1b's note is the long version. A separate array from the world
                     // lane's: the two cursors both start at 0, so one shared array would have the FP
@@ -44458,7 +45084,7 @@ void destroyHostWindow(Renderer* R);
         auto measureAndOverlay = [&]() {
             if (g_live.pAplPipeline && g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
                 const uint32_t aplGrid = 128u;   // 128x128 = 16384 samples; see apl.comp.fsl
-                if (g_live.pAplParamsCbv->pCpuMappedAddress) {
+                if (fbr(g_live.pAplParamsCbv)) {
                     // --- THE REGION SPLIT'S TWO INPUTS ---------------------------------------
                     // The water plane in the SAME camera-relative Z the classifier reconstructs
                     // into, spelled exactly the way waterfog.h.fsl's waterFogPlaneRelZ() spells it
@@ -44471,11 +45097,11 @@ void destroyHostWindow(Renderer* R);
                     // split vanish the moment someone switched the model off to A/B it — the reading
                     // would disappear precisely when it is wanted most.
                     const float* sp = (g_live.pShadowMaskParamsCbv
-                                       && g_live.pShadowMaskParamsCbv->pCpuMappedAddress)
-                                          ? (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress
+                                       && fbr(g_live.pShadowMaskParamsCbv))
+                                          ? (const float*)fbr(g_live.pShadowMaskParamsCbv)
                                           : nullptr;
-                    const float* lf = (g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress)
-                                          ? (const float*)g_live.pFrameCbv->pCpuMappedAddress
+                    const float* lf = (g_live.pFrameCbv && fbr(g_live.pFrameCbv))
+                                          ? (const float*)fbr(g_live.pFrameCbv)
                                           : nullptr;
                     const bool  splitOn = g_aplSplitWater && sp && lf
                                           && sp[kWaterFogPlaneFloat + 3] > 0.5f;
@@ -44511,7 +45137,7 @@ void destroyHostWindow(Renderer* R);
                     p[25] = (float)g_live.height;
                     p[26] = 0.0f;
                     p[27] = 0.0f;
-                    std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
+                    std::memcpy(fbw(g_live.pAplParamsCbv), p, sizeof(p));
                 }
                 RenderTargetBarrier arb = {};
                 arb.pRenderTarget = g_live.pRT;   // the DELIVERED image, always single-sample
@@ -44522,7 +45148,7 @@ void destroyHostWindow(Renderer* R);
                 gpuPhaseBegin(kGpuPhaseApl);
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "APL (delivered colour -> mean RGB + log luma)");
                 cmdBindPipeline(g_live.pCmd, g_live.pAplPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAplSet);
+                cmdBindDescriptorSet(g_live.pCmd, g_live.recSlot, g_live.pAplSet);   // slot's RT
                 cmdDispatch(g_live.pCmd, 1, 1, 1);   // ONE group by design — see apl.comp.fsl
                 cmdEndDebugMarker(g_live.pCmd);
 
@@ -44537,7 +45163,7 @@ void destroyHostWindow(Renderer* R);
                     bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                     g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                        g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 96);
+                        g_live.pAplReadback->mDx.pResource, rbLaneOff(), g_live.pAplOut->mDx.pResource, 0, 96);
                     bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                     bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
@@ -44947,8 +45573,8 @@ void destroyHostWindow(Renderer* R);
             const uint32_t tilesX = (deliveredW + K - 1u) / K;
             const uint32_t tilesY = (deliveredH + K - 1u) / K;
 
-            if (g_live.pMbParamsCbv->pCpuMappedAddress) {
-                float* mp = (float*)g_live.pMbParamsCbv->pCpuMappedAddress;
+            if (fbr(g_live.pMbParamsCbv)) {
+                float* mp = (float*)fbw(g_live.pMbParamsCbv);
                 // ⚠ THE RESERVED LANES FIRST, THEN THE LANES THAT ARE WRITTEN. MB-2 step 0 exists
                 // because a "clear the reserved lanes" line sat AFTER a block that wrote one of them
                 // and silently ate it for three weeks, while the heartbeat went on reporting the
@@ -45110,7 +45736,7 @@ void destroyHostWindow(Renderer* R);
                 bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                 cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                 g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                    g_live.pMbStatsReadback->mDx.pResource, 0,
+                    g_live.pMbStatsReadback->mDx.pResource, rbLaneOff(),
                     g_live.pMbStats->mDx.pResource, 0, sizeof(uint32_t) * 4);
                 bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                 bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -45133,8 +45759,8 @@ void destroyHostWindow(Renderer* R);
             // Latched WHOLE, not field by field: percentage, taps and length come from one frame, so
             // a per-field max would report a frame that never happened.
             ++g_mbRanFrames;
-            if (g_live.pMbStatsReadback && g_live.pMbStatsReadback->pCpuMappedAddress) {
-                const uint32_t* ps = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
+            if (g_live.pMbStatsReadback && fbr(g_live.pMbStatsReadback)) {
+                const uint32_t* ps = (const uint32_t*)rbLane(g_live.pMbStatsReadback);
                 if (ps[0] > 0u) {
                     ++g_mbBlurFrames;
                     const double pct = 100.0 * (double)ps[0] / (double)g_lastMbPixels;
@@ -45202,8 +45828,8 @@ void destroyHostWindow(Renderer* R);
             auto lh = [&](uint32_t m) { return bloomLevelDim(deliveredH, g_live.allocHeight, m); };
             auto fill = [&](uint32_t si, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH) {
                 Buffer* b = g_live.pBloomParamsCbv[si];
-                if (!b || !b->pCpuMappedAddress) { return; }
-                float* p = (float*)b->pCpuMappedAddress;
+                if (!b || !fbr(b)) { return; }
+                float* p = (float*)fbw(b);
                 p[0]  = (float)srcW; p[1] = (float)srcH; p[2] = 0.0f; p[3] = 0.0f;   // src rect
                 p[4]  = (float)dstW; p[5] = (float)dstH; p[6] = 0.0f; p[7] = 0.0f;   // dst rect
                 p[8]  = std::max(0.0f, g_bloomThreshold);
@@ -45302,7 +45928,7 @@ void destroyHostWindow(Renderer* R);
             // The filter's diameter/radius and whether it ran are decided ONCE, above the whole post
             // chain, beside shaderResolve — motion blur consumes the same answer long before this
             // block is reached. Read here, never re-derived.
-            if (g_live.pResolveParamsCbv->pCpuMappedAddress) {
+            if (fbr(g_live.pResolveParamsCbv)) {
                 const float diam   = rfDiam;
                 const float radius = rfRadius;
                 // ⚠ width/height, NOT allocWidth/allocHeight — the clamp bound must be the RENDER
@@ -45406,7 +46032,7 @@ void destroyHostWindow(Renderer* R);
                                       (float)bloomLevelDim(deliveredH, g_live.allocHeight, 0),
                                       1.0f,
                                       rfRunning ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
-                std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
+                std::memcpy(fbw(g_live.pResolveParamsCbv), p, sizeof(p));
             }
 
             // Source: MSAA colour RENDER_TARGET -> SHADER_RESOURCE (the APL block's idiom, and it is
@@ -45432,10 +46058,9 @@ void destroyHostWindow(Renderer* R);
             // (The compute PRE-FILTER that fills gResolveFiltered ran far above this block — it
             // had to move so motion blur could read it. See kGpuPhaseResolveFilter.)
 
-            // Destination: the SHARED resource, driven natively like the hardware path does.
-            // ⚠ Only on non-first frames. Frame 0 it was created RENDER_TARGET, which is already the
-            // state we want — and D3D12 rejects a transition whose before and after states match.
-            if (!g_live.firstFrame) {
+            // Destination: the SHARED resource, driven natively like the hardware path does. Every
+            // frame, the first included: both shared RTs are created in COMMON (P3).
+            {
                 D3D12_RESOURCE_BARRIER toRt = {};
                 toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 toRt.Transition.pResource   = g_live.pSharedRes;
@@ -45514,9 +46139,8 @@ void destroyHostWindow(Renderer* R);
             pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             pre[1].Transition.pResource = dstRes;
             pre[1].Transition.Subresource = 0;
-            // First frame the shared RT was created RENDER_TARGET; steady state is COMMON.
-            pre[1].Transition.StateBefore = g_live.firstFrame ? D3D12_RESOURCE_STATE_RENDER_TARGET
-                                                              : D3D12_RESOURCE_STATE_COMMON;
+            // COMMON on every frame: the handoff state, and the state both shared RTs are created in.
+            pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
             pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_DEST;
             cl->ResourceBarrier(2, pre);
 
@@ -45575,7 +46199,7 @@ void destroyHostWindow(Renderer* R);
                 // lie. Latent since the MSAA+fp16 degrade was written; M0 only widened which
                 // configurations can reach it. A stale frame is meant to be a diagnosable
                 // non-event, not a debug-layer error on top of the failure it is reporting.
-                if (!g_live.firstFrame) {
+                {
                     RenderTargetBarrier toRT = {};
                     toRT.pRenderTarget = g_live.pRT;
                     toRT.mCurrentState = RESOURCE_STATE_COMMON;
@@ -45592,11 +46216,10 @@ void destroyHostWindow(Renderer* R);
         }
         gpuPhaseEnd(kGpuPhaseResolve);
         gpuPhaseEnd(kGpuPhaseFrame);   // close the whole-frame GPU-execution timer
-        // Resolve all GPU phase timestamps into the readback buffer. Tier 1: these are valid after
-        // this frame's fence, which is now waited at the TOP of the NEXT renderScene — so they are
-        // read there (settleFrameFence), one frame late, before anything records into the pool again.
-        if (g_live.pGpuQueryPool) {
-            cmdResolveQuery(g_live.pCmd, g_live.pGpuQueryPool, 0, kGpuPhaseCount);
+        // Resolve all GPU phase timestamps into this slot's pool. Valid after this frame's fence;
+        // read by the drain of this slot (drainSlot), before the slot records again.
+        if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) {
+            cmdResolveQuery(g_live.pCmd, qp, 0, kGpuPhaseCount);
         }
         endCmd(g_live.pCmd);
         const double tRec1 = hostNowMs();   // end of CPU recording (record = tRec1 - tRec0)
@@ -45604,9 +46227,9 @@ void destroyHostWindow(Renderer* R);
         QueueSubmitDesc submitDesc = {};
         submitDesc.mCmdCount = 1;
         submitDesc.ppCmds = &g_live.pCmd;   // chunk B when split; the whole frame otherwise
-        submitDesc.pSignalFence = g_live.pFence;
+        submitDesc.pSignalFence = g_live.pFence[g_live.recSlot];
         submitDesc.mSubmitDone = true;
-        queueSubmit(g_live.pQueue, &submitDesc);
+        frameSubmit(&submitDesc, /*frameEnd*/true, kGpuPhaseFbCopyB);
         // The linear scene dump (numpad 1 / dev panel), and this is exactly where it belongs.
         //
         // AFTER the frame's queueSubmit, because submitting on the SAME QUEUE is what orders the
@@ -45648,8 +46271,8 @@ void destroyHostWindow(Renderer* R);
             armHdrDump();
         }
         hdrDumpIfArmed(rzViewProj);
-        // Tier 1: NO fence wait here — the wait moved to the top of the NEXT renderScene
-        // (settleFrameFence). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
+        // Tier 1: NO fence wait here — this slot is waited when it is next recorded into
+        // (beginFrameSlot). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
         // queue-ordered behind the frame we just submitted. That signal is the client's only proof
         // the RT is finished, now that the RPC reply returns before the GPU does: the client waits
         // this value as a Vulkan timeline semaphore in its RT copy. Signalled here rather than after
@@ -45663,7 +46286,7 @@ void destroyHostWindow(Renderer* R);
             // this value. Kept armed in every mode (cheap) so switching modes never finds it stale.
             frameEventArmed = armFrameEvent(g_live.sharedFenceValue);
         }
-        g_framePending = true;
+        snapshotFrameSlot();   // after the ++ above: the slot carries this frame's shared-fence value
         // ⚠ AFTER the shared-fence signal, deliberately. That signal is the client's permission to
         // read pRT, and the overlay window has nothing to do with the delivered frame — putting its
         // submit and present ahead of the signal would add a debug window's latency to every game
@@ -45677,18 +46300,18 @@ void destroyHostWindow(Renderer* R);
         for (uint32_t i = 0; i < kGpuPhaseCount; ++i) { g_lastCpuPhaseMs[i] = cpuPhaseAcc[i]; }
         // Tier 1 fail-safe: with no client-side sync object there is nothing to stop MW's copy
         // racing this draw, so fall back to the pre-Tier-1 contract and settle right here. Costs
-        // the overlap, never correctness. settleFrameFence rather than a bare wait so the readbacks
-        // still land this frame; it clears g_framePending, so next frame's top-of-frame call then
-        // finds nothing left to do. Placed after g_lastRecMs so its dlLogGpuSlow reports THIS
-        // frame's record time rather than the previous frame's.
+        // the overlap, never correctness. A settle rather than a bare wait so the readbacks still
+        // land this frame; it drains the slot, so the next frame's beginFrameSlot finds nothing left
+        // to do. Placed after g_lastRecMs so its dlLogGpuSlow reports THIS frame's record time
+        // rather than the previous frame's.
         // Mode 2 also needs THIS frame's event armed; a refused registration means the client's
         // wait proves nothing, so settle (and the event handoff is off from here on).
         if (!g_clientSyncsOnFence || (g_clientSyncMode == 2u && !frameEventArmed)) {
-            settleFrameFence(R);
+            settleAllFrames(R);
         }
-        // NOTE: g_lastGpuMs / g_lastGpuPhaseMs / the three readback buffers are NOT read here any
-        // more — they are only valid once this frame's fence signals, which is now next frame's
-        // settleFrameFence. Everything they feed is one frame stale by construction.
+        // NOTE: g_lastGpuMs / g_lastGpuPhaseMs / the readback lanes are NOT read here — they are
+        // only valid once this frame's fence signals, i.e. at a later drain of this slot.
+        // Everything they feed is at least one frame stale by construction.
         // A dense exterior frame is the suspected trigger; pin a removal to the draw submit.
         logDeviceRemoved(R, "renderScene/submit");
         const double tSubmit1 = hostNowMs();   // Tier 1: end of submit == start of the "post" phase
@@ -45912,8 +46535,7 @@ void destroyHostWindow(Renderer* R);
             }
             if (g_live.pHizPipelineFirst && g_live.pHizPipeline) {
                 // Re-arm after an earlier failed reload (set/cmd/fence are persistent).
-                g_live.hizReady = g_live.pHiz && g_live.pHizSet && g_live.pHizCmdPool
-                               && g_live.pHizCmd && g_live.pHizFence;
+                g_live.hizReady = g_live.pHiz && g_live.pHizSet && hizObjectsReady();
                 LOG::logline(">> [forge] hiz shaders hot-reloaded (hizfirst_sc%c + hizreduce)",
                              (g_live.sampleCount > 1) ? '4' : '1'); LOG::flush();
             } else {
@@ -46403,7 +47025,7 @@ void destroyHostWindow(Renderer* R);
     static bool readbackDeliveredRect(std::vector<uint8_t>& out, uint32_t& W, uint32_t& H) {
         if (!g_live.pRenderer || !g_live.pRT) { return false; }
         Renderer* R = g_live.pRenderer;
-        settleFrameFence(R);
+        settleAllFrames(R);
         W = g_live.outWidth; H = g_live.outHeight;
         const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
         const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
@@ -46418,15 +47040,15 @@ void destroyHostWindow(Renderer* R);
         bd.ppBuffer = &pReadback;
         addResource(&bd, nullptr);
         waitForAllResourceLoads();
-        resetCmdPool(R, g_live.pCmdPool);
+        resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
         beginCmd(g_live.pCmd);
         RenderTargetBarrier b = {};
         b.pRenderTarget = g_live.pRT; b.mCurrentState = RESOURCE_STATE_COMMON; b.mNewState = RESOURCE_STATE_COPY_SOURCE;
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &b);
         endCmd(g_live.pCmd);
-        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
+        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence[g_live.recSlot]; sd.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &sd);
-        waitForFences(R, 1, &g_live.pFence);
+        waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
         TextureCopyDesc cd = {};
         cd.pTexture = g_live.pRT->pTexture; cd.pBuffer = pReadback;
         cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
@@ -46520,7 +47142,7 @@ void destroyHostWindow(Renderer* R);
         // fence, which since the wait moved may belong to a frame still executing. Dev-triggered
         // and not per-frame, so the cheapest correct fix is to settle the frame first rather than
         // give a diagnostic its own pool.
-        settleFrameFence(R);
+        settleAllFrames(R);
 
         // Direct texture readback: copy the default-white texture (4x4 RGBA, uploaded via
         // TextureUpdateDesc) straight to a buffer — proves whether the UPLOAD worked, bypassing
@@ -46538,13 +47160,13 @@ void destroyHostWindow(Renderer* R);
             tb.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
             Buffer* pTexRb = nullptr; tb.ppBuffer = &pTexRb;
             addResource(&tb, nullptr); waitForAllResourceLoads();
-            resetCmdPool(R, g_live.pCmdPool);
+            resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
             beginCmd(g_live.pCmd);
             TextureBarrier tbar = { g_live.pDefaultWhite, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tbar, 0, nullptr);
             endCmd(g_live.pCmd);
-            QueueSubmitDesc s2 = {}; s2.mCmdCount = 1; s2.ppCmds = &g_live.pCmd; s2.pSignalFence = g_live.pFence; s2.mSubmitDone = true;
-            queueSubmit(g_live.pQueue, &s2); waitForFences(R, 1, &g_live.pFence);
+            QueueSubmitDesc s2 = {}; s2.mCmdCount = 1; s2.ppCmds = &g_live.pCmd; s2.pSignalFence = g_live.pFence[g_live.recSlot]; s2.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &s2); waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
             TextureCopyDesc tc = {}; tc.pTexture = g_live.pDefaultWhite; tc.pBuffer = pTexRb;
             tc.mTextureState = RESOURCE_STATE_COPY_SOURCE; tc.mQueueType = QUEUE_TYPE_GRAPHICS;
             SyncToken tk = {}; copyResource(&tc, &tk); waitForToken(&tk);
@@ -46572,15 +47194,15 @@ void destroyHostWindow(Renderer* R);
         bd.ppBuffer = &pReadback;
         addResource(&bd, nullptr);
         waitForAllResourceLoads();
-        resetCmdPool(R, g_live.pCmdPool);
+        resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
         beginCmd(g_live.pCmd);
         RenderTargetBarrier b = {};
         b.pRenderTarget = g_live.pRT; b.mCurrentState = RESOURCE_STATE_COMMON; b.mNewState = RESOURCE_STATE_COPY_SOURCE;
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &b);
         endCmd(g_live.pCmd);
-        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
+        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence[g_live.recSlot]; sd.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &sd);
-        waitForFences(R, 1, &g_live.pFence);
+        waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
         TextureCopyDesc cd = {};
         cd.pTexture = g_live.pRT->pTexture; cd.pBuffer = pReadback;
         cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
@@ -46632,7 +47254,7 @@ void destroyHostWindow(Renderer* R);
         Renderer* R = g_live.pRenderer;
         // Tier 1: same hazard as debugReadbackCenterPixel — this cycles the FRAME's pool/fence and
         // a frame may be in flight. Settle it first (dev-triggered, so the cost is irrelevant).
-        settleFrameFence(R);
+        settleAllFrames(R);
         // Follow what the last frame actually WROTE, not the checkbox: with half-res on, pAO is
         // never written and the AO the frame produced lives in pAOHalf at HALF dimensions. Sizing
         // this readback at pAO's dimensions would walk past the end of the half resource, and the
@@ -46653,13 +47275,13 @@ void destroyHostWindow(Renderer* R);
             bd2.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
             Buffer* pRb2 = nullptr; bd2.ppBuffer = &pRb2;
             addResource(&bd2, nullptr); waitForAllResourceLoads();
-            resetCmdPool(R, g_live.pCmdPool);
+            resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
             beginCmd(g_live.pCmd);
             TextureBarrier tb2 = { g_live.pLinearDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb2, 0, nullptr);
             endCmd(g_live.pCmd);
-            QueueSubmitDesc s2 = {}; s2.mCmdCount = 1; s2.ppCmds = &g_live.pCmd; s2.pSignalFence = g_live.pFence; s2.mSubmitDone = true;
-            queueSubmit(g_live.pQueue, &s2); waitForFences(R, 1, &g_live.pFence);
+            QueueSubmitDesc s2 = {}; s2.mCmdCount = 1; s2.ppCmds = &g_live.pCmd; s2.pSignalFence = g_live.pFence[g_live.recSlot]; s2.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &s2); waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
             TextureCopyDesc c2 = {}; c2.pTexture = g_live.pLinearDepth; c2.pBuffer = pRb2;
             c2.mTextureState = RESOURCE_STATE_COPY_SOURCE; c2.mQueueType = QUEUE_TYPE_GRAPHICS;
             SyncToken t2 = {}; copyResource(&c2, &t2); waitForToken(&t2);
@@ -46686,14 +47308,14 @@ void destroyHostWindow(Renderer* R);
         bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
         Buffer* pRb = nullptr; bd.ppBuffer = &pRb;
         addResource(&bd, nullptr); waitForAllResourceLoads();
-        resetCmdPool(R, g_live.pCmdPool);
+        resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
         beginCmd(g_live.pCmd);
         // pAO(Half) ends each renderScene in SHADER_RESOURCE (post-GTAO barrier) → COPY_SOURCE.
         TextureBarrier tb = { pAORb, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
         endCmd(g_live.pCmd);
-        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
-        queueSubmit(g_live.pQueue, &sd); waitForFences(R, 1, &g_live.pFence);
+        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence[g_live.recSlot]; sd.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &sd); waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
         TextureCopyDesc cd = {};
         cd.pTexture = pAORb; cd.pBuffer = pRb;
         cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
@@ -47062,6 +47684,7 @@ void destroyHostWindow(Renderer* R);
         const uint8_t* p   = (const uint8_t*)blob;
         const uint8_t* end = p + byteCount;
         unsigned built = 0;
+        std::vector<std::pair<uint32_t, bool>> rebind;   // (slot, dataTex), bound after the flush
 
         for (unsigned i = 0; i < count; ++i) {
             if (p + sizeof(IPC::TexUploadWire) > end) { break; }
@@ -47085,7 +47708,7 @@ void destroyHostWindow(Renderer* R);
             if (release) {
                 if (hdr.slot != 0 && hdr.slot < kMaxTextures && !IPC::isFlipSlot(hdr.slot)) {
                     if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
-                        g_texRetire.push_back(g_live.pTextures[hdr.slot]);
+                        g_texRetire.push_back({ g_live.pTextures[hdr.slot], g_frameSerial });
                         g_live.pTextures[hdr.slot] = g_live.pDefaultWhite;
                         DescriptorData dd = {};
                         dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
@@ -47192,7 +47815,7 @@ void destroyHostWindow(Renderer* R);
             // the bindless table. Park it; settleFrameFence frees it once the frame fence proves
             // every submission has retired.
             if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
-                g_texRetire.push_back(g_live.pTextures[hdr.slot]);
+                g_texRetire.push_back({ g_live.pTextures[hdr.slot], g_frameSerial });
             }
             g_live.pTextures[hdr.slot] = tex;
             if (hdr.slot + 1 > g_live.texHigh) { g_live.texHigh = hdr.slot + 1; }
@@ -47203,18 +47826,25 @@ void destroyHostWindow(Renderer* R);
                 g_texResidentBytes += landed;
             }
 
-            DescriptorData dd = {};   // rebind just this slot in the bindless array
-            dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
-            dd.mArrayOffset = hdr.slot;
-            dd.mCount = 1;
-            dd.ppTextures = &g_live.pTextures[hdr.slot];
-            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
-            g_texIsData[hdr.slot] = dataTex ? 1u : 0u;   // landed: now, and only now, it counts
+            rebind.push_back({ hdr.slot, dataTex });
             ++built;
         }
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
         // former per-texture fence — the batch is window-bounded so this is a single short wait.
         if (built) { flushTextureUploads(R); }
+        // ...and only THEN rebind the slots (P2, tasks/forge-pipeline-depth.md). The rebind used to
+        // sit inside the loop, BEFORE the flush: the bindless table named a texture whose upload had
+        // not even been submitted, and a frame in flight — or recorded before this flush landed —
+        // could sample it half-written.
+        for (const auto& rb : rebind) {
+            DescriptorData dd = {};   // rebind just this slot in the bindless array
+            dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
+            dd.mArrayOffset = rb.first;
+            dd.mCount = 1;
+            dd.ppTextures = &g_live.pTextures[rb.first];
+            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+            g_texIsData[rb.first] = rb.second ? 1u : 0u;   // landed: now, and only now, it counts
+        }
         // Sampled AFTER the flush, so the driver has committed the batch; before it, this call's
         // textures would be attributed to whatever ran next.
         if (vram0) { g_vramTexBytes += (std::int64_t)vramNow(R) - (std::int64_t)vram0; }
@@ -47715,6 +48345,7 @@ void destroyHostWindow(Renderer* R);
     Buffer*   g_pStaticsArgsRingRefl = nullptr;
     uint32_t  g_liveLastSubsetsRefl = 0;               // indirect-arg count for the reflect statics draw
     uint32_t  g_liveLastInstRefl    = 0;               // instance count (diagnostics)
+    uint32_t liveReflInstCount() { return g_liveLastInstRefl; }
     struct LiveGridCell {
         std::vector<uint32_t> inst;                    // instance indices into g_usageData ws0 records
         float minx, miny, minz, maxx, maxy, maxz;      // AABB of member placements (padded for cull)
@@ -47797,7 +48428,7 @@ void destroyHostWindow(Renderer* R);
 
         // Tier 1: park, don't free — an in-flight frame may still sample the old atlas through the
         // bindless table. settleFrameFence drains this once the frame fence has signalled.
-        if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back(g_live.pTextures[slot]); }
+        if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back({ g_live.pTextures[slot], g_frameSerial }); }
         g_live.pTextures[slot] = tex;
         g_texIsData[slot] = 0u;   // a host-owned texture (atlas, cloud, sun) is never a param map
         if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
@@ -48525,7 +49156,7 @@ void destroyHostWindow(Renderer* R);
                                                           : "terrainInstRingSvm";
             ir.pData              = nullptr;
             ir.ppBuffer           = &v->instRing;
-            addResource(&ir, nullptr);
+            addFrameBuf(&ir);
         });
         waitForAllResourceLoads();
         forEachTerrainView([&](TerrainView& v) { ringsOk = ringsOk && v.instRing; });
@@ -49815,7 +50446,8 @@ void destroyHostWindow(Renderer* R);
                 running += V.drawCounts[f][l];
             }
         }
-        uint8_t* dst = (uint8_t*)V.instRing->pCpuMappedAddress;
+        uint8_t* dst = (uint8_t*)fbwRange(V.instRing, 0,
+                                          (uint64_t)std::min<uint32_t>(running, V.maxRows) * kTerrainInstStride);
 
         // One row. `fam`/`rung` pick the run, `ox`/`oy` are the patch origin in BASE QUADS (0,0 for
         // a whole cell, which is what makes the shader's decode one expression for both families).
@@ -50931,14 +51563,14 @@ void destroyHostWindow(Renderer* R);
         ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
         ib.mDesc.mSize = 5 * kSkyInstStride; ib.mDesc.pName = "skyInst";   // dome/cloud/sun/fill/mirror-band
         ib.pData = nullptr; ib.ppBuffer = &g_sky.inst;
-        addResource(&ib, nullptr);
+        addFrameBuf(&ib);
         BufferLoadDesc sb = {};
         sb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
         sb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
         sb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
         sb.mDesc.mSize = 6 * 20; sb.mDesc.pName = "skySunVB";   // 6 StaticElem verts
         sb.pData = nullptr; sb.ppBuffer = &g_sky.sunVB;
-        addResource(&sb, nullptr);
+        addFrameBuf(&sb);
         // Static fullscreen-fill triangle (clip-space, StaticElem stride). Position.xy = clip coords,
         // consumed directly by skymesh.vert mode 3 (no viewProj). Built once; never rewritten.
         BufferLoadDesc fb = {};
@@ -51051,14 +51683,14 @@ void destroyHostWindow(Renderer* R);
             vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
             vb.mDesc.mSize = 6 * 16; vb.mDesc.pName = "glowBaseVB";
             vb.pData = nullptr; vb.ppBuffer = &g_live.pGlowBaseVB;
-            addResource(&vb, nullptr);
+            addFrameBuf(&vb);
             waitForAllResourceLoads();
             if (!g_live.pGlowBaseVB) { std::printf("[forge][glow] base VB alloc FAILED\n"); return false; }
             const float quad[6][2] = {
                 { -1.0f,  1.0f }, {  1.0f,  1.0f }, {  1.0f, -1.0f },   // TL, TR, BR
                 { -1.0f,  1.0f }, {  1.0f, -1.0f }, { -1.0f, -1.0f },   // TL, BR, BL
             };
-            float* bv = (float*)g_live.pGlowBaseVB->pCpuMappedAddress;
+            float* bv = (float*)fbw(g_live.pGlowBaseVB);
             for (int i = 0; i < 6; ++i) {
                 bv[i*4+0] = quad[i][0]; bv[i*4+1] = quad[i][1];   // corner.xy
                 bv[i*4+2] = quad[i][0]; bv[i*4+3] = quad[i][1];   // radial uv == corner
@@ -51098,7 +51730,7 @@ void destroyHostWindow(Renderer* R);
             ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
             ib.mDesc.mSize = (uint64_t)cap * 32; ib.mDesc.pName = "glowInstBuf";
             ib.pData = nullptr; ib.ppBuffer = &g_live.pGlowInstBuf;
-            addResource(&ib, nullptr);
+            addFrameBuf(&ib);
             waitForAllResourceLoads();
             if (!g_live.pGlowInstBuf) { std::printf("[forge][glow] instance VB alloc FAILED\n"); return false; }
             g_live.glowInstCap = cap;
@@ -51138,7 +51770,7 @@ void destroyHostWindow(Renderer* R);
         const float sunSize = 0.045f * sunDist;
 
         // --- per-instance records: 0 dome band, 1 cloud, 2 sun, 3 fill (32 floats each = kSkyInstStride) ---
-        float* inst = (float*)g_sky.inst->pCpuMappedAddress;
+        float* inst = (float*)fbw(g_sky.inst);
         auto setWorldScale = [](float* r, float s) {
             r[0]=s; r[1]=0; r[2]=0; r[3]=0;  r[4]=0; r[5]=s; r[6]=0; r[7]=0;
             r[8]=0; r[9]=0; r[10]=s; r[11]=0; r[12]=0; r[13]=0; r[14]=0; r[15]=1;
@@ -51225,7 +51857,7 @@ void destroyHostWindow(Renderer* R);
         };
         float TL[3],TR[3],BR[3],BL[3];
         corner(TL,-1.0f, 1.0f); corner(TR, 1.0f, 1.0f); corner(BR, 1.0f,-1.0f); corner(BL,-1.0f,-1.0f);
-        uint8_t* sv = (uint8_t*)g_sky.sunVB->pCpuMappedAddress;
+        uint8_t* sv = (uint8_t*)fbw(g_sky.sunVB);
         auto putHalf = [](uint8_t*& c, float f){ uint16_t h = skyF32ToF16(f); std::memcpy(c, &h, 2); c += 2; };
         auto writeVert = [&](uint8_t*& c, const float p[3], float u, float v){
             putHalf(c,p[0]); putHalf(c,p[1]); putHalf(c,p[2]); putHalf(c,1.0f);  // pos FLOAT16_4 (w=1)
@@ -51387,7 +52019,7 @@ void destroyHostWindow(Renderer* R);
         const float waterZ = waterLevelAbs + (underwater ? 5.0f : -5.0f);
         const float depthBase[3] = { 0.02f, 0.10f, 0.14f };   // deep-water tint
 
-        uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
+        uint8_t* wbuf = (uint8_t*)fbw(g_live.pWaterWorldsBuf);
         for (uint32_t k = 0; k < kWaterLevels; ++k) {
             const float cell = g_waterLevels[k].cellSize * wscale;   // horizon-extended
             const float snap = 2.0f * cell;
@@ -52422,7 +53054,7 @@ void destroyHostWindow(Renderer* R);
                 endCmd(pCmd);
                 QueueSubmitDesc sd = {};
                 sd.mCmdCount = 1; sd.ppCmds = &pCmd; sd.pSignalFence = pFence; sd.mSubmitDone = true;
-                queueSubmit(g_live.pQueue, &sd);
+                frameSubmit(&sd);
                 waitForFences(R, 1, &pFence);
             }
             if (pFence) { exitFence(R, pFence); }
@@ -52692,7 +53324,7 @@ void destroyHostWindow(Renderer* R);
         vp[2]=vp[3]-vp[2]; vp[6]=vp[7]-vp[6]; vp[10]=vp[11]-vp[10]; vp[14]=vp[15]-vp[14];
 
         // Fill gFrameData directly (opaque.srt.h FrameData layout, float indices).
-        float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+        float* fd = (float*)fbw(g_live.pFrameCbv);
         std::memcpy(fd, vp, 16*sizeof(float));
         float sun[3] = { 0.4f, 0.2f, -0.9f }; dlNorm3(sun);          // world sun TRAVEL dir (to-sun = -sun)
         fd[16]=sun[0]; fd[17]=sun[1]; fd[18]=sun[2]; fd[19]=0;       // sunDir
@@ -52739,9 +53371,16 @@ void destroyHostWindow(Renderer* R);
         // so nothing should be in flight, but settle first for the same reason the dev readbacks do
         // — resetting an allocator whose commands are still executing is undefined behaviour, and a
         // "can't happen here" is not worth a device removal.
-        settleFrameFence(R);
-        resetCmdPool(R, g_live.pCmdPool);
+        settleAllFrames(R);
+        resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
         beginCmd(g_live.pCmd);
+        {   // Both shared RTs are born in COMMON (P3); this probe used to lean on "created RENDER_TARGET".
+            RenderTargetBarrier toRT = {};
+            toRT.pRenderTarget = g_live.pRT;
+            toRT.mCurrentState = RESOURCE_STATE_COMMON;
+            toRT.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
+        }
         BindRenderTargetsDesc bind = {};
         bind.mRenderTargetCount = 1;
         bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
@@ -52778,10 +53417,10 @@ void destroyHostWindow(Renderer* R);
         QueueSubmitDesc submit = {};
         submit.mCmdCount = 1;
         submit.ppCmds = &g_live.pCmd;
-        submit.pSignalFence = g_live.pFence;
+        submit.pSignalFence = g_live.pFence[g_live.recSlot];
         submit.mSubmitDone = true;
-        queueSubmit(g_live.pQueue, &submit);
-        waitForFences(R, 1, &g_live.pFence);
+        frameSubmit(&submit);
+        waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
 
         TextureCopyDesc copyDesc = {};
         copyDesc.pTexture = g_live.pRT->pTexture;
@@ -53168,7 +53807,7 @@ void destroyHostWindow(Renderer* R);
             dlMul(view, proj, vp);
             vp[2]=vp[3]-vp[2]; vp[6]=vp[7]-vp[6]; vp[10]=vp[11]-vp[10]; vp[14]=vp[15]-vp[14];
 
-            float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* fd = (float*)fbw(g_live.pFrameCbv);
             std::memcpy(fd, vp, 16*sizeof(float));
             float sun[3] = { kViewerSunDir[0], kViewerSunDir[1], kViewerSunDir[2] }; dlNorm3(sun);
             fd[16]=sun[0]; fd[17]=sun[1]; fd[18]=sun[2]; fd[19]=0;
@@ -53198,7 +53837,7 @@ void destroyHostWindow(Renderer* R);
             acquireNextImage(R, pSwap, pImgSem, nullptr, &idx);
             RenderTarget* bb = pSwap->ppRenderTargets[idx];
 
-            resetCmdPool(R, g_live.pCmdPool);
+            resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
             beginCmd(g_live.pCmd);
             // MSAA (sampleCount > 1): draw into g_live.pSceneColor and ResolveSubresource into the
             // acquired backbuffer at the end — the same shape as the live path (which resolves into
@@ -53281,16 +53920,16 @@ void destroyHostWindow(Renderer* R);
 
             QueueSubmitDesc sub = {};
             sub.mCmdCount = 1; sub.ppCmds = &g_live.pCmd;
-            sub.pSignalFence = g_live.pFence;
+            sub.pSignalFence = g_live.pFence[g_live.recSlot];
             sub.mWaitSemaphoreCount = 1; sub.ppWaitSemaphores = &pImgSem;
             sub.mSignalSemaphoreCount = 1; sub.ppSignalSemaphores = &pRenderSem;
-            queueSubmit(g_live.pQueue, &sub);
+            frameSubmit(&sub);
             QueuePresentDesc pres = {};
             pres.pSwapChain = pSwap; pres.mIndex = (uint8_t)idx;
             pres.mWaitSemaphoreCount = 1; pres.ppWaitSemaphores = &pRenderSem;
             pres.mSubmitDone = true;
             queuePresent(g_live.pQueue, &pres);
-            waitForFences(R, 1, &g_live.pFence);
+            waitForFences(R, 1, &g_live.pFence[g_live.recSlot]);
         }
 
         waitQueueIdle(g_live.pQueue);
@@ -53299,8 +53938,8 @@ void destroyHostWindow(Renderer* R);
         if (g_viewerReflectTex) { removeResource(g_viewerReflectTex); g_viewerReflectTex = nullptr; }
         // SK V2 viewer sky teardown.
         if (g_sky.fillVB)    { removeResource(g_sky.fillVB);    g_sky.fillVB = nullptr; }
-        if (g_sky.sunVB)     { removeResource(g_sky.sunVB);     g_sky.sunVB = nullptr; }
-        if (g_sky.inst)      { removeResource(g_sky.inst);      g_sky.inst = nullptr; }
+        if (g_sky.sunVB)     { removeFrameBuf(g_sky.sunVB);     g_sky.sunVB = nullptr; }
+        if (g_sky.inst)      { removeFrameBuf(g_sky.inst);      g_sky.inst = nullptr; }
         if (g_sky.pipeSun)   { removePipeline(R, g_sky.pipeSun);   g_sky.pipeSun = nullptr; }
         if (g_sky.pipeCloud) { removePipeline(R, g_sky.pipeCloud); g_sky.pipeCloud = nullptr; }
         if (g_sky.pipeDome)  { removePipeline(R, g_sky.pipeDome);  g_sky.pipeDome = nullptr; }
@@ -54467,9 +55106,9 @@ void destroyHostWindow(Renderer* R);
     void updateGrassField(Renderer* R) {
         if (!g_grassFieldReady || !g_drawGrass || !g_dlExterior) { return; }
         if (!g_live.pGrassCullInst) { return; }
-        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pFrameCbv || !fbr(g_live.pFrameCbv)) { return; }
 
-        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float* mfd = (const float*)fbr(g_live.pFrameCbv);
         const int32_t ecx = (int32_t)std::floor(mfd[56] / grassfmt::kCellSize);
         const int32_t ecy = (int32_t)std::floor(mfd[57] / grassfmt::kCellSize);
         // Exactly the cells the draw range can reach and no more. ⚠ No slack ring: a blade `range`
@@ -54494,12 +55133,7 @@ void destroyHostWindow(Renderer* R);
 
         if (g_grassInstCount) {
             const uint64_t bytes = (uint64_t)sizeof(GpuCullInstance) * g_grassInstCount;
-            BufferUpdateDesc u = {};
-            u.pBuffer = g_live.pGrassCullInst; u.mDstOffset = 0; u.mSize = bytes;
-            beginUpdateResource(&u);
-            std::memcpy(u.pMappedData, g_grassInst.data(), (size_t)bytes);
-            endUpdateResource(&u);
-            flushTextureUploads(R);
+            std::memcpy(fbwRange(g_live.pGrassCullInst, 0, bytes), g_grassInst.data(), (size_t)bytes);
         }
 
         g_grassWinCX = ecx; g_grassWinCY = ecy; g_grassWinRadius = radius;
@@ -54532,7 +55166,7 @@ void destroyHostWindow(Renderer* R);
         ir.mDesc.pName = "staticsInstRing";
         ir.pData = nullptr;
         ir.ppBuffer = &g_pStaticsInstRing;
-        addResource(&ir, nullptr);
+        addFrameBuf(&ir);
         BufferLoadDesc ar = {};
         ar.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDIRECT_BUFFER;
         ar.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -54541,12 +55175,12 @@ void destroyHostWindow(Renderer* R);
         ar.mDesc.pName = "staticsArgsRing";
         ar.pData = nullptr;
         ar.ppBuffer = &g_pStaticsArgsRing;
-        addResource(&ar, nullptr);
+        addFrameBuf(&ar);
         // WV2: duplicate rings for the reflection cull (same caps; filled by the mirror-frustum cull).
         BufferLoadDesc irR = ir; irR.mDesc.pName = "staticsInstRingRefl"; irR.ppBuffer = &g_pStaticsInstRingRefl;
-        addResource(&irR, nullptr);
+        addFrameBuf(&irR);
         BufferLoadDesc arR = ar; arR.mDesc.pName = "staticsArgsRingRefl"; arR.ppBuffer = &g_pStaticsArgsRingRefl;
-        addResource(&arR, nullptr);
+        addFrameBuf(&arR);
         waitForAllResourceLoads();
         return g_pStaticsInstRing && g_pStaticsArgsRing
             && g_pStaticsInstRingRefl && g_pStaticsArgsRingRefl;
@@ -54579,7 +55213,7 @@ void destroyHostWindow(Renderer* R);
         BufferLoadDesc rb = {};
         rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
         rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-        rb.mDesc.mSize        = 16;
+        rb.mDesc.mSize        = kRbLane * kFrameSlots;
         rb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
         rb.mDesc.pName        = "lightOccReadback";
         rb.ppBuffer           = &g_live.pLightOccReadback;
@@ -54604,11 +55238,11 @@ void destroyHostWindow(Renderer* R);
         hb.mDesc.mSize        = 1024;                         // >= sizeof(LightCullParams) (608B), CBV-aligned
         hb.mDesc.pName        = "lightHizCbv";
         hb.ppBuffer           = &g_live.pLightHizCbv;
-        addResource(&hb, nullptr);
+        addFrameBuf(&hb);
 
         waitForAllResourceLoads();
-        if (g_live.pLightOccZero && g_live.pLightOccZero->pCpuMappedAddress) {
-            std::memset(g_live.pLightOccZero->pCpuMappedAddress, 0, 16);   // reset source (never changes)
+        if (g_live.pLightOccZero && fbr(g_live.pLightOccZero)) {
+            std::memset(fbw(g_live.pLightOccZero), 0, 16);   // reset source (never changes)
         }
         if (!g_live.pLightOccBits || !g_live.pLightOccReadback
             || !g_live.pLightOccZero || !g_live.pLightHizCbv) {
@@ -54679,7 +55313,9 @@ void destroyHostWindow(Renderer* R);
         ib.mDesc.pName         = "cullInstBuf";
         ib.pData               = g_cullInst.data();           // staged upload at load
         ib.ppBuffer            = &g_live.pCullInstBuf;
-        addResource(&ib, nullptr);
+        // A FrameBuf: dlNearOwnRefresh rewrites visIndex words while the previous frame's cull
+        // may still be reading this buffer — through the queue, not the loader, since P2.
+        addFrameBuf(&ib);
 
         // (2) Survivor-count UAV (uint[4]; [0] = Σ numSubsets). DEFAULT heap (UAV can't be upload/readback).
         BufferLoadDesc cb = {};
@@ -54699,7 +55335,7 @@ void destroyHostWindow(Renderer* R);
         BufferLoadDesc rb = {};
         rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
         rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-        rb.mDesc.mSize        = 16;
+        rb.mDesc.mSize        = kRbLane * kFrameSlots;
         rb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
         rb.mDesc.pName        = "cullCountReadback";
         rb.ppBuffer           = &g_live.pCullCountReadback;
@@ -54720,7 +55356,7 @@ void destroyHostWindow(Renderer* R);
         pb.mDesc.mSize        = 512;                          // == sizeof(CullParams) (512B), CBV-aligned
         pb.mDesc.pName        = "cullParamsCbv";
         pb.ppBuffer           = &g_live.pCullParamsCbv;
-        addResource(&pb, nullptr);
+        addFrameBuf(&pb);
 
         // ---- Stage B (B3) count->prefix-sum->scatter resources ----
         const uint32_t subsetCount = (uint32_t)g_staticsSubsets.size();
@@ -54752,7 +55388,7 @@ void destroyHostWindow(Renderer* R);
                 hb.mDesc.mSize        = 256;          // 3 float4 — min CBV size
                 hb.mDesc.pName        = name;
                 hb.ppBuffer           = out;
-                addResource(&hb, nullptr);
+                addFrameBuf(&hb);
             };
             addHeightOccCbv(&g_live.pHeightOccCbvOff,  "heightOccParamsOff");
             addHeightOccCbv(&g_live.pHeightOccCbvRefl, "heightOccParamsRefl");
@@ -54762,13 +55398,13 @@ void destroyHostWindow(Renderer* R);
             // allocation to be zero — is the [[feedback_clear_reserved_lanes_before_writing_them]]
             // rule: a lane that read uninitialised memory would arm the test on whichever machine
             // happened to hand back a nonzero byte.
-            if (g_live.pHeightOccCbvOff && g_live.pHeightOccCbvOff->pCpuMappedAddress) {
-                std::memset(g_live.pHeightOccCbvOff->pCpuMappedAddress, 0, 256);
+            if (g_live.pHeightOccCbvOff && fbr(g_live.pHeightOccCbvOff)) {
+                std::memset(fbw(g_live.pHeightOccCbvOff), 0, 256);
             }
             // ...and the mirror's, ALSO zeroed at create. It is refreshed per frame while armed, but
             // a frame where dispatchReflCull runs before the first fill would otherwise read garbage.
-            if (g_live.pHeightOccCbvRefl && g_live.pHeightOccCbvRefl->pCpuMappedAddress) {
-                std::memset(g_live.pHeightOccCbvRefl->pCpuMappedAddress, 0, 256);
+            if (g_live.pHeightOccCbvRefl && fbr(g_live.pHeightOccCbvRefl)) {
+                std::memset(fbw(g_live.pHeightOccCbvRefl), 0, 256);
             }
         }
 
@@ -54824,11 +55460,11 @@ void destroyHostWindow(Renderer* R);
         addResource(&ob, nullptr);
 
         waitForAllResourceLoads();
-        if (g_live.pCullCountZero && g_live.pCullCountZero->pCpuMappedAddress) {
-            std::memset(g_live.pCullCountZero->pCpuMappedAddress, 0, 16);  // reset source (never changes)
+        if (g_live.pCullCountZero && fbr(g_live.pCullCountZero)) {
+            std::memset(fbw(g_live.pCullCountZero), 0, 16);  // reset source (never changes)
         }
-        if (g_live.pSubsetCountZero && g_live.pSubsetCountZero->pCpuMappedAddress) {
-            std::memset(g_live.pSubsetCountZero->pCpuMappedAddress, 0, (size_t)sizeof(uint32_t) * subsetCount);
+        if (g_live.pSubsetCountZero && fbr(g_live.pSubsetCountZero)) {
+            std::memset(fbw(g_live.pSubsetCountZero), 0, (size_t)sizeof(uint32_t) * subsetCount);
         }
         if (!g_live.pCullInstBuf || !g_live.pCullCountBuf || !g_live.pCullCountReadback
             || !g_live.pCullCountZero || !g_live.pCullParamsCbv) {
@@ -54921,7 +55557,7 @@ void destroyHostWindow(Renderer* R);
             spc.mDesc.mSize        = 512;                     // matches the camera CullParams (512B)
             spc.mDesc.pName        = "sunCullParamsCbv";
             spc.ppBuffer           = &g_live.pSunCullParamsCbv;
-            addResource(&spc, nullptr);
+            addFrameBuf(&spc);
 
             BufferLoadDesc scc = {};
             scc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -55025,7 +55661,7 @@ void destroyHostWindow(Renderer* R);
             rpc.mDesc.mSize        = 512;                     // matches the camera CullParams (512B)
             rpc.mDesc.pName        = "reflCullParamsCbv";
             rpc.ppBuffer           = &g_live.pReflCullParamsCbv;
-            addResource(&rpc, nullptr);
+            addFrameBuf(&rpc);
 
             BufferLoadDesc rcc = {};
             rcc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -55043,7 +55679,7 @@ void destroyHostWindow(Renderer* R);
             BufferLoadDesc rrb = {};
             rrb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
             rrb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            rrb.mDesc.mSize        = 16;
+            rrb.mDesc.mSize        = kRbLane * kFrameSlots;
             rrb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
             rrb.mDesc.pName        = "reflCullReadback";
             rrb.ppBuffer           = &g_live.pReflCullReadback;
@@ -55137,11 +55773,11 @@ void destroyHostWindow(Renderer* R);
             kpc.mDesc.mSize        = 512;
             kpc.mDesc.pName        = "skyCullParamsCbv";
             kpc.ppBuffer           = &g_live.pSkyCullParamsCbv;
-            addResource(&kpc, nullptr);
+            addFrameBuf(&kpc);
             for (uint32_t d = 0; d < 32; ++d) {
                 kpc.mDesc.pName = "svmCullParamsCbv";
                 kpc.ppBuffer    = &g_live.pSvmCullCbv[d];
-                addResource(&kpc, nullptr);
+                addFrameBuf(&kpc);
             }
 
             BufferLoadDesc kcc = {};
@@ -55158,7 +55794,7 @@ void destroyHostWindow(Renderer* R);
             BufferLoadDesc krb = {};
             krb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
             krb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            krb.mDesc.mSize        = 16;
+            krb.mDesc.mSize        = kRbLane * kFrameSlots;
             krb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
             krb.mDesc.pName        = "skyCullCountReadback";
             krb.ppBuffer           = &g_live.pSkyCullReadback;
@@ -55271,7 +55907,7 @@ void destroyHostWindow(Renderer* R);
             gib.mDesc.pName         = "grassCullInst";
             gib.pData               = nullptr;
             gib.ppBuffer            = &g_live.pGrassCullInst;
-            addResource(&gib, nullptr);
+            addFrameBuf(&gib);   // rewritten on every window rebuild, under a frame in flight
 
             BufferLoadDesc gsb = {};
             gsb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
@@ -55330,7 +55966,7 @@ void destroyHostWindow(Renderer* R);
                 bd.mDesc.mSize        = 512;                  // matches the camera CullParams
                 bd.mDesc.pName        = name;
                 bd.ppBuffer           = out;
-                addResource(&bd, nullptr);
+                addFrameBuf(&bd);
             };
             auto addGrassCount = [&](Buffer** out, const char* name) {
                 BufferLoadDesc bd = {};
@@ -55372,7 +56008,7 @@ void destroyHostWindow(Renderer* R);
             BufferLoadDesc grb = {};
             grb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
             grb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            grb.mDesc.mSize        = 16;
+            grb.mDesc.mSize        = kRbLane * kFrameSlots;
             grb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
             grb.mDesc.pName        = "grassCullReadback";
             grb.ppBuffer           = &g_live.pGrassCullReadback;
@@ -55389,8 +56025,8 @@ void destroyHostWindow(Renderer* R);
             addGrassInstOut(&g_live.pGrassSunInstOut, "grassSunCullInstOut");
 
             waitForAllResourceLoads();
-            if (g_live.pGrassSubsetCountZero && g_live.pGrassSubsetCountZero->pCpuMappedAddress) {
-                std::memset(g_live.pGrassSubsetCountZero->pCpuMappedAddress, 0,
+            if (g_live.pGrassSubsetCountZero && fbr(g_live.pGrassSubsetCountZero)) {
+                std::memset(fbw(g_live.pGrassSubsetCountZero), 0,
                             (size_t)sizeof(uint32_t) * gSub);
             }
 
@@ -55550,12 +56186,12 @@ void destroyHostWindow(Renderer* R);
         if (!T.primary) { g_reflCullValid = false; }
         // ...and the handover plane (lodParams.z): an interior never reaches the block that writes
         // it, and a stale armed value would cut the near scene at the last exterior's reach.
-        if (T.primary && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress) {
-            ((float*)g_live.pFrameCbv->pCpuMappedAddress)[50] = 0.0f;
+        if (T.primary && g_live.pFrameCbv && fbr(g_live.pFrameCbv)) {
+            ((float*)fbw(g_live.pFrameCbv))[50] = 0.0f;
             // ...and the LIGHT handover (lodParams.x) for the same reason: a stale exterior radius
             // would run the G4 shadow->gobo fade and the twinless-light fade inside an interior.
             // An exterior frame rewrites both below.
-            ((float*)g_live.pFrameCbv->pCpuMappedAddress)[48] = 0.0f;
+            ((float*)fbw(g_live.pFrameCbv))[48] = 0.0f;
             g_dlHandoverR = 0.0f;
         }
         if (!g_dlExterior) { return; }
@@ -55611,7 +56247,7 @@ void destroyHostWindow(Renderer* R);
         // these are camera-independent, so the reflect cull must not touch pFrameCbv (its geo cbuffer
         // is a copy made in the reflect pass).
         if (T.primary) {
-            float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* fd = (float*)fbw(g_live.pFrameCbv);
             // lodParams.x = the light handoff above (terrain.frag's per-fragment near/far pick).
             // .z was one of the DL world bake's normal/detail atlas slots — retired with the bake.
             // .w (nearViewRange) survives: statics.vert still gates the hero near-cut on it.
@@ -55725,7 +56361,7 @@ void destroyHostWindow(Renderer* R);
             }
 
             if (g_live.pDistLightCbv) {
-                float* lc = (float*)g_live.pDistLightCbv->pCpuMappedAddress;
+                float* lc = (float*)fbw(g_live.pDistLightCbv);
                 if (g_drawDistLights) {
                     // reachK (hoisted above) matches the near path so baked + live lights fade
                     // identically at the handoff.
@@ -55813,7 +56449,7 @@ void destroyHostWindow(Renderer* R);
             // radial-slice grid. The reflect pass keeps froxelDims=0 in ITS frame cbuffer (mirror
             // viewProj differs) -> brute loop there. Clustering off (no lights / disabled / not ready)
             // -> froxelDims.x=0 -> frags brute-loop. Slice metric = radial distance, matching the frag.
-            float* mfd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* mfd = (float*)fbw(g_live.pFrameCbv);
             g_live.froxelActive = false;
             const uint32_t nAll = nUp + (uint32_t)s_dyn.size();   // baked + G4b twinless, as uploaded
             if (g_live.froxelReady && g_useFroxel && g_drawDistLights && nAll > 0u && g_live.pFroxelParamsCbv) {
@@ -55827,7 +56463,7 @@ void destroyHostWindow(Renderer* R);
                 const float logd0  = std::log(d0);
                 const float invLog = 1.0f / std::max(std::log(d1 / d0), 1e-4f);
 
-                float* fp = (float*)g_live.pFroxelParamsCbv->pCpuMappedAddress;
+                float* fp = (float*)fbw(g_live.pFroxelParamsCbv);
                 std::memcpy(fp, mfd, 16 * sizeof(float));                          // [0..15] = gFrameData.viewProj
                 // ^ use the FRAME cbuffer's viewProj (what the DL vertex shader uses to make SV_Position),
                 //   NOT the `viewProj` param — guarantees the froxel projection matches the rasterized tile.
@@ -55866,7 +56502,7 @@ void destroyHostWindow(Renderer* R);
 
         if (!g_staticsLiveOk) { return; }
         // nearViewRange (fd[51]) is a constant written by the primary path; read it for the near cutoff.
-        const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float* fd = (const float*)fbr(g_live.pFrameCbv);
 
         // Statics: per-cell coarse reject, then per-instance tier/distance/MinSize + frustum cull.
         // Survivors expand to (instance x subset), grouped by subset into the instance ring.
@@ -56043,8 +56679,9 @@ void destroyHostWindow(Renderer* R);
         }
 
         // Flatten the touched subsets into the caller's rings (one indirect-arg per subset).
-        float* instMap = (float*)(*T.instRing)->pCpuMappedAddress;
-        IndirectDrawIndexArguments* argMap = (IndirectDrawIndexArguments*)(*T.argRing)->pCpuMappedAddress;
+        // Used prefix marked after the loop (the counts are only known there).
+        float* instMap = (float*)fbwPre(*T.instRing);
+        IndirectDrawIndexArguments* argMap = (IndirectDrawIndexArguments*)fbwPre(*T.argRing);
         uint32_t instBase = 0, drawCount = 0;
         for (uint32_t sid : s_touched) {
             std::vector<float>& v = s_bySubset[sid];
@@ -56063,6 +56700,8 @@ void destroyHostWindow(Renderer* R);
             instBase += instCount;
             v.clear();   // reset for next frame (capacity retained)
         }
+        fbwRange(*T.instRing, 0, (uint64_t)instBase * 20 * sizeof(float));
+        fbwRange(*T.argRing, 0, (uint64_t)drawCount * sizeof(IndirectDrawIndexArguments));
         *T.lastSubsets = drawCount;
         if (T.lastInst) { *T.lastInst = instBase; }
         if (T.primary) {
@@ -56092,8 +56731,8 @@ void destroyHostWindow(Renderer* R);
         // cbuffer (the validation dispatch runs during command recording, post-beginCmd). The GPU
         // tests every instance with this identical rule → its Σ numSubsets must equal g_liveLastInst.
         // PRIMARY only — the GPU-cull validation belongs to the main path (mirror planes would corrupt it).
-        if (T.primary && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress) {
-            float* cp = (float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+        if (T.primary && g_live.pCullParamsCbv && fbr(g_live.pCullParamsCbv)) {
+            float* cp = (float*)fbw(g_live.pCullParamsCbv);
             for (int p = 0; p < 6; ++p) { std::memcpy(cp + p * 4, planes[p], 4 * sizeof(float)); } // 0..23
             cp[24] = eye[0]; cp[25] = eye[1]; cp[26] = eye[2]; cp[27] = 0.0f;                       // eye
             cp[28] = nearEnd * nearEnd; cp[29] = farEnd * farEnd;                                   // ranges
@@ -56313,15 +56952,10 @@ void destroyHostWindow(Renderer* R);
             auto o = g_nearOwnOverrides.find(ii);
             gi.visIndex = (gi.visIndex & kVisIndexMask) | (o != g_nearOwnOverrides.end() ? o->second : 0u);
             if (!g_live.pCullInstBuf) { continue; }
-            BufferUpdateDesc u = {};
-            u.pBuffer    = g_live.pCullInstBuf;
-            u.mDstOffset = (uint64_t)ii * sizeof(GpuCullInstance) + offsetof(GpuCullInstance, visIndex);
-            u.mSize      = sizeof(uint32_t);
-            beginUpdateResource(&u);
-            std::memcpy(u.pMappedData, &gi.visIndex, sizeof(uint32_t));
-            endUpdateResource(&u);
+            const uint64_t off = (uint64_t)ii * sizeof(GpuCullInstance) + offsetof(GpuCullInstance, visIndex);
+            std::memcpy((uint8_t*)fbwRange(g_live.pCullInstBuf, off, sizeof(uint32_t)) + off,
+                        &gi.visIndex, sizeof(uint32_t));
         }
-        if (g_live.pCullInstBuf) { flushTextureUploads(R); }
         LOG::logline(">> [forge][dl] near-own refresh: t=%llu refs=%zu window=%u matched=%u orphans=%u adopted=%u "
                      "wrote=%zu centre=(%d,%d) mask=0x%03X", (unsigned long long)GetTickCount64(),
                      g_nearRefs.size(), g_nearOwnWindow, g_nearOwnMatched, g_nearOwnOrphans,
@@ -56549,9 +57183,9 @@ void destroyHostWindow(Renderer* R);
     void dispatchSunCull() {
         if (!g_live.sunCullReady || !g_live.pCullPipeline || !g_live.cullInstCount) { return; }
         if (!g_dlExterior || !g_dlLiveInit || !g_staticsLiveOk) { return; }
-        if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress
-            || !g_live.pSunCullParamsCbv || !g_live.pSunCullParamsCbv->pCpuMappedAddress
-            || !g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pCullParamsCbv || !fbr(g_live.pCullParamsCbv)
+            || !g_live.pSunCullParamsCbv || !fbr(g_live.pSunCullParamsCbv)
+            || !g_live.pFrameCbv || !fbr(g_live.pFrameCbv)) { return; }
 
         // Sun CullParams = copy of the camera params (inherits eye + misc = inst/subset counts + the
         // dynamic visibility mask), then override planes / ranges / Hi-Z. Layout: planes[0..23],
@@ -56560,11 +57194,11 @@ void destroyHostWindow(Renderer* R);
         // The copy MUST span all 512 B: the sun cull runs with nearCut²=0 and huge tier ranges so DL
         // statics cast into the near scene and from off-screen, which means a hidden instance the
         // camera cull dropped would still cast here — a shadow on bare ground with no building.
-        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
-        float*       sp  = (float*)g_live.pSunCullParamsCbv->pCpuMappedAddress;
+        const float* cam = (const float*)fbr(g_live.pCullParamsCbv);
+        float*       sp  = (float*)fbw(g_live.pSunCullParamsCbv);
         std::memcpy(sp, cam, 512);
 
-        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float* mfd = (const float*)fbr(g_live.pFrameCbv);
         float xa[3], ya[3], za[3];
         sunLightBasis(&mfd[16], xa, ya, za);
         // The cull box is the OUTERMOST cascade's (the inner ones are concentric subsets of it) and
@@ -56660,11 +57294,11 @@ void destroyHostWindow(Renderer* R);
         if (!g_live.reflCullReady || !g_live.pCullPipeline || !g_live.cullInstCount) { return; }
         if (!g_dlExterior || !g_dlLiveInit || !g_staticsLiveOk) { return; }
         if (!g_reflCullValid || !g_reflGeoReady) { return; }
-        if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress
-            || !g_live.pReflCullParamsCbv || !g_live.pReflCullParamsCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pCullParamsCbv || !fbr(g_live.pCullParamsCbv)
+            || !g_live.pReflCullParamsCbv || !fbr(g_live.pReflCullParamsCbv)) { return; }
 
-        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
-        float*       cp  = (float*)g_live.pReflCullParamsCbv->pCpuMappedAddress;
+        const float* cam = (const float*)fbr(g_live.pCullParamsCbv);
+        float*       cp  = (float*)fbw(g_live.pReflCullParamsCbv);
         std::memcpy(cp, cam, 512);
         for (int pl = 0; pl < 6; ++pl) { std::memcpy(cp + pl * 4, g_reflCullPlanes[pl], 4 * sizeof(float)); }
         cp[24] = g_reflCullEye[0]; cp[25] = g_reflCullEye[1]; cp[26] = g_reflCullEye[2];
@@ -56678,10 +57312,10 @@ void destroyHostWindow(Renderer* R);
         // describes this window, and has a pyramid over it. A shader that armed itself off a knob
         // alone would march a map from the wrong snap cell the frame after a crossing.
         g_reflHeightOccArmed = false;
-        if (g_live.pHeightOccCbvRefl && g_live.pHeightOccCbvRefl->pCpuMappedAddress) {
+        if (g_live.pHeightOccCbvRefl && fbr(g_live.pHeightOccCbvRefl)) {
             const bool arm = g_reflHeightOcc && g_skyHeightValid && g_skyHeightMinValid
                           && g_live.skyHeightMinReady && g_live.pSkyHeightMin;
-            float* hp = (float*)g_live.pHeightOccCbvRefl->pCpuMappedAddress;
+            float* hp = (float*)fbw(g_live.pHeightOccCbvRefl);
             hp[0] = arm ? 1.0f : 0.0f;
             hp[1] = g_reflMirrorZAbs;                          // the water plane (absolute world Z)
             hp[2] = std::max(1.0f, g_reflHeightOccSteps);
@@ -56742,7 +57376,7 @@ void destroyHostWindow(Renderer* R);
         // meaningless, and a lane whose survivors were quietly wrong looks identical to one that is
         // right until someone notices a building missing from the water.
         bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
-        cl->CopyBufferRegion(g_live.pReflCullReadback->mDx.pResource, 0,
+        cl->CopyBufferRegion(g_live.pReflCullReadback->mDx.pResource, rbLaneOff(),
                              g_live.pReflCullCount->mDx.pResource, 0, 2 * sizeof(uint32_t));
         bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         bufBarrier(g_live.pReflArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
@@ -56791,7 +57425,7 @@ void destroyHostWindow(Renderer* R);
             cb.mDesc.mSize        = 512;
             cb.mDesc.pName        = "occProbeCullParams";
             cb.ppBuffer           = &g_live.pOccProbeCullCbv[v];
-            addResource(&cb, nullptr);
+            addFrameBuf(&cb);
 
             BufferLoadDesc pb = {};
             pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -56800,7 +57434,7 @@ void destroyHostWindow(Renderer* R);
             pb.mDesc.mSize        = 256;   // four float4s; 256 B = min CBV
             pb.mDesc.pName        = "occProbeParams";
             pb.ppBuffer           = &g_live.pOccProbeParamsCbv[v];
-            addResource(&pb, nullptr);
+            addFrameBuf(&pb);
 
             // (2) The counters, and their readback. Reset from the SHARED pCullCountZero (16 B),
             //     exactly as every other counter on this host is.
@@ -56820,7 +57454,7 @@ void destroyHostWindow(Renderer* R);
             BufferLoadDesc rb = {};
             rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
             rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            rb.mDesc.mSize        = 16;
+            rb.mDesc.mSize        = kRbLane * kFrameSlots;
             rb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
             rb.mDesc.pName        = "occProbeReadback";
             rb.ppBuffer           = &g_live.pOccProbeReadback[v];
@@ -56895,9 +57529,9 @@ void destroyHostWindow(Renderer* R);
         // Which views have something to say THIS frame. Either may be silent on its own; a silent
         // view reports 0/0, which reads differently from "0 rejected out of 12,000".
         const bool sunArm = g_live.sunCullReady && g_sunOccValid && g_skyHeightValid
-                         && g_live.pSunCullParamsCbv && g_live.pSunCullParamsCbv->pCpuMappedAddress;
+                         && g_live.pSunCullParamsCbv && fbr(g_live.pSunCullParamsCbv);
         const bool reflArm = g_reflGeoReady && g_reflCullValid && g_skyHeightValid
-                          && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress;
+                          && g_live.pCullParamsCbv && fbr(g_live.pCullParamsCbv);
         if (!sunArm && !reflArm) { return; }
 
         ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
@@ -56912,17 +57546,17 @@ void destroyHostWindow(Renderer* R);
             if (isSun ? !sunArm : !reflArm) { continue; }
 
             // --- the VIEW's own cull rule, copied whole ------------------------------------------
-            float* cp = (float*)g_live.pOccProbeCullCbv[v]->pCpuMappedAddress;
+            float* cp = (float*)fbw(g_live.pOccProbeCullCbv[v]);
             if (isSun) {
                 // The sun cull publishes a complete CullParams every frame, so the sun probe's
                 // denominator is that cull's own numbers with nothing reconstructed at all.
-                std::memcpy(cp, g_live.pSunCullParamsCbv->pCpuMappedAddress, 512);
+                std::memcpy(cp, fbr(g_live.pSunCullParamsCbv), 512);
             } else {
                 // The mirror has no cbuffer of its own, so start from the CAMERA's (which carries
                 // misc = the instance/subset counts and the whole visMask — both shared, and both
                 // things the reflect CPU cull genuinely applies) and override the four fields that
                 // are the mirror's alone. Exactly the shape dispatchSunCull uses for the same reason.
-                std::memcpy(cp, g_live.pCullParamsCbv->pCpuMappedAddress, 512);
+                std::memcpy(cp, fbr(g_live.pCullParamsCbv), 512);
                 for (int pl = 0; pl < 6; ++pl) { std::memcpy(cp + pl * 4, g_reflCullPlanes[pl], 4 * sizeof(float)); }
                 cp[24] = g_reflCullEye[0]; cp[25] = g_reflCullEye[1]; cp[26] = g_reflCullEye[2];
                 cp[28] = g_reflCullRanges[0]; cp[29] = g_reflCullRanges[1]; cp[30] = g_reflCullRanges[2];
@@ -56933,7 +57567,7 @@ void destroyHostWindow(Renderer* R);
             }
 
             // --- the probe's own params ----------------------------------------------------------
-            float* pp = (float*)g_live.pOccProbeParamsCbv[v]->pCpuMappedAddress;
+            float* pp = (float*)fbw(g_live.pOccProbeParamsCbv[v]);
             pp[0] = g_skyHeightOrigin[0]; pp[1] = g_skyHeightOrigin[1];
             pp[2] = kSkyHeightTexel;      pp[3] = (float)kSkyHeightRes;
             pp[4] = (float)kSunOccRes;    pp[5] = kSunOccTexel;
@@ -56969,7 +57603,7 @@ void destroyHostWindow(Renderer* R);
             cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
 
             bufBarrier(g_live.pOccProbeCount[v], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
-            cl->CopyBufferRegion(g_live.pOccProbeReadback[v]->mDx.pResource, 0,
+            cl->CopyBufferRegion(g_live.pOccProbeReadback[v]->mDx.pResource, rbLaneOff(),
                                  g_live.pOccProbeCount[v]->mDx.pResource, 0, 4 * sizeof(uint32_t));
             bufBarrier(g_live.pOccProbeCount[v], RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
@@ -57006,9 +57640,9 @@ void destroyHostWindow(Renderer* R);
         Buffer* instOut   = sunLane ? g_live.pGrassSunInstOut       : g_live.pGrassInstOut;
         DescriptorSet* set = sunLane ? g_live.pGrassSunCullSet      : g_live.pGrassCullSet;
         bool&   inDraw    = sunLane ? g_live.grassSunArgsInDrawState : g_live.grassArgsInDrawState;
-        if (!set || !paramsCbv || !paramsCbv->pCpuMappedAddress) { return; }
-        if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress) { return; }
-        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+        if (!set || !paramsCbv || !fbr(paramsCbv)) { return; }
+        if (!g_live.pCullParamsCbv || !fbr(g_live.pCullParamsCbv)) { return; }
+        if (!g_live.pFrameCbv || !fbr(g_live.pFrameCbv)) { return; }
 
         // Same clone contract as dispatchSunCull: copy the camera params WHOLE (inheriting the eye,
         // the Hi-Z pyramid state and the dynamic visibility mask), then override only what differs.
@@ -57019,7 +57653,7 @@ void destroyHostWindow(Renderer* R);
         // is one streaming read plus one streaming write. It also leaves `lp` as a plain-memory
         // SNAPSHOT of exactly what the GPU was told, which is what the heartbeat's cross-check reads
         // — asking the WC cbuffer would be both slow and, at 300-frame intervals, pointlessly so.
-        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+        const float* cam = (const float*)fbr(g_live.pCullParamsCbv);
         float lp[128];
         std::memcpy(lp, cam, 512);
         float* gp = lp;
@@ -57039,7 +57673,7 @@ void destroyHostWindow(Renderer* R);
             // The caster's frustum is the outermost sun cascade's ortho box, exactly as
             // dispatchSunCull builds it — one cull feeds every cascade because the inner boxes are
             // concentric subsets of it.
-            const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float* mfd = (const float*)fbr(g_live.pFrameCbv);
             float xa[3], ya[3], za[3];
             sunLightBasis(&mfd[16], xa, ya, za);
             const float range = g_sunShadowRange, depthHalf = 2.0f * g_sunShadowRange;
@@ -57069,7 +57703,7 @@ void destroyHostWindow(Renderer* R);
         gp[127] = (!sunLane && g_grassNearCut) ? lp[127] : 0.0f;
 
         // Publish, and keep the camera lane's copy for the heartbeat cross-check.
-        std::memcpy(paramsCbv->pCpuMappedAddress, lp, 512);
+        std::memcpy(fbw(paramsCbv), lp, 512);
         if (!sunLane) { std::memcpy(g_grassCullDbg, lp, sizeof(g_grassCullDbg)); g_grassCullDbgOk = true; }
 
         ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
@@ -57121,7 +57755,7 @@ void destroyHostWindow(Renderer* R);
         // raises is worth checking, and one it does not raise is a real all-clear.
         if (!sunLane && g_live.pGrassCullReadback) {
             bufBarrier(countBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
-            cl->CopyBufferRegion(g_live.pGrassCullReadback->mDx.pResource, 0,
+            cl->CopyBufferRegion(g_live.pGrassCullReadback->mDx.pResource, rbLaneOff(),
                                  countBuf->mDx.pResource, 0, 2 * sizeof(uint32_t));
             bufBarrier(countBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
@@ -57305,8 +57939,8 @@ void destroyHostWindow(Renderer* R);
         // instance/subset counts and the dynamic visibility mask), then override only what
         // differs. The copy MUST span all 512 B — this cull runs with no near cut and no
         // ownership, so an instance the camera cull dropped still has to be considered here.
-        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
-        float*       kp  = (float*)kcbv->pCpuMappedAddress;
+        const float* cam = (const float*)fbr(g_live.pCullParamsCbv);
+        float*       kp  = (float*)fbw(kcbv);
         std::memcpy(kp, cam, 512);
 
         // Six box planes, camera-relative: inside == dot(n, c - eye) + d >= -r.
@@ -57375,8 +58009,8 @@ void destroyHostWindow(Renderer* R);
         return g_svm && g_live.skyVisReady && g_dlExterior && K > 0 && g_svmDrawn >= K;
     }
     void publishSkyVis() {
-        if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
-        float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        if (!g_live.pShadowMaskParamsCbv || !fbr(g_live.pShadowMaskParamsCbv)) { return; }
+        float* mp = (float*)fbw(g_live.pShadowMaskParamsCbv);
         mp[kSkyVisFloat + 0] = skyVisArmed() ? g_svmBuilt[0] : 0.0f;
         // The distance match (skyamb.h.fsl skyAOTermPx): 2% + 16 u. Loose enough for the half-res
         // neighbour on one surface, tight enough that the next surface back never qualifies.
@@ -57408,8 +58042,8 @@ void destroyHostWindow(Renderer* R);
     // (the camera's inverse matrix, the dims, and per map its clip rows + eye relative to THIS
     // frame's camera) and dispatches over the half-res rect. Leaves pSvmScreen in SHADER_RESOURCE.
     void dispatchSkyVisScreen(const float* rzViewProj) {
-        if (!skyVisArmed() || !g_live.pSkyVisParamsCbv || !g_live.pSkyVisParamsCbv->pCpuMappedAddress) { return; }
-        SkyVisParams* sp = (SkyVisParams*)g_live.pSkyVisParamsCbv->pCpuMappedAddress;
+        if (!skyVisArmed() || !g_live.pSkyVisParamsCbv || !fbr(g_live.pSkyVisParamsCbv)) { return; }
+        SkyVisParams* sp = (SkyVisParams*)fbw(g_live.pSkyVisParamsCbv);
         float invVP[16];
         if (!invert4x4(rzViewProj, invVP)) { return; }
         std::memcpy(&sp->invViewProj, invVP, sizeof(invVP));
@@ -57464,10 +58098,10 @@ void destroyHostWindow(Renderer* R);
         if (!g_svm || !g_live.pSvmDepth || !g_pSvmStaticsPipeline) { return; }
         // No rebuild-frame stand-down any more: each direction has its OWN frame and cull CBVs
         // (instance 1+k), so the height-map rebuild's instance 0 is never overwritten under it.
-        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pFrameCbv || !fbr(g_live.pFrameCbv)) { return; }
         const bool lane = g_live.skyCullReady && g_live.pPerFrameSetSkyHeight
                        && g_live.pCullPipeline && g_live.cullInstCount && g_dlLiveInit && g_staticsLiveOk
-                       && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress;
+                       && g_live.pCullParamsCbv && fbr(g_live.pCullParamsCbv);
         if (!lane) { return; }
 
         const uint32_t K   = (uint32_t)std::max(1.0f, std::min(g_svmDirs, (float)kSvmMaxDirs));
@@ -57489,7 +58123,7 @@ void destroyHostWindow(Renderer* R);
 
         // gFrameData once, off the write-combined CBV (not once per direction).
         alignas(16) uint8_t fdCopy[kFrameDataBytes];
-        std::memcpy(fdCopy, g_live.pFrameCbv->pCpuMappedAddress, kFrameDataBytes);
+        std::memcpy(fdCopy, fbr(g_live.pFrameCbv), kFrameDataBytes);
         const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
         const float texel = 2.0f * ext / (float)res;
         auto dotEye = [&](const float* a) {
@@ -57509,7 +58143,7 @@ void destroyHostWindow(Renderer* R);
             const uint32_t k = fill ? n : (g_svmNext % K);
             if (!fill) { g_svmNext = (k + 1) % K; }
             Buffer* const fcbv = g_live.pSvmFrameCbv[k];
-            if (!fcbv || !fcbv->pCpuMappedAddress || !g_live.pSvmCullCbv[k]) { continue; }
+            if (!fcbv || !fbr(fcbv) || !g_live.pSvmCullCbv[k]) { continue; }
 
             // The direction's ortho, snapped to its own texel grid in WORLD space (sunSnapOffset of
             // the eye's absolute coordinate), so a redraw after the eye moved lands texels where the
@@ -57534,8 +58168,8 @@ void destroyHostWindow(Renderer* R);
             TerrainView& TV = g_terrainSvmV[k];
             terrainCullAndBuild(TV, /*primary*/false, planes, eye, /*nearCut*/0.0f,
                                 /*lodBias*/0u, /*lodFloor*/kTerrainBaseLod);
-            std::memcpy(fcbv->pCpuMappedAddress, fdCopy, kFrameDataBytes);
-            std::memcpy(fcbv->pCpuMappedAddress, T.vp, 16 * sizeof(float));
+            std::memcpy(fbw(fcbv), fdCopy, kFrameDataBytes);
+            std::memcpy(fbw(fcbv), T.vp, 16 * sizeof(float));
 
             BindRenderTargetsDesc b = {};
             b.mRenderTargetCount = 0;
@@ -57591,10 +58225,10 @@ void destroyHostWindow(Renderer* R);
 
     void rebuildSkyHeightMap() {
         if (!g_live.skyHeightReady || !g_dlExterior) { return; }
-        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
-        if (!g_live.pSkyHeightParamsCbv || !g_live.pSkyHeightParamsCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pFrameCbv || !fbr(g_live.pFrameCbv)) { return; }
+        if (!g_live.pSkyHeightParamsCbv || !fbr(g_live.pSkyHeightParamsCbv)) { return; }
 
-        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float* mfd = (const float*)fbr(g_live.pFrameCbv);
         const float eyeX = mfd[56], eyeY = mfd[57];   // lodEye — absolute, live every frame
         // The origin the eye WANTS: its snap cell, backed off by half the window so the camera sits
         // in the middle with the same reach in every direction.
@@ -57612,7 +58246,7 @@ void destroyHostWindow(Renderer* R);
         const float ctrX = wantX + 0.5f * kSkyHeightExtent;
         const float ctrY = wantY + 0.5f * kSkyHeightExtent;
 
-        float* shp = (float*)g_live.pSkyHeightParamsCbv->pCpuMappedAddress;
+        float* shp = (float*)fbw(g_live.pSkyHeightParamsCbv);
         shp[0] = wantX; shp[1] = wantY; shp[2] = kSkyHeightTexel; shp[3] = (float)kSkyHeightRes;
         shp[4] = (float)g_terrainGridMinX;   shp[5] = (float)g_terrainGridMinY;
         shp[6] = (float)g_terrainGridSpanX;  shp[7] = (float)g_terrainGridSpanY;
@@ -57625,8 +58259,8 @@ void destroyHostWindow(Renderer* R);
                             && g_live.pPerFrameSetSkyHeight && g_live.pSkyHeightFrameCbv
                             && g_live.pCullPipeline && g_live.cullInstCount
                             && g_dlLiveInit && g_staticsLiveOk
-                            && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress
-                            && g_live.pSkyCullParamsCbv && g_live.pSkyCullParamsCbv->pCpuMappedAddress;
+                            && g_live.pCullParamsCbv && fbr(g_live.pCullParamsCbv)
+                            && g_live.pSkyCullParamsCbv && fbr(g_live.pSkyCullParamsCbv);
 
         ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
         auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
@@ -57655,7 +58289,7 @@ void destroyHostWindow(Renderer* R);
             // latency, on a pass that runs once per snap cell — free.
             if (g_live.pSkyCullReadback) {
                 bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
-                cl->CopyBufferRegion(g_live.pSkyCullReadback->mDx.pResource, 0,
+                cl->CopyBufferRegion(g_live.pSkyCullReadback->mDx.pResource, rbLaneOff(),
                                      g_live.pSkyCullCount->mDx.pResource, 0, 2 * sizeof(uint32_t));
                 bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
             }
@@ -57678,8 +58312,8 @@ void destroyHostWindow(Renderer* R);
             float ortho[16];
             buildSunOrthoVP(xa, ya, za, half, kSkyHeightDepthHalf,
                             eyeX - ctrX, -(eyeY - ctrY), ortho);
-            std::memcpy(g_live.pSkyHeightFrameCbv->pCpuMappedAddress, mfd, kFrameDataBytes);
-            std::memcpy(g_live.pSkyHeightFrameCbv->pCpuMappedAddress, ortho, 16 * sizeof(float));
+            std::memcpy(fbw(g_live.pSkyHeightFrameCbv), mfd, kFrameDataBytes);
+            std::memcpy(fbw(g_live.pSkyHeightFrameCbv), ortho, 16 * sizeof(float));
         }
 
         // --- (1) Clear to the sentinel, then (2) draw the statics into it -------------------------
@@ -57847,8 +58481,8 @@ void destroyHostWindow(Renderer* R);
         // mapped and the GPU reads it when the frame executes, which is after all recording.
         // (publishSunOcc rides along for the same reason, and its in-sync check needs BOTH the new
         // origin and the rebuild above to have happened.)
-        if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-            float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
+            float* mp = (float*)fbw(g_live.pShadowMaskParamsCbv);
             publishSkyAO(mp, true);
             publishSunOcc(mp, true);
         }
@@ -57871,8 +58505,8 @@ void destroyHostWindow(Renderer* R);
     // 1024² x ~48 taps that is a fraction of a millisecond, on frames that are already rare.
     void rebuildSunOccMap(bool force) {
         if (!g_live.sunOccReady || !g_dlExterior) { return; }
-        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
-        if (!g_live.pSunOccParamsCbv || !g_live.pSunOccParamsCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pFrameCbv || !fbr(g_live.pFrameCbv)) { return; }
+        if (!g_live.pSunOccParamsCbv || !fbr(g_live.pSunOccParamsCbv)) { return; }
         // Nothing to build over a map that does not exist yet — the first exterior frames.
         if (!g_skyHeightValid) { return; }
 
@@ -57881,14 +58515,14 @@ void destroyHostWindow(Renderer* R);
         // Without this, arming and — more importantly — DISARMING at dusk both take effect one frame
         // late, which is a frame of the receiver sampling a map built for a sun that has set.
         auto republish = [&]() {
-            if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-                publishSunOcc((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress, true);
+            if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
+                publishSunOcc((float*)fbw(g_live.pShadowMaskParamsCbv), true);
             }
         };
 
         // gFrameData.sunDir is the direction light TRAVELS, so the direction TO the sun is its
         // negation — the same flip every receiver makes when it writes -gFrameData.sunDir.
-        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float* mfd = (const float*)fbr(g_live.pFrameCbv);
         float sx = -mfd[16], sy = -mfd[17], sz = -mfd[18];
         const float sl = std::sqrt(sx*sx + sy*sy + sz*sz);
         if (sl < 1e-6f) { g_sunOccValid = false; republish(); return; }
@@ -57925,7 +58559,7 @@ void destroyHostWindow(Renderer* R);
         const float outer = std::max(std::min(g_sunOccOuter, reliefCut),
                                      g_sunOccInner + kSunOccTexel);
 
-        float* sp = (float*)g_live.pSunOccParamsCbv->pCpuMappedAddress;
+        float* sp = (float*)fbw(g_live.pSunOccParamsCbv);
         sp[0] = g_skyHeightOrigin[0];   sp[1] = g_skyHeightOrigin[1];
         sp[2] = kSunOccTexel;           sp[3] = (float)kSunOccRes;
         sp[4] = dirX;                   sp[5] = dirY;
@@ -57983,7 +58617,7 @@ void destroyHostWindow(Renderer* R);
     {
         g_atmosShArmed = false;
         if (!g_live.atmosReady) { return; }
-        if (!g_live.pAtmosParamsCbv || !g_live.pAtmosParamsCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pAtmosParamsCbv || !fbr(g_live.pAtmosParamsCbv)) { return; }
 
         // ⚠ INTERIORS PUBLISH NOTHING AND DISPATCH NOTHING — the idiom the sun, sky-AO and
         // sky-ambient lanes already use, and the S1 interior control (`medium parked at Clear`) is
@@ -58166,7 +58800,7 @@ void destroyHostWindow(Renderer* R);
             ++g_atmosSkips;
             return;
         }
-        std::memcpy(g_live.pAtmosParamsCbv->pCpuMappedAddress, pk, sizeof(pk));
+        std::memcpy(fbw(g_live.pAtmosParamsCbv), pk, sizeof(pk));
         std::memcpy(g_atmosLastPk, pk, sizeof(pk));
         g_atmosPkValid = true;
         ++g_atmosBuilds;
@@ -58224,7 +58858,7 @@ void destroyHostWindow(Renderer* R);
             bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
             cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
             g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                g_live.pAtmosShReadback->mDx.pResource, 0, g_live.pAtmosShOut->mDx.pResource, 0,
+                g_live.pAtmosShReadback->mDx.pResource, rbLaneOff(), g_live.pAtmosShOut->mDx.pResource, 0,
                 (UINT64)sizeof(uint32_t) * kAtmosShUints);
             bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
             bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -58940,8 +59574,8 @@ void destroyHostWindow(Renderer* R);
     }
 
     void publishSunShadowParams(const float* sunVPs, const float* cascadeTexels, bool active) {
-        if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
-        float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        if (!g_live.pShadowMaskParamsCbv || !fbr(g_live.pShadowMaskParamsCbv)) { return; }
+        float* mp = (float*)fbw(g_live.pShadowMaskParamsCbv);
         if (active && sunVPs) {
             std::memcpy(mp + kSunVPFloat, sunVPs, 16 * kSunCascades * sizeof(float));
             for (uint32_t c = 0; c < 4; ++c) {
@@ -59033,11 +59667,11 @@ void destroyHostWindow(Renderer* R);
                                                   kSunBlurSigmaMin), (float)kSunBlurRadius);
             const float ox = (float)(c * kSunShadowRes);
             // H: read the atlas at tile offset, write the scratch at 0; clamp inside the tile.
-            float* ph = (float*)g_live.pSunBlurParamsCbv[2 * c]->pCpuMappedAddress;
+            float* ph = (float*)fbw(g_live.pSunBlurParamsCbv[2 * c]);
             ph[0] = sigma; ph[1] = (float)kSunShadowRes; ph[2] = 1.0f; ph[3] = 0.0f;
             ph[4] = ox;    ph[5] = 0.0f;                 ph[6] = ox;   ph[7] = ox + (float)kSunShadowRes - 1.0f;
             // V: read the scratch at 0, write the atlas at tile offset; clamp inside the scratch.
-            float* pv = (float*)g_live.pSunBlurParamsCbv[2 * c + 1]->pCpuMappedAddress;
+            float* pv = (float*)fbw(g_live.pSunBlurParamsCbv[2 * c + 1]);
             pv[0] = sigma; pv[1] = (float)kSunShadowRes; pv[2] = 0.0f; pv[3] = 1.0f;
             pv[4] = 0.0f;  pv[5] = ox;                   pv[6] = 0.0f; pv[7] = (float)kSunShadowRes - 1.0f;
 
@@ -59074,7 +59708,7 @@ void destroyHostWindow(Renderer* R);
         // built from gFrameData.sunDir (float[16..18], camera-relative space — same as statics.vert
         // projects). All cascades share ONE depth slab so a caster high up-sun stays inside the near
         // box and one normalised depth bias stays valid for all of them.
-        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const float* mfd = (const float*)fbr(g_live.pFrameCbv);
         float sunVP[16 * kSunCascades];
         float cascadeTexel[kSunCascades];
         const float depthHalf = 2.0f * g_sunShadowRange;
@@ -59093,8 +59727,8 @@ void destroyHostWindow(Renderer* R);
                             sunSnapOffset(g_sunSnapAccX, cascadeTexel[c]),
                             sunSnapOffset(g_sunSnapAccY, cascadeTexel[c]),
                             sunVP + 16 * c);
-            std::memcpy(g_live.pSunFrameCbv[c]->pCpuMappedAddress, mfd, kFrameDataBytes);
-            std::memcpy(g_live.pSunFrameCbv[c]->pCpuMappedAddress, sunVP + 16 * c, 16 * sizeof(float));
+            std::memcpy(fbw(g_live.pSunFrameCbv[c]), mfd, kFrameDataBytes);
+            std::memcpy(fbw(g_live.pSunFrameCbv[c]), sunVP + 16 * c, 16 * sizeof(float));
         }
         // Phase B: hand the SAME matrices to the receivers. Caster and receiver must project by one
         // matrix or the shadow slides — this is the only place they are built.
@@ -59290,7 +59924,7 @@ void destroyHostWindow(Renderer* R);
         if (!g_live.pFrameCbv) { return; }
 
         const double tWalk0 = hostNowMs();   // isolate the CPU walk from the caller's RT-bind/draw overhead
-        const float* vp = (const float*)g_live.pFrameCbv->pCpuMappedAddress;   // reverse-Z, camera-relative (v*M)
+        const float* vp = (const float*)fbr(g_live.pFrameCbv);   // reverse-Z, camera-relative (v*M)
         float planes[6][4];
         dlExtractFrustum(vp, planes);
         const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
@@ -59316,7 +59950,7 @@ void destroyHostWindow(Renderer* R);
             ow = x*vp[3] + y*vp[7] + z*vp[11] + vp[15];
         };
 
-        float* out = (float*)g_live.pGlowInstBuf->pCpuMappedAddress;
+        float* out = (float*)fbw(g_live.pGlowInstBuf);
         uint32_t n = 0;
         const size_t nSrc = g_glowSrc.size();
         const GlowSrc* src = g_glowSrc.data();
@@ -59757,12 +60391,8 @@ void destroyHostWindow(Renderer* R);
     // pass records the draws (dlReflectRecordGeo) only then. Defined after the DL globals it reads.
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater) {
-        // H2a parity: save the PREVIOUS frame's CPU survivor count before this call overwrites it.
-        // The latch has to happen HERE and not at the readback settle, because settleFrameFence runs
-        // AFTER this function — so by then g_liveLastInstRefl already holds frame N while the
-        // readback holds frame N-1, and comparing the two would build an instrument that reports on
-        // camera motion rather than on whether the two cull rules agree.
-        g_reflCpuCullPrev = g_liveLastInstRefl;
+        // H2a parity: each frame's CPU survivor count travels with its frame slot
+        // (snapshotFrameSlot) and is compared at that slot's drain — see drainSlot.
         g_reflGeoReady = false;
         g_reflFrameReady = false;
 
@@ -59814,10 +60444,10 @@ void destroyHostWindow(Renderer* R);
         // FrameData: this was a bare 272 (= through gReflWaterClip), which silently truncated every
         // field appended after it — timeParams (float 80) landed past the end, so the reflected
         // ghostfence would have stood still while the real one scrolled. Size it off the struct.
-        std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, fcbvR, kFrameDataBytes);
-        std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, mirrorGeoVP, 64);
+        std::memcpy(fbw(g_live.pReflectFrameCbvGeo), fcbvR, kFrameDataBytes);
+        std::memcpy(fbw(g_live.pReflectFrameCbvGeo), mirrorGeoVP, 64);
         {
-            float* gp = (float*)g_live.pReflectFrameCbvGeo->pCpuMappedAddress;
+            float* gp = (float*)fbw(g_live.pReflectFrameCbvGeo);
             gp[64] = 0.0f; gp[65] = 0.0f; gp[66] = nz; gp[67] = dClip;
             // Clustered forward is MAIN-VIEW only: the memcpy above copied the main view's froxelDims
             // (float 116), but this pass uses the MIRROR viewProj + reflection rings, so its froxel grid
@@ -60481,14 +61111,15 @@ void destroyHostWindow(Renderer* R);
         // be executing right now. Settle it before anything below is released — this wait is
         // MANDATORY, not defensive: tearing down the RT/pipelines/buffers under a running frame is
         // a device-removal. Same reason the Hi-Z tail submit has always needed the wait below.
-        if (g_live.pFence) {
-            waitForFences(R, 1, &g_live.pFence);
+        // Both slots: up to kFrameSlots frames may be in flight.
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            if (g_live.pFence[s]) { waitForFences(R, 1, &g_live.pFence[s]); }
         }
-        // Phase 3 prologue: the LAST tail submit may still be in flight — the prologue is
+        // Phase 3 prologue: the LAST tail submits may still be in flight — the prologue is
         // deliberately never waited during the frame loop. Releasing pHiz/pHizCmd under a running
         // prologue is a device-removal.
-        if (g_live.pHizFence) {
-            waitForFences(R, 1, &g_live.pHizFence);
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            if (g_live.pHizFence[s]) { waitForFences(R, 1, &g_live.pHizFence[s]); }
         }
         freeMeshStore();   // release VB/IB before the resource loader goes down
         exitDevUI();       // Forge IUI/IFont teardown while the renderer is still alive
@@ -60512,7 +61143,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainCellGrid)     { removeResource(g_pTerrainCellGrid);        g_pTerrainCellGrid = nullptr; }
         forEachTerrainView([&](TerrainView& tv) {
             TerrainView* v = &tv;
-            if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
+            if (v->instRing) { removeFrameBuf(v->instRing); v->instRing = nullptr; }
             v->visible.clear(); v->lodOf.clear(); v->lodStamp.clear();
             v->cells = 0;
             std::memset(v->drawCounts, 0, sizeof(v->drawCounts));
@@ -60537,28 +61168,24 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPerLightsSet)   { removeDescriptorSet(R, g_live.pPerLightsSet); }
         if (g_live.pPerBatchSet)    { removeDescriptorSet(R, g_live.pPerBatchSet); }
         if (g_live.pPersistentSet)  { removeDescriptorSet(R, g_live.pPersistentSet); }
-        if (g_live.pFrameCbv)       { removeResource(g_live.pFrameCbv); }
-        if (g_live.pLightCbv)       { removeResource(g_live.pLightCbv); }
+        if (g_live.pFrameCbv)       { removeFrameBuf(g_live.pFrameCbv); }
+        if (g_live.pLightCbv)       { removeFrameBuf(g_live.pLightCbv); }
         if (g_live.pArenaVB)        { removeResource(g_live.pArenaVB); }
         if (g_live.pArenaIB)        { removeResource(g_live.pArenaIB); }
-        if (g_live.pIndirectArgs)   { removeResource(g_live.pIndirectArgs); }
+        if (g_live.pIndirectArgs)   { removeFrameBuf(g_live.pIndirectArgs); }
         g_arenaVB = FreeList{};
         g_arenaIB = FreeList{};
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
-            if (g_live.pWorldsBuf[b]) { removeResource(g_live.pWorldsBuf[b]); }
+            if (g_live.pWorldsBuf[b]) { removeFrameBuf(g_live.pWorldsBuf[b]); }
         }
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
-            if (g_live.pInstanceBuf[b]) { removeResource(g_live.pInstanceBuf[b]); }
+            if (g_live.pInstanceBuf[b]) { removeFrameBuf(g_live.pInstanceBuf[b]); }
         }
         // Tier 1: anything parked for retirement is unreachable from pTextures[] and would otherwise
-        // leak past shutdown. The mandatory frame-fence wait at the top of this function already
-        // settled every submission, so freeing them here is safe.
-        for (Texture* t : g_texRetire) { removeResource(t); }
-        g_texRetire.clear();
-        // freeMeshStore() above already drained the geometry queue; belt-and-braces for any path
-        // that parks a buffer between there and here.
-        for (Buffer* b : g_bufRetire) { removeResource(b); }
-        g_bufRetire.clear();
+        // leak past shutdown. The mandatory frame-fence waits at the top of this function already
+        // settled every submission, so freeing them here is safe. (freeMeshStore() above drained the
+        // geometry queues too; this also covers any path that parked something since.)
+        drainRetired(UINT64_MAX);
         // Phase 2 texture teardown: distinct uploaded textures, then the shared default.
         for (uint32_t i = 0; i < g_live.texHigh; ++i) {
             if (g_live.pTextures[i] && g_live.pTextures[i] != g_live.pDefaultWhite) {
@@ -60575,9 +61202,9 @@ void destroyHostWindow(Renderer* R);
         // M-Skinning teardown.
         if (g_live.pPerBatchSetSkin) { removeDescriptorSet(R, g_live.pPerBatchSetSkin); }
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
-            if (g_live.pBonesBuf[b]) { removeResource(g_live.pBonesBuf[b]); }
+            if (g_live.pBonesBuf[b]) { removeFrameBuf(g_live.pBonesBuf[b]); }
         }
-        if (g_live.pInstanceBufSkin) { removeResource(g_live.pInstanceBufSkin); }
+        if (g_live.pInstanceBufSkin) { removeFrameBuf(g_live.pInstanceBufSkin); }
         if (g_live.pSkinnedPipeline)       { removePipeline(R, g_live.pSkinnedPipeline); }
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
         if (g_live.pSkinnedPrepassPipeline)       { removePipeline(R, g_live.pSkinnedPrepassPipeline); }
@@ -60602,8 +61229,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
         // Tier 4 multi-map teardown.
         if (g_live.pPerBatchSetMM)          { removeDescriptorSet(R, g_live.pPerBatchSetMM); }
-        if (g_live.pMMWorldsBuf)            { removeResource(g_live.pMMWorldsBuf); }
-        if (g_live.pInstanceBufMM)          { removeResource(g_live.pInstanceBufMM); }
+        if (g_live.pMMWorldsBuf)            { removeFrameBuf(g_live.pMMWorldsBuf); }
+        if (g_live.pInstanceBufMM)          { removeFrameBuf(g_live.pInstanceBufMM); }
         if (g_live.pMultiMapPipeline)       { removePipeline(R, g_live.pMultiMapPipeline); }
         if (g_live.pMultiMapPipelineMirror) { removePipeline(R, g_live.pMultiMapPipelineMirror); }
         if (g_live.pMultiMapReflectPipeline)       { removePipeline(R, g_live.pMultiMapReflectPipeline); }
@@ -60623,14 +61250,14 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPerBatchSetFP)          { removeDescriptorSet(R, g_live.pPerBatchSetFP); }
         if (g_live.pPerBatchSetFPSkin)      { removeDescriptorSet(R, g_live.pPerBatchSetFPSkin); }
         if (g_live.pPerBatchSetFPMM)        { removeDescriptorSet(R, g_live.pPerBatchSetFPMM); }
-        if (g_live.pFPFrameCbv)             { removeResource(g_live.pFPFrameCbv); }
-        if (g_live.pFPLightCbv)             { removeResource(g_live.pFPLightCbv); }
-        if (g_live.pFPWorldsBuf)            { removeResource(g_live.pFPWorldsBuf); }
-        if (g_live.pFPInstanceBuf)          { removeResource(g_live.pFPInstanceBuf); }
-        if (g_live.pFPMMWorldsBuf)          { removeResource(g_live.pFPMMWorldsBuf); }
-        if (g_live.pFPInstanceBufMM)        { removeResource(g_live.pFPInstanceBufMM); }
-        if (g_live.pFPBonesBuf)             { removeResource(g_live.pFPBonesBuf); }
-        if (g_live.pFPInstanceBufSkin)      { removeResource(g_live.pFPInstanceBufSkin); }
+        if (g_live.pFPFrameCbv)             { removeFrameBuf(g_live.pFPFrameCbv); }
+        if (g_live.pFPLightCbv)             { removeFrameBuf(g_live.pFPLightCbv); }
+        if (g_live.pFPWorldsBuf)            { removeFrameBuf(g_live.pFPWorldsBuf); }
+        if (g_live.pFPInstanceBuf)          { removeFrameBuf(g_live.pFPInstanceBuf); }
+        if (g_live.pFPMMWorldsBuf)          { removeFrameBuf(g_live.pFPMMWorldsBuf); }
+        if (g_live.pFPInstanceBufMM)        { removeFrameBuf(g_live.pFPInstanceBufMM); }
+        if (g_live.pFPBonesBuf)             { removeFrameBuf(g_live.pFPBonesBuf); }
+        if (g_live.pFPInstanceBufSkin)      { removeFrameBuf(g_live.pFPInstanceBufSkin); }
         if (g_live.pFPMaskAllLit)           { removeResource(g_live.pFPMaskAllLit); }
         if (g_live.pFPOpaquePipeline)        { removePipeline(R, g_live.pFPOpaquePipeline); }
         if (g_live.pFPOpaquePipelineMirror)  { removePipeline(R, g_live.pFPOpaquePipelineMirror); }
@@ -60640,8 +61267,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pFPMultiMapPipelineMirror){ removePipeline(R, g_live.pFPMultiMapPipelineMirror); }
         // SK1 sky teardown.
         if (g_live.pPerBatchSetSky)         { removeDescriptorSet(R, g_live.pPerBatchSetSky); }
-        if (g_live.pSkyWorldsBuf)           { removeResource(g_live.pSkyWorldsBuf); }
-        if (g_live.pSkyInstanceBuf)         { removeResource(g_live.pSkyInstanceBuf); }
+        if (g_live.pSkyWorldsBuf)           { removeFrameBuf(g_live.pSkyWorldsBuf); }
+        if (g_live.pSkyInstanceBuf)         { removeFrameBuf(g_live.pSkyInstanceBuf); }
         if (g_live.pSkyPipeline)            { removePipeline(R, g_live.pSkyPipeline); }
         if (g_live.pSkyPipelineAdd)         { removePipeline(R, g_live.pSkyPipelineAdd); }
         if (g_live.pSkyShader)              { removeShader(R, g_live.pSkyShader); }
@@ -60650,9 +61277,9 @@ void destroyHostWindow(Renderer* R);
         // reflect one with the rest of the reflect objects).
         if (g_live.pSkyHwPipeline)          { removePipeline(R, g_live.pSkyHwPipeline); }
         if (g_live.pSkyHwShader)            { removeShader(R, g_live.pSkyHwShader); }
-        if (g_live.pSkyViewCbv[0])          { removeResource(g_live.pSkyViewCbv[0]); }
-        if (g_live.pSkyViewCbv[1])          { removeResource(g_live.pSkyViewCbv[1]); }
-        if (g_live.pDebugLineVB)            { removeResource(g_live.pDebugLineVB); }
+        if (g_live.pSkyViewCbv[0])          { removeFrameBuf(g_live.pSkyViewCbv[0]); }
+        if (g_live.pSkyViewCbv[1])          { removeFrameBuf(g_live.pSkyViewCbv[1]); }
+        if (g_live.pDebugLineVB)            { removeFrameBuf(g_live.pDebugLineVB); }
         if (g_live.pDebugLinePipeline)      { removePipeline(R, g_live.pDebugLinePipeline); }
         if (g_live.pDebugLineShader)        { removeShader(R, g_live.pDebugLineShader); }
         if (g_live.pShadowAtlasViewPipeline){ removePipeline(R, g_live.pShadowAtlasViewPipeline); }
@@ -60664,11 +61291,11 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pVolFogShader)           { removeShader(R, g_live.pVolFogShader); g_live.pVolFogShader = nullptr; }
         if (g_live.pWaterFillShader)        { removeShader(R, g_live.pWaterFillShader); g_live.pWaterFillShader = nullptr; }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
-        if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
-        if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }
-        if (g_live.pAlphaStagesBuf)         { removeResource(g_live.pAlphaStagesBuf); }
-        if (g_live.pCapAlphaVB)             { removeResource(g_live.pCapAlphaVB); }
-        if (g_live.pCapAlphaIB)             { removeResource(g_live.pCapAlphaIB); }
+        if (g_live.pAlphaWorldsBuf)         { removeFrameBuf(g_live.pAlphaWorldsBuf); }
+        if (g_live.pAlphaInstanceBuf)       { removeFrameBuf(g_live.pAlphaInstanceBuf); }
+        if (g_live.pAlphaStagesBuf)         { removeFrameBuf(g_live.pAlphaStagesBuf); }
+        if (g_live.pCapAlphaVB)             { removeFrameBuf(g_live.pCapAlphaVB); }
+        if (g_live.pCapAlphaIB)             { removeFrameBuf(g_live.pCapAlphaIB); }
         if (g_live.pAlphaPipeline)          { removePipeline(R, g_live.pAlphaPipeline); }
         if (g_live.pAlphaPipelineBack)      { removePipeline(R, g_live.pAlphaPipelineBack); }
         if (g_live.pAlphaPipelineBackMirror){ removePipeline(R, g_live.pAlphaPipelineBackMirror); }
@@ -60682,8 +61309,8 @@ void destroyHostWindow(Renderer* R);
         // (First-person shadow reception is a direct cube-atlas frag test — no FP-specific resources.)
         // WT1 water teardown.
         if (g_live.pPerBatchSetWater)       { removeDescriptorSet(R, g_live.pPerBatchSetWater); }
-        if (g_live.pWaterWorldsBuf)         { removeResource(g_live.pWaterWorldsBuf); }
-        if (g_live.pWaterInstanceBuf)       { removeResource(g_live.pWaterInstanceBuf); }
+        if (g_live.pWaterWorldsBuf)         { removeFrameBuf(g_live.pWaterWorldsBuf); }
+        if (g_live.pWaterInstanceBuf)       { removeFrameBuf(g_live.pWaterInstanceBuf); }
         if (g_live.pWaterVB)                { removeResource(g_live.pWaterVB); }
         if (g_live.pWaterIB)                { removeResource(g_live.pWaterIB); }
         if (g_live.pRefractColor)           { removeResource(g_live.pRefractColor); }
@@ -60695,20 +61322,20 @@ void destroyHostWindow(Renderer* R);
         // Phase F glow-billboard teardown.
         if (g_live.pGlowPipeline)           { removePipeline(R, g_live.pGlowPipeline); }
         if (g_live.pGlowShader)             { removeShader(R, g_live.pGlowShader); }
-        if (g_live.pGlowBaseVB)             { removeResource(g_live.pGlowBaseVB); }
-        if (g_live.pGlowInstBuf)            { removeResource(g_live.pGlowInstBuf); }
+        if (g_live.pGlowBaseVB)             { removeFrameBuf(g_live.pGlowBaseVB); }
+        if (g_live.pGlowInstBuf)            { removeFrameBuf(g_live.pGlowInstBuf); }
         // WT2 reflection teardown.
         if (g_live.pPerFrameSetReflect)     { removeDescriptorSet(R, g_live.pPerFrameSetReflect); }
         if (g_live.pPerFrameSetReflectGeo)  { removeDescriptorSet(R, g_live.pPerFrameSetReflectGeo); }
         if (g_live.pPerFrameSetSun)         { removeDescriptorSet(R, g_live.pPerFrameSetSun); g_live.pPerFrameSetSun = nullptr; }
         if (g_live.pPerBatchSetReflectSky)  { removeDescriptorSet(R, g_live.pPerBatchSetReflectSky); }
-        if (g_live.pReflectFrameCbv)        { removeResource(g_live.pReflectFrameCbv); }
-        if (g_live.pReflectFrameCbvGeo)     { removeResource(g_live.pReflectFrameCbvGeo); }
+        if (g_live.pReflectFrameCbv)        { removeFrameBuf(g_live.pReflectFrameCbv); }
+        if (g_live.pReflectFrameCbvGeo)     { removeFrameBuf(g_live.pReflectFrameCbvGeo); }
         for (uint32_t c = 0; c < kSunCascades; ++c) {
-            if (g_live.pSunFrameCbv[c]) { removeResource(g_live.pSunFrameCbv[c]); g_live.pSunFrameCbv[c] = nullptr; }
+            if (g_live.pSunFrameCbv[c]) { removeFrameBuf(g_live.pSunFrameCbv[c]); g_live.pSunFrameCbv[c] = nullptr; }
         }
-        if (g_live.pReflectSkyWorldsBuf)    { removeResource(g_live.pReflectSkyWorldsBuf); }
-        if (g_live.pReflectSkyInstanceBuf)  { removeResource(g_live.pReflectSkyInstanceBuf); }
+        if (g_live.pReflectSkyWorldsBuf)    { removeFrameBuf(g_live.pReflectSkyWorldsBuf); }
+        if (g_live.pReflectSkyInstanceBuf)  { removeFrameBuf(g_live.pReflectSkyInstanceBuf); }
         if (g_live.pReflectColor)           { removeRenderTarget(R, g_live.pReflectColor); }
         if (g_live.pReflectDepth)           { removeRenderTarget(R, g_live.pReflectDepth); }
         // Phase 1b distant-statics teardown (per-subset textures freed by the bindless loop below).
@@ -60755,19 +61382,19 @@ void destroyHostWindow(Renderer* R);
         g_usageData.clear();
         g_staticsDrawCount = 0; g_staticsInstTotal = 0; g_staticsLoaded = false;
         // Phase 1a/1b LIVE distant-land teardown (persistent rings + grid + flags).
-        if (g_pStaticsArgsRing) { removeResource(g_pStaticsArgsRing); g_pStaticsArgsRing = nullptr; }
-        if (g_pStaticsInstRing) { removeResource(g_pStaticsInstRing); g_pStaticsInstRing = nullptr; }
-        if (g_pStaticsArgsRingRefl) { removeResource(g_pStaticsArgsRingRefl); g_pStaticsArgsRingRefl = nullptr; }
-        if (g_pStaticsInstRingRefl) { removeResource(g_pStaticsInstRingRefl); g_pStaticsInstRingRefl = nullptr; }
+        if (g_pStaticsArgsRing) { removeFrameBuf(g_pStaticsArgsRing); g_pStaticsArgsRing = nullptr; }
+        if (g_pStaticsInstRing) { removeFrameBuf(g_pStaticsInstRing); g_pStaticsInstRing = nullptr; }
+        if (g_pStaticsArgsRingRefl) { removeFrameBuf(g_pStaticsArgsRingRefl); g_pStaticsArgsRingRefl = nullptr; }
+        if (g_pStaticsInstRingRefl) { removeFrameBuf(g_pStaticsInstRingRefl); g_pStaticsInstRingRefl = nullptr; }
         // Stage B (M1) GPU cull resources.
         if (g_live.pCullSet)           { removeDescriptorSet(R, g_live.pCullSet);    g_live.pCullSet = nullptr; }
         if (g_live.pCullPipeline)      { removePipeline(R, g_live.pCullPipeline);    g_live.pCullPipeline = nullptr; }
         if (g_live.pCullShader)        { removeShader(R, g_live.pCullShader);        g_live.pCullShader = nullptr; }
-        if (g_live.pCullParamsCbv)     { removeResource(g_live.pCullParamsCbv);      g_live.pCullParamsCbv = nullptr; }
+        if (g_live.pCullParamsCbv)     { removeFrameBuf(g_live.pCullParamsCbv);      g_live.pCullParamsCbv = nullptr; }
         if (g_live.pCullCountZero)     { removeResource(g_live.pCullCountZero);      g_live.pCullCountZero = nullptr; }
         if (g_live.pCullCountReadback) { removeResource(g_live.pCullCountReadback);  g_live.pCullCountReadback = nullptr; }
         if (g_live.pCullCountBuf)      { removeResource(g_live.pCullCountBuf);       g_live.pCullCountBuf = nullptr; }
-        if (g_live.pCullInstBuf)       { removeResource(g_live.pCullInstBuf);        g_live.pCullInstBuf = nullptr; }
+        if (g_live.pCullInstBuf)       { removeFrameBuf(g_live.pCullInstBuf);        g_live.pCullInstBuf = nullptr; }
         // Stage B (B3) GPU-draw resources + extra pipelines.
         if (g_live.pCullScanPipeline)    { removePipeline(R, g_live.pCullScanPipeline);    g_live.pCullScanPipeline = nullptr; }
         if (g_live.pCullScanShader)      { removeShader(R, g_live.pCullScanShader);        g_live.pCullScanShader = nullptr; }
@@ -60782,7 +61409,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGpuInstOut)         { removeResource(g_live.pGpuInstOut);        g_live.pGpuInstOut = nullptr; }
         // SUN shadow A2: the second-cull resources.
         if (g_live.pSunCullSet)        { removeDescriptorSet(R, g_live.pSunCullSet); g_live.pSunCullSet = nullptr; }
-        if (g_live.pSunCullParamsCbv)  { removeResource(g_live.pSunCullParamsCbv);   g_live.pSunCullParamsCbv = nullptr; }
+        if (g_live.pSunCullParamsCbv)  { removeFrameBuf(g_live.pSunCullParamsCbv);   g_live.pSunCullParamsCbv = nullptr; }
         if (g_live.pSunCullCount)      { removeResource(g_live.pSunCullCount);       g_live.pSunCullCount = nullptr; }
         if (g_live.pSunSubsetCount)    { removeResource(g_live.pSunSubsetCount);     g_live.pSunSubsetCount = nullptr; }
         if (g_live.pSunSubsetOffset)   { removeResource(g_live.pSunSubsetOffset);    g_live.pSunSubsetOffset = nullptr; }
@@ -60792,7 +61419,7 @@ void destroyHostWindow(Renderer* R);
         g_live.sunCullReady = false; g_live.sunArgsInDrawState = false;
         // H2a: the MIRROR lane (same clone, same teardown, plus its readback).
         if (g_live.pReflCullSet)       { removeDescriptorSet(R, g_live.pReflCullSet); g_live.pReflCullSet = nullptr; }
-        if (g_live.pReflCullParamsCbv) { removeResource(g_live.pReflCullParamsCbv);   g_live.pReflCullParamsCbv = nullptr; }
+        if (g_live.pReflCullParamsCbv) { removeFrameBuf(g_live.pReflCullParamsCbv);   g_live.pReflCullParamsCbv = nullptr; }
         if (g_live.pReflCullCount)     { removeResource(g_live.pReflCullCount);       g_live.pReflCullCount = nullptr; }
         if (g_live.pReflCullReadback)  { removeResource(g_live.pReflCullReadback);    g_live.pReflCullReadback = nullptr; }
         if (g_live.pReflSubsetCount)   { removeResource(g_live.pReflSubsetCount);     g_live.pReflSubsetCount = nullptr; }
@@ -60802,12 +61429,12 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pReflInstOut)       { removeResource(g_live.pReflInstOut);         g_live.pReflInstOut = nullptr; }
         g_live.reflCullReady = false; g_live.reflArgsInDrawState = false;
         // H2b: the two shared HeightOccParams cbuffers (every cull lane binds one of them).
-        if (g_live.pHeightOccCbvOff)   { removeResource(g_live.pHeightOccCbvOff);   g_live.pHeightOccCbvOff = nullptr; }
-        if (g_live.pHeightOccCbvRefl)  { removeResource(g_live.pHeightOccCbvRefl);  g_live.pHeightOccCbvRefl = nullptr; }
+        if (g_live.pHeightOccCbvOff)   { removeFrameBuf(g_live.pHeightOccCbvOff);   g_live.pHeightOccCbvOff = nullptr; }
+        if (g_live.pHeightOccCbvRefl)  { removeFrameBuf(g_live.pHeightOccCbvRefl);  g_live.pHeightOccCbvRefl = nullptr; }
         // H0 probe (only ever non-null if `occProbe` armed the lazy create).
         for (uint32_t v = 0; v < 2u; ++v) {
-            if (g_live.pOccProbeCullCbv[v])   { removeResource(g_live.pOccProbeCullCbv[v]);   g_live.pOccProbeCullCbv[v] = nullptr; }
-            if (g_live.pOccProbeParamsCbv[v]) { removeResource(g_live.pOccProbeParamsCbv[v]); g_live.pOccProbeParamsCbv[v] = nullptr; }
+            if (g_live.pOccProbeCullCbv[v])   { removeFrameBuf(g_live.pOccProbeCullCbv[v]);   g_live.pOccProbeCullCbv[v] = nullptr; }
+            if (g_live.pOccProbeParamsCbv[v]) { removeFrameBuf(g_live.pOccProbeParamsCbv[v]); g_live.pOccProbeParamsCbv[v] = nullptr; }
             if (g_live.pOccProbeCount[v])     { removeResource(g_live.pOccProbeCount[v]);     g_live.pOccProbeCount[v] = nullptr; }
             if (g_live.pOccProbeReadback[v])  { removeResource(g_live.pOccProbeReadback[v]);  g_live.pOccProbeReadback[v] = nullptr; }
         }
@@ -60817,7 +61444,7 @@ void destroyHostWindow(Renderer* R);
         g_live.occProbeReady = false;
         // SH2 stage B: the third-cull resources (same clone, same teardown).
         if (g_live.pSkyCullSet)        { removeDescriptorSet(R, g_live.pSkyCullSet); g_live.pSkyCullSet = nullptr; }
-        if (g_live.pSkyCullParamsCbv)  { removeResource(g_live.pSkyCullParamsCbv);   g_live.pSkyCullParamsCbv = nullptr; }
+        if (g_live.pSkyCullParamsCbv)  { removeFrameBuf(g_live.pSkyCullParamsCbv);   g_live.pSkyCullParamsCbv = nullptr; }
         if (g_live.pSkyCullCount)      { removeResource(g_live.pSkyCullCount);       g_live.pSkyCullCount = nullptr; }
         if (g_live.pSkyCullReadback)   { removeResource(g_live.pSkyCullReadback);    g_live.pSkyCullReadback = nullptr; }
         if (g_live.pSkySubsetCount)    { removeResource(g_live.pSkySubsetCount);     g_live.pSkySubsetCount = nullptr; }
@@ -60830,9 +61457,9 @@ void destroyHostWindow(Renderer* R);
         // and sky clones do not own (they borrow the statics ones).
         if (g_live.pGrassCullSet)      { removeDescriptorSet(R, g_live.pGrassCullSet); g_live.pGrassCullSet = nullptr; }
         if (g_live.pGrassSunCullSet)   { removeDescriptorSet(R, g_live.pGrassSunCullSet); g_live.pGrassSunCullSet = nullptr; }
-        if (g_live.pGrassCullInst)     { removeResource(g_live.pGrassCullInst);     g_live.pGrassCullInst = nullptr; }
+        if (g_live.pGrassCullInst)     { removeFrameBuf(g_live.pGrassCullInst);     g_live.pGrassCullInst = nullptr; }
         if (g_live.pGrassSubsetBuf)    { removeResource(g_live.pGrassSubsetBuf);    g_live.pGrassSubsetBuf = nullptr; }
-        if (g_live.pGrassCullParamsCbv){ removeResource(g_live.pGrassCullParamsCbv); g_live.pGrassCullParamsCbv = nullptr; }
+        if (g_live.pGrassCullParamsCbv){ removeFrameBuf(g_live.pGrassCullParamsCbv); g_live.pGrassCullParamsCbv = nullptr; }
         if (g_live.pGrassCullCount)    { removeResource(g_live.pGrassCullCount);    g_live.pGrassCullCount = nullptr; }
         if (g_live.pGrassCullReadback) { removeResource(g_live.pGrassCullReadback); g_live.pGrassCullReadback = nullptr; }
         if (g_live.pGrassSubsetCount)  { removeResource(g_live.pGrassSubsetCount);  g_live.pGrassSubsetCount = nullptr; }
@@ -60841,7 +61468,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGrassSubsetCountZero) { removeResource(g_live.pGrassSubsetCountZero); g_live.pGrassSubsetCountZero = nullptr; }
         if (g_live.pGrassArgs)         { removeResource(g_live.pGrassArgs);         g_live.pGrassArgs = nullptr; }
         if (g_live.pGrassInstOut)      { removeResource(g_live.pGrassInstOut);      g_live.pGrassInstOut = nullptr; }
-        if (g_live.pGrassSunCullParamsCbv) { removeResource(g_live.pGrassSunCullParamsCbv); g_live.pGrassSunCullParamsCbv = nullptr; }
+        if (g_live.pGrassSunCullParamsCbv) { removeFrameBuf(g_live.pGrassSunCullParamsCbv); g_live.pGrassSunCullParamsCbv = nullptr; }
         if (g_live.pGrassSunCullCount)   { removeResource(g_live.pGrassSunCullCount);   g_live.pGrassSunCullCount = nullptr; }
         if (g_live.pGrassSunSubsetCount) { removeResource(g_live.pGrassSunSubsetCount); g_live.pGrassSunSubsetCount = nullptr; }
         if (g_live.pGrassSunSubsetOffset){ removeResource(g_live.pGrassSunSubsetOffset);g_live.pGrassSunSubsetOffset = nullptr; }
@@ -60865,7 +61492,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pLightOccBits)       { removeResource(g_live.pLightOccBits);      g_live.pLightOccBits = nullptr; }
         if (g_live.pLightOccReadback)   { removeResource(g_live.pLightOccReadback);  g_live.pLightOccReadback = nullptr; }
         if (g_live.pLightOccZero)       { removeResource(g_live.pLightOccZero);      g_live.pLightOccZero = nullptr; }
-        if (g_live.pLightHizCbv)        { removeResource(g_live.pLightHizCbv);       g_live.pLightHizCbv = nullptr; }
+        if (g_live.pLightHizCbv)        { removeFrameBuf(g_live.pLightHizCbv);       g_live.pLightHizCbv = nullptr; }
         g_live.shadowLightCullReady = false;
         g_lightOccludedBits = 0; g_lightOccValid = false;
         g_live.cullInstCount = 0; g_live.cullSubsetCount = 0;
@@ -60880,10 +61507,12 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pHizPipelineFirst){ removePipeline(R, g_live.pHizPipelineFirst); }
         if (g_live.pHizShader)       { removeShader(R, g_live.pHizShader); }
         if (g_live.pHizShaderFirst)  { removeShader(R, g_live.pHizShaderFirst); }
-        if (g_live.pHizQueryPool)    { exitQueryPool(R, g_live.pHizQueryPool); }
-        if (g_live.pHizFence)        { exitFence(R, g_live.pHizFence); }
-        if (g_live.pHizCmd)          { exitCmd(R, g_live.pHizCmd); }
-        if (g_live.pHizCmdPool)      { exitCmdPool(R, g_live.pHizCmdPool); }
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            if (g_live.pHizQueryPool[s]) { exitQueryPool(R, g_live.pHizQueryPool[s]); }
+            if (g_live.pHizFence[s])     { exitFence(R, g_live.pHizFence[s]); }
+            if (g_live.pHizCmd[s])       { exitCmd(R, g_live.pHizCmd[s]); }
+            if (g_live.pHizCmdPool[s])   { exitCmdPool(R, g_live.pHizCmdPool[s]); }
+        }
         if (g_live.pHiz)             { removeResource(g_live.pHiz); }
         // H1 min-pyramid over the sky-height field — same shape as the Hi-Z above, same teardown.
         if (g_live.pSkyHeightMinSet)          { removeDescriptorSet(R, g_live.pSkyHeightMinSet);       g_live.pSkyHeightMinSet = nullptr; }
@@ -60906,8 +61535,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pShadowMaskSet)       { removeDescriptorSet(R, g_live.pShadowMaskSet); }
         if (g_live.pShadowFaceSet)       { removeDescriptorSet(R, g_live.pShadowFaceSet); }
         if (g_live.pShadowBatchSet)      { removeDescriptorSet(R, g_live.pShadowBatchSet); }
-        if (g_live.pShadowWorldsBuf)     { removeResource(g_live.pShadowWorldsBuf); }
-        if (g_live.pShadowInstanceBuf)   { removeResource(g_live.pShadowInstanceBuf); }
+        if (g_live.pShadowWorldsBuf)     { removeFrameBuf(g_live.pShadowWorldsBuf); }
+        if (g_live.pShadowInstanceBuf)   { removeFrameBuf(g_live.pShadowInstanceBuf); }
         if (g_live.pShadowMaskPipeline)  { removePipeline(R, g_live.pShadowMaskPipeline); }
         if (g_live.pShadowMaskShader)    { removeShader(R, g_live.pShadowMaskShader); }
         if (g_live.pShadowClearPipeline) { removePipeline(R, g_live.pShadowClearPipeline); }
@@ -60919,9 +61548,9 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pShadowPipelineFront)  { removePipeline(R, g_live.pShadowPipelineFront); }
         if (g_live.pShadowPipelineFrontMirror) { removePipeline(R, g_live.pShadowPipelineFrontMirror); }
         for (uint32_t f = 0; f < kShadowFaceCbvs; ++f) {
-            if (g_live.pShadowFaceCbv[f]) { removeResource(g_live.pShadowFaceCbv[f]); }
+            if (g_live.pShadowFaceCbv[f]) { removeFrameBuf(g_live.pShadowFaceCbv[f]); }
         }
-        if (g_live.pShadowMaskParamsCbv) { removeResource(g_live.pShadowMaskParamsCbv); }
+        if (g_live.pShadowMaskParamsCbv) { removeFrameBuf(g_live.pShadowMaskParamsCbv); }
         if (g_live.pShadowMask)          { removeResource(g_live.pShadowMask); }
         // Sun moments blur — drop the set/pipeline/shader BEFORE the textures they reference.
         g_live.sunBlurReady = false;
@@ -60929,7 +61558,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSunBlurPipeline) { removePipeline(R, g_live.pSunBlurPipeline); g_live.pSunBlurPipeline = nullptr; }
         if (g_live.pSunBlurShader)   { removeShader(R, g_live.pSunBlurShader); g_live.pSunBlurShader = nullptr; }
         for (uint32_t d = 0; d < 2 * kSunCascades; ++d) {
-            if (g_live.pSunBlurParamsCbv[d]) { removeResource(g_live.pSunBlurParamsCbv[d]); g_live.pSunBlurParamsCbv[d] = nullptr; }
+            if (g_live.pSunBlurParamsCbv[d]) { removeFrameBuf(g_live.pSunBlurParamsCbv[d]); g_live.pSunBlurParamsCbv[d] = nullptr; }
         }
         if (g_live.pSunMomentsScratch)   { removeResource(g_live.pSunMomentsScratch); g_live.pSunMomentsScratch = nullptr; }
         if (g_live.pSunMoments)          { removeRenderTarget(R, g_live.pSunMoments); g_live.pSunMoments = nullptr; }
@@ -60938,11 +61567,11 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSkyVisSet)           { removeDescriptorSet(R, g_live.pSkyVisSet); g_live.pSkyVisSet = nullptr; }
         if (g_live.pSkyVisPipeline)      { removePipeline(R, g_live.pSkyVisPipeline); g_live.pSkyVisPipeline = nullptr; }
         if (g_live.pSkyVisShader)        { removeShader(R, g_live.pSkyVisShader); g_live.pSkyVisShader = nullptr; }
-        if (g_live.pSkyVisParamsCbv)     { removeResource(g_live.pSkyVisParamsCbv); g_live.pSkyVisParamsCbv = nullptr; }
+        if (g_live.pSkyVisParamsCbv)     { removeFrameBuf(g_live.pSkyVisParamsCbv); g_live.pSkyVisParamsCbv = nullptr; }
         if (g_live.pSvmScreen)           { removeResource(g_live.pSvmScreen); g_live.pSvmScreen = nullptr; }
         for (uint32_t d = 0; d < 32; ++d) {
-            if (g_live.pSvmFrameCbv[d]) { removeResource(g_live.pSvmFrameCbv[d]); g_live.pSvmFrameCbv[d] = nullptr; }
-            if (g_live.pSvmCullCbv[d])  { removeResource(g_live.pSvmCullCbv[d]);  g_live.pSvmCullCbv[d]  = nullptr; }
+            if (g_live.pSvmFrameCbv[d]) { removeFrameBuf(g_live.pSvmFrameCbv[d]); g_live.pSvmFrameCbv[d] = nullptr; }
+            if (g_live.pSvmCullCbv[d])  { removeFrameBuf(g_live.pSvmCullCbv[d]);  g_live.pSvmCullCbv[d]  = nullptr; }
         }
         g_live.skyVisReady = false; g_live.svmScreenInSR = false;
         if (g_live.pShadowAtlas)         { removeRenderTarget(R, g_live.pShadowAtlas); }
@@ -60959,7 +61588,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAODownPipeline)   { removePipeline(R, g_live.pAODownPipeline); }
         if (g_live.pAOUpShader)       { removeShader(R, g_live.pAOUpShader); }
         if (g_live.pAODownShader)     { removeShader(R, g_live.pAODownShader); }
-        if (g_live.pAOUpCbv)          { removeResource(g_live.pAOUpCbv); }
+        if (g_live.pAOUpCbv)          { removeFrameBuf(g_live.pAOUpCbv); }
         if (g_live.pAOBlurHalf)       { removeResource(g_live.pAOBlurHalf); }
         if (g_live.pAOHalf)           { removeResource(g_live.pAOHalf); }
         if (g_live.pLinearDepthHalf)  { removeResource(g_live.pLinearDepthHalf); }
@@ -60989,7 +61618,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAplShader)      { removeShader(R, g_live.pAplShader);      g_live.pAplShader = nullptr; }
         if (g_live.pAplReadback)    { removeResource(g_live.pAplReadback);     g_live.pAplReadback = nullptr; }
         if (g_live.pAplOut)         { removeResource(g_live.pAplOut);          g_live.pAplOut = nullptr; }
-        if (g_live.pAplParamsCbv)   { removeResource(g_live.pAplParamsCbv);    g_live.pAplParamsCbv = nullptr; }
+        if (g_live.pAplParamsCbv)   { removeFrameBuf(g_live.pAplParamsCbv);    g_live.pAplParamsCbv = nullptr; }
         // P2 Hosek cross-check — same set -> pipeline -> shader -> buffers order.
         // S2: the ATMOSPHERE's LUT chain (this replaced the Hosek cross-check's teardown). The set
         // goes before the resources bound into it, which is the order every other block here uses.
@@ -61007,26 +61636,26 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pObjVelSkinPipelineMirror) { removePipeline(R, g_live.pObjVelSkinPipelineMirror); g_live.pObjVelSkinPipelineMirror = nullptr; }
         if (g_live.pObjVelSkinPipeline)   { removePipeline(R, g_live.pObjVelSkinPipeline);   g_live.pObjVelSkinPipeline = nullptr; }
         if (g_live.pObjVelSkinShader)     { removeShader(R, g_live.pObjVelSkinShader);       g_live.pObjVelSkinShader = nullptr; }
-        if (g_live.pObjVelBonesCurCbv)    { removeResource(g_live.pObjVelBonesCurCbv);       g_live.pObjVelBonesCurCbv = nullptr; }
-        if (g_live.pObjVelBonesPrevCbv)   { removeResource(g_live.pObjVelBonesPrevCbv);      g_live.pObjVelBonesPrevCbv = nullptr; }
-        if (g_live.pObjVelSkinInstanceBuf){ removeResource(g_live.pObjVelSkinInstanceBuf);   g_live.pObjVelSkinInstanceBuf = nullptr; }
+        if (g_live.pObjVelBonesCurCbv)    { removeFrameBuf(g_live.pObjVelBonesCurCbv);       g_live.pObjVelBonesCurCbv = nullptr; }
+        if (g_live.pObjVelBonesPrevCbv)   { removeFrameBuf(g_live.pObjVelBonesPrevCbv);      g_live.pObjVelBonesPrevCbv = nullptr; }
+        if (g_live.pObjVelSkinInstanceBuf){ removeFrameBuf(g_live.pObjVelSkinInstanceBuf);   g_live.pObjVelSkinInstanceBuf = nullptr; }
         g_live.objVelSkinReady = false;
         if (g_live.pObjVelPipelineMirror) { removePipeline(R, g_live.pObjVelPipelineMirror); g_live.pObjVelPipelineMirror = nullptr; }
         if (g_live.pObjVelPipelineMM)     { removePipeline(R, g_live.pObjVelPipelineMM);       g_live.pObjVelPipelineMM = nullptr; }
         if (g_live.pObjVelPipelineMMMirror) { removePipeline(R, g_live.pObjVelPipelineMMMirror); g_live.pObjVelPipelineMMMirror = nullptr; }
         if (g_live.pObjVelPipeline)       { removePipeline(R, g_live.pObjVelPipeline);      g_live.pObjVelPipeline = nullptr; }
         if (g_live.pObjVelShader)         { removeShader(R, g_live.pObjVelShader);          g_live.pObjVelShader = nullptr; }
-        if (g_live.pObjVelParamsCbv)      { removeResource(g_live.pObjVelParamsCbv);        g_live.pObjVelParamsCbv = nullptr; }
-        if (g_live.pObjVelBatchCbv)       { removeResource(g_live.pObjVelBatchCbv);         g_live.pObjVelBatchCbv = nullptr; }
-        if (g_live.pObjVelInstanceBuf)    { removeResource(g_live.pObjVelInstanceBuf);      g_live.pObjVelInstanceBuf = nullptr; }
+        if (g_live.pObjVelParamsCbv)      { removeFrameBuf(g_live.pObjVelParamsCbv);        g_live.pObjVelParamsCbv = nullptr; }
+        if (g_live.pObjVelBatchCbv)       { removeFrameBuf(g_live.pObjVelBatchCbv);         g_live.pObjVelBatchCbv = nullptr; }
+        if (g_live.pObjVelInstanceBuf)    { removeFrameBuf(g_live.pObjVelInstanceBuf);      g_live.pObjVelInstanceBuf = nullptr; }
         if (g_live.pObjVelFrags)          { removeResource(g_live.pObjVelFrags);            g_live.pObjVelFrags = nullptr; }
         if (g_live.pObjVelFragsReset)     { removeResource(g_live.pObjVelFragsReset);       g_live.pObjVelFragsReset = nullptr; }
         if (g_live.pObjVelFragsReadback)  { removeResource(g_live.pObjVelFragsReadback);    g_live.pObjVelFragsReadback = nullptr; }
-        if (g_live.pObjVelParamsCbvFP)       { removeResource(g_live.pObjVelParamsCbvFP);       g_live.pObjVelParamsCbvFP = nullptr; }
-        if (g_live.pObjVelBatchCbvFP)        { removeResource(g_live.pObjVelBatchCbvFP);        g_live.pObjVelBatchCbvFP = nullptr; }
-        if (g_live.pObjVelBonesCurCbvFP)     { removeResource(g_live.pObjVelBonesCurCbvFP);     g_live.pObjVelBonesCurCbvFP = nullptr; }
-        if (g_live.pObjVelBonesPrevCbvFP)    { removeResource(g_live.pObjVelBonesPrevCbvFP);    g_live.pObjVelBonesPrevCbvFP = nullptr; }
-        if (g_live.pObjVelSkinInstanceBufFP) { removeResource(g_live.pObjVelSkinInstanceBufFP); g_live.pObjVelSkinInstanceBufFP = nullptr; }
+        if (g_live.pObjVelParamsCbvFP)       { removeFrameBuf(g_live.pObjVelParamsCbvFP);       g_live.pObjVelParamsCbvFP = nullptr; }
+        if (g_live.pObjVelBatchCbvFP)        { removeFrameBuf(g_live.pObjVelBatchCbvFP);        g_live.pObjVelBatchCbvFP = nullptr; }
+        if (g_live.pObjVelBonesCurCbvFP)     { removeFrameBuf(g_live.pObjVelBonesCurCbvFP);     g_live.pObjVelBonesCurCbvFP = nullptr; }
+        if (g_live.pObjVelBonesPrevCbvFP)    { removeFrameBuf(g_live.pObjVelBonesPrevCbvFP);    g_live.pObjVelBonesPrevCbvFP = nullptr; }
+        if (g_live.pObjVelSkinInstanceBufFP) { removeFrameBuf(g_live.pObjVelSkinInstanceBufFP); g_live.pObjVelSkinInstanceBufFP = nullptr; }
         g_live.objVelFPReady = false;
         // MB-1d: the arm camera dies with the device. A retained matrix from before a reset would
         // pair with a fresh frame's poses and streak the arms across the screen for one frame — the
@@ -61036,7 +61665,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pMvFsSet)        { removeDescriptorSet(R, g_live.pMvFsSet);  g_live.pMvFsSet = nullptr; }
         if (g_live.pMvFsPipeline)   { removePipeline(R, g_live.pMvFsPipeline);  g_live.pMvFsPipeline = nullptr; }
         if (g_live.pMvFsShader)     { removeShader(R, g_live.pMvFsShader);      g_live.pMvFsShader = nullptr; }
-        if (g_live.pMvFsParamsCbv)  { removeResource(g_live.pMvFsParamsCbv);    g_live.pMvFsParamsCbv = nullptr; }
+        if (g_live.pMvFsParamsCbv)  { removeFrameBuf(g_live.pMvFsParamsCbv);    g_live.pMvFsParamsCbv = nullptr; }
         if (g_live.pMvFsStats)      { removeResource(g_live.pMvFsStats);        g_live.pMvFsStats = nullptr; }
         if (g_live.pMvFsReset)      { removeResource(g_live.pMvFsReset);        g_live.pMvFsReset = nullptr; }
         if (g_live.pMvFsReadback)   { removeResource(g_live.pMvFsReadback);     g_live.pMvFsReadback = nullptr; }
@@ -61051,7 +61680,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAtmosTransShader)   { removeShader(R, g_live.pAtmosTransShader);      g_live.pAtmosTransShader = nullptr; }
         if (g_live.pAtmosShReadback)    { removeResource(g_live.pAtmosShReadback);        g_live.pAtmosShReadback = nullptr; }
         if (g_live.pAtmosShOut)         { removeResource(g_live.pAtmosShOut);             g_live.pAtmosShOut = nullptr; }
-        if (g_live.pAtmosParamsCbv)     { removeResource(g_live.pAtmosParamsCbv);         g_live.pAtmosParamsCbv = nullptr; }
+        if (g_live.pAtmosParamsCbv)     { removeFrameBuf(g_live.pAtmosParamsCbv);         g_live.pAtmosParamsCbv = nullptr; }
         if (g_live.pAtmosSkyView)       { removeResource(g_live.pAtmosSkyView);           g_live.pAtmosSkyView = nullptr; }
         if (g_live.pAtmosSkyViewClear)  { removeResource(g_live.pAtmosSkyViewClear);      g_live.pAtmosSkyViewClear = nullptr; }
         if (g_live.pAtmosMultiScatter)  { removeResource(g_live.pAtmosMultiScatter);      g_live.pAtmosMultiScatter = nullptr; }
@@ -61065,7 +61694,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pResolveSet)      { removeDescriptorSet(R, g_live.pResolveSet); g_live.pResolveSet = nullptr; }
         if (g_live.pResolvePipeline) { removePipeline(R, g_live.pResolvePipeline); g_live.pResolvePipeline = nullptr; }
         if (g_live.pResolveShader)   { removeShader(R, g_live.pResolveShader);     g_live.pResolveShader = nullptr; }
-        if (g_live.pResolveParamsCbv){ removeResource(g_live.pResolveParamsCbv);   g_live.pResolveParamsCbv = nullptr; }
+        if (g_live.pResolveParamsCbv){ removeFrameBuf(g_live.pResolveParamsCbv);   g_live.pResolveParamsCbv = nullptr; }
         // M1 step 4b: the upscaler. TWO calls, and they are not the same thing — shutdown() releases
         // the GPU resources through the renderer, destroyUpscaler() frees the object off the tf_
         // allocator it was made on. Splitting them is what keeps `new`/`delete` (which IMemory.h
@@ -61098,7 +61727,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pBloomDownShader)       { removeShader(R, g_live.pBloomDownShader);          g_live.pBloomDownShader = nullptr; }
         if (g_live.pBloomPrefilterShader)  { removeShader(R, g_live.pBloomPrefilterShader);     g_live.pBloomPrefilterShader = nullptr; }
         for (uint32_t s = 0; s < kBloomSetCount; ++s) {
-            if (g_live.pBloomParamsCbv[s]) { removeResource(g_live.pBloomParamsCbv[s]); g_live.pBloomParamsCbv[s] = nullptr; }
+            if (g_live.pBloomParamsCbv[s]) { removeFrameBuf(g_live.pBloomParamsCbv[s]); g_live.pBloomParamsCbv[s] = nullptr; }
         }
         if (g_live.pBloomMips)             { removeResource(g_live.pBloomMips); g_live.pBloomMips = nullptr; }
         g_live.bloomReady = false;
@@ -61116,7 +61745,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pMbStatsReadback)    { removeResource(g_live.pMbStatsReadback);       g_live.pMbStatsReadback = nullptr; }
         if (g_live.pMbStatsReset)       { removeResource(g_live.pMbStatsReset);          g_live.pMbStatsReset = nullptr; }
         if (g_live.pMbStats)            { removeResource(g_live.pMbStats);               g_live.pMbStats = nullptr; }
-        if (g_live.pMbParamsCbv)        { removeResource(g_live.pMbParamsCbv);           g_live.pMbParamsCbv = nullptr; }
+        if (g_live.pMbParamsCbv)        { removeFrameBuf(g_live.pMbParamsCbv);           g_live.pMbParamsCbv = nullptr; }
         if (g_live.pMbNeighbor)         { removeResource(g_live.pMbNeighbor);            g_live.pMbNeighbor = nullptr; }
         if (g_live.pMbTile)             { removeResource(g_live.pMbTile);                g_live.pMbTile = nullptr; }
         if (g_live.pMotionBlur)         { removeResource(g_live.pMotionBlur);            g_live.pMotionBlur = nullptr; }
@@ -61130,13 +61759,13 @@ void destroyHostWindow(Renderer* R);
         g_mbVelFrozen = false;
         g_simHeld = false;
         g_mbHeldFrames = 0;
-        if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
+        if (g_live.pAOParamsCbv)    { removeFrameBuf(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }
         if (g_live.pLinearDepth)    { removeResource(g_live.pLinearDepth); }
         if (g_live.pMbVelocity)     { removeResource(g_live.pMbVelocity); g_live.pMbVelocity = nullptr; }
         if (g_live.pMotionVectors)  { removeResource(g_live.pMotionVectors); }
-        if (g_live.pMvParamsCbv)    { removeResource(g_live.pMvParamsCbv); }
+        if (g_live.pMvParamsCbv)    { removeFrameBuf(g_live.pMvParamsCbv); }
         if (g_live.pMvStats)        { removeResource(g_live.pMvStats); }
         if (g_live.pMvStatsReset)   { removeResource(g_live.pMvStatsReset); }
         if (g_live.pMvStatsReadback){ removeResource(g_live.pMvStatsReadback); }
@@ -61149,9 +61778,9 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pFroxelSet)            { removeDescriptorSet(R, g_live.pFroxelSet); }
         if (g_live.pFroxelSetNear)        { removeDescriptorSet(R, g_live.pFroxelSetNear); }
         if (g_live.pFroxelMask)           { removeResource(g_live.pFroxelMask); }
-        if (g_live.pFroxelParamsCbv)      { removeResource(g_live.pFroxelParamsCbv); }
+        if (g_live.pFroxelParamsCbv)      { removeFrameBuf(g_live.pFroxelParamsCbv); }
         if (g_live.pFroxelMaskNear)       { removeResource(g_live.pFroxelMaskNear); }
-        if (g_live.pFroxelParamsCbvNear)  { removeResource(g_live.pFroxelParamsCbvNear); }
+        if (g_live.pFroxelParamsCbvNear)  { removeFrameBuf(g_live.pFroxelParamsCbvNear); }
         if (g_live.pFroxelClearPipeline)  { removePipeline(R, g_live.pFroxelClearPipeline); }
         if (g_live.pFroxelAssignPipeline) { removePipeline(R, g_live.pFroxelAssignPipeline); }
         if (g_live.pFroxelClearShader)    { removeShader(R, g_live.pFroxelClearShader); }
@@ -61163,7 +61792,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pCausticMap)             { removeResource(g_live.pCausticMap); }
         if (g_live.pCausticAccum)           { removeResource(g_live.pCausticAccum); }
         for (uint32_t i = 0; i < kCausticSetCount; ++i) {
-            if (g_live.pCausticCbv[i])      { removeResource(g_live.pCausticCbv[i]); }
+            if (g_live.pCausticCbv[i])      { removeFrameBuf(g_live.pCausticCbv[i]); }
         }
         if (g_live.pCausticPipeline)        { removePipeline(R, g_live.pCausticPipeline); }
         if (g_live.pCausticDynPipeline)     { removePipeline(R, g_live.pCausticDynPipeline); }
@@ -61175,33 +61804,42 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGrassCrushSet)             { removeDescriptorSet(R, g_live.pGrassCrushSet); }
         if (g_live.pGrassCrushField)           { removeResource(g_live.pGrassCrushField); }
         if (g_live.pGrassCrushAccum)           { removeResource(g_live.pGrassCrushAccum); }
-        if (g_live.pGrassCrushersBuf)          { removeResource(g_live.pGrassCrushersBuf); }
-        if (g_live.pGrassCrushCbv)             { removeResource(g_live.pGrassCrushCbv); }
+        if (g_live.pGrassCrushersBuf)          { removeFrameBuf(g_live.pGrassCrushersBuf); }
+        if (g_live.pGrassCrushCbv)             { removeFrameBuf(g_live.pGrassCrushCbv); }
         if (g_live.pGrassCrushPipeline)        { removePipeline(R, g_live.pGrassCrushPipeline); }
         if (g_live.pGrassCrushSplatPipeline)   { removePipeline(R, g_live.pGrassCrushSplatPipeline); }
         if (g_live.pGrassCrushResolvePipeline) { removePipeline(R, g_live.pGrassCrushResolvePipeline); }
         if (g_live.pGrassCrushShader)          { removeShader(R, g_live.pGrassCrushShader); }
         if (g_live.pGrassCrushSplatShader)     { removeShader(R, g_live.pGrassCrushSplatShader); }
         if (g_live.pGrassCrushResolveShader)   { removeShader(R, g_live.pGrassCrushResolveShader); }
-        if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
+        if (g_live.pUVAnimBuf)            { removeFrameBuf(g_live.pUVAnimBuf); }
         if (g_live.pSceneColor)      { removeRenderTarget(R, g_live.pSceneColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         // The overlay window first: its swapchain references the present queue and its command
         // pool the device, so it goes before anything below tears those down.
         destroyHostWindow(R);
+        fbShutdown(R);
         if (g_live.pAuxFence)   { waitForFences(R, 1, &g_live.pAuxFence); exitFence(R, g_live.pAuxFence); }
         if (g_live.pAuxCmd)     { exitCmd(R, g_live.pAuxCmd); }
         if (g_live.pAuxCmdPool) { exitCmdPool(R, g_live.pAuxCmdPool); }
-        if (g_live.pFence)    { exitFence(R, g_live.pFence); }
-        if (g_live.pCmd)      { exitCmd(R, g_live.pCmd); }
-        if (g_live.pCmdB)     { exitCmd(R, g_live.pCmdB); }
-        if (g_live.pCmdPool)  { exitCmdPool(R, g_live.pCmdPool); }
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            if (g_live.pFence[s])        { exitFence(R, g_live.pFence[s]); }
+            if (g_live.pCmdA[s])         { exitCmd(R, g_live.pCmdA[s]); }
+            if (g_live.pCmdB[s])         { exitCmd(R, g_live.pCmdB[s]); }
+            if (g_live.pCmdPool[s])      { exitCmdPool(R, g_live.pCmdPool[s]); }
+            if (g_live.pGpuQueryPool[s]) { exitQueryPool(R, g_live.pGpuQueryPool[s]); }
+        }
         if (g_live.pPipeline) { removePipeline(R, g_live.pPipeline); }
-        if (g_live.ntHandle)  { CloseHandle(g_live.ntHandle); }
         if (g_live.ntFenceHandle) { CloseHandle(g_live.ntFenceHandle); }
-        if (g_live.hFrameEvent)   { CloseHandle(g_live.hFrameEvent); }
         if (g_live.pSharedFence)  { g_live.pSharedFence->Release(); }
-        if (g_live.pRT)       { removeRenderTarget(R, g_live.pRT); }  // releases pSharedRes
+        for (uint32_t s = 0; s < kFrameSlots; ++s) {
+            if (g_live.ntHandles[s])    { CloseHandle(g_live.ntHandles[s]); }
+            if (g_live.hFrameEvents[s]) { CloseHandle(g_live.hFrameEvents[s]); }
+            // The RT owns (and releases) its adopted resource; one that never got an RT — init
+            // failed between the two — is released here instead.
+            if (g_live.pRTs[s])              { removeRenderTarget(R, g_live.pRTs[s]); }
+            else if (g_live.pSharedResS[s])  { g_live.pSharedResS[s]->Release(); }
+        }
         if (g_live.pShader)   { removeShader(R, g_live.pShader); exitRootSignature(R); }
         forgeTearDown(R, g_live.pQueue);
         g_live = LiveRenderer{};

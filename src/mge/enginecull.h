@@ -71,6 +71,16 @@ namespace MGE::EngineCull {
     // Cheap; safe to call on frames where the traversal never runs.
     void beginFrame(int ownedFlags);
 
+    // PARK-MODE LEAD. In produce mode 3 the drawn set classified NOW is fired to the host at the
+    // start of the NEXT frame with THAT frame's camera, so a fast turn brings in geometry from the
+    // leading edge that this frustum never saw: it is missing for exactly one frame (a whole wall
+    // at the screen edge, Arrille's, 2026-09-29; gone in produce mode 2). With the lead on, the
+    // classify also collects leaves inside a frustum whose four side planes are rotated outward
+    // by lead = base + gain x (camera rotation since the last classify), feeds them to the sink,
+    // and does NOT hand them to the engine's display — the engine draws exactly what it always
+    // did; only the host's list grows. Call before classifyNow(); off = byte-identical traversal.
+    void setFeedLead(bool on);
+
     // Run the world-camera traversal NOW and hand the drawn set to the sink,
     // deferring every geometry leaf to the engine's own top-level CullShow.
     // `camera` may be the world camera (validated) or null (we resolve it) — the
@@ -148,6 +158,8 @@ namespace MGE::EngineCull {
         uint32_t ownedOpaqueSkipped;
         uint32_t ownedAlphaSkipped;
         uint32_t displayed;
+        uint32_t leadFed;             // leaves fed ONLY because of the park-mode lead band
+        float    leadDeg;             // the lead used by the last classify (0 = off)
         // Frames where classifyNow() collected leaves but the engine's display
         // pass never arrived to draw them. Should be 0. Anything else means the
         // root-identity match is missing the engine's real top-level pass, which

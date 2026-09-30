@@ -152,6 +152,11 @@ namespace RenderProcess {
     // failed seam falls back to (g_initOk false), and it is the ONLY fallback.
     bool forgeOwnsFrame();
 
+    // True when this frame's classify will be FIRED to the host next frame with a newer camera
+    // (produce mode 3, park-and-fire). The early classify then collects a lead band past the
+    // frustum's side planes (EngineCull::setFeedLead) so a fast turn does not lose the leading edge.
+    bool parkFiresLater();
+
     // Lift the first-sight capture budget for the next `frames` builds. Called when the references
     // MW holds change (a grid shift): the host hands those references to the near path at once, so
     // the near path must be able to draw every newly held shape in that same build.
