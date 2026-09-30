@@ -3001,10 +3001,12 @@ namespace {
                 const std::uint32_t s = it->second;
                 if (s == 0) { g_texSlot.erase(it); continue; }   // a cached miss: forget it too
                 if (IPC::isFlipSlot(s) || s >= IPC::kMaxTextures || g_slotName[s] != n) { continue; }
-                const std::uint32_t cold = coldBit(s);   // before the age resets below
+                const std::uint32_t cold = coldBit(s);
                 g_texSlot.erase(it);
                 g_slotName[s].clear();
-                g_slotLastUsed[s] = 0;
+                // g_slotLastUsed KEPT (unlike evictStaleTextures, whose slots are 600+ frames old):
+                // Morrowind may have dropped a texture drawn last frame, and the slot's reuse must
+                // still read hot so the host waits the frames in flight before rewriting it.
                 bytes += g_slotBytes[s];
                 g_slotBytes[s] = 0;
                 g_texFreeSlots.push_back(s);
@@ -3025,6 +3027,64 @@ namespace {
                              (unsigned long long)g_texMirrorReleases, (double)g_texMirrorBytes / (1024.0 * 1024.0));
             }
         }
+    }
+
+    // BOOKKEEPING AT A QUIET MOMENT (user, 2026-09-30: "player is expected to enter an interior or
+    // sleep or pause the game etc. best moment for bookkeeping"). Releasing textures one by one frees
+    // their bytes but not the VRAM: D3D12MA hands out 64 MB heap blocks and returns one to the driver
+    // only when it is EMPTY, and streamed textures share blocks with each other and with long-lived
+    // resources. So the host's local VRAM ratcheted to its high-water mark — AutoZip, 500 cell
+    // changes: allocator slack up to 1.77 GB, local VRAM ending at its max while textures had fallen.
+    // A load is the moment nobody is looking and everything is being re-resolved anyway (the geometry
+    // cache was just purged): release EVERY streamed slot, so whole blocks empty and go back, and let
+    // the post-load window + grid prefetch refill what the new cell uses into fresh blocks.
+    // Flip-book arrays stay (session-resident, one descriptor each). Produce context, like the purge.
+    // MGE_TEX_BOOKKEEP=0 turns it off (A/B).
+    void texBookkeepingRelease(const char* why) {
+        static int s_on = -1;
+        if (s_on < 0) {
+            char e[16] = {};
+            s_on = (GetEnvironmentVariableA("MGE_TEX_BOOKKEEP", e, sizeof(e)) > 0 && e[0] == '0') ? 0 : 1;
+            LOG::logline(">> [tex-bookkeep] release-all at loads %s (MGE_TEX_BOOKKEEP=0 turns it off)",
+                         s_on ? "ON" : "OFF");
+        }
+        if (!s_on || !g_texVec) {
+            return;
+        }
+        std::uint32_t released = 0;
+        std::uint64_t bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            if (g_slotName.size() != IPC::kMaxTextures) {
+                return;
+            }
+            const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
+            for (std::uint32_t s = 1; s < g_nextTexSlot && s < cap; ++s) {
+                if (g_slotName[s].empty()) { continue; }   // free, or a placeholder awaiting retire
+                const std::uint32_t cold = coldBit(s);
+                g_slotName[s].clear();
+                // g_slotLastUsed KEPT: this slot may have been drawn last frame, and its reuse must
+                // still read hot (host waits the frames in flight) — zeroing it would make it look cold.
+                bytes += g_slotBytes[s];
+                g_slotBytes[s] = 0;
+                g_texFreeSlots.push_back(s);
+                const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease | cold, 0u, 0u };
+                stageTexUpload(rel, nullptr, 0u);
+                ++released;
+            }
+            // Every name but the flip books' encoded slots (and their cached misses) goes; a cached
+            // miss is cheap to re-probe and the new cell may have files the old one lacked.
+            for (auto it = g_texSlot.begin(); it != g_texSlot.end();) {
+                if (IPC::isFlipSlot(it->second)) { ++it; } else { it = g_texSlot.erase(it); }
+            }
+            g_texStreamQueue.clear();   // their slots were just released
+            ++g_texEpoch;               // every cached slot re-resolves by name
+        }
+        g_capTexMemo.clear();
+        g_gridTexQueue.clear();
+        g_mwDroppedNames.clear();
+        LOG::logline("-- [tex-bookkeep] %s: released all %u streamed slots (%.0f MB); the new cell refills"
+                     " them into fresh heap blocks", why, released, (double)bytes / (1024.0 * 1024.0));
     }
 
     void evictStaleTextures() {
@@ -6484,6 +6544,7 @@ namespace RenderProcess {
                 // Draining here resolves the keys to the OLD slots, while they still mean what
                 // they meant at purge time.
                 drainReleasedSlots();
+                texBookkeepingRelease("load");
             } else {
                 // First load: no purge, so no post-load residency window either — yet this needs one
                 // as much as a transition does. Whatever the pre-seam loading-screen walks left in
