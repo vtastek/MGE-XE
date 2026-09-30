@@ -2,6 +2,11 @@
 # Post-load pop-in harness: launch minimized off a pinned save -> let the AutoTurn360 lua mod sweep
 # the player through 360 deg -> report whether any geometry was captured FIRST-SIGHT during the turn.
 # Usage: forge-popin-run.sh [delay=0] [save=playeroldebonheart.ess] [duration=3] [reload=0] [timeout=240]
+#                           [clientEnv="NAME=v,NAME=v"] [trace] [degrees=360]
+#
+# clientEnv / trace work as in forge-perf-run.sh: CLIENT_ENV_NAMES are always cleared first, and any
+# non-empty 7th arg sets MGE_FRAME_TRACE=1 (per-frame CSV: the fast-turn fps drop needs per-frame dt,
+# which a heartbeat averages away).
 #
 # reload=1 is THE repro (c). A first load runs its loading frames before the seam owns them, so the
 # full refresh walk still runs and pre-populates the cache - measured 11705 entries already cached at
@@ -28,6 +33,10 @@ SAVE="${2:-playeroldebonheart.ess}"
 DURATION="${3:-3}"
 RELOAD="${4:-0}"
 TIMEOUT="${5:-240}"
+CLIENTENV="${6:-}"
+TRACE="${7:-}"
+DEGREES="${8:-360}"
+CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD"
 
 MW="/mnt/c/mgem/morrowind64"
 XELOG="$MW/mgeXE.log"
@@ -58,16 +67,16 @@ restore() {
 }
 trap restore EXIT
 
-python3 - "$ILCFG" "$SAVE" "$ATCFG" "$DELAY" "$DURATION" "$SETTLE" "$RELOAD" <<'PY'
+python3 - "$ILCFG" "$SAVE" "$ATCFG" "$DELAY" "$DURATION" "$SETTLE" "$RELOAD" "$DEGREES" <<'PY'
 import json, sys
-il, save, at, delay, dur, settle, reload_ = sys.argv[1:8]
+il, save, at, delay, dur, settle, reload_, degrees = sys.argv[1:9]
 with open(il) as f: cfg = json.load(f)
 cfg["continue"] = False          # else the mod loads the NEWEST save, not ours
 cfg["overrideFile"] = save
 with open(il, "w") as f: json.dump(cfg, f, indent=2)
 with open(at, "w") as f:
     json.dump({"enabled": True, "delay": float(delay), "duration": float(dur),
-               "degrees": 360, "settle": float(settle), "reload": reload_ == "1",
+               "degrees": float(degrees), "settle": float(settle), "reload": reload_ == "1",
                "saveFile": save[:-4] if save.lower().endswith(".ess") else save}, f, indent=2)
 PY
 echo "[popin] pinned save=$SAVE | autoturn delay=${DELAY}s duration=${DURATION}s settle=${SETTLE}s reload=${RELOAD}"
@@ -100,6 +109,23 @@ if [ -n "${MGE_EXACT_POS:-}" ]; then
   ENVSET="${ENVSET}\$env:MGE_EXACT_POS='$MGE_EXACT_POS'; "
 else
   ENVSET="${ENVSET}Remove-Item Env:MGE_EXACT_POS -ErrorAction SilentlyContinue; "
+fi
+if [ -n "$TRACE" ]; then
+  echo "[popin] MGE_FRAME_TRACE=1"
+  ENVSET="${ENVSET}\$env:MGE_FRAME_TRACE='1'; "
+else
+  ENVSET="${ENVSET}Remove-Item Env:MGE_FRAME_TRACE -ErrorAction SilentlyContinue; "
+fi
+ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
+for n in $CLIENT_ENV_NAMES; do
+  ENVSET="${ENVSET}Remove-Item Env:$n -ErrorAction SilentlyContinue; "
+done
+if [ -n "$CLIENTENV" ]; then
+  echo "[popin] client env = $CLIENTENV"
+  IFS=',' read -r -a _pairs <<< "$CLIENTENV"
+  for p in "${_pairs[@]}"; do
+    ENVSET="${ENVSET}\$env:${p%%=*}='${p#*=}'; "
+  done
 fi
 powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
 echo "[popin] launched Morrowind; waiting for the sweep..."

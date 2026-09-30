@@ -47,19 +47,18 @@
 // not apply the bend at all (they are not in the Z-prepass gAO is built from).
 
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
-#define MAX_TEXTURES 880    // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
+#define MAX_TEXTURES 4064   // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h),
+                            // which says why (a dense exterior grid is ~1100 textures) and why < 4096
 // NiFlipController flip books: a descriptor-array of Texture2DArrays, one element per (format,
 // size) bucket, one LAYER per book frame. A 300-frame book used to claim 300 gTextures slots; it
 // now claims one descriptor. Same structure as MAX_STATICS_BUCKETS below and the same reason.
-// MAX_TEXTURES + MAX_STATICS_BUCKETS + MAX_FLIP_BUCKETS = 1024, the proven-OK Persistent-table
-// size — these 16 came OUT of gTextures, which is why that dropped 896 -> 880.
 // MUST match IPC::kMaxFlipBuckets (geomwire.h). Slot encoding: see texsample.h.fsl::isFlipSlot.
 #define MAX_FLIP_BUCKETS 16
 // Distant-statics texture residency: a descriptor-array of Texture2DArrays, one element per
 // (format, capped-size) bucket. Each element is ONE descriptor (format/size are runtime resource
 // props; HLSL sees only Texture2DArray<float4>), so this holds arrays of DIFFERENT formats+sizes
-// indexed bindlessly — no switch, no per-texture descriptor. MAX_TEXTURES + MAX_STATICS_BUCKETS =
-// 1024, the proven-OK Persistent-table size (see geomwire.h). statics texSlot = (bucket<<16)|layer.
+// indexed bindlessly — no switch, no per-texture descriptor. Shares the Persistent table with
+// gTextures (see geomwire.h kMaxTextures). statics texSlot = (bucket<<16)|layer.
 #define MAX_STATICS_BUCKETS 128
 // Host-owned terrain land textures: same bucketed-Texture2DArray residency as gStaticsArrays, in
 // its OWN declaration (see gTerrainArrays). 499 unique LTEX over a handful of (format, capped size)
@@ -360,8 +359,8 @@ BEGIN_SRT_NO_AB(SrtData)
         //   gTerrainColor  : one 0x00BBGGRR per vertex,       cell stride 4225 uints.
         // Both index as slot*stride + (y*65 + x). Read by terrain.vert ONLY (a null tail for every
         // other shader on this root signature); appended LAST so every existing PerFrame offset
-        // stays stable. In the PerFrame set rather than Persistent because that set's SRV table is
-        // already at its proven-OK 1024 entries (gTextures + gStaticsArrays + gFlipArrays).
+        // stays stable. In the PerFrame set rather than Persistent because that set's SRV table was
+        // then capped at 1024 entries (gTextures + gStaticsArrays + gFlipArrays; lifted 2026-09-30).
         DECL_BUFFER(PerFrame, Buffer(uint), gTerrainHeights)
         DECL_BUFFER(PerFrame, Buffer(uint), gTerrainColor)
         // ...and the LAND texture layout: gTerrainTex holds each cell's 16x16 VTEX as ONE texture
@@ -377,7 +376,7 @@ BEGIN_SRT_NO_AB(SrtData)
         DECL_BUFFER(PerFrame, Buffer(uint), gTerrainCellGrid)
         // Land textures: array of Texture2DArrays bucketed by (format, capped size), exactly the
         // gStaticsArrays shape and for the same reason — 499 unique LTEX will not fit in individual
-        // bindless slots (MAX_TEXTURES is 880 with the near scene already contending). Its own
+        // bindless slots (MAX_TEXTURES was 880 with the near scene already contending). Its own
         // declaration, NOT gStaticsArrays: the statics bake is itself on the way out.
         // Slot encoding is the same (bucket<<16)|layer. Declared LAST in the set.
         DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gTerrainArrays, MAX_TERRAIN_BUCKETS)
@@ -641,8 +640,8 @@ BEGIN_SRT_NO_AB(SrtData)
         // two are the other half of it; statics.frag reads them.
         //
         // ⚠ PerFrame AND NOT Persistent, although gStaticsArrays — the albedo these belong to — is
-        // Persistent. That table is EXACTLY at its proven-OK 1024 (gTextures 880 + gStaticsArrays 128
-        // + gFlipArrays 16) and has no room at all, so the companion set lives here, exactly as
+        // Persistent. That table was then EXACTLY at its 1024 cap (gTextures 880 + gStaticsArrays 128
+        // + gFlipArrays 16; lifted 2026-09-30) with no room at all, so the companion set lives here, as
         // gTerrainParamArrays does for the same reason. It costs the statics pass nothing: it already
         // binds a PerFrame set for gFrameData/gShadowParams/gFroxelMask.
         //

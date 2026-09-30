@@ -14,6 +14,7 @@
 #include "worldcontroller_view.h"
 #include "exactpos.h"
 #include "morrowindbsa.h"
+#include "statusoverlay.h"
 #include "mge_tracy.h"
 #include "imgui.h"
 #include "proxydx/texledger.h"   // Morrowind's own texture bytes (tasks/forge-memory-shape.md)
@@ -124,6 +125,23 @@ namespace {
     // when, is unchanged: frame N still reaches g_mainTex before this MW frame's blit.
     // numpad-* cycles off -> 1-ahead -> 1.5-ahead; MGE_COPY_AT_BLIT=0|1 sets it at seam init.
     bool   g_copyAtBlit = true;
+
+    // The pipelining mode as ONE value (numpad-* and the panel's radio set it; both flags derive).
+    enum PipeMode { kPipeOff = 0, kPipeAhead1 = 1, kPipeAhead15 = 2 };
+    int pipeMode() { return !g_frameAheadLive ? kPipeOff : g_copyAtBlit ? kPipeAhead15 : kPipeAhead1; }
+    const char* pipeModeName(int m) {
+        return m == kPipeOff ? "OFF (serial)" : m == kPipeAhead1 ? "1-ahead" : "1.5-ahead (copy at blit)";
+    }
+    // Set, log, and SAY it on screen: a key press with no visible answer reads as a key that did
+    // nothing, and this switch has no instant visual tell of its own.
+    void setPipeMode(int m) {
+        g_frameAheadLive = (m != kPipeOff);
+        g_copyAtBlit     = (m == kPipeAhead15);
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "Forge pipelining: %s", pipeModeName(m));
+        LOG::logline(">> [seam] %s", msg);
+        StatusOverlay::setStatus(msg);
+    }
     // Client produce (buildGeometryDrawLists + flush + RPC-start, D3D9-free after Tier 1a) on a
     // fresh dedicated worker. NUMPAD8 cycles 3 modes. (S5a: every mode was additionally gated on
     // !UseRenderThread — the legacy MGE render thread owned the device lock and forced a
@@ -1034,6 +1052,19 @@ namespace {
         bool          data;   // a _paramh: upload with kTexUploadData
     };
     std::deque<TexStreamJob>                  g_texStreamQueue;
+    // A streamed texture's full file goes into a FRESH slot, not over its placeholder: the host is
+    // 2-deep, so frames that draw with the placeholder are usually still executing when the full file
+    // lands, and rewriting their slot's descriptor under them is a race the host could only avoid by
+    // waiting (tasks/forge-pipeline-depth.md P4 refinement). The name moves to the new slot at once;
+    // the placeholder's slot retires here and returns to the pool IPC::kTexColdFrames later, when no
+    // draw list still in flight can name it.
+    struct TexSlotRetire {
+        std::uint32_t slot;
+        std::uint32_t frame;   // g_frame when the name moved off it
+    };
+    std::deque<TexSlotRetire>                 g_texRetireSlots;
+    std::uint64_t                             g_texFreshStreams = 0;   // session totals
+    std::uint64_t                             g_texInPlaceStreams = 0; // no fresh slot free: old path
     std::uint32_t                             g_texStreamBudgetMB = 16;
     std::uint64_t                             g_texPlaceholders = 0;  // session totals
     std::uint64_t                             g_texDeferredData = 0;
@@ -1569,6 +1600,7 @@ namespace {
             g_slotBytes.clear();
             g_texFreeSlots.clear();
             g_texStreamQueue.clear();          // its slots belonged to the OLD host
+            g_texRetireSlots.clear();          // ...and so did these
             g_nextTexSlot = 1;                 // 0 = host default white
             ++g_texEpoch;                      // invalidate every cached ResolvedTex fast-path (name+epoch)
             g_texPendingEntries.clear();       // drop tex uploads staged for the OLD host
@@ -1745,6 +1777,13 @@ namespace {
                 g_copyAtBlit = (v[0] != '0');
                 LOG::logline(">> [seam] MGE_COPY_AT_BLIT=%c — RT copy %s", v[0],
                              g_copyAtBlit ? "at the blit (1.5-ahead)" : "at the collect (1-ahead)");
+            }
+            // MGE_FRAME_AHEAD=0: boot with frame-ahead OFF — the third numpad-* state, which the
+            // harness cannot reach by key. Exists so the OFF path gets tested at all (it once froze).
+            if (GetEnvironmentVariableA("MGE_FRAME_AHEAD", v, sizeof(v)) > 0) {
+                g_frameAheadLive = (v[0] != '0');
+                LOG::logline(">> [seam] MGE_FRAME_AHEAD=%c — frame-ahead pipelining %s", v[0],
+                             g_frameAheadLive ? "ON" : "OFF");
             }
         }
 
@@ -2081,6 +2120,14 @@ namespace {
         return s;
     }
 
+    // No draw list still in flight can name slot s: its last reference is at least IPC::kTexColdFrames
+    // old. Read BEFORE the caller stamps the slot for its new use. Callers hold g_texResidencyMx.
+    // Released slots rest at g_slotLastUsed 0, so they are cold once the session is 8 frames old.
+    inline bool slotIsCold(std::uint32_t s) {
+        return s != 0 && s < g_slotLastUsed.size() && g_frame - g_slotLastUsed[s] >= IPC::kTexColdFrames;
+    }
+    inline std::uint32_t coldBit(std::uint32_t s) { return slotIsCold(s) ? IPC::kTexUploadCold : 0u; }
+
     // Stage one [TexUploadWire][dds] entry for the next flush. Callers hold g_texResidencyMx.
     // Returns false if the allocation failed — a texture we cannot stage must go WHITE, never take
     // the process down. The produce worker runs this with no handler above it (std::thread ->
@@ -2227,6 +2274,9 @@ namespace {
             // slot value is suspect. Epoch bump forces per-key re-resolve (one-off).
             ++g_texEpoch;
         }
+        // Cold (no in-flight frame names it) is decided from the slot's PREVIOUS use: fresh and
+        // released slots are, a just-recycled LRU slot may not be — then the host waits, as before.
+        const std::uint32_t cold = coldBit(slot);
         g_texSlot[name] = slot;
         g_slotName[slot] = name;
         g_slotLastUsed[slot] = g_frame;
@@ -2238,10 +2288,10 @@ namespace {
             // copies). Reset the slot anyway: an LRU-recycled slot still holds its previous occupant
             // on the host, and a stale param map would shade this draw with someone else's material.
             // White + not-data is exactly "no param map" to the shader.
-            const IPC::TexUploadWire rel{ slot | IPC::kTexUploadRelease, 0u, 0u };
+            const IPC::TexUploadWire rel{ slot | IPC::kTexUploadRelease | cold, 0u, 0u };
             staged = stageTexUpload(rel, nullptr, 0u);
         } else {
-            IPC::TexUploadWire hdr{ slot | (dataTexture ? IPC::kTexUploadData : 0u), size, 0u };
+            IPC::TexUploadWire hdr{ slot | (dataTexture ? IPC::kTexUploadData : 0u) | cold, size, 0u };
             staged = stageTexUpload(hdr, data, size);
         }
         std::free(data);
@@ -2552,7 +2602,27 @@ namespace {
         const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
         std::size_t staged = 0;
         std::uint32_t shipped = 0, dropped = 0;
-        std::lock_guard<std::mutex> lk(g_texResidencyMx);
+        // (old slot -> new slot) moves made below, applied to the per-key caches after the lock.
+        static std::vector<std::pair<std::uint32_t, std::uint32_t>> s_moved;
+        s_moved.clear();
+        std::unique_lock<std::mutex> lk(g_texResidencyMx);
+        // Placeholder slots whose name moved off kTexColdFrames ago: no draw list in flight names them
+        // now. Release on the host (cold: no wait) and hand them back to the pool.
+        while (!g_texRetireSlots.empty() && g_frame - g_texRetireSlots.front().frame >= IPC::kTexColdFrames) {
+            const std::uint32_t s = g_texRetireSlots.front().slot;
+            g_texRetireSlots.pop_front();
+            if (!g_slotName[s].empty()) {
+                // Reallocated while it waited (only possible if something re-stamped its age and the
+                // LRU took it): it belongs to another texture now — releasing it would blank that one.
+                continue;
+            }
+            g_slotLastUsed[s] = 0;
+            g_slotBytes[s] = 0;
+            const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease | IPC::kTexUploadCold, 0u, 0u };
+            stageTexUpload(rel, nullptr, 0u);   // a failed stage only delays the host's free
+            g_texFreeSlots.push_back(s);
+        }
+        const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
         while (!g_texStreamQueue.empty() && (shipped == 0 || staged < budget)) {
             TexStreamJob job = std::move(g_texStreamQueue.front());
             g_texStreamQueue.pop_front();
@@ -2575,21 +2645,71 @@ namespace {
                 ++dropped;
                 continue;
             }
-            const IPC::TexUploadWire hdr{ job.slot | (job.data ? IPC::kTexUploadData : 0u), size, 0u };
+            // A fresh slot (free list, else grow) — never the LRU: recycling would evict a live
+            // texture to make room for one that already has a drawable stand-in.
+            std::uint32_t slot = 0;
+            if (!g_texFreeSlots.empty()) {
+                slot = g_texFreeSlots.back();
+                g_texFreeSlots.pop_back();
+            } else if (g_nextTexSlot < cap) {
+                slot = g_nextTexSlot++;
+            }
+            const std::uint32_t cold = slot ? coldBit(slot) : 0u;
+            if (!cold) {
+                // No cold slot to spare (range full, or the session is younger than kTexColdFrames):
+                // replace the placeholder in place, as before — the host then waits the frames in
+                // flight (descWriteGuard), which is correct, only slower.
+                if (slot) { g_texFreeSlots.push_back(slot); }
+                slot = job.slot;
+            }
+            const IPC::TexUploadWire hdr{ slot | (job.data ? IPC::kTexUploadData : 0u) | cold, size, 0u };
             if (stageTexUpload(hdr, data, size)) {
-                g_slotBytes[job.slot] = size;
+                if (slot != job.slot) {
+                    // The name moves now; draws built from here on use the new slot. The old one is
+                    // pinned out of the LRU (age "in the future") until it retires.
+                    g_texSlot[job.name] = slot;
+                    g_slotName[slot] = job.name;
+                    g_slotLastUsed[slot] = g_frame;
+                    g_slotName[job.slot].clear();
+                    g_slotLastUsed[job.slot] = 0xFFFFFFFFu;
+                    g_texRetireSlots.push_back(TexSlotRetire{ job.slot, g_frame });
+                    s_moved.emplace_back(job.slot, slot);
+                    ++g_texFreshStreams;
+                } else {
+                    ++g_texInPlaceStreams;
+                }
+                g_slotBytes[slot] = size;
                 staged += size;
                 ++shipped;
                 ++g_texStreamed;
                 g_texStreamedBytes += size;
+            } else if (slot != job.slot) {
+                g_texFreeSlots.push_back(slot);   // not staged: the fresh slot goes back unused
             }
             std::free(data);
         }
+        const std::size_t queued = g_texStreamQueue.size();
+        lk.unlock();
+        // Every cross-frame copy of a slot lives in a SlotInfo (see g_texFreeSlots). Point the ones
+        // naming a moved slot at its replacement directly — no epoch bump, so nothing else
+        // re-resolves. g_keySlot is produce-owned, and this runs in the produce.
+        if (!s_moved.empty()) {
+            for (auto& kv : g_keySlot) {
+                SlotInfo& si = kv.second;
+                for (const auto& mv : s_moved) {
+                    if (si.baseSlot  == mv.first) { si.baseSlot  = mv.second; }
+                    if (si.ovSlot    == mv.first) { si.ovSlot    = mv.second; }
+                    if (si.paramSlot == mv.first) { si.paramSlot = mv.second; }
+                }
+            }
+        }
         if (shipped || dropped) {
             static std::uint32_t s_logThrottle = 0;
-            if ((s_logThrottle++ % 30) == 0 || g_texStreamQueue.empty()) {
-                LOG::logline("-- [tex-stream] shipped %u full textures (%.1f MB) this frame, %u dropped, %zu queued",
-                             shipped, (double)staged / (1024.0 * 1024.0), dropped, g_texStreamQueue.size());
+            if ((s_logThrottle++ % 30) == 0 || queued == 0) {
+                LOG::logline("-- [tex-stream] shipped %u full textures (%.1f MB) this frame, %u dropped, %zu queued"
+                             " | session: %llu into fresh slots, %llu in place",
+                             shipped, (double)staged / (1024.0 * 1024.0), dropped, queued,
+                             (unsigned long long)g_texFreshStreams, (unsigned long long)g_texInPlaceStreams);
             }
         }
     }
@@ -2666,13 +2786,14 @@ namespace {
                 if (g_frame - g_slotLastUsed[s] < g_texEvictAgeFrames) { continue; }
                 if (s_ref[s]) { ++heldStale; continue; }     // a live part still names it
                 if (released >= kMaxTexEvictPerPass) { continue; }   // next pass
+                const std::uint32_t cold = coldBit(s);   // before the age resets below
                 g_texSlot.erase(g_slotName[s]);
                 g_slotName[s].clear();
                 g_slotLastUsed[s] = 0;
                 bytes += g_slotBytes[s];
                 g_slotBytes[s] = 0;
                 g_texFreeSlots.push_back(s);
-                const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease, 0u, 0u };
+                const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease | cold, 0u, 0u };
                 stageTexUpload(rel, nullptr, 0u);   // a failed stage only delays the host's free
                 s_gone[s] = 1u;
                 ++released;
@@ -5318,11 +5439,7 @@ namespace RenderProcess {
         // g_copyAtBlit drops still drains at the blit or a backstop (drainPendingCopy keys on
         // g_pendingCopy.valid, not this flag).
         if (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) {
-            if (!g_frameAheadLive)  { g_frameAheadLive = true; g_copyAtBlit = false; }
-            else if (!g_copyAtBlit) { g_copyAtBlit = true; }
-            else                    { g_frameAheadLive = false; }
-            LOG::logline(">> [seam] frame-ahead pipelining %s",
-                         !g_frameAheadLive ? "OFF" : g_copyAtBlit ? "1.5-ahead (copy at blit)" : "1-ahead");
+            setPipeMode((pipeMode() + 1) % 3);   // OFF -> 1-ahead -> 1.5-ahead -> OFF
         }
         // (The NUMPAD8 produce-worker mode cycle lived here — a bring-up knob from before PARK
         // became the shipping default. Deleted 2026-08-02: one stray keypress cycled the mode to
@@ -7509,6 +7626,7 @@ namespace RenderProcess {
     ProduceWorker g_produceWorker;
 
     void doDeferredFinish(bool allowCopyDefer = false);   // fwd (defined below); Phase 0 deferred wait
+    void finishUndeferred(const char* where, bool atCollect);   // fwd (defined below); frame-ahead OFF
     void stashDeferredFinish();   // fwd (defined below); move g_kick's finish state to the holder
 
     // Drain an in-flight async (mode 2) produce. Idempotent + cheap when none is pending, so it can
@@ -7830,6 +7948,9 @@ namespace RenderProcess {
         // the engine mutates it. Accepted deliberately (we are a frame ahead and the host owns
         // the draw); g_produceMode 1 (FENCED) is the instant A/B back to an in-frame fence.
         waitProduce();
+        // Backstop: an early frame with frame-ahead OFF that never reached its blit left its host
+        // render unfinished (see finishUndeferred). Close it before anything reuses the channel.
+        finishUndeferred("next collect (blit missed)", /*atCollect=*/true);
         // Phase 0: the previous frame's deferred finish NO LONGER runs here. It moves to
         // collectDeferredFinish (non-early / not-ready frames, after frameSetupEarly latches the
         // gate) or to onStage0CompositeKickoff (early frames, run late). See collectDeferredFinish.
@@ -7920,8 +8041,43 @@ namespace RenderProcess {
         drainPendingCopy();
     }
 
+    // An early-kickoff frame whose kick did NOT defer its finish: frame-ahead OFF (numpad-*) with the
+    // early latch still up. The dispatcher then kicks serially at BeginScene(0) and nothing else
+    // finishes it — EndScene(0)'s finish only runs on non-early frames, and the collect only takes
+    // deferred ones. Left alone the host's RPC window stays open for good: every later RPC is refused
+    // ("attempted inside the async RenderFrame window", geomUpload built 0/N) and the world freezes.
+    // Finish + copy it here instead. Main thread only.
+    //
+    // atCollect: the next frame's collect, a backstop for a frame that never reached the blit. There
+    // the produce is already drained and an undeferred pending kick is orphaned by definition (non-early
+    // frames finish at their own EndScene(0)), so the state alone decides — the flag may have just
+    // flipped back ON in this collect's key poll. At the blit the flag gates first, so frame-ahead ON
+    // never pays a waitProduce there (mode 2 keeps its worker in flight until the next collect).
+    void finishUndeferred(const char* where, bool atCollect) {
+        if ((!atCollect && g_frameAheadLive) || g_kick.deferFinish) {
+            return;   // deferred frames belong to the next collect
+        }
+        waitProduce();   // mode 2 may still own g_kick on the worker
+        if (!g_kick.rpcPending && !g_kick.rpcEarlyFinished) {
+            return;
+        }
+        MGE_ZoneScopedN("Forge undeferred finish");
+        const FinishResult fr = finishAndCopy(g_kick);
+        if (fr.ok) {
+            accumFrameStats(g_kick, fr, nowMs(), false, 0.0);
+        }
+        static unsigned s_logged = 0;
+        if (s_logged < 4) {
+            ++s_logged;
+            LOG::logline(">> [pipe] frame-ahead OFF: finished the early frame's host render at the %s", where);
+        }
+    }
+
     void onFrameAheadBlit(IDirect3DDevice9* device) {
         markMainPhase(MP_BLIT);
+        // Frame-ahead OFF on an early frame: this frame's own host render, finished at the latest point
+        // that is still before the blit (the whole MW frame is IPC-free by the early latch).
+        finishUndeferred("blit", /*atCollect=*/false);
         // 1.5-ahead: the collect finished the previous host frame but left its RT copy for here, so
         // the host could start the next frame while its GPU was still drawing this one. Copy it now
         // (the wait for the host GPU lands here, under MW's frame instead of ahead of the fire).
@@ -8545,6 +8701,7 @@ namespace RenderProcess {
         g_slotBytes.clear();
         g_texFreeSlots.clear();
         g_texStreamQueue.clear();
+        g_texRetireSlots.clear();
         g_nextSlot = 0;
         g_nextTexSlot = 1;
         g_initOk = false;
@@ -8650,8 +8807,23 @@ void DrawForgeDevPanel() {
     ImGui::Separator();
     ImGui::Text("Seam A/B");
     logCheck("Forge composite (F11)", g_enabled, "composite");
-    logCheck("Frame-ahead pipelining (numpad *)", g_frameAheadLive, "frame-ahead pipelining");
-    logCheck("  RT copy at blit: 1.5-ahead (numpad *)", g_copyAtBlit, "RT copy at blit (1.5-ahead)");
+    {   // One control for the one mode numpad-* cycles (it used to be two checkboxes, both "numpad *").
+        ImGui::Text("Pipelining (numpad *):");
+        const int cur = pipeMode();
+        for (int m = kPipeOff; m <= kPipeAhead15; ++m) {
+            ImGui::SameLine();
+            if (ImGui::RadioButton(m == kPipeOff ? "OFF" : m == kPipeAhead1 ? "1-ahead" : "1.5-ahead",
+                                   cur == m) && cur != m) {
+                setPipeMode(m);
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "OFF: the host frame is finished and copied inside the same MW frame (serial).\n"
+                "1-ahead: finish + RT copy at the next frame's start; the host overlaps MW's frame.\n"
+                "1.5-ahead: finish at the next frame's start, RT copy at the blit; the host also\n"
+                "records its next frame while its GPU draws this one (tasks/forge-pipeline-depth.md).");
+    }
     logCheck("FP arm suppression (numpad /)", g_fpSuppressLive, "FP suppression (FP1b)");
 
     // Live render-scale (supersampling). The host renders into a g_rw x g_rh sub-rect of the fixed

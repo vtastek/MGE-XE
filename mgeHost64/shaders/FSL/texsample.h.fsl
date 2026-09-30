@@ -32,7 +32,7 @@
 // shared verbatim with IPC::makeFlipSlot / the wire / packTexAlpha — one representation end to end,
 // which is why no path needs an extra per-draw lane to say "this one is an array".
 //   bit 15 = flip-array slice   bits 11..14 = bucket   bits 0..10 = layer
-// Plain slots are < MAX_TEXTURES (880), so they can never collide with the flag.
+// Plain slots are < MAX_TEXTURES (4064), so they can never collide with the flag.
 #define FLIP_SLOT_FLAG   0x8000u
 #define FLIP_LAYER_MASK  0x7FFu
 bool isFlipSlot(uint texIdx) { return (texIdx & FLIP_SLOT_FLAG) != 0u; }

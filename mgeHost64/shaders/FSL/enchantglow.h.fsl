@@ -81,7 +81,7 @@ float3 enchantCamUp()    { return normalize(gFrameData.viewProj[1].xyz); }
 // The caustic frame this draw should show, as a bindless slot, plus the texgen mode. The CLIENT
 // resolves MW's current sourceTexture to a slot each frame and ships it in skyZenith.w (a lane the
 // sky dome never used); the HOST then ORs in the mode bit. Packed into ONE lane rather than taking
-// a second: bindless slots are < MAX_TEXTURES (880), so a bit at 4096 can never collide with one,
+// a second: bindless slots are < MAX_TEXTURES (4064), so a bit at 4096 can never collide with one,
 // and the alternative free FrameData lanes are all written from paths that do not run every frame
 // (the DL primary block zeroes lodParams.yz, and it is skipped in interiors).
 //

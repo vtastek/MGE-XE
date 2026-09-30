@@ -3635,8 +3635,9 @@ namespace {
         // drawIndex, so forwarding it as ONE flat uint buys the frag arbitrary per-draw data.
         // .xyz = packMMStage words, .w = stage count (0 = base map only, the overwhelming case).
         Buffer*        pAlphaStagesBuf = nullptr;
-        // AT3 captured-alpha: single-buffered persistent-mapped VB/IB the client refills each frame
-        // from its VB/IB Lock-copy of MW's blended DIPs (NiParticles smoke/flames + multimap/decal/
+        // AT3 captured-alpha: FrameBuf VB/IB (CPU shadow + in-queue copy, so a refill never races the
+        // frame in flight — tasks/forge-pipeline-depth.md P2), refilled each frame from the client's
+        // VB/IB Lock-copy of MW's blended DIPs (NiParticles smoke/flames + multimap/decal/
         // untextured blends). Sentinel-slot AlphaDrawWire items (slot == kAlphaSlotCaptured) draw
         // from these instead of an uploaded mesh slot. GeomVertexWire (36B) layout, uint16 indices.
         Buffer*        pCapAlphaVB = nullptr;              // captured verts (kMaxCapturedAlphaVerts x 36B)
@@ -3883,8 +3884,9 @@ namespace {
         // GPU-driven draws: per-frame indirect-argument buffer (one IndirectDrawIndexArguments
         // per static arena part). The ~2667 cmdDrawIndexedInstanced API calls collapse into a
         // handful of cmdExecuteIndirect (one per (mirror,batch) group) — kills the per-draw-CALL
-        // CPU record cost. CPU_TO_GPU upload heap = GENERIC_READ (includes INDIRECT_ARGUMENT),
-        // so no per-frame barrier; single-buffered (host render is lockstep, waitForFences gates).
+        // CPU record cost. A FrameBuf (P2): one GPU buffer resting in GENERIC_READ (includes
+        // INDIRECT_ARGUMENT), refilled by the in-queue copy ahead of each chunk — so the CPU write for
+        // frame N+1 never touches what GPU frame N is still reading (the host is 2-deep since P4).
         Buffer*        pIndirectArgs = nullptr;
     };
     LiveRenderer g_live;
@@ -7610,6 +7612,10 @@ namespace {
 
     // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
     constexpr uint32_t kMaxTextures = MAX_TEXTURES;
+    // The client assigns slots against IPC::kMaxTextures; a mismatch once made every slot above the
+    // host's cap silently white (project_forge_bindless_textures). 4096: enchantglow's 12-bit slot.
+    static_assert(kMaxTextures == IPC::kMaxTextures, "host MAX_TEXTURES must equal IPC::kMaxTextures");
+    static_assert(kMaxTextures < 4096u, "enchantglow.h.fsl packs a slot into 12 bits (ENCHANT_REFLECT_BIT)");
 
     // C3a shadow casters: per-slot alpha-channel classification, computed once at DDS upload
     // (classifyDdsAlpha). MW's NIF alpha flags can't tell a cutout MASK from true translucency —
@@ -12990,10 +12996,10 @@ namespace {
             aib.ppBuffer = &g_live.pAlphaInstanceBuf;
             addFrameBuf(&aib);
 
-            // AT3 captured-alpha VB/IB: single-buffered, persistent-mapped, CPU_TO_GPU — the client
-            // refills them (memcpy in renderScene) each frame from its VB/IB Lock-copy of MW's
-            // blended DIPs. Sized to the client caps (geomwire.h): 20000 verts (720KB) + 60000
-            // uint16 (120KB). The host renderFrame is fence-waited/blocking, so single-buffered is safe.
+            // AT3 captured-alpha VB/IB: FrameBufs — renderScene memcpys into the CPU shadow each
+            // frame from the client's VB/IB Lock-copy of MW's blended DIPs, and the in-queue copy
+            // delivers only the written range, so the frame in flight keeps its own bytes (P2/P4).
+            // Sized to the client caps (geomwire.h): 20000 verts (720KB) + 60000 uint16 (120KB).
             BufferLoadDesc cvb = {};
             cvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             cvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -33184,7 +33190,7 @@ void destroyHostWindow(Renderer* R);
                                    const float* rzViewProj, uint32_t vStride, uint32_t iStride,
                                    PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
         // Direct draws — ≤ kShadowMaxCasters low-poly casters x 6 faces; the exec-indirect args
-        // buffer is camera-shaped + single-buffered, so indirect here would fight the main pass
+        // buffer is camera-shaped (one set of args per frame), so indirect here would fight the main pass
         // (revisit only if profiled). Both atlases rest SHADER_RESOURCE and flip to DEPTH_WRITE
         // only on re-render frames; each tile is cleared by the viewport triangle (z = 0), NEVER
         // by a load action (that would wipe every cached tile).
@@ -47666,6 +47672,32 @@ void destroyHostWindow(Renderer* R);
         return true;
     }
 
+    // Point gTextures[slot] at g_live.pTextures[slot]. cold = IPC::kTexUploadCold: the client vouches
+    // that no draw list still in flight names this slot (fresh, evicted, or a streamed texture's new
+    // slot). The Persistent SRV range is DESCRIPTORS_VOLATILE (Graphics/FSL/defaults.h), so writing a
+    // descriptor that no executing command reads is legal while a frame runs — no wait. Anything else
+    // goes through descWriteGuard and waits the frames in flight, the conservative default.
+    uint64_t g_texColdBinds = 0, g_texHotBinds = 0;   // session totals ([tex-bind] line below)
+    void bindTextureSlot(Renderer* R, uint32_t slot, bool cold) {
+        DescriptorData dd = {};
+        dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
+        dd.mArrayOffset = slot;
+        dd.mCount = 1;
+        dd.ppTextures = &g_live.pTextures[slot];
+        if (cold) {
+            ++g_texColdBinds;
+            (::updateDescriptorSet)(R, 0, g_live.pPersistentSet, 1, &dd);   // parenthesised: skips the guard macro
+        } else {
+            ++g_texHotBinds;
+            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+        }
+        const uint64_t n = g_texColdBinds + g_texHotBinds;
+        if ((n & 1023u) == 0u) {
+            LOG::logline(">> [tex-bind] %llu slot writes: %llu cold (no wait), %llu hot (waited if a frame was in flight)",
+                         (unsigned long long)n, (unsigned long long)g_texColdBinds, (unsigned long long)g_texHotBinds);
+        }
+    }
+
     // Parse [TexUploadWire][dds bytes]* and decode each into gTextures[slot]. slot 0 is reserved
     // (default white). Returns the number of textures successfully built. No-op if Forge/the
     // opaque path isn't live yet (textures arrive after the first scene builds the PerFrame set).
@@ -47684,7 +47716,8 @@ void destroyHostWindow(Renderer* R);
         const uint8_t* p   = (const uint8_t*)blob;
         const uint8_t* end = p + byteCount;
         unsigned built = 0;
-        std::vector<std::pair<uint32_t, bool>> rebind;   // (slot, dataTex), bound after the flush
+        struct Rebind { uint32_t slot; bool dataTex; bool cold; };
+        std::vector<Rebind> rebind;   // bound after the flush
 
         for (unsigned i = 0; i < count; ++i) {
             if (p + sizeof(IPC::TexUploadWire) > end) { break; }
@@ -47694,7 +47727,8 @@ void destroyHostWindow(Renderer* R);
             // slot as a number: a flagged slot is 0x80000000+ and the range check below would drop it.
             const bool dataTex = (hdr.slot & IPC::kTexUploadData) != 0u;
             const bool release = (hdr.slot & IPC::kTexUploadRelease) != 0u;
-            hdr.slot &= ~(IPC::kTexUploadData | IPC::kTexUploadRelease);
+            const bool cold    = (hdr.slot & IPC::kTexUploadCold) != 0u;
+            hdr.slot &= ~(IPC::kTexUploadData | IPC::kTexUploadRelease | IPC::kTexUploadCold);
             const uint8_t* dds    = p + sizeof(hdr);
             const uint8_t* ddsEnd = dds + hdr.byteLen;
             if (ddsEnd > end) { break; }
@@ -47710,14 +47744,14 @@ void destroyHostWindow(Renderer* R);
                     if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
                         g_texRetire.push_back({ g_live.pTextures[hdr.slot], g_frameSerial });
                         g_live.pTextures[hdr.slot] = g_live.pDefaultWhite;
-                        DescriptorData dd = {};
-                        dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
-                        dd.mArrayOffset = hdr.slot;
-                        dd.mCount = 1;
-                        dd.ppTextures = &g_live.pTextures[hdr.slot];
-                        updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+                        bindTextureSlot(R, hdr.slot, cold);
                         ++g_texReleased;
                     }
+                    // References earlier in the heartbeat window predate the release and were served
+                    // by the old texture; without this the WHITE-TEXTURE TRIAGE reports every slot a
+                    // streamed texture moved off (41 at a load) as "still DEFAULT WHITE". A draw that
+                    // names the slot AFTER the release sets the bit again — the real bug stays visible.
+                    g_texSeenBits[hdr.slot >> 5] &= ~(1u << (hdr.slot & 31u));
                     g_texResidentBytes -= g_texSlotBytes[hdr.slot];
                     g_texSlotBytes[hdr.slot] = 0u;
                     g_texIsData[hdr.slot] = 0u;
@@ -47809,11 +47843,10 @@ void destroyHostWindow(Renderer* R);
             // whole batch N times (the "slow" with hundreds of new textures on area load).
 
             // Replace any prior texture in this slot (revision re-upload), store, rebind the
-            // single bindless descriptor. The rebind only copies CPU descriptor handles, so the
-            // rebind itself is safe between frames — but the OLD Texture* is NOT free to release
-            // here: since Tier 1 a frame may be executing right now and can still reach it through
-            // the bindless table. Park it; settleFrameFence frees it once the frame fence proves
-            // every submission has retired.
+            // single bindless descriptor (after the flush, below). With the host 2-deep a frame is
+            // usually executing right now: the rebind itself waits for it (descWriteGuard — the SRT
+            // descriptors are static), and the OLD Texture* is parked, not released, because a frame
+            // may still reach it through the table. drainRetired frees it once its frame retires.
             if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
                 g_texRetire.push_back({ g_live.pTextures[hdr.slot], g_frameSerial });
             }
@@ -47826,7 +47859,7 @@ void destroyHostWindow(Renderer* R);
                 g_texResidentBytes += landed;
             }
 
-            rebind.push_back({ hdr.slot, dataTex });
+            rebind.push_back({ hdr.slot, dataTex, cold });
             ++built;
         }
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
@@ -47837,13 +47870,8 @@ void destroyHostWindow(Renderer* R);
         // not even been submitted, and a frame in flight — or recorded before this flush landed —
         // could sample it half-written.
         for (const auto& rb : rebind) {
-            DescriptorData dd = {};   // rebind just this slot in the bindless array
-            dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
-            dd.mArrayOffset = rb.first;
-            dd.mCount = 1;
-            dd.ppTextures = &g_live.pTextures[rb.first];
-            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
-            g_texIsData[rb.first] = rb.second ? 1u : 0u;   // landed: now, and only now, it counts
+            bindTextureSlot(R, rb.slot, rb.cold);   // cold: no in-flight frame names it, no wait
+            g_texIsData[rb.slot] = rb.dataTex ? 1u : 0u;   // landed: now, and only now, it counts
         }
         // Sampled AFTER the flush, so the driver has committed the batch; before it, this call's
         // textures would be attributed to whatever ran next.
@@ -48257,8 +48285,8 @@ void destroyHostWindow(Renderer* R);
     // 1 cloud) + the clear-weather cloud/sun DDS loaded into dedicated bindless slots. Drawn as a few
     // fixed, camera-relative draws (no usage.data / no instancing / no grid). See tasks/forge-viewer-sky.md.
     constexpr uint32_t kSkyInstStride = 128;                 // 4 world rows (64B) + 4 sky-param float4 (64B)
-    constexpr uint32_t kSkyCloudSlot  = MAX_TEXTURES - 4;    // 892 (just below the land atlas slots)
-    constexpr uint32_t kSkySunSlot    = MAX_TEXTURES - 5;    // 891
+    constexpr uint32_t kSkyCloudSlot  = MAX_TEXTURES - 4;    // just below the land atlas slots
+    constexpr uint32_t kSkySunSlot    = MAX_TEXTURES - 5;
     struct SkySubset { uint32_t vbBase = 0, ibBase = 0, indexCount = 0; };   // into the sky mega VB/IB
     struct SkyState {
         Buffer*   vb        = nullptr;        // sky mega per-vertex (GPU_ONLY, stride 20 StaticElem)

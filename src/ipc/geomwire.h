@@ -269,9 +269,20 @@ namespace IPC {
     // evicted it (evictStaleTextures: no live part names it, unsampled for a while); the host
     // retires the texture after the frame fence and points the slot back at the default white.
     constexpr std::uint32_t kTexUploadRelease = 0x40000000u;
+    // TexUploadWire::slot bit 29: the slot is COLD — no draw list the client shipped in the last
+    // kTexColdFrames frames names it (a never-used slot, an evicted one, or a streamed texture's
+    // fresh slot). The host is 2-deep (tasks/forge-pipeline-depth.md), so a frame is usually executing
+    // when an upload lands; the bindless range is DESCRIPTORS_VOLATILE, and a descriptor write to a
+    // slot no in-flight frame reads needs no wait. Without the bit the host waits the frames in flight
+    // first (descWriteGuard) — the safe default for a slot something may still be sampling.
+    constexpr std::uint32_t kTexUploadCold = 0x20000000u;
+    // Client frames (g_frame) after which a slot's last reference can no longer be in flight: a park
+    // build stamps frame f, fires at f+1, and the host holds at most two frames — so f+4 is clear.
+    // Twice that, for margin; it only delays when a streamed texture's old slot returns to the pool.
+    constexpr std::uint32_t kTexColdFrames = 8;
 
     struct TexUploadWire {
-        std::uint32_t slot;       // bindless slot (or encoded flip slot); bit 31 = kTexUploadData, bit 30 = kTexUploadRelease
+        std::uint32_t slot;       // bindless slot (or encoded flip slot); bit 31 = kTexUploadData, bit 30 = kTexUploadRelease, bit 29 = kTexUploadCold
         std::uint32_t byteLen;    // length of the DDS blob that follows inline
         // FLIP-BOOK ARRAY SLICES ONLY (slot & kFlipSlotFlag): total slice count of the
         // Texture2DArray this slice belongs to. Every slice of a bucket carries the SAME value, so
@@ -283,14 +294,22 @@ namespace IPC {
 
     // Bindless texture-array capacity (client residency cap == host gTextures[] size; the host
     // mirrors this as MAX_TEXTURES in opaque.srt.h / kMaxTextures in forgerender.cpp).
-    // MUST stay in lock-step with host MAX_TEXTURES. The Persistent descriptor TABLE (gTextures +
-    // gStaticsArrays) crashes Forge's addDescriptorSet >1024 entries on this stack (2048 faults in
-    // consume_descriptor_handles; 1024 verified OK). gTextures(880) + gStaticsArrays(128) +
-    // gFlipArrays(16) = 1024, exactly the proven-OK boundary. Distant STATICS no longer live in
-    // gTextures — they moved to gStaticsArrays (descriptor-array of Texture2DArrays, bucketed by
-    // format/size; see forgerender.cpp). Only the 3 distant-land ATLAS slots remain host-reserved
-    // in gTextures. gFlipArrays cost 16 of the former 896: see kMaxFlipBuckets.
-    constexpr std::uint32_t kMaxTextures = 880;
+    // MUST stay in lock-step with host MAX_TEXTURES.
+    //
+    // SIZED BY THE ACTIVE GRID (2026-09-30). At 880 a dense exterior did not fit: the MWSE census
+    // (tools/mwse-dev-mods/MGEProbe texcensus) counts 1079 unique texture files in Dragonstar East's
+    // 9 loaded cells (Seyda Neen: 475), so every fast turn LRU-recycled what the last turn loaded —
+    // 1400 recycles over a 720 deg spin, 25-87 ms frames on BOTH laps. MW loads a cell's textures
+    // with the cell, so the grid's set is fixed and a cap above it makes turning free after the
+    // first sight. Upper bound: < 4096, because enchantglow.h.fsl packs a slot into 12 bits
+    // (ENCHANT_REFLECT_BIT). Plain slots also stay clear of kFlipSlotFlag (0x8000).
+    //
+    // The old ceiling ("the Persistent table crashes addDescriptorSet above 1024 entries") dated from
+    // the June DIAG8 cap-mismatch era; nothing in Forge's D3D12 path limits it today (1M-entry
+    // shader-visible heap, unbounded rootsig range, one set instance). Table = gTextures +
+    // gStaticsArrays(128) + gFlipArrays(16). Only the 3 distant-land ATLAS slots are host-reserved in
+    // gTextures (kDlReserve, at the top).
+    constexpr std::uint32_t kMaxTextures = 4064;
 
     // ---- Flip-book texture arrays -----------------------------------------------------------
     // A NiFlipController flip book used to claim ONE BINDLESS SLOT PER FRAME — Enhanced Light's
@@ -312,7 +331,7 @@ namespace IPC {
     //   bit 15      : set = this is a flip-array slice, not a gTextures[] slot
     //   bits 11..14 : bucket  (0..kMaxFlipBuckets-1)
     //   bits 0..10  : layer   (0..kMaxFlipLayers-1)
-    // Plain slots are < kMaxTextures (880) so they never collide with the flag.
+    // Plain slots are < kMaxTextures (4064) so they never collide with the flag.
     constexpr std::uint32_t kFlipSlotFlag   = 0x8000u;
     constexpr std::uint32_t kFlipBucketShift = 11u;
     constexpr std::uint32_t kFlipLayerMask   = 0x7FFu;
