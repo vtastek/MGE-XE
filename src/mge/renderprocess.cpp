@@ -1071,6 +1071,30 @@ namespace {
     std::uint64_t                             g_texStreamed = 0;
     std::uint64_t                             g_texStreamedBytes = 0;
 
+    // GRID PREFETCH (tasks/forge-pipeline-depth.md "Fast-turn fps drop"). Textures reach the host on
+    // FIRST SIGHT, so the first look behind you after a load resolved ~400 of them in 4 frames
+    // (50-80 ms each on Dragonstar East): ~290 with no DL LOD copy shipped full-size, synchronously.
+    // But the post-load residency walk has already captured the whole active grid into the geometry
+    // cache — the names are known long before the turn. prefetchGridTextures resolves them in the
+    // background, a few MB per frame, through the same resolveTextureSlotEx the draws use (so
+    // placeholders, streaming and cold slots all behave exactly as on first sight). The first turn
+    // then finds every slot already resident.
+    //
+    // The set it built also PINS: evictStaleTextures only held textures named by an emitted part in
+    // the grid, and a prefetched texture behind the camera has none — it would be released 600
+    // frames later and the first look would hitch again. g_gridTexPins holds every normalized name
+    // (base, overlay, multimap, param companions) of the active grid's cached entries; it is rebuilt
+    // when the grid moves. Guarded by g_texResidencyMx (eviction reads it on the fire thread).
+    struct GridTexJob {
+        std::string name;   // normalized; for a param job, the base STEM
+        bool        param;  // try <stem>_paramh.dds, then <stem>_paramh_np.dds (resolveParamSlot's order)
+    };
+    std::deque<GridTexJob>                    g_gridTexQueue;       // produce-owned
+    std::unordered_set<std::string>           g_gridTexPins;        // under g_texResidencyMx
+    std::uint32_t                             g_gridPrefetchMB = 4; // MGE_TEX_PREFETCH_MB; 0 = off
+    std::uint64_t                             g_gridPrefetched = 0; // session totals
+    std::uint64_t                             g_gridPrefetchedBytes = 0;
+
     // ---- Flip-book texture arrays (NiFlipController) ---------------------------------------
     // A book used to claim ONE SLOT PER FRAME out of the ~872 client slots; Enhanced Light's
     // magelight is 300 frames. Books are uniform by construction, so each becomes a run of LAYERS
@@ -1601,6 +1625,7 @@ namespace {
             g_texFreeSlots.clear();
             g_texStreamQueue.clear();          // its slots belonged to the OLD host
             g_texRetireSlots.clear();          // ...and so did these
+            g_gridTexQueue.clear();            // the epoch bump below makes the prefetch rescan
             g_nextTexSlot = 1;                 // 0 = host default white
             ++g_texEpoch;                      // invalidate every cached ResolvedTex fast-path (name+epoch)
             g_texPendingEntries.clear();       // drop tex uploads staged for the OLD host
@@ -2100,6 +2125,12 @@ namespace {
             LOG::logline(">> [tex-stream] first-sight streaming %s (%u MB of full files per frame, DL LOD"
                          " copies as placeholders; MGE_TEX_STREAM_MB overrides, 0 = off)",
                          g_texStreamBudgetMB ? "ON" : "OFF", g_texStreamBudgetMB);
+            if (GetEnvironmentVariableA("MGE_TEX_PREFETCH_MB", e, sizeof(e)) > 0) {
+                g_gridPrefetchMB = (std::uint32_t)std::strtoul(e, nullptr, 10);
+            }
+            LOG::logline(">> [tex-prefetch] active-grid texture prefetch %s (%u MB per frame;"
+                         " MGE_TEX_PREFETCH_MB overrides, 0 = off)",
+                         g_gridPrefetchMB ? "ON" : "OFF", g_gridPrefetchMB);
         }
     }
 
@@ -2714,6 +2745,170 @@ namespace {
         }
     }
 
+    // Resolve the active grid's textures ahead of first sight (see g_gridTexQueue). Called in the
+    // BUILD, beside streamPendingTextures and before it, so its budget is measured against only this
+    // frame's own first sights: a cell-load frame that already staged a lot prefetches nothing.
+    constexpr std::uint32_t kGridPrefetchRescanFrames = 30;   // re-read the cache while it still grows
+    constexpr std::uint64_t kGridPrefetchFreshFrames  = 600;  // entries visited this recently only
+    constexpr std::uint32_t kGridPrefetchSlotHeadroom = 256;  // never prefetch into an LRU recycle
+    constexpr double        kGridPrefetchMaxMs        = 2.0;  // disk reads, per frame
+    void prefetchGridTextures() {
+        if (g_gridPrefetchMB == 0 || !g_texVec) {
+            return;
+        }
+        // --- Scan: when the grid moved, or while the post-load walk is still filling the cache. ---
+        void* dh = MGE::SceneGraph::getDataHandler();
+        const void* interiorCell = dh ? MGE::DataHandlerView::currentInteriorCell(dh) : nullptr;
+        const std::int32_t gx = dh ? MGE::DataHandlerView::centralGridX(dh) : 0;
+        const std::int32_t gy = dh ? MGE::DataHandlerView::centralGridY(dh) : 0;
+        static const void*   s_cell = nullptr;
+        static std::int32_t  s_gx = 0, s_gy = 0;
+        static std::uint32_t s_epoch = 0xFFFFFFFFu;
+        static std::size_t   s_cacheSize = 0;
+        static std::uint32_t s_scanFrame = 0;
+        const auto& cacheMap = MGE::GeometryCache::cache();
+        const bool gridMoved = interiorCell != s_cell || gx != s_gx || gy != s_gy || g_cellEpoch != s_epoch;
+        const bool cacheGrew = cacheMap.size() != s_cacheSize && g_frame - s_scanFrame >= kGridPrefetchRescanFrames;
+        if (dh && (gridMoved || cacheGrew)) {
+            s_cell = interiorCell; s_gx = gx; s_gy = gy; s_epoch = g_cellEpoch;
+            s_cacheSize = cacheMap.size();
+            s_scanFrame = g_frame;
+            // Every distinct name pointer in the grid, once. Names are engine pointers, and a string is
+            // only READ through one whose entry was visited recently, so the NiSourceTexture behind it
+            // is alive (the post-load walk stamps the whole grid; the draw build stamps what it sees).
+            // Older entries — a cell behind you that you have not looked at since — reuse the name
+            // their pointer normalised to when it was fresh (s_ptrName), so they stay pinned across a
+            // grid move without the pointer being dereferenced. A recycled pointer in that map can at
+            // worst pin or prefetch one wrong texture; the map is dropped with every cell epoch.
+            const std::uint64_t cacheFrame = MGE::GeometryCache::currentFrame();
+            static std::unordered_map<const char*, std::string> s_ptrName;
+            static std::uint32_t s_ptrEpoch = 0xFFFFFFFFu;
+            if (s_ptrEpoch != g_cellEpoch) { s_ptrName.clear(); s_ptrEpoch = g_cellEpoch; }
+            constexpr std::uint8_t kFresh = 1, kBase = 2;   // kBase: gets a param-companion probe
+            static std::unordered_map<const char*, std::uint8_t> s_ptrs;
+            s_ptrs.clear();
+            for (const auto& kv : cacheMap) {
+                const MGE::GeometryCache::CachedGeometry& e = kv.second;
+                if (e.isSky || e.texAnimated) { continue; }
+                if (!interiorCell) {
+                    // Same cell derivation as stampSlotCell / the eviction's active-grid hold.
+                    const std::int32_t cx = (std::int32_t)std::floor(e.worldTransformD3D[12] / 8192.0f);
+                    const std::int32_t cy = (std::int32_t)std::floor(e.worldTransformD3D[13] / 8192.0f);
+                    if (std::abs(cx - gx) > 1 || std::abs(cy - gy) > 1) { continue; }
+                }
+                const std::uint8_t fresh = cacheFrame - e.lastFrame <= kGridPrefetchFreshFrames ? kFresh : 0;
+                if (e.textureName) {
+                    s_ptrs[e.textureName] |= fresh | (!e.isSkinned && !e.isFP ? kBase : 0);
+                }
+                if (e.isLandscape && e.d3dOverlay && e.overlayTextureName) { s_ptrs[e.overlayTextureName] |= fresh; }
+                if (e.d3dDark   && e.darkTextureName)   { s_ptrs[e.darkTextureName]   |= fresh; }
+                if (e.d3dDetail && e.detailTextureName) { s_ptrs[e.detailTextureName] |= fresh; }
+                if (e.d3dGlow   && e.glowTextureName)   { s_ptrs[e.glowTextureName]   |= fresh; }
+            }
+            std::vector<GridTexJob> jobs;
+            std::unordered_set<std::string> names;
+            for (const auto& pf : s_ptrs) {
+                std::string n;
+                if (pf.second & kFresh) {
+                    n = normalizeTextureName(pf.first);
+                    s_ptrName[pf.first] = n;
+                } else {
+                    const auto known = s_ptrName.find(pf.first);
+                    if (known == s_ptrName.end()) { continue; }   // never seen fresh: not read
+                    n = known->second;
+                }
+                if (n.empty()) { continue; }
+                if (pf.second & kBase) {
+                    std::string stem = n;
+                    const std::size_t dot = stem.find_last_of('.');
+                    const std::size_t sep = stem.find_last_of('\\');
+                    if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) { stem.erase(dot); }
+                    if (!stem.empty() && names.insert(stem + "_paramh.dds").second) {
+                        names.insert(stem + "_paramh_np.dds");
+                        jobs.push_back(GridTexJob{ stem, true });
+                    }
+                }
+                if (names.insert(n).second) { jobs.push_back(GridTexJob{ std::move(n), false }); }
+            }
+            std::size_t queued = 0, resident = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_texResidencyMx);
+                if (gridMoved) {
+                    g_gridTexPins.swap(names);   // the old grid's textures age out normally
+                } else {
+                    g_gridTexPins.insert(names.begin(), names.end());
+                }
+                // `jobs` is the whole current set, so it REPLACES the queue: appending re-queued every
+                // name the last scan had queued and not yet reached (444 duplicates on Dragonstar).
+                g_gridTexQueue.clear();
+                for (GridTexJob& j : jobs) {
+                    bool known;
+                    if (j.param) {
+                        // Settled once _paramh resolved, or missed AND _paramh_np has been tried.
+                        const auto ph = g_texSlot.find(j.name + "_paramh.dds");
+                        known = ph != g_texSlot.end() && (ph->second != 0 || g_texSlot.count(j.name + "_paramh_np.dds"));
+                    } else {
+                        known = g_texSlot.count(j.name) != 0;
+                    }
+                    if (known) { ++resident; continue; }
+                    g_gridTexQueue.push_back(std::move(j));
+                    ++queued;
+                }
+            }
+            if (queued) {
+                LOG::logline("-- [tex-prefetch] grid (%d,%d)%s: %zu textures, %zu resident, %zu queued"
+                             " (%zu entries)", gx, gy, interiorCell ? " interior" : "",
+                             s_ptrs.size(), resident, queued, cacheMap.size());
+            }
+        }
+        if (g_gridTexQueue.empty()) {
+            return;
+        }
+        // --- Drain: resolve until this frame has staged the budget, or spent its disk-read time. ---
+        const std::size_t budget = (std::size_t)g_gridPrefetchMB << 20;
+        const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
+        const double t0 = nowMs();
+        std::uint32_t done = 0;
+        std::size_t bytes = 0;
+        while (!g_gridTexQueue.empty() && nowMs() - t0 < kGridPrefetchMaxMs) {
+            std::size_t before;
+            {
+                std::lock_guard<std::mutex> lk(g_texResidencyMx);
+                if (g_texPendingBytes >= budget) { break; }
+                // A prefetch must never push a slot out: with the range full the resolve recycles the
+                // LRU — a live texture, and an epoch bump that re-resolves every cached slot.
+                const std::uint32_t freeSlots = (std::uint32_t)g_texFreeSlots.size() + (cap - std::min(g_nextTexSlot, cap));
+                if (freeSlots <= kGridPrefetchSlotHeadroom) {
+                    LOG::logline("!! [tex-prefetch] only %u free slots — dropping %zu queued prefetches",
+                                 freeSlots, g_gridTexQueue.size());
+                    g_gridTexQueue.clear();
+                    break;
+                }
+                before = g_texPendingBytes;
+            }
+            const GridTexJob j = std::move(g_gridTexQueue.front());
+            g_gridTexQueue.pop_front();
+            if (j.param) {
+                if (resolveTextureSlotEx((j.name + "_paramh.dds").c_str(), true, true) == 0) {
+                    resolveTextureSlotEx((j.name + "_paramh_np.dds").c_str(), true, true);
+                }
+            } else {
+                resolveTextureSlotEx(j.name.c_str(), false, false);   // a miss logs, as the draw's would
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_texResidencyMx);
+                if (g_texPendingBytes > before) { bytes += g_texPendingBytes - before; }
+            }
+            ++done;
+        }
+        g_gridPrefetched += done;
+        g_gridPrefetchedBytes += bytes;
+        if (done && g_gridTexQueue.empty()) {
+            LOG::logline("-- [tex-prefetch] grid done | session: %llu prefetched, %.1f MB staged",
+                         (unsigned long long)g_gridPrefetched, (double)g_gridPrefetchedBytes / (1024.0 * 1024.0));
+        }
+    }
+
     // Release the texture slots no live part names and nothing has sampled for g_texEvictAgeFrames
     // (the rule, and why it is safe, is at g_texFreeSlots). Runs in the produce context between
     // flushGeometry and flushTextures: g_keySlot is produce-owned, and the releases staged here ride
@@ -2785,6 +2980,7 @@ namespace {
                 if (g_slotName[s].empty()) { continue; }   // already free
                 if (g_frame - g_slotLastUsed[s] < g_texEvictAgeFrames) { continue; }
                 if (s_ref[s]) { ++heldStale; continue; }     // a live part still names it
+                if (g_gridTexPins.count(g_slotName[s])) { ++heldStale; continue; }   // grid prefetch set
                 if (released >= kMaxTexEvictPerPass) { continue; }   // next pass
                 const std::uint32_t cold = coldBit(s);   // before the age resets below
                 g_texSlot.erase(g_slotName[s]);
@@ -6281,6 +6477,7 @@ namespace RenderProcess {
             // this frame's FP walk) ship in the same flush the pass draws from.
             markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
+            prefetchGridTextures();    // budgeted against this frame's first sights, so before streaming
             streamPendingTextures();   // after every resolver of the frame has queued its first sights
         }
         const double tBuild = nowMs();
@@ -7511,6 +7708,7 @@ namespace RenderProcess {
             skyCount = buildSkyDrawList();
             markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
+            prefetchGridTextures();    // same place as the serial kickoff (see its comment)
             streamPendingTextures();   // worker-side, like the resolvers above (see its comment)
         }
         g_park.epoch           = g_cellEpoch;
@@ -8702,6 +8900,8 @@ namespace RenderProcess {
         g_texFreeSlots.clear();
         g_texStreamQueue.clear();
         g_texRetireSlots.clear();
+        g_gridTexQueue.clear();
+        g_gridTexPins.clear();
         g_nextSlot = 0;
         g_nextTexSlot = 1;
         g_initOk = false;
