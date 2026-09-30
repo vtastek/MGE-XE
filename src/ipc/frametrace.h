@@ -18,10 +18,13 @@
 // LITERALS (pointers are stored, not copied).
 
 #include <windows.h>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <new>
 
 namespace FrameTrace {
 
@@ -68,20 +71,69 @@ namespace FrameTrace {
 
     // `clockOffsetMs` is added to every stored time: the host records with hostNowMs() (steady_clock),
     // and passes (qpcMs() - hostNowMs()) so the file is in QPC ms like the client's.
+    //
+    // OFF THE CALLER'S THREAD. This used to fprintf the whole ring (~2 MB of text) under the ring lock,
+    // on the calling thread: the host's render thread and MW's main thread. That was a stall every 300
+    // frames that only existed while tracing — frame x00 waited ~22 ms on the host, x01/x02 ran ~35-43
+    // ms against ~14 — and every traced measurement carried it (a walk run without the trace: worst
+    // quiet-window frame 18-28 ms). Now the caller only copies the ring (a memcpy under the lock) and a
+    // writer thread formats it. The file is written beside the target and renamed over it, so a kill
+    // mid-write (the harness always kills) leaves the previous complete file instead of a torn row.
+    // One write in flight at a time; a dump that finds the writer busy is skipped — the next one
+    // carries the same ring, 300 frames later.
     inline void dump(const char* path, const char* process, double clockOffsetMs = 0.0) {
         if (!enabled()) { return; }
-        State& s = state();
-        std::lock_guard<std::mutex> lk(s.mx);
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "wb") != 0 || !f) { return; }
-        std::fprintf(f, "# frametrace process=%s spans=%u\nlane,name,t0,t1,frame\n", process, s.count);
-        const std::uint32_t first = (s.head + kCap - s.count) % kCap;
-        for (std::uint32_t i = 0; i < s.count; ++i) {
-            const Span& p = s.ring[(first + i) % kCap];
-            std::fprintf(f, "%s,%s,%.4f,%.4f,%lld\n", p.lane, p.name,
-                         p.t0 + clockOffsetMs, p.t1 + clockOffsetMs, (long long)p.frame);
+        static std::atomic<bool> s_busy{ false };
+        if (s_busy.exchange(true)) { return; }
+        struct Job {
+            Span*         spans;
+            std::uint32_t count;
+            const char*   path;      // literals at every call site
+            const char*   process;
+            double        offset;
+        };
+        Job* job = new (std::nothrow) Job{ new (std::nothrow) Span[kCap], 0u, path, process, clockOffsetMs };
+        if (!job || !job->spans) {
+            if (job) { delete job; }
+            s_busy.store(false);
+            return;
         }
-        std::fclose(f);
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lk(s.mx);
+            const std::uint32_t first = (s.head + kCap - s.count) % kCap;
+            const std::uint32_t tail = (kCap - first < s.count) ? kCap - first : s.count;
+            std::memcpy(job->spans, s.ring + first, tail * sizeof(Span));
+            std::memcpy(job->spans + tail, s.ring, (s.count - tail) * sizeof(Span));
+            job->count = s.count;
+        }
+        HANDLE h = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+            Job* j = static_cast<Job*>(p);
+            char tmp[MAX_PATH];
+            std::snprintf(tmp, sizeof(tmp), "%s.tmp", j->path);
+            FILE* f = nullptr;
+            if (fopen_s(&f, tmp, "wb") == 0 && f) {
+                std::fprintf(f, "# frametrace process=%s spans=%u\nlane,name,t0,t1,frame\n", j->process, j->count);
+                for (std::uint32_t i = 0; i < j->count; ++i) {
+                    const Span& s = j->spans[i];
+                    std::fprintf(f, "%s,%s,%.4f,%.4f,%lld\n", s.lane, s.name,
+                                 s.t0 + j->offset, s.t1 + j->offset, (long long)s.frame);
+                }
+                const bool ok = std::fclose(f) == 0;
+                if (ok) { MoveFileExA(tmp, j->path, MOVEFILE_REPLACE_EXISTING); }
+            }
+            delete[] j->spans;
+            delete j;
+            s_busy.store(false);
+            return 0;
+        }, job, 0, nullptr);
+        if (h) {
+            CloseHandle(h);
+        } else {
+            delete[] job->spans;
+            delete job;
+            s_busy.store(false);
+        }
     }
 
 } // namespace FrameTrace
