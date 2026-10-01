@@ -16351,6 +16351,10 @@ namespace {
         uint64_t bufBytes;
         uint64_t vbOff;         // byte offset into pArenaVB (valid when inArena)
         uint64_t ibOff;         // byte offset into pArenaIB (valid when inArena)
+        // GEOMETRY DEDUP: the shared arena BLOCK (g_arenaBlocks) this slot's range belongs to, or 0
+        // when the slot owns its range outright. The range is parked only when the block's last
+        // holder releases (releaseMeshBuffers).
+        uint32_t blockId;
         // --- dynamic (re-uploaded / animated) path ---
         bool     dynamic;       // in the persistent upload-heap ring (true morph only)
         uint8_t  ring;          // next ring index to write
@@ -16980,6 +16984,23 @@ namespace {
     // the range under it.
     struct RetiredRange { uint64_t vbOff, vbBytes, ibOff, ibBytes, serial; };
     std::vector<RetiredRange> g_arenaRetire;
+
+    // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md): one arena VB+IB range per unique mesh, shared by
+    // every slot that is an instance of it. Created by a plain static upload carrying a nonzero
+    // GeomPartWire::block, joined by kGeomFlagAlias records, and refcounted by the slots holding it.
+    // Ids are client-assigned and never reused. The geometry fields are copied into each holder's
+    // HostMesh, so no draw path knows blocks exist.
+    struct ArenaBlock {
+        uint64_t vbOff, ibOff;
+        uint32_t vertexCount, indexCount;
+        float    localCenter[3];
+        float    localRadius;
+        uint32_t refs;
+    };
+    std::unordered_map<uint32_t, ArenaBlock> g_arenaBlocks;
+    uint64_t g_blockRefTotal   = 0;   // sum of refs, maintained incrementally (heartbeat tripwire)
+    uint64_t g_aliasMissing    = 0;   // alias records naming a block the host does not hold
+    uint64_t g_blockDupCreates = 0;   // block uploads whose id already existed (replayed chunk)
 
     // ─── FRAME SLOT STATE ───────────────────────────────────────────────────────────────────────
     // g_frameSerial counts RECORDED frames (beginFrameSlot); frame F records into slot F & 1.
@@ -26776,14 +26797,36 @@ namespace {
         // charged to one bucket cannot be credited to another.
         if (m.inArena) {
             // Arena parts own no D3D12 resources — the suballocations are PARKED (g_arenaRetire)
-            // until every frame that could still read them has retired.
-            g_arenaRetire.push_back({ m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire),
-                                      m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t), g_frameSerial });
+            // until every frame that could still read them has retired. A SHARED range (blockId) is
+            // parked only by its last holder; every other holder just detaches from it.
+            bool lastHolder = true;
+            if (m.blockId) {
+                auto it = g_arenaBlocks.find(m.blockId);
+                if (it == g_arenaBlocks.end()) {
+                    // Cannot happen while refs are balanced; parking here would double-free a range
+                    // some other holder may still draw, so detach and say so instead.
+                    LOG::logline("!! [geom-alias] release of slot holding UNKNOWN block %u — detached, range not parked",
+                                 m.blockId);
+                    lastHolder = false;
+                } else {
+                    if (g_blockRefTotal) { --g_blockRefTotal; }
+                    if (--it->second.refs != 0) {
+                        lastHolder = false;
+                    } else {
+                        g_arenaBlocks.erase(it);
+                    }
+                }
+                m.blockId = 0;
+            }
+            if (lastHolder) {
+                g_arenaRetire.push_back({ m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire),
+                                          m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t), g_frameSerial });
+                g_geoArena.destroyedBytes += (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire)
+                                          + (uint64_t)m.indexCount  * sizeof(uint16_t);
+                ++g_geoArena.destroys;
+            }
             m.inArena = false;
             m.vbOff = m.ibOff = 0;
-            g_geoArena.destroyedBytes += (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire)
-                                      + (uint64_t)m.indexCount  * sizeof(uint16_t);
-            ++g_geoArena.destroys;
         } else if (m.dynamic) {
             // PARKED, not destroyed: this runs on the IPC-service thread between frames, and a
             // submitted frame may still be reading the ring entry it is not currently writing.
@@ -26819,6 +26862,24 @@ namespace {
         m.uvAnimId = 0;
     }
 
+    // The slot is a DIFFERENT object now (a shape-changing upload, or an alias landing): forget its
+    // per-instance record so a recycled slot never casts, streaks or moves as the old object did.
+    void resetInstanceRecord(HostMesh& m) {
+        m.lastWorldFrame = 0;
+        // MB-1: and its velocity pair. A shape change is the one event that says "this
+        // slot is a DIFFERENT object now" — the exact case where differencing the two
+        // recorded poses would streak the new mesh from the old mesh's position.
+        m.prevWorldFrame = 0;
+        // ...and the SKINNED pair, cleared in the SAME place for the same reason. A
+        // changed shape is a changed bone count more often than not, so prevBoneCount
+        // would usually catch this on its own — usually is not a guarantee, and a slot
+        // recycled between two meshes that happen to share a bone count is exactly the
+        // pair that tears a limb across the screen.
+        m.prevBoneFrame = 0;
+        m.everMoved = false;   // a recycled slot starts as a fresh static until proven a mover
+        m.lastMoveFrame = 0;
+    }
+
     // Free everything parked by frames up to and including `upTo` (UINT64_MAX = all of it, for
     // teardown, whose callers have already idled the queue).
     void drainRetired(uint64_t upTo) {
@@ -26836,6 +26897,36 @@ namespace {
             g_arenaVB.release(r.vbOff, r.vbBytes);
             g_arenaIB.release(r.ibOff, r.ibBytes);
         });
+    }
+
+    // Reclaim every PARKED arena range now, instead of growing past them. Called from the geometry
+    // upload when an arena alloc fails: a load ships the old cell's releases ahead of the new cell's
+    // parts (client checkCellEpochAndPurge), but releaseMeshBuffers parks their ranges until the
+    // frames that could read them retire — so without this the new cell found the arena "full" of
+    // dead ranges and doubled it (stress run: 320 -> 640 MB, never shrinking).
+    // SAFE because the upload runs on the IPC-service thread strictly BETWEEN renderScene calls (the
+    // A/B split-submit is inside one renderScene), so every frame that could reference a parked range
+    // is already submitted; a queue-idle wait retires them all, and the next frame cannot draw a
+    // released mesh (valid=false). Costs one GPU wait — paid only when the alternative is a grow,
+    // which waits a fence AND copies the whole arena.
+    // Returns the bytes handed back (VB + IB).
+    uint64_t reclaimArenaRetired() {
+        if (g_arenaRetire.empty() || !g_live.pQueue) { return 0; }
+        const auto t0 = std::chrono::steady_clock::now();
+        waitQueueIdle(g_live.pQueue);
+        uint64_t vb = 0, ib = 0;
+        for (const RetiredRange& r : g_arenaRetire) {
+            g_arenaVB.release(r.vbOff, r.vbBytes);
+            g_arenaIB.release(r.ibOff, r.ibBytes);
+            vb += r.vbBytes;
+            ib += r.ibBytes;
+        }
+        const size_t n = g_arenaRetire.size();
+        g_arenaRetire.clear();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        LOG::logline("-- [arena] reclaimed %zu parked ranges before growing: VB %llu KB, IB %llu KB (queue-idle wait + release %.2f ms)",
+                     n, (unsigned long long)(vb >> 10), (unsigned long long)(ib >> 10), ms);
+        return vb + ib;
     }
 
     // ─── FRAMEBUF FLUSH (see FrameBuf) ──────────────────────────────────────────────────────────
@@ -27092,6 +27183,11 @@ namespace {
             drainRetired(UINT64_MAX);
             tf_free(g_meshes);
         }
+        if (!g_arenaBlocks.empty()) {
+            LOG::logline("!! [geom-alias] %zu blocks still held after releasing every slot", g_arenaBlocks.size());
+        }
+        g_arenaBlocks.clear();
+        g_blockRefTotal = 0;
         g_meshes   = nullptr;
         g_meshCap  = 0;
         g_meshHigh = 0;
@@ -34788,6 +34884,32 @@ void destroyHostWindow(Renderer* R);
                              (unsigned long long)(g_skippedVBTotal >> 10),
                              (unsigned long long)(g_skippedIBTotal >> 10),
                              g_lastUniqueTex);
+                // GEOMETRY DEDUP. shared = the arena bytes the aliases would otherwise own. The tripwire
+                // checks the incrementally kept ref total against a scan of the slots that hold one: a
+                // mismatch means a release path dropped (or skipped) a ref, i.e. a range will leak or be
+                // parked under a live holder.
+                {
+                    uint64_t sharedBytes = 0;
+                    for (const auto& kv : g_arenaBlocks) {
+                        sharedBytes += (uint64_t)(kv.second.refs - 1)
+                                     * ((uint64_t)kv.second.vertexCount * sizeof(IPC::GeomVertexWire)
+                                        + (uint64_t)kv.second.indexCount * sizeof(uint16_t));
+                    }
+                    uint64_t blockSlots = 0;
+                    for (uint32_t s = 0; s < g_meshHigh; ++s) {
+                        const HostMesh& hm = g_meshes[s];
+                        if (hm.valid && hm.inArena && hm.blockId) { ++blockSlots; }
+                    }
+                    LOG::logline(">> [forge-hb] geom-alias: blocks=%zu aliasSlots=%llu shared=%.1f MB missing=%llu dupCreates=%llu",
+                                 g_arenaBlocks.size(),
+                                 (unsigned long long)(g_blockRefTotal - (uint64_t)g_arenaBlocks.size()),
+                                 (double)sharedBytes / (1024.0 * 1024.0),
+                                 (unsigned long long)g_aliasMissing, (unsigned long long)g_blockDupCreates);
+                    if (blockSlots != g_blockRefTotal) {
+                        LOG::logline("!! [geom-alias] ref tripwire: refs=%llu but %llu valid slots hold a block",
+                                     (unsigned long long)g_blockRefTotal, (unsigned long long)blockSlots);
+                    }
+                }
                 // VRAM budget + EcoQoS, the two regime probes (see forgeVramAdapter above).
                 // Read `local` against its BUDGET, not against the card total: the budget is what
                 // the driver is currently willing to give US, it moves when another app takes
@@ -60734,6 +60856,59 @@ void destroyHostWindow(Renderer* R);
                 continue;
             }
 
+            // ALIAS (header-only, no payload): another instance of a mesh already in the arena as
+            // block hdr.block. Point the slot at the block's range and take a ref — no bytes, no
+            // arena alloc. Like Release it is consumed whatever happens (a re-send cannot help).
+            if (hdr.flags & IPC::kGeomFlagAlias) {
+                ++built;
+                if (!ensureMeshSlot(hdr.slot)) {
+                    ++skippedParts;
+                    continue;
+                }
+                HostMesh& m = g_meshes[hdr.slot];
+                if (m.valid) {
+                    releaseMeshBuffers(m);
+                    m.valid = false;
+                    m.uploadStreak = 0;
+                }
+                resetInstanceRecord(m);
+                auto it = g_arenaBlocks.find(hdr.block);
+                if (it == g_arenaBlocks.end()) {
+                    // The client only aliases a block it still holds a ref on, and it drops refs no
+                    // later than the host does — so this is a broken invariant (or the owner's
+                    // upload was refused for arena space). The slot stays invalid: no fallback (PD1).
+                    if (g_aliasMissing++ < 32) {
+                        LOG::logline("!! [geom-alias] missing block %u for slot %u (total %llu)",
+                                     hdr.block, hdr.slot, (unsigned long long)g_aliasMissing);
+                    }
+                    continue;
+                }
+                ArenaBlock& b = it->second;
+                m.skinned  = false;
+                m.multimap = false;
+                m.inArena  = true;
+                m.vbOff    = b.vbOff;
+                m.ibOff    = b.ibOff;
+                m.vb = m.ib = nullptr;
+                m.bufBytes = 0;
+                m.blockId  = hdr.block;
+                m.localCenter[0] = b.localCenter[0];
+                m.localCenter[1] = b.localCenter[1];
+                m.localCenter[2] = b.localCenter[2];
+                m.localRadius    = b.localRadius;
+                m.vertexCount    = b.vertexCount;
+                m.indexCount     = b.indexCount;
+                m.valid          = true;
+                m.dynamic        = false;
+                m.lastUploadFrame = g_renderFrame;
+                ++b.refs;
+                ++g_blockRefTotal;
+                if (hdr.slot + 1 > g_meshHigh) {
+                    g_meshHigh = hdr.slot + 1;
+                }
+                continue;
+            }
+
             const bool isSkinned  = (hdr.flags & IPC::kGeomFlagSkinned) != 0;
             const bool isMultiMap = (hdr.flags & IPC::kGeomFlagMultiMap) != 0;
             const uint64_t vStride = isSkinned  ? sizeof(IPC::SkinnedVertexWire)
@@ -60806,19 +60981,7 @@ void destroyHostWindow(Renderer* R);
                 // record here made every morph look like a first sighting and re-dirtied every
                 // shadow slot near a light fixture every frame (the gather=3-4ms churn).
                 if (!sameShape) {
-                    m.lastWorldFrame = 0;
-                    // MB-1: and its velocity pair. A shape change is the one event that says "this
-                    // slot is a DIFFERENT object now" — the exact case where differencing the two
-                    // recorded poses would streak the new mesh from the old mesh's position.
-                    m.prevWorldFrame = 0;
-                    // ...and the SKINNED pair, cleared in the SAME place for the same reason. A
-                    // changed shape is a changed bone count more often than not, so prevBoneCount
-                    // would usually catch this on its own — usually is not a guarantee, and a slot
-                    // recycled between two meshes that happen to share a bone count is exactly the
-                    // pair that tears a limb across the screen.
-                    m.prevBoneFrame = 0;
-                    m.everMoved = false;   // a recycled slot starts as a fresh static until proven a mover
-                    m.lastMoveFrame = 0;
+                    resetInstanceRecord(m);
                 }
             }
 
@@ -60951,6 +61114,12 @@ void destroyHostWindow(Renderer* R);
                         flushTextureUploads(g_live.pRenderer);
                         anyArena = false;
                     }
+                    // Reuse the dead before growing: ranges released earlier (this chunk's leading
+                    // load releases, or earlier frames' still parked) are reclaimed, then retry.
+                    if (reclaimArenaRetired() != 0) {
+                        if (vbo == UINT64_MAX) { vbo = g_arenaVB.alloc(vbBytes); }
+                        if (ibo == UINT64_MAX) { ibo = g_arenaIB.alloc(ibBytes); }
+                    }
                     if (vbo == UINT64_MAX) {
                         growArenaBuffer(&g_live.pArenaVB, g_arenaVB, vbBytes,
                                         sizeof(IPC::GeomVertexWire), kArenaVBMaxBytes,
@@ -61005,6 +61174,32 @@ void destroyHostWindow(Renderer* R);
                 // the 3 GB — it is a fixed 256 MB buffer, so any large number here is a bug in me.
                 g_geoArena.createdBytes += vbBytes + ibBytes; ++g_geoArena.creates;
                 anyArena = true;
+                // GEOMETRY DEDUP: register the range as a shareable block. An id that already exists
+                // means this chunk was replayed; the live block keeps serving its aliases and this
+                // copy stays a private range (blockId 0), so nothing is double-freed.
+                m.blockId = 0;
+                if (hdr.block != 0) {
+                    if (g_arenaBlocks.count(hdr.block)) {
+                        if (g_blockDupCreates++ < 32) {
+                            LOG::logline("!! [geom-alias] block %u uploaded again (slot %u) — kept private",
+                                         hdr.block, hdr.slot);
+                        }
+                    } else {
+                        ArenaBlock b = {};
+                        b.vbOff = vbo;
+                        b.ibOff = ibo;
+                        b.vertexCount = hdr.vertexCount;
+                        b.indexCount  = hdr.indexCount;
+                        b.localCenter[0] = m.localCenter[0];
+                        b.localCenter[1] = m.localCenter[1];
+                        b.localCenter[2] = m.localCenter[2];
+                        b.localRadius = m.localRadius;
+                        b.refs = 1;
+                        g_arenaBlocks.emplace(hdr.block, b);
+                        m.blockId = hdr.block;
+                        ++g_blockRefTotal;
+                    }
+                }
             } else {
                 // ⚠ ASK THE BUDGET BEFORE ASKING D3D12. addBuffer AVs on a refused allocation
                 // (kMeshBufMaxBytes has the full story), so this check is the only thing standing

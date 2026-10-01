@@ -71,6 +71,13 @@ namespace IPC {
     // indices (uvAnimBytes in the header). The host evaluates the track from MW sim time and
     // scrolls the UVs in-shader — the engine's per-tick vertex-UV rewrites no longer reship.
     constexpr std::uint16_t kGeomFlagUVAnim   = 0x8;
+    // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md): this slot is another INSTANCE of a mesh whose
+    // bytes are already in the host arena as BLOCK `GeomPartWire::block`. Header-only (vertexCount =
+    // indexCount = 0, no payload), like Release. The host points the slot at the block's VB/IB range
+    // and refcounts it; the range is parked only when its last holder releases. Vertices are
+    // model-space, so every placed copy of a rock/tree/wall used to ship identical bytes (85% of the
+    // geometry shipped in an AutoZip stress run was such duplicates).
+    constexpr std::uint16_t kGeomFlagAlias    = 0x10;
 
     // Per-part header preceding the part's vertex+index data in the batch blob. When
     // (flags & kGeomFlagSkinned), the part's vertices are SkinnedVertexWire (stride 44)
@@ -88,7 +95,13 @@ namespace IPC {
         // wire, so old blobs parse identically). Both part-boundary walkers (client chunker
         // flushGeometry, host parser uploadGeometry) add it to the part size.
         std::uint16_t uvAnimBytes;
+        // GEOMETRY DEDUP block id (client-assigned, monotonic, never reused; 0 = none). On a plain
+        // static arena upload: nonzero = the host registers this part's arena range as that block,
+        // so later kGeomFlagAlias records can share it. On an alias: the block to share. 0 for every
+        // part that is not a block (skinned, multimap, uvAnim, forced and re-uploads).
+        std::uint32_t block;
     };
+    static_assert(sizeof(GeomPartWire) == 24, "GeomPartWire changed size: client and host must ship together");
 
     // NiUVController key track, shipped ONCE with the mesh (appended after the part's indices;
     // size in GeomPartWire::uvAnimBytes). Followed inline by (keyCountU + keyCountV +

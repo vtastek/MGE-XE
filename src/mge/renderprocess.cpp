@@ -645,6 +645,67 @@ namespace {
     struct UploadSig { std::uint32_t id; std::uint32_t vc; std::uint16_t rev; };
     std::unordered_map<std::uint32_t, UploadSig> g_uploadedRev;    // cache key -> last sent identity
     std::uint32_t                             g_nextSlot = 0;
+    // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md). Vertices ship model-space, so every placed copy
+    // of a mesh is byte-identical; the host keeps one arena range (a BLOCK) per unique content and
+    // further instances send a header-only kGeomFlagAlias record. Keyed on {hash, vc, ic} so a 64-bit
+    // collision must also match both sizes. `refs` counts the slots holding the block (owner + aliases)
+    // and is dropped when a slot is QUEUED for release (drainReleasedSlots) or re-uploads — always no
+    // later than the host drops it, so an alias is only ever sent for a block the host still holds.
+    struct ContentKey {
+        std::uint64_t hash;
+        std::uint32_t vc, ic;
+        bool operator==(const ContentKey& o) const { return hash == o.hash && vc == o.vc && ic == o.ic; }
+    };
+    struct ContentKeyHash {
+        std::size_t operator()(const ContentKey& k) const {
+            return (std::size_t)(k.hash ^ (k.hash >> 32) ^ ((std::uint64_t)k.vc * 0x9E3779B1u) ^ k.ic);
+        }
+    };
+    struct BlockRef { std::uint32_t block; std::uint32_t refs; };
+    std::unordered_map<ContentKey, BlockRef, ContentKeyHash> g_blockByContent;
+    std::unordered_map<std::uint32_t, ContentKey>            g_slotBlock;     // host slot -> the block it holds a ref on
+    std::uint32_t                                            g_nextBlock = 0; // never reused (0 = none)
+
+    // MGE_GEOM_ALIAS=0 is the kill switch (the A/B oracle arm). Default ON.
+    bool geomAliasOn() {
+        static const bool on = [] {
+            const char* e = std::getenv("MGE_GEOM_ALIAS");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
+    // Per load window (logged at the load that ends it): what dedup did, and what the hash cost.
+    struct AliasStats {
+        std::uint32_t blocks = 0;        // first sights shipped as a new block
+        std::uint32_t aliases = 0;       // instances shipped as a header-only alias
+        std::uint64_t aliasedBytes = 0;  // vertex+index bytes those aliases did not ship
+        double        hashMs = 0.0;      // content hashing, all first uploads
+    };
+    AliasStats g_aliasStats;
+
+    void aliasWindowEnd(unsigned frame) {
+        if (!geomAliasOn()) {
+            return;
+        }
+        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu",
+                     frame, g_aliasStats.blocks, g_aliasStats.aliases, g_aliasStats.aliasedBytes / 1048576.0,
+                     g_aliasStats.hashMs, g_blockByContent.size(), g_slotBlock.size());
+        g_aliasStats = AliasStats{};
+    }
+
+    // Drop `slot`'s block ref, if it holds one; the block entry dies with its last ref.
+    void dropBlockRef(std::uint32_t slot) {
+        auto sb = g_slotBlock.find(slot);
+        if (sb == g_slotBlock.end()) {
+            return;
+        }
+        auto it = g_blockByContent.find(sb->second);
+        if (it != g_blockByContent.end() && --it->second.refs == 0) {
+            g_blockByContent.erase(it);
+        }
+        g_slotBlock.erase(sb);
+    }
     // Deferred host-slot release queue. Evicted keys resolve to their (old, monotonic, never-reused)
     // host slot immediately in drainReleasedSlots, but the release SENTINEL is shipped a bounded
     // number per flush (appendBoundedReleaseRecords) so a mass eviction can't flood the blocking
@@ -1637,6 +1698,8 @@ namespace {
         }
         g_keySlot.clear();
         g_uploadedRev.clear();
+        g_blockByContent.clear();              // the fresh host has an empty block table
+        g_slotBlock.clear();
         g_nextSlot = 0;
         g_pendingBlob.clear();                 // drop geom staged for the OLD host
         g_pendingParts = 0;
@@ -2591,18 +2654,20 @@ namespace {
                 continue;   // never had a host slot (culled-only / never shipped)
             }
             g_pendingReleaseSlots.push_back(ks->second.slot);
+            dropBlockRef(ks->second.slot);   // the host drops its ref when the record arrives (later)
             g_keySlot.erase(ks);
             g_uploadedRev.erase(key);
         }
     }
 
-    // Append up to kMaxReleasesPerFlush queued slot-releases to g_pendingBlob as header-only
-    // sentinels. Called by flushGeometry each present; bounding the per-flush count keeps the release
-    // contribution to any one blocking RPC small while the backlog drains over subsequent frames.
-    // Queue order is irrelevant (monotonic slots, no reuse), so a plain front-drain is fine.
-    void appendBoundedReleaseRecords() {
+    // Append up to `limit` queued slot-releases to g_pendingBlob as header-only sentinels. Called by
+    // flushGeometry each present with kMaxReleasesPerFlush: bounding the per-flush count keeps the
+    // release contribution to any one blocking RPC small while the backlog drains over subsequent
+    // frames. A LOAD ships the whole queue instead (checkCellEpochAndPurge), ahead of the new cell's
+    // parts. Queue order is irrelevant (monotonic slots, no reuse), so a plain front-drain is fine.
+    void appendBoundedReleaseRecords(std::size_t limit = kMaxReleasesPerFlush) {
         if (g_pendingReleaseSlots.empty()) return;
-        const std::size_t n = std::min<std::size_t>(g_pendingReleaseSlots.size(), kMaxReleasesPerFlush);
+        const std::size_t n = std::min<std::size_t>(g_pendingReleaseSlots.size(), limit);
         for (std::size_t i = 0; i < n; ++i) {
             IPC::GeomPartWire hdr = {};
             hdr.slot  = g_pendingReleaseSlots[i];
@@ -6522,6 +6587,8 @@ namespace RenderProcess {
     // exterior<->exterior load doors / fast travel, which keep the interior pointer null).
     // Runs once per produced frame: from kickoffBody on the serial/inline paths, from
     // fireParked (main, frame start) in produce mode 3 — never both in one frame.
+    void contentProbeWindowEnd(unsigned frame);   // geometry content probe (defined with captureGeometry)
+
     void checkCellEpochAndPurge(unsigned frame) {
         void* dh = MGE::SceneGraph::getDataHandler();
         const void* interiorCell = dh ? MGE::DataHandlerView::currentInteriorCell(dh) : nullptr;
@@ -6561,6 +6628,8 @@ namespace RenderProcess {
                          g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
                          (int)reloaded, (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
             g_texSyncFrame = g_frame;   // this build's first sights load full files (see g_texSyncFrame)
+            contentProbeWindowEnd(frame);   // MGE_GEOM_CONTENT_PROBE: the window up to this load
+            aliasWindowEnd(frame);          // geometry dedup: the same window
             if (!firstEval) {
                 MGE::GeometryCache::purgeAll();
                 // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
@@ -6574,6 +6643,18 @@ namespace RenderProcess {
                 // Draining here resolves the keys to the OLD slots, while they still mean what
                 // they meant at purge time.
                 drainReleasedSlots();
+                // BULK release at a load: the whole old cell, in this build's blob AHEAD of the new
+                // cell's parts (the build below appends those). Trickled 64 per flush, the old cell's
+                // arena ranges were still held when the new cell uploaded, so the host doubled the
+                // arena instead of reusing them (stress: 320 -> 640 MB, 15403 releases queued). The
+                // host processes a chunk in order and reclaims parked ranges before it grows
+                // (forgerender reclaimArenaRetired), so the new cell lands in the old one's space.
+                // A load frame is allowed to be late; the per-release host cost is paid here once.
+                {
+                    const std::size_t queued = g_pendingReleaseSlots.size();
+                    appendBoundedReleaseRecords(queued);
+                    LOG::logline("-- [release] load: %zu releases shipped ahead of the new cell", queued);
+                }
                 texBookkeepingRelease("load");
             } else {
                 // First load: no purge, so no post-load residency window either — yet this needs one
@@ -8883,6 +8964,124 @@ namespace RenderProcess {
         g_upFrame.parts[cat] += 1; g_upFrame.bytes[cat] += bytes;
     }
 
+    // ---- Geometry CONTENT probe (MGE_GEOM_CONTENT_PROBE=1) -----------------------------------------
+    // MEASUREMENT for a content-keyed host mesh cache ("DL is same meshes, maybe that cache can be
+    // reused for cell loads"). Uploads are keyed per INSTANCE (cache key = shape) and the host drops
+    // them at every load, so each copy of a rock uploads its own geometry, and a revisit or a cell
+    // built from the same kit re-uploads all of it. This hashes every shipped part's vertex+index
+    // bytes and, per window between two loads, sorts the bytes into:
+    //   new      content never shipped before this session
+    //   earlier  shipped in an EARLIER window (the host had it, the load threw it away)
+    //   repeat   shipped earlier in THIS window by ANOTHER instance (another copy of the same mesh)
+    //   resend   shipped earlier in this window by the SAME instance (a re-upload, not instancing)
+    // earlier + repeat is what a content-keyed cache would not have to upload; resend is a separate
+    // problem (the per-instance dedup missing its own earlier copy). Off by default: the hash reads
+    // every uploaded byte once (~32 MB on a load).
+    // A fifth class, aliased, counts what GEOMETRY DEDUP did NOT ship: instances sent as a header-only
+    // kGeomFlagAlias record (their bytes are what would otherwise have landed in repeat).
+    struct ContentWindow {
+        std::uint64_t bytes[3][5] = {};   // [kind: static, skinned, multimap][new, earlier, repeat, resend, aliased]
+        std::uint32_t parts[3][5] = {};
+    };
+    struct ContentSeen {
+        std::uint32_t window;
+        std::uint32_t key;      // the instance that shipped it last
+    };
+    ContentWindow                                  g_contentWin;
+    std::unordered_map<std::uint64_t, ContentSeen> g_contentSeen;   // content hash -> last window / key
+    std::uint32_t                                  g_contentWindowId = 0;
+
+    bool contentProbeOn() {
+        static const bool on = [] {
+            const char* e = std::getenv("MGE_GEOM_CONTENT_PROBE");
+            return e && e[0] == '1';
+        }();
+        return on;
+    }
+
+    std::uint64_t hashBytes(const void* p, std::size_t n, std::uint64_t h) {
+        const std::uint8_t* b = static_cast<const std::uint8_t*>(p);
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            std::uint64_t w;
+            memcpy(&w, b + i, 8);
+            h ^= w;
+            h *= 0x9E3779B97F4A7C15ull;
+            h ^= h >> 29;
+        }
+        for (; i < n; ++i) {
+            h ^= b[i];
+            h *= 0x100000001B3ull;
+        }
+        return h ^ (std::uint64_t)n;
+    }
+
+    void noteContent(int kind, std::uint32_t key, const void* verts, std::size_t vbBytes, const void* indices, std::size_t ibBytes) {
+        if (!contentProbeOn()) {
+            return;
+        }
+        const std::uint64_t h = hashBytes(indices, ibBytes, hashBytes(verts, vbBytes, 0xCBF29CE484222325ull + (std::uint64_t)kind));
+        const std::uint64_t bytes = vbBytes + ibBytes;
+        auto it = g_contentSeen.find(h);
+        int cls;
+        if (it == g_contentSeen.end()) {
+            cls = 0;
+            g_contentSeen.emplace(h, ContentSeen{ g_contentWindowId, key });
+        } else {
+            if (it->second.window != g_contentWindowId) {
+                cls = 1;
+            } else {
+                cls = (it->second.key == key) ? 3 : 2;
+            }
+            it->second = ContentSeen{ g_contentWindowId, key };
+        }
+        g_contentWin.bytes[kind][cls] += bytes;
+        ++g_contentWin.parts[kind][cls];
+    }
+
+    void noteContentAliased(std::size_t bytes) {
+        if (!contentProbeOn()) {
+            return;
+        }
+        g_contentWin.bytes[0][4] += bytes;
+        ++g_contentWin.parts[0][4];
+    }
+
+    // One line per window, at the load that ends it.
+    void contentProbeWindowEnd(unsigned frame) {
+        if (!contentProbeOn()) {
+            return;
+        }
+        static const char* kKind[3] = { "static", "skinned", "multimap" };
+        std::uint64_t tot[5] = {};
+        for (int k = 0; k < 3; ++k) {
+            for (int c = 0; c < 5; ++c) {
+                tot[c] += g_contentWin.bytes[k][c];
+            }
+        }
+        const std::uint64_t all = tot[0] + tot[1] + tot[2] + tot[3];
+        LOG::logline(">> [geom-content] window %u ending at frame %u: %.1f MB shipped = new %.1f | earlier %.1f | repeat %.1f | resend %.1f MB  (content cache saves %.0f%%, unique hashes this session %zu) | aliased (not shipped) %.1f MB",
+                     g_contentWindowId, frame, all / 1048576.0, tot[0] / 1048576.0, tot[1] / 1048576.0,
+                     tot[2] / 1048576.0, tot[3] / 1048576.0, all ? 100.0 * (tot[1] + tot[2]) / all : 0.0,
+                     g_contentSeen.size(), tot[4] / 1048576.0);
+        for (int k = 0; k < 3; ++k) {
+            const std::uint64_t kb = g_contentWin.bytes[k][0] + g_contentWin.bytes[k][1] + g_contentWin.bytes[k][2] + g_contentWin.bytes[k][3];
+            if (kb == 0 && g_contentWin.bytes[k][4] == 0) {
+                continue;
+            }
+            LOG::logline("   [geom-content]   %-8s %.1f MB in %u parts: new %.1f MB/%u | earlier %.1f MB/%u | repeat %.1f MB/%u | resend %.1f MB/%u | aliased %.1f MB/%u",
+                         kKind[k], kb / 1048576.0,
+                         g_contentWin.parts[k][0] + g_contentWin.parts[k][1] + g_contentWin.parts[k][2] + g_contentWin.parts[k][3],
+                         g_contentWin.bytes[k][0] / 1048576.0, g_contentWin.parts[k][0],
+                         g_contentWin.bytes[k][1] / 1048576.0, g_contentWin.parts[k][1],
+                         g_contentWin.bytes[k][2] / 1048576.0, g_contentWin.parts[k][2],
+                         g_contentWin.bytes[k][3] / 1048576.0, g_contentWin.parts[k][3],
+                         g_contentWin.bytes[k][4] / 1048576.0, g_contentWin.parts[k][4]);
+        }
+        g_contentWin = ContentWindow{};
+        ++g_contentWindowId;
+    }
+
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount,
@@ -8921,10 +9120,49 @@ namespace RenderProcess {
             hdr.flags      |= IPC::kGeomFlagUVAnim;
             hdr.uvAnimBytes = uvAnimBytes;
         }
+        // Latched BEFORE drainPendingIfFull: that can run a whole flushGeometry, whose eviction drain
+        // erases g_uploadedRev entries (and with them, possibly, `rev`).
+        const bool firstUpload = (rev == g_uploadedRev.end());
 
         drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
+
+        // GEOMETRY DEDUP. A re-upload of a slot that holds a block ref drops it first — the host's
+        // rebuild path releases the slot's range the same way — and ships plain (block 0), so a
+        // morphing mesh keeps the sameShape/streak path it always had. Only a key's FIRST upload
+        // (no prior g_uploadedRev entry) may share: a block is plain, unanimated static content.
+        dropBlockRef(slot);
+        if (firstUpload && !forceReupload && !hdr.uvAnimBytes && geomAliasOn()) {
+            const double tHash0 = nowMs();
+            const ContentKey ck{ hashBytes(indices, ibBytes, hashBytes(verts, vbBytes, 0xCBF29CE484222325ull)),
+                                 vertexCount, indexCount };
+            g_aliasStats.hashMs += nowMs() - tHash0;
+            auto bc = g_blockByContent.find(ck);
+            if (bc != g_blockByContent.end()) {
+                IPC::GeomPartWire ah = {};
+                ah.slot       = slot;
+                ah.revisionID = revision;
+                ah.flags      = IPC::kGeomFlagAlias;   // vertexCount = indexCount = 0 -> header-only
+                ah.block      = bc->second.block;
+                const std::size_t at = g_pendingBlob.size();
+                g_pendingBlob.resize(at + sizeof(ah));
+                memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
+                ++g_pendingParts;
+                ++bc->second.refs;
+                g_slotBlock.emplace(slot, ck);
+                g_uploadedRev[key] = { modelId, vertexCount, revision };
+                ++g_aliasStats.aliases;
+                g_aliasStats.aliasedBytes += vbBytes + ibBytes;
+                noteContentAliased(vbBytes + ibBytes);
+                return;
+            }
+            hdr.block = ++g_nextBlock;
+            g_blockByContent.emplace(ck, BlockRef{ hdr.block, 1u });
+            g_slotBlock.emplace(slot, ck);
+            ++g_aliasStats.blocks;
+        }
+
         const std::size_t at = g_pendingBlob.size();
         g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         std::uint8_t* dst = g_pendingBlob.data() + at;
@@ -8935,6 +9173,7 @@ namespace RenderProcess {
 
         ++g_pendingParts;
         g_uploadedRev[key] = { modelId, vertexCount, revision };
+        noteContent(0, key, verts, vbBytes, indices, ibBytes);
     }
 
     void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
@@ -8961,6 +9200,7 @@ namespace RenderProcess {
             g_keySlot.emplace(key, SlotInfo{ slot });
         }
 
+        dropBlockRef(slot);   // a recycled key's slot may hold a block; the host releases it on rebuild
         IPC::GeomPartWire hdr = {};
         hdr.slot        = slot;
         hdr.revisionID  = revision;
@@ -8981,6 +9221,7 @@ namespace RenderProcess {
 
         ++g_pendingParts;
         g_uploadedRev[key] = { modelId, vertexCount, revision };
+        noteContent(1, key, verts, vbBytes, indices, ibBytes);
     }
 
     void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
@@ -9007,6 +9248,7 @@ namespace RenderProcess {
             g_keySlot.emplace(key, SlotInfo{ slot });
         }
 
+        dropBlockRef(slot);   // a recycled key's slot may hold a block; the host releases it on rebuild
         IPC::GeomPartWire hdr = {};
         hdr.slot        = slot;
         hdr.revisionID  = revision;
@@ -9031,6 +9273,7 @@ namespace RenderProcess {
 
         ++g_pendingParts;
         g_uploadedRev[key] = { modelId, vertexCount, revision };
+        noteContent(2, key, verts, vbBytes, indices, ibBytes);
     }
 
     void shutdown() {
@@ -9090,6 +9333,8 @@ namespace RenderProcess {
         g_texPendingCount = 0;
         g_keySlot.clear();
         g_uploadedRev.clear();
+        g_blockByContent.clear();
+        g_slotBlock.clear();
         g_texSlot.clear();
         g_slotName.clear();
         g_slotLastUsed.clear();
