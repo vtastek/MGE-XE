@@ -9016,6 +9016,52 @@ namespace RenderProcess {
         return h ^ (std::uint64_t)n;
     }
 
+    // GEOMETRY DEDUP content hash, built for THIS client: it is 32-bit x86, where hashBytes' 64-bit
+    // multiply is emulated (three imuls) and every step waits on the last — 3.2 GB/s, ~22 ms for one
+    // exterior's first sights. xxHash32's round instead: four INDEPENDENT 32-bit lanes over 16-byte
+    // stripes, so the multiplies overlap. The 128-bit state folds to 64 bits through two different
+    // projections; the dedup key also requires equal vertex and index counts, and each buffer's tail
+    // is mixed with its length known from those counts, so the two-buffer stream is unambiguous.
+    struct ContentHasher {
+        static constexpr std::uint32_t P1 = 2654435761u, P2 = 2246822519u, P3 = 3266489917u,
+                                       P4 = 668265263u,  P5 = 374761393u;
+        static std::uint32_t rotl(std::uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
+        static std::uint32_t avalanche(std::uint32_t h) {
+            h ^= h >> 15; h *= P2; h ^= h >> 13; h *= P3; h ^= h >> 16;
+            return h;
+        }
+        std::uint32_t v[4] = { P1 + P2, P2, 0u, 0u - P1 };
+
+        void update(const void* p, std::size_t n) {
+            const std::uint8_t* b = static_cast<const std::uint8_t*>(p);
+            std::uint32_t a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
+            std::size_t i = 0;
+            for (; i + 16 <= n; i += 16) {
+                std::uint32_t w[4];
+                memcpy(w, b + i, 16);
+                a0 = rotl(a0 + w[0] * P2, 13) * P1;
+                a1 = rotl(a1 + w[1] * P2, 13) * P1;
+                a2 = rotl(a2 + w[2] * P2, 13) * P1;
+                a3 = rotl(a3 + w[3] * P2, 13) * P1;
+            }
+            for (; i + 4 <= n; i += 4) {
+                std::uint32_t w;
+                memcpy(&w, b + i, 4);
+                a0 = rotl(a0 + w * P3, 17) * P4;
+            }
+            for (; i < n; ++i) {
+                a1 = rotl(a1 + b[i] * P5, 11) * P1;
+            }
+            v[0] = a0; v[1] = a1; v[2] = a2; v[3] = a3;
+        }
+
+        std::uint64_t finish() const {
+            const std::uint32_t lo = avalanche(rotl(v[0], 1) + rotl(v[1], 7) + rotl(v[2], 12) + rotl(v[3], 18));
+            const std::uint32_t hi = avalanche((v[0] * P3) ^ rotl(v[1], 9)) + avalanche((v[2] * P4) ^ rotl(v[3], 23));
+            return ((std::uint64_t)hi << 32) | lo;
+        }
+    };
+
     void noteContent(int kind, std::uint32_t key, const void* verts, std::size_t vbBytes, const void* indices, std::size_t ibBytes) {
         if (!contentProbeOn()) {
             return;
@@ -9135,8 +9181,10 @@ namespace RenderProcess {
         dropBlockRef(slot);
         if (firstUpload && !forceReupload && !hdr.uvAnimBytes && geomAliasOn()) {
             const double tHash0 = nowMs();
-            const ContentKey ck{ hashBytes(indices, ibBytes, hashBytes(verts, vbBytes, 0xCBF29CE484222325ull)),
-                                 vertexCount, indexCount };
+            ContentHasher hasher;
+            hasher.update(verts, vbBytes);
+            hasher.update(indices, ibBytes);
+            const ContentKey ck{ hasher.finish(), vertexCount, indexCount };
             g_aliasStats.hashMs += nowMs() - tHash0;
             auto bc = g_blockByContent.find(ck);
             if (bc != g_blockByContent.end()) {
