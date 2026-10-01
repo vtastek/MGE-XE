@@ -2141,6 +2141,8 @@ namespace {
     // ⚠ OPT-IN and OFF by default: it costs a window, a swapchain, and one extra submit+present per
     // frame, for a feature only a dev with an injected overlay wants.
     bool         g_hostWindow = false;
+    // Run the full alpha classification beside the sampled one and log disagreements (classifyAlpha).
+    bool         g_texClassifyVerify = false;
     HWND         g_hostHwnd = nullptr;
     SwapChain*   g_pHostSwapChain = nullptr;
     // Matches the swapchain's image count: the ring exists to let the submit for frame N stay in
@@ -23364,6 +23366,9 @@ namespace {
             // are created at all), which is why it is here and has no panel checkbox — the panel it
             // would live on is drawn into the game's frame, not this window.
             { "hostWindow",          &g_hostWindow          },
+            // The oracle for the sampled DDS alpha classification: full scan beside it, mismatches
+            // logged as `!! [classify]`, a running tally every 256 as `-- [classify] verify:`.
+            { "texClassifyVerify",   &g_texClassifyVerify   },
             // ⚠ A SUBMIT BOUNDARY IS A SCHEDULING BOUNDARY. The frame is recorded into two command
             // buffers and submitted twice (chunk A ends just before the reflect pass) so the CPU can
             // get chunk A onto the GPU sooner. That is a real win on the CPU side, but it also hands
@@ -47615,7 +47620,21 @@ void destroyHostWindow(Renderer* R);
     // Buckets: transparent < 32, opaque ≥ 224, mid between. MASK = meaningful transparent
     // coverage (> 1/64 of texels) AND mid-band < 1/4 (cutout edges stay well under that; true
     // translucents are mostly mid). DXBC1 alpha is punch-through 1-bit → mask by construction.
-    static uint8_t classifyDdsAlpha(const uint8_t* d, uint32_t size, const DdsInfo& info) {
+    //
+    // SAMPLED: the verdict is a pair of FRACTIONS, so it needs a fair sample of mip 0, not all of it.
+    // Decoding every block of a 4096² BC3 is 16M texels, ~10-15 ms of the IPC thread per 4K map
+    // (Balmora -> Caldera crossings: [texup] calls of 17-19 ms whose create/copy/flush summed to 4).
+    // At most kClassifyMaxBlocks blocks (texels, for uncompressed), on an ODD stride so the sample
+    // rotates through the columns row by row instead of locking onto one. Mip 0, never a smaller mip:
+    // a downsampled mip blurs a cutout's hard edges into the mid band and can turn MASK into
+    // TRANSLUCENT. maxBlocks 0 = every block (the texClassifyVerify oracle).
+    constexpr uint32_t kClassifyMaxBlocks = 65536;
+    static uint32_t classifyStride(uint64_t n, uint32_t maxN) {
+        if (maxN == 0 || n <= maxN) { return 1u; }
+        return (uint32_t)(n / maxN) | 1u;
+    }
+    static uint8_t classifyDdsAlpha(const uint8_t* d, uint32_t size, const DdsInfo& info,
+                                    uint32_t maxBlocks = kClassifyMaxBlocks) {
         const uint8_t* src = d + info.dataOffset;
         const uint8_t* end = d + size;
         uint64_t nTrans = 0, nMid = 0, nTexels = 0;
@@ -47623,8 +47642,9 @@ void destroyHostWindow(Renderer* R);
         switch (info.fmt) {
         case TinyImageFormat_DXBC1_RGBA_UNORM: {
             const uint32_t blocks = ((w + 3) / 4) * ((h + 3) / 4);
-            const uint8_t* p = src;
-            for (uint32_t b = 0; b < blocks && p + 8 <= end; ++b, p += 8) {
+            const uint32_t step = classifyStride(blocks, maxBlocks);
+            for (uint32_t b = 0; b < blocks && src + (size_t)b * 8 + 8 <= end; b += step) {
+                const uint8_t* p = src + (size_t)b * 8;
                 nTexels += 16;
                 const uint16_t c0 = (uint16_t)(p[0] | (p[1] << 8));
                 const uint16_t c1 = (uint16_t)(p[2] | (p[3] << 8));
@@ -47639,8 +47659,9 @@ void destroyHostWindow(Renderer* R);
         }
         case TinyImageFormat_DXBC2_UNORM: {   // explicit 4-bit alpha (first 8 bytes/block)
             const uint32_t blocks = ((w + 3) / 4) * ((h + 3) / 4);
-            const uint8_t* p = src;
-            for (uint32_t b = 0; b < blocks && p + 16 <= end; ++b, p += 16) {
+            const uint32_t step = classifyStride(blocks, maxBlocks);
+            for (uint32_t b = 0; b < blocks && src + (size_t)b * 16 + 16 <= end; b += step) {
+                const uint8_t* p = src + (size_t)b * 16;
                 for (uint32_t t = 0; t < 16; ++t) {
                     const uint8_t a4 = (uint8_t)((p[t >> 1] >> ((t & 1) * 4)) & 0xFu);
                     ++nTexels;
@@ -47651,8 +47672,9 @@ void destroyHostWindow(Renderer* R);
         }
         case TinyImageFormat_DXBC3_UNORM: {   // interpolated alpha (a0/a1 + 3-bit indices)
             const uint32_t blocks = ((w + 3) / 4) * ((h + 3) / 4);
-            const uint8_t* p = src;
-            for (uint32_t b = 0; b < blocks && p + 16 <= end; ++b, p += 16) {
+            const uint32_t step = classifyStride(blocks, maxBlocks);
+            for (uint32_t b = 0; b < blocks && src + (size_t)b * 16 + 16 <= end; b += step) {
+                const uint8_t* p = src + (size_t)b * 16;
                 const uint8_t a0 = p[0], a1 = p[1];
                 uint8_t tab[8]; tab[0] = a0; tab[1] = a1;
                 if (a0 > a1) {
@@ -47674,7 +47696,8 @@ void destroyHostWindow(Renderer* R);
         case TinyImageFormat_B8G8R8A8_UNORM:
         case TinyImageFormat_R8G8B8A8_UNORM: {
             const uint64_t n = (uint64_t)w * h;
-            for (uint64_t t = 0; t < n && src + t * 4 + 4 <= end; ++t) {
+            const uint32_t step = classifyStride(n, maxBlocks ? maxBlocks * 16u : 0u);
+            for (uint64_t t = 0; t < n && src + t * 4 + 4 <= end; t += step) {
                 const uint8_t a = src[t * 4 + 3];
                 ++nTexels;
                 if (a < 32u) { ++nTrans; } else if (a < 224u) { ++nMid; }
@@ -47706,6 +47729,26 @@ void destroyHostWindow(Renderer* R);
         // ends up caging its own light. Nothing downstream can recover the distinction, because
         // `nTrans` is exactly what the TRANSLUCENT verdict throws away. So keep it.
         return hasHoles ? kTexAlphaTranslucent : kTexAlphaSoft;
+    }
+
+    // Every classification goes through here. With the texClassifyVerify knob the full scan runs
+    // beside the sampled one and any disagreement is logged — the oracle for the sampling.
+    uint64_t g_classifyChecked = 0, g_classifyMismatch = 0;
+    static uint8_t classifyAlpha(const uint8_t* d, uint32_t size, const DdsInfo& info, const char* what) {
+        const uint8_t kind = classifyDdsAlpha(d, size, info);
+        if (g_texClassifyVerify) {
+            const uint8_t full = classifyDdsAlpha(d, size, info, 0);
+            ++g_classifyChecked;
+            if (full != kind && g_classifyMismatch++ < 32) {
+                LOG::logline("!! [classify] %s %ux%u fmt=%u: sampled %u vs full %u",
+                             what, info.width, info.height, (unsigned)info.fmt, kind, full);
+            }
+            if ((g_classifyChecked & 255u) == 0) {
+                LOG::logline("-- [classify] verify: %llu checked, %llu mismatched",
+                             (unsigned long long)g_classifyChecked, (unsigned long long)g_classifyMismatch);
+            }
+        }
+        return kind;
     }
 
     // Per-bucket flip-array state. `slices` is what the client declared (every slice of a bucket
@@ -47802,7 +47845,7 @@ void destroyHostWindow(Renderer* R);
         }
         endUpdateResource(&upd);
 
-        g_flipAlphaKind[bucket][layer] = classifyDdsAlpha(dds, hdr.byteLen, info);
+        g_flipAlphaKind[bucket][layer] = classifyAlpha(dds, hdr.byteLen, info, "flip");
         ++fb.filled;
         return true;
     }
@@ -47847,6 +47890,13 @@ void destroyHostWindow(Renderer* R);
             return 0;
         }
         Renderer* R = g_live.pRenderer;
+        // [texup] split (Balmora->Caldera crossings: one 4K replacer per texflush, 7-28 ms of client-
+        // blocking rpc). Which step is it — create (addResource + its load wait, a possible new D3D12MA
+        // block), copy (the row memcpy into the upload buffer), flush (submit + fence), bind?
+        const double tUp0 = hostNowMs();
+        double tCreateMs = 0.0, tCopyMs = 0.0, tClassifyMs = 0.0;
+        uint64_t texBytes = 0;
+        uint32_t biggestW = 0, biggestH = 0;
         const uint64_t vram0 = vramNow(R);   // bracket: attribute only THIS call's allocation
         const uint8_t* p   = (const uint8_t*)blob;
         const uint8_t* end = p + byteCount;
@@ -47921,7 +47971,9 @@ void destroyHostWindow(Renderer* R);
             // A DATA texture's alpha is not coverage — a _paramh keeps HEIGHT there — so classifying
             // it would invent a cutout out of a height field. Opaque, and never consulted anyway: a
             // param slot is not any draw's base texture.
-            g_texAlphaKind[hdr.slot] = dataTex ? kTexAlphaOpaque : classifyDdsAlpha(dds, hdr.byteLen, info);
+            const double tClassify0 = hostNowMs();
+            g_texAlphaKind[hdr.slot] = dataTex ? kTexAlphaOpaque : classifyAlpha(dds, hdr.byteLen, info, "near");
+            tClassifyMs += hostNowMs() - tClassify0;
 
             Texture* tex = nullptr;
             TextureDesc td = {};
@@ -47937,8 +47989,10 @@ void destroyHostWindow(Renderer* R);
             TextureLoadDesc tld = {};
             tld.ppTexture = &tex;
             tld.pDesc = &td;
+            const double tCreate0 = hostNowMs();
             addResource(&tld, nullptr);
             waitForAllResourceLoads();
+            tCreateMs += hostNowMs() - tCreate0;
             if (!tex) {
                 LOGF(eWARNING, "[forge] tex slot %u: addResource gave no texture for %ux%u fmt=%u"
                      " mips=%u (slot stays white)", hdr.slot, info.width, info.height,
@@ -47953,6 +48007,7 @@ void destroyHostWindow(Renderer* R);
             upd.mBaseMipLevel = 0; upd.mMipLevels = info.mipLevels;
             upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
             upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;   // created in & returned to this state
+            const double tCopy0 = hostNowMs();
             beginUpdateResource(&upd);
             for (uint32_t m = 0; m < info.mipLevels; ++m) {
                 TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, 0);
@@ -47973,6 +48028,11 @@ void destroyHostWindow(Renderer* R);
                 src += mipBytes;
             }
             endUpdateResource(&upd);
+            tCopyMs += hostNowMs() - tCopy0;
+            texBytes += hdr.byteLen;
+            if ((uint64_t)info.width * info.height > (uint64_t)biggestW * biggestH) {
+                biggestW = info.width; biggestH = info.height;
+            }
             // NOTE: the upload-engine copy is submitted ONCE for the whole batch after the loop
             // (flushTextureUploads below) — not per texture. A per-texture GPU fence stalled the
             // whole batch N times (the "slow" with hundreds of new textures on area load).
@@ -47999,14 +48059,26 @@ void destroyHostWindow(Renderer* R);
         }
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
         // former per-texture fence — the batch is window-bounded so this is a single short wait.
+        const double tFlush0 = hostNowMs();
         if (built) { flushTextureUploads(R); }
+        const double tFlushMs = hostNowMs() - tFlush0;
         // ...and only THEN rebind the slots (P2, tasks/forge-pipeline-depth.md). The rebind used to
         // sit inside the loop, BEFORE the flush: the bindless table named a texture whose upload had
         // not even been submitted, and a frame in flight — or recorded before this flush landed —
         // could sample it half-written.
+        const double tBind0 = hostNowMs();
+        uint32_t warmBinds = 0;
         for (const auto& rb : rebind) {
             bindTextureSlot(R, rb.slot, rb.cold);   // cold: no in-flight frame names it, no wait
             g_texIsData[rb.slot] = rb.dataTex ? 1u : 0u;   // landed: now, and only now, it counts
+            if (!rb.cold) { ++warmBinds; }
+        }
+        const double tBindMs = hostNowMs() - tBind0;
+        const double tTotalMs = hostNowMs() - tUp0;
+        if (tTotalMs >= 5.0) {
+            LOG::logline("-- [texup] %.2f ms: %u tex %.1f MB (largest %ux%u) | classify %.2f create %.2f copy %.2f flush %.2f bind %.2f (%u warm)",
+                         tTotalMs, built, (double)texBytes / (1024.0 * 1024.0), biggestW, biggestH,
+                         tClassifyMs, tCreateMs, tCopyMs, tFlushMs, tBindMs, warmBinds);
         }
         // Sampled AFTER the flush, so the driver has committed the batch; before it, this call's
         // textures would be attributed to whatever ran next.
@@ -52503,7 +52575,7 @@ void destroyHostWindow(Renderer* R);
                 std::vector<uint8_t> dds;
                 if (readStaticsTex(g_fixSubsetTex[fs], dds)) {
                     DdsInfo info = parseDds(dds.data(), (uint32_t)dds.size());
-                    if (info.ok) { kind = classifyDdsAlpha(dds.data(), (uint32_t)dds.size(), info); }
+                    if (info.ok) { kind = classifyAlpha(dds.data(), (uint32_t)dds.size(), info, "statics"); }
                 }
                 kc = kindCache.emplace(g_fixSubsetTex[fs], kind).first;
             }
