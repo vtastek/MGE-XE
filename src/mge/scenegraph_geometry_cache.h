@@ -466,6 +466,11 @@ namespace MGE::GeometryCache {
     // does NOT purge — the very first evaluation, where there is no old cell to flush.
     void armPostLoadWalk();
 
+    // The same window for an exterior CROSSING (the grid slid; nothing was purged). The cells the old
+    // centre's 3x3 already covered are resident, so the window walks only the cells outside it
+    // (MGE_SCOPED_WALK=0: a full window, as a load gets). A window already open stays full.
+    void armCrossingWalk(int oldGridX, int oldGridY);
+
     // Refresh (or lazily capture) ONE entry straight off its live NiTriShape*. Only
     // valid for keys the engine drew THIS frame (classify visible set) — that is what
     // guarantees the pointer is alive. Refreshes exactly the per-frame-varying fields

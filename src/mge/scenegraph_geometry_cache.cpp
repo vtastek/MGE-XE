@@ -413,6 +413,14 @@ namespace MGE::GeometryCache {
         uint32_t  g_deepDisabledSkips     = 0;   // DISABLED reference subtrees the deep walk refused
         uint32_t  g_deepDisabledShapes    = 0;   // shapes under them (the refusal's collateral)
         int       g_postLoadFramesUsed    = 0;   // frames the current window has actually consumed
+        // CROSSING scope (armCrossingWalk): the window walks only the loaded cells outside the old
+        // centre's 3x3 instead of the whole gated grid. Off for loads (purge/first eval), which have
+        // no resident cells to skip.
+        bool      g_postLoadScoped        = false;
+        int       g_scopeOldGX = 0, g_scopeOldGY = 0;
+        uint32_t  g_scopedCellsLast       = 0;   // receipt: new cells the last scoped frame walked
+        uint32_t  g_scopedFullFallback    = 0;   // receipt: scoped frames that fell back to the full walk
+        uint32_t  g_scopedRootExtra       = 0;   // receipt: world-root children that are no 3x3 cell's root
         // [postload-walk] observability, sampled at arm time and reported once when the window
         // closes (once per cell transition — not a hot path).
         bool      g_postLoadInterior      = false;
@@ -4265,6 +4273,85 @@ namespace MGE::GeometryCache {
         g_walkRanFrame = g_frame;
     }
 
+    // The crossing window's walk (armCrossingWalk): only the loaded cells OUTSIDE the old centre's
+    // 3x3. The rest of the grid was resident before the crossing and nothing about it changed, so
+    // re-walking it every window frame was pure traversal (~2 ms a frame, ~5 on the first).
+    //
+    // A cell root is walked exactly as the full walk reaches it — same gate, pick roots tagged — but
+    // the full walk passes through the WORLD root first, and world suppression (MW-ONLY-UI) app-culls
+    // that root. So a culled world root stops its cells here too. If a new cell's root does not hang
+    // directly off its world root, this frame cannot claim to cover what the full walk would reach,
+    // so it takes the full walk instead (counted in the receipt).
+    //
+    // Deliberately does NOT stamp g_walkRanFrame: it says nothing about the old cells, so the
+    // eviction sweep must not read it as the authoritative "unvisited == gone" walk.
+    static void walkCrossingCells(void* dh) {
+        NI::Node* newStatic[DataHandlerView::EXT_CELL_DATA_COUNT] = {};
+        NI::Node* newPick[DataHandlerView::EXT_CELL_DATA_COUNT] = {};
+        NI::Node* allRoots[2 * DataHandlerView::EXT_CELL_DATA_COUNT] = {};
+        uint32_t n = 0, nAll = 0;
+        bool direct = true;
+        for (size_t i = 0; i < DataHandlerView::EXT_CELL_DATA_COUNT; ++i) {
+            void* ecd = DataHandlerView::exteriorCellData(dh, i);
+            if (!DataHandlerView::exteriorCellLoaded(ecd)) continue;
+            void* cell = DataHandlerView::exteriorCellRecord(ecd);
+            if (!cell) continue;
+            NI::Node* s = DataHandlerView::cellStaticObjectsRoot(cell);
+            NI::Node* p = DataHandlerView::cellPickObjectsRoot(cell);
+            allRoots[nAll++] = s;
+            allRoots[nAll++] = p;
+            const int dx = DataHandlerView::cellExteriorGridX(cell) - g_scopeOldGX;
+            const int dy = DataHandlerView::cellExteriorGridY(cell) - g_scopeOldGY;
+            if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) continue;   // resident before the crossing
+            if ((s && s->parentNode != g_objRoot) || (p && p->parentNode != g_pickRoot)) direct = false;
+            newStatic[n] = s;
+            newPick[n] = p;
+            ++n;
+        }
+        // Evidence for the scope (receipt, first window frame): world-root children that are no 3x3
+        // cell's root. Nonzero means something else hangs there too (ring cells, loose objects) that
+        // the full walk visited and this one does not.
+        if (g_postLoadFramesUsed == 0) {
+            uint32_t extra = 0;
+            for (NI::Node* world : { g_objRoot, g_pickRoot }) {
+                if (!world) continue;
+                const auto count = world->children.getEndIndex();
+                for (size_t c = 0; c < count; ++c) {
+                    NI::AVObject* child = world->children.at(c).get();
+                    if (!child) continue;
+                    bool isCell = false;
+                    for (uint32_t k = 0; k < nAll && !isCell; ++k) isCell = (allRoots[k] == child);
+                    if (!isCell) ++extra;
+                }
+            }
+            g_scopedRootExtra = extra;
+        }
+        g_scopedCellsLast = n;
+        if (!direct) {
+            ++g_scopedFullFallback;
+            ensureFullWalk();
+            return;
+        }
+        const double t0 = gcNowMs();
+        const bool objCulled = g_objRoot->getAppCulled();
+        const bool pickCulled = !g_pickRoot || g_pickRoot->getAppCulled();
+        for (uint32_t k = 0; k < n; ++k) {
+            if (!objCulled) walk(newStatic[k]);
+            if (!pickCulled) {
+                g_walkingPick = true;
+                walk(newPick[k]);
+                g_walkingPick = false;
+            }
+        }
+        const double tObj = gcNowMs();
+        // The landscape root in full: it is cheap (~0.1 ms) and its per-cell layout is not needed.
+        g_walkingLandscape = true;
+        walk(g_landRoot);
+        g_walkingLandscape = false;
+        g_gcAccum.obj  += tObj - t0;
+        g_gcAccum.land += gcNowMs() - tObj;
+    }
+
     // Enchanted-item glow: recursive stamp over a live subtree the enchant effect is attached to.
     // Twin of stampSuppressed — same "touch only entries that already exist, deref nothing but the
     // child arrays" contract — writing enchantGlow instead of suppressedFrame, and recording each
@@ -4661,7 +4748,9 @@ namespace MGE::GeometryCache {
         // took it back down, forcing a per-frame eviction sweep for the rest of the session.
         const bool postLoadWindow =
             g_postPurgeCaptureFrames > 0 && RenderProcess::forgeOwnsFrame() && g_objRoot;
+        bool windowScopedIdle = false;   // a scoped (crossing) window frame that captured nothing
         if (postLoadWindow) {
+            const uint64_t capturesBefore = g_captureTotal;
             // Spread the window's first-sight captures over its frames instead of taking the whole
             // cell in one. Without this the walk below captures EVERY uncached shape in the gate on
             // its first frame — measured 13k captures + a 148MB texture flush in a single 340ms
@@ -4710,6 +4799,10 @@ namespace MGE::GeometryCache {
                     g_walkingPick = false;
                 }
                 g_gateThisFrame = savedGate;
+            } else if (g_postLoadScoped) {
+                // A CROSSING: only the cells the slide brought in (see walkCrossingCells).
+                MGE_ZoneScopedN("GeomCache:postLoadWalkScoped");
+                walkCrossingCells(dataHandler);
             } else {
                 MGE_ZoneScopedN("GeomCache:postLoadWalk");
                 // EXTERIOR: a PLAIN gated walk, not bypassCullDeep. The walk's active-cell gate is
@@ -4729,6 +4822,7 @@ namespace MGE::GeometryCache {
             g_windowCaptureBudget = -1;   // disarm before the sky/FP walks below
             RenderProcess::setWindowCapture(false);
             ++g_postLoadFramesUsed;
+            windowScopedIdle = g_postLoadScoped && !g_captureInteriorCell && g_captureTotal == capturesBefore;
 
             // The window's job is "the cell is resident", not "N frames elapsed". While the budget
             // is still deferring captures there is grid left to bring in, so hold the window open
@@ -4739,13 +4833,16 @@ namespace MGE::GeometryCache {
                                      && g_postLoadFramesUsed < kPostLoadWalkFramesMax;
             if (!stillCapturing && --g_postPurgeCaptureFrames == 0) {
                 LOG::logline(">> [postload-walk] %s done: frames=%d/%d cache=%u->%u captures=%u "
-                             "lastDeferred=%u disabledSkipped=%u/%ushapes gateR=%.0f",
+                             "lastDeferred=%u disabledSkipped=%u/%ushapes gateR=%.0f "
+                             "scoped=%d cells=%u fullFallback=%u rootExtra=%u",
                              g_postLoadInterior ? "interior" : "exterior",
                              g_postLoadFramesUsed, g_postLoadFramesArmed,
                              g_postLoadCacheAtArm, (unsigned)g_cache.size(),
                              (unsigned)(g_captureTotal - g_postLoadCapturesAtArm),
                              g_windowCaptureDeferred, g_deepDisabledSkips, g_deepDisabledShapes,
-                             g_gateRadius);
+                             g_gateRadius, (int)g_postLoadScoped, g_scopedCellsLast,
+                             g_scopedFullFallback, g_scopedRootExtra);
+                g_postLoadScoped = false;
             }
         }
         const double tLand = gcNowMs();
@@ -4916,8 +5013,11 @@ namespace MGE::GeometryCache {
         // postLoadWindow, not the raw counter: it is the frame that actually captured (so the sweep
         // stays in step with the capture, including the LAST window frame, whose decrement already
         // took the counter to 0) and it cannot stick on when the window can never drain.
+        // A scoped (crossing) window frame that captured nothing is exempt: the cache did not change,
+        // so neither did the caster set, and without the full walk's stamp a forced sweep would climb
+        // every entry (~1.2 ms) for nothing. The 30-frame cadence still sweeps as in steady play.
         const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu()
-                              || postLoadWindow;
+                              || (postLoadWindow && !windowScopedIdle);
         // Cell-grid mode NEVER forces a walk — it reads MW's grid directly. Parent-chain forces one
         // only during its validation window / the forceWalk bisect knob.
         const bool validating = g_evictByParentChain && !g_evictByCellGrid && (g_evictSweepNo < kEvictValidateSweeps);
@@ -5690,6 +5790,32 @@ namespace MGE::GeometryCache {
         g_postLoadFramesUsed    = 0;
         g_postLoadCacheAtArm    = (uint32_t)g_cache.size();
         g_postLoadCapturesAtArm = g_captureTotal;
+        g_postLoadScoped        = false;
+        g_scopedCellsLast       = 0;
+        g_scopedFullFallback    = 0;
+        g_scopedRootExtra       = 0;
+    }
+
+    void armCrossingWalk(int oldGridX, int oldGridY) {
+        static int s_scopedOn = -1;   // MGE_SCOPED_WALK=0: a crossing gets the full window, as before P2
+        if (s_scopedOn < 0) {
+            char e[16];
+            s_scopedOn = 1;
+            if (GetEnvironmentVariableA("MGE_SCOPED_WALK", e, sizeof(e)) > 0) {
+                s_scopedOn = std::strtoul(e, nullptr, 10) != 0 ? 1 : 0;
+            }
+            LOG::logline(">> [postload-walk] crossing scope %s (MGE_SCOPED_WALK=0 = walk the whole grid)",
+                         s_scopedOn ? "ON" : "OFF");
+        }
+        // A window still open was armed by a load or an earlier crossing, and its cells are not all
+        // resident yet: the old centre's 3x3 is not a safe "already covered" set, so stay full.
+        const bool windowOpen = g_postPurgeCaptureFrames > 0;
+        armPostLoadWalk();
+        if (s_scopedOn && !windowOpen && !g_postLoadInterior) {
+            g_postLoadScoped = true;
+            g_scopeOldGX = oldGridX;
+            g_scopeOldGY = oldGridY;
+        }
     }
 
     void purgeAll() {

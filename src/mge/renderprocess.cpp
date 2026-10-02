@@ -3404,7 +3404,8 @@ namespace {
             const bool crossing = gridMoved && s_epoch == g_cellEpoch && !interiorCell && !s_cell
                                && s_epoch != 0xFFFFFFFFu;
             if (crossing) {
-                MGE::GeometryCache::armPostLoadWalk();
+                // Scoped to the cells outside the OLD centre's 3x3 (s_gx/s_gy, not yet updated).
+                MGE::GeometryCache::armCrossingWalk(s_gx, s_gy);
             }
             s_cell = interiorCell; s_gx = gx; s_gy = gy; s_epoch = g_cellEpoch;
             s_cacheSize = cacheMap.size();
