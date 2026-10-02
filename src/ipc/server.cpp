@@ -838,8 +838,13 @@ namespace IPC {
 			bytes = availBytes;
 		}
 		params.texturesUploaded = ForgeRender::uploadTextures(&vec[0], bytes, params.texCount);
-		LOG::logline(">> [tex] texUpload DONE: built %u/%u (%u bytes)",
-			params.texturesUploaded, params.texCount, bytes);
-		LOG::flush();
+		// No per-call log + FlushFileBuffers here: this RPC BLOCKS the client, and a disk sync on
+		// every one (201 on one Balmora -> Caldera walk) was paid inside its wait — the same per-call
+		// tax uploadGeometry's tail log was (tasks/forge-async-texture-stream.md). A short count is
+		// the only thing worth saying; slow calls get their split from [texup] (forgerender.cpp).
+		if (params.texturesUploaded != params.texCount) {
+			LOG::logline("!! [tex] texUpload built %u/%u (%u bytes)",
+				params.texturesUploaded, params.texCount, bytes);
+		}
 	}
 }

@@ -5994,6 +5994,18 @@ namespace RenderProcess {
         // work buys little. Names carry (N-1) because under frame-ahead the drained frame is
         // one behind MW's current frame — the plot point lands on the frame that CONSUMED it.
         g_lastHostTimings = hostT;
+        // A slow HOST frame, split. [spike] fires on the CLIENT's feed, so a host-bound frame with a
+        // small feed (the frame after a crossing: feed 12 ms, RT copy waiting 43 ms) never said where
+        // the host's time went. One line per frame whose host total or GPU frame reached 20 ms.
+        if (r.ok && (hostT.totalMs >= 20.0f || hostT.gpuFrameMs >= 20.0f)) {
+            LOG::logline("!! [host-spike] client frame %u: host total=%.2f gpuWait=%.2f | cpu setup=%.2f cull=%.2f record=%.2f post=%.2f"
+                         " | gpu frame=%.2f cull=%.2f prepass=%.2f shadow=%.2f postdepth=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f",
+                         g_frame, hostT.totalMs, hostT.gpuWaitMs,
+                         hostT.cpuSetupMs, hostT.cpuCullMs, hostT.cpuRecordMs, hostT.cpuPostMs,
+                         hostT.gpuFrameMs, hostT.gpuCullMs, hostT.gpuPrepassMs, hostT.gpuShadowMs,
+                         hostT.gpuPostDepthMs, hostT.gpuReflectMs, hostT.gpuColorMs, hostT.gpuWaterMs,
+                         hostT.gpuResolveMs);
+        }
         // T3: does the host own the world's terrain this frame? Only then may MW stop drawing its
         // own (buildGeometryDrawLists' dropMWLand). r.ok gates it because a FAILED finish leaves
         // hostT default-constructed — reading a zeroed block as "not owned" is the safe direction
