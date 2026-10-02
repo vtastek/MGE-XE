@@ -4211,12 +4211,25 @@ namespace MGE::GeometryCache {
     // verts. The clock MUST be headMorphTiming, not the global sim timestamp (~3.7M),
     // which evaluates outside the key range and zeroes the weights.
     // Runs before the walks/ensureLive so the same frame's capture sees moved verts.
+    //
+    // ⚠ EVALUATE ONLY WHEN MW's TIMING MOVED. A dialogue mod (Animated Dialogue) holds MW's clock and
+    // drives the same morpher itself — target:update{controllers, time = its own lip/blink phase} —
+    // relying on MW's display to write the verts. Re-evaluating at MW's frozen headMorphTiming here
+    // overwrote those weights every frame, so the lips moved in MW and not in the host (in-game,
+    // 2026-10-03). When the timing has not moved, the controller already holds the right weights —
+    // our own from the last time it did, or whoever drove it since — so only APPLY them. Same
+    // weights, same verts in play and behind an ordinary menu; a mod's weights reach the mesh.
     static void driveHeadMorphs() {
+        static std::unordered_map<const void*, float> s_lastTiming;   // head -> timing last evaluated at
+        if (s_lastTiming.size() > 4096) { s_lastTiming.clear(); }    // heads come and go; re-evaluates once
         forEachActorHead([](const char* anim, NI::Geometry* head) {
             const float timing = *(const float*)(anim + 0x2F4);
+            auto it = s_lastTiming.find(head);
+            const bool evaluate = (it == s_lastTiming.end()) || (it->second != timing);
+            if (evaluate) { s_lastTiming[head] = timing; }
             for (NI::TimeController* c = head->controllers; c; c = c->nextController) {
                 if (!c->isOfType(NI::RTTIStaticPtr::NiGeomMorpherController)) continue;
-                c->vTable.asController->update(c, timing);
+                if (evaluate) { c->vTable.asController->update(c, timing); }
                 c->vTable.asController->onPreDisplay(c);
             }
         });

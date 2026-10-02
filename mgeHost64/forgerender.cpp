@@ -7480,6 +7480,8 @@ namespace {
                                        // frame. Integrating (not multiplying a global clock) is what lets the
                                        // rate change — with motion/wind — without popping the waveform. Double
                                        // so it stays exact over a long session; shipped to the mask as float.
+        float    fLastI     = -1.0f;   // MW's intensity last frame — a change behind a held clock means a
+                                       // mod is animating this light (g_sceneLiveSeen, the live pause)
         float    fSpeed     = 0.0f;    // EWMA world speed of the light (units/s). A CARRIED torch flickers
                                        // harder than a wall sconce; reset on (re)assignment so a slot swap or
                                        // a teleport is never read as motion.
@@ -19152,6 +19154,17 @@ namespace {
     // object pass, the first-person object pass) and three derivations of one condition are three
     // things that can disagree — the failure this file has hit twice already.
     bool     g_mbVelFrozen = false;
+    // ⚠ A PAUSED SIM CLOCK IS NOT A STILL PICTURE. Animated Dialogue keeps posing NPCs, flickering
+    // lights and running particles from Lua while the dialogue menu holds MW's clock. The live pause
+    // (derived beside g_simDt, see "THE LIVE PAUSE") runs the host's clock on wall time then, and
+    // the blur takes fresh fields instead of the one held from the trigger frame (in-game,
+    // 2026-10-03: "the motion blur is stuck from the time of trigger"). Evidence: the world object-
+    // velocity walks (a paired mover whose matrices/palette are not last frame's bytes) and the
+    // shadow-slot loop (a light whose MW intensity changed). Read one frame late — they run after
+    // the derivation — and only counted when that frame was itself already paused.
+    bool     g_sceneLiveSeen   = false;   // this frame saw a mover move or a light's MW intensity change
+    bool     g_simLive         = false;   // THIS frame is a live pause: host clock runs on wall time
+    uint32_t g_simLiveFrames   = 0;       // live-pause frames (heartbeat window)
     // ── MB-2j: THE RECONSTRUCTION (default ON; 0 is the legacy control arm) ──────────────────
     // Two defects, one shape, both measured against GROUND TRUTH in mgeHost64/mbsynth:
     //   * a tap on the centre's OWN surface scored up to 1+1+2 = 4 against a foreground tap's 1,
@@ -35208,18 +35221,19 @@ void destroyHostWindow(Renderer* R);
                 LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
                              " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
                              " | held=%u (sim frozen — menu, blurring by the HELD field)"
+                             " live=%u (clock paused, picture animated: host clock on wall time)"
                              " | arms: recon=%d bg=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
                              " K=%u reach=%u cap=%u px dbg=%u"
                              "  [this is the frame `mb=` is priced by — cost is (searched px) x"
                              " (their taps); the sampled line above is usually a PARKED frame]",
                              g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
-                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames,
+                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames, g_simLiveFrames,
                              g_mbRecon ? 1 : 0, (int)std::min(g_mbBgMode, 2u), g_mbTwoDir ? 1 : 0,
                              g_mbObjectOnly ? 1 : 0,
                              (double)g_mbTileJitter, (double)g_mbSoftZ,
                              g_lastMbK, g_lastMbReach, g_lastMbK * g_lastMbReach, g_mbDebug);
                 g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
-                g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0;
+                g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0; g_simLiveFrames = 0;
             }
             if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
                 LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
@@ -36943,10 +36957,7 @@ void destroyHostWindow(Renderer* R);
             s_prevSimT = nowSimT;
             g_simDt = std::min(std::max(g_simDt, 0.0f), 0.1f);   // a hitch/alt-tab must not fast-forward
             g_simFrozen = (g_simDt <= 0.0f);
-            // The integral. Accumulating the CLAMPED delta is the point, not a shortcut: a hitch
-            // adds at most 0.1 s here, so a load screen cannot fast-forward the sea, the caustics
-            // and every grass imprint through the whole stall.
-            g_simClock += (double)g_simDt;
+            // (The integral, g_simClock += g_simDt, is taken BELOW the live-pause substitution.)
 
             // ⚠⚠ A MENU DOES NOT STOP MW'S SIM CLOCK CLEANLY, so `g_simFrozen` — a raw per-frame
             // delta test — FLICKERS while paused: MW ticks the clock a little on input, and every
@@ -36987,9 +36998,42 @@ void destroyHostWindow(Renderer* R);
                     }
                 }
             }
+            // ═══ THE LIVE PAUSE: MW's CLOCK IS HELD BUT THE PICTURE IS STILL BEING ANIMATED ══════════
+            // Animated Dialogue (and mods like it) hold MW's clock with the dialogue menu and go on
+            // posing the speaker, flickering lights and running particles from Lua. Everything the HOST
+            // animates on this clock — the flame phase behind light flicker and shadow sway, grass,
+            // the sea, caustics, the wake — then froze while MW's own picture kept moving (in-game,
+            // 2026-10-03: "flicker and shadow flicker are both missing in host", grass, wake, and the
+            // motion blur latched from the trigger frame). The game paused; the PRESENTATION did not.
+            //
+            // So when the clock is held (g_simHeld, the latch above — on MW's RAW clock, so this can
+            // never feed back into it) AND the previous frame, itself already paused, saw something
+            // animate (g_sceneLiveSeen: a mover's matrices/palette or a light's MW intensity not the
+            // previous frame's bytes), the host's clock advances by WALL time. In an ordinary paused
+            // menu nothing animates, every test still-snaps, and the hold is exactly what it was.
+            // ⚠ "PREVIOUS FRAME ALREADY PAUSED" IS LOAD-BEARING: the last gameplay frame before a menu
+            // is full of motion, and counting it would release the motion-blur hold on the first
+            // paused frame and latch a zero field — the paused-blur feature, deleted.
+            {
+                static bool s_prevHeld = false;
+                const bool seen = g_sceneLiveSeen;
+                g_sceneLiveSeen = false;   // this frame's walks and light loop set it again
+                g_simLive = g_simHeld && s_prevHeld && seen && g_simDt <= 0.0f;
+                s_prevHeld = g_simHeld;
+                if (g_simLive) {
+                    g_simDt = (float)std::min(g_frameDtMs * 0.001, 0.1);
+                    g_simFrozen = (g_simDt <= 0.0f);
+                    ++g_simLiveFrames;
+                }
+            }
+            // The integral. Accumulating the CLAMPED delta is the point, not a shortcut: a hitch
+            // adds at most 0.1 s here, so a load screen cannot fast-forward the sea, the caustics
+            // and every grass imprint through the whole stall.
+            g_simClock += (double)g_simDt;
             // MB-2m, derived here so every producer this frame reads ONE answer. g_lastMbRan is the
             // PREVIOUS frame's, which is the point: freeze only onto a field a real blur just used.
-            g_mbVelFrozen = g_simHeld && g_mbEnable && g_live.mbReady && g_lastMbRan;
+            // Not on a live pause: the picture is moving, so the blur takes this frame's field.
+            g_mbVelFrozen = g_simHeld && !g_simLive && g_mbEnable && g_live.mbReady && g_lastMbRan;
         }
 
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
@@ -38102,7 +38146,10 @@ void destroyHostWindow(Renderer* R);
         // exactly how a shadow detaches from its blade). g_uvAnimSimT is MW's raw simulation seconds,
         // frozen in menus like the rest of the sim clock; publishGrassParams does the 2*pi wrap.
         if (g_live.pShadowMaskParamsCbv && fbr(g_live.pShadowMaskParamsCbv)) {
-            publishGrassParams((float*)fbw(g_live.pShadowMaskParamsCbv), g_uvAnimSimT);
+            // g_simClock, not MW's raw sim time: the same clock in play (minus the hitch clamp), and the
+            // one that keeps running through a LIVE PAUSE (see g_simLive) so the grass sways while a
+            // dialogue mod animates the scene; still held behind an ordinary menu.
+            publishGrassParams((float*)fbw(g_live.pShadowMaskParamsCbv), g_simClock);
         }
         // Panel readout. The gate is one float and disarms every receiver silently, so say out loud
         // whether it fired and what sky is being projected — a DC that moves with the weather is the
@@ -38692,6 +38739,13 @@ void destroyHostWindow(Renderer* R);
                         }
                     }
                 }
+                // Live-pause evidence (see g_simLive): MW's own intensity for this light moved between
+                // two contiguous sightings. Only meaningful behind a held clock, where MW itself animates
+                // nothing — the derivation only reads it then.
+                if (sl.lastSeenFrame + 1 == frame && sl.fLastI >= 0.0f && L.intensity != sl.fLastI) {
+                    g_sceneLiveSeen = true;
+                }
+                sl.fLastI = L.intensity;
                 sl.absPos[0] = ax; sl.absPos[1] = ay; sl.absPos[2] = az;
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.lastSeenFrame = frame; sl.activeThisFrame = true; sl.curLightIdx = L.idx;
@@ -42751,6 +42805,8 @@ void destroyHostWindow(Renderer* R);
                             // is 'still' means the pass is drawing things it has no reason to.
                             std::memcpy(pw, it.world, 64);
                             ++ovStill;
+                        } else {
+                            g_sceneLiveSeen = true;
                         }
 
                         // ⚠ THE ARENA DIVIDE IS SAFE FOR MULTIMAP WITHOUT A SECOND CASE, and that
@@ -43081,6 +43137,8 @@ void destroyHostWindow(Renderer* R);
                                 // their difference is identically 0.0f.
                                 std::memcpy(dst, cur, (size_t)bones * 64);
                                 ++ovsStill;
+                            } else {
+                                g_sceneLiveSeen = true;
                             }
 
                             const uint32_t inst = (uint32_t)s_objVelSkin.size();
