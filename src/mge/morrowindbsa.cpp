@@ -120,6 +120,18 @@ void init() {
     FindClose(h);
 }
 
+// readAt - Read `size` bytes at `position` of an archive. POSITIONAL: the offset rides the OVERLAPPED,
+// so no seek pointer is shared between callers and concurrent reads of one archive handle are safe
+// (on a synchronous handle the call still completes before returning). The old SetFilePointer +
+// ReadFile pair raced on the handle's file position, which is why every caller had to hold
+// RenderProcess's g_texResidencyMx around a read (tasks/forge-crossing-frame.md P1).
+static bool readAt(HANDLE file, DWORD position, void* dst, DWORD size) {
+    OVERLAPPED ov = {};
+    ov.Offset = position;
+    DWORD bytesRead = 0;
+    return ReadFile(file, dst, size, &bytesRead, &ov) && bytesRead == size;
+}
+
 // loadFile - Read a single file into memory, identified by hash only
 static EntryData BSALoadFile(BSAHash3 hash) {
     auto it = cacheMap.find(hash.LValue);
@@ -129,16 +141,33 @@ static EntryData BSALoadFile(BSAHash3 hash) {
 
     const CacheEntry& entry = it->second;
     auto buf = std::make_unique<char[]>(entry.size);
-    DWORD bytesRead;
-
-    SetFilePointer(entry.file, entry.position, 0, FILE_BEGIN);
-    ReadFile(entry.file, buf.get(), entry.size, &bytesRead, 0);
-
-    if (bytesRead == entry.size) {
+    if (readAt(entry.file, entry.position, buf.get(), entry.size)) {
         return EntryData { std::move(buf), entry.size };
     } else {
         return EntryData();
     }
+}
+
+// BSALoadFileMalloc - The same read, straight into a malloc'd buffer the caller frees: the raw-bytes
+// loaders used to read into BSALoadFile's buffer and then copy all of it again (a 21 MB 4K map: a
+// second 21 MB allocation and copy per read).
+static bool BSALoadFileMalloc(BSAHash3 hash, void** outData, unsigned* outSize) {
+    auto it = cacheMap.find(hash.LValue);
+    if (it == cacheMap.end()) {
+        return false;
+    }
+    const CacheEntry& entry = it->second;
+    void* buf = std::malloc(entry.size);
+    if (!buf) {
+        return false;
+    }
+    if (!readAt(entry.file, entry.position, buf, entry.size)) {
+        std::free(buf);
+        return false;
+    }
+    *outData = buf;
+    *outSize = entry.size;
+    return true;
 }
 
 // loadTextureExact - Attempt to load a texture from a prioritized list of sources.
@@ -264,18 +293,7 @@ static bool loadFileBytesExact(const char* filename, void** outData, unsigned* o
     }
 
     // BSAs
-    BSAHash3 hash = hashString(filename);
-    EntryData ed = BSALoadFile(hash);
-    if (ed.valid()) {
-        void* buf = std::malloc(ed.size);
-        if (!buf) { return false; }
-        std::memcpy(buf, ed.data.get(), ed.size);
-        *outData = buf;
-        *outSize = ed.size;
-        return true;
-    }
-
-    return false;
+    return BSALoadFileMalloc(hashString(filename), outData, outSize);
 }
 
 // loadFileBytes - Public raw-bytes loader, mirrors loadTexture's prefix + .dds substitution.

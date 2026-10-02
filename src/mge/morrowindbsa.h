@@ -20,6 +20,8 @@ namespace BSA {
     // skipDistantStatics: when true, do NOT prefer the distantland\statics LOD folder (its
     // downscaled copies blur near geometry); resolve loose Data Files -> BSA like the engine's
     // near renderer. The Forge near-texturing path passes true.
+    // THREAD-SAFE after init() (as are fileExists and loadDistantLodBytes): the BSA index is read-only
+    // and archive reads are positional, so callers need no lock around a read.
     bool loadFileBytes(const char* filename, void** outData, unsigned* outSize, bool skipDistantStatics = false);
 
     // Would loadFileBytes(filename, ..., skipDistantStatics) find it? Same name substitution and

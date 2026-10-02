@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <deque>
+#include <memory>
 #include <new>
 #include <optional>
 #include <string>
@@ -1104,6 +1105,184 @@ namespace {
     std::uint64_t                             g_texEvictions = 0;   // session totals
     std::uint64_t                             g_texEvictedBytes = 0;
 
+    // ---- Texture I/O thread (tasks/forge-crossing-frame.md P1) -----------------------------------
+    // The frame after a crossing spent 13-17 ms of the BUILD (which main's waitProduce blocks on in
+    // park mode) reading texture files: the stream lane's full files (~4.5 ms read + ~5 ms copying
+    // each into a fresh vector) and the prefetch drain's first sights (a 2 ms read cap, 4.5-6 ms
+    // measured). None of those bytes is needed THIS frame. So one thread reads them ahead and the
+    // build only takes reads that have FINISHED: stream entries gather straight from the read buffer
+    // into the stream window, prefetch resolves hand their bytes to resolveTextureSlotEx.
+    //
+    // The thread touches no residency state and takes no residency lock; BSA reads are positional
+    // (BSA::readAt), so they need none. A request is a refcounted TexIoRead: whoever drops the last
+    // ref (a consumer, or the thread finding the request abandoned) frees the bytes. Bytes read but
+    // not yet consumed are capped (kTexIoMaxHeldBytes): this is a 32-bit process, and an unbounded
+    // read-ahead of 21 MB 4K maps would be the content-sized buffer again
+    // ([[feedback_content_sized_staging_buffer]]). MGE_TEX_IO_THREAD=0 = read inline in the build.
+    struct FirstSightBytes {
+        void*    data = nullptr;   // malloc'd: the full file, or the LOD placeholder when `deferred`
+        unsigned size = 0;
+        bool     deferred = false; // the full file streams later (data = placeholder, or null)
+        bool     found = false;    // false = a miss (the slot goes white)
+    };
+    // resolveTextureSlotEx's first-sight read, factored out so it can run on any thread: the
+    // placeholder decision (deferAllowed) is made by the caller under the residency lock and carried.
+    FirstSightBytes readFirstSight(const std::string& name, bool dataTexture, bool deferAllowed) {
+        FirstSightBytes r;
+        if (deferAllowed) {
+            // The LOD library carries the PBR companions too since 2026-09-20, so a _paramh can have
+            // a stand-in like any base map. Bakes made before that have none, and a param map then
+            // defers with nothing to show.
+            r.deferred = BSA::loadDistantLodBytes(name.c_str(), &r.data, &r.size) && r.data && r.size > 0;
+            if (!r.deferred && r.data) { std::free(r.data); r.data = nullptr; r.size = 0; }
+            if (!r.deferred && dataTexture) {
+                r.deferred = BSA::fileExists(name.c_str(), true);
+            }
+        }
+        if (r.deferred) {
+            r.found = true;
+            return r;
+        }
+        // skipDistantStatics=true: the Forge near path must NOT pick the distantland\statics
+        // downscaled-LOD copies (they blur near geometry) — resolve loose Data Files -> BSA.
+        if (BSA::loadFileBytes(name.c_str(), &r.data, &r.size, true) && r.data && r.size > 0) {
+            r.found = true;
+        } else {
+            if (r.data) { std::free(r.data); }
+            r.data = nullptr;
+            r.size = 0;
+        }
+        return r;
+    }
+
+    constexpr std::uint64_t kTexIoMaxHeldBytes = 48ull << 20;
+    struct TexIoRead {
+        enum Kind : std::uint8_t { kFull, kFirstSight };
+        std::string       name;
+        Kind              kind = kFull;
+        bool              dataTexture = false;   // kFirstSight only
+        bool              deferAllowed = false;  // kFirstSight only: the decision the read was made under
+        FirstSightBytes   r;                     // kFull: data/size/found only
+        std::atomic<bool> done{ false };
+        ~TexIoRead();
+    };
+    using TexIoHandle = std::shared_ptr<TexIoRead>;
+
+    class TexIo {
+    public:
+        bool on() const { return m_thread.joinable(); }
+        void start() {
+            if (on()) { return; }
+            m_stop = false;
+            m_thread = std::thread([this] { run(); });
+        }
+        void stop() {
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                m_stop = true;
+                // Complete what never ran as a failed read, so no consumer still holding one waits on it
+                // forever (the stream stage stops at an unfinished head).
+                for (auto& q : m_queue) { q->done.store(true, std::memory_order_release); }
+                m_queue.clear();
+            }
+            m_cv.notify_all();
+            if (m_thread.joinable()) { m_thread.join(); }
+        }
+        ~TexIo() {
+            // Normal teardown stops the thread in RenderProcess::shutdown. If that never ran, a joinable
+            // std::thread here would std::terminate, and joining under the loader lock can deadlock.
+            if (m_thread.joinable()) { m_thread.detach(); }
+        }
+        // Queue a read. With the thread off, read it now (MGE_TEX_IO_THREAD=0: today's inline reads).
+        TexIoHandle submit(std::string name, TexIoRead::Kind kind, bool dataTexture = false, bool deferAllowed = false) {
+            auto h = std::make_shared<TexIoRead>();
+            h->name = std::move(name);
+            h->kind = kind;
+            h->dataTexture = dataTexture;
+            h->deferAllowed = deferAllowed;
+            if (!on()) {
+                read(*h);
+                return h;
+            }
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                m_queue.push_back(h);
+            }
+            m_cv.notify_one();
+            return h;
+        }
+        void release(std::uint64_t bytes) {
+            m_held.fetch_sub(bytes);
+            m_cv.notify_one();
+        }
+        // Session totals for the [tex-stream] line.
+        std::atomic<std::uint64_t> reads{ 0 }, readBytes{ 0 }, abandoned{ 0 }, heldPeak{ 0 };
+        std::atomic<double>        readMs{ 0.0 };
+
+    private:
+        void read(TexIoRead& q) {
+            MGE_ZoneScopedN("tex:io read");
+            const auto t0 = std::chrono::steady_clock::now();
+            if (q.kind == TexIoRead::kFull) {
+                q.r.found = BSA::loadFileBytes(q.name.c_str(), &q.r.data, &q.r.size, true) && q.r.data && q.r.size > 0;
+                if (!q.r.found && q.r.data) { std::free(q.r.data); q.r.data = nullptr; q.r.size = 0; }
+            } else {
+                q.r = readFirstSight(q.name, q.dataTexture, q.deferAllowed);
+            }
+            if (q.r.data) {
+                const std::uint64_t held = m_held.fetch_add(q.r.size) + q.r.size;
+                std::uint64_t peak = heldPeak.load();
+                while (held > peak && !heldPeak.compare_exchange_weak(peak, held)) {}
+            }
+            reads.fetch_add(1);
+            readBytes.fetch_add(q.r.size);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            double cur = readMs.load();
+            while (!readMs.compare_exchange_weak(cur, cur + ms)) {}
+            q.done.store(true, std::memory_order_release);
+        }
+        void run() {
+            for (;;) {
+                TexIoHandle q;
+                {
+                    std::unique_lock<std::mutex> lk(m_mx);
+                    // Back-pressure: hold off the next read while the unconsumed bytes are over the cap.
+                    m_cv.wait(lk, [this] { return m_stop || (!m_queue.empty() && m_held.load() < kTexIoMaxHeldBytes); });
+                    if (m_stop) { return; }
+                    q = std::move(m_queue.front());
+                    m_queue.pop_front();
+                }
+                if (q.use_count() == 1) {
+                    abandoned.fetch_add(1);   // its job was dropped while it waited: nobody wants the bytes
+                    q->done.store(true, std::memory_order_release);
+                    continue;
+                }
+                read(*q);
+            }
+        }
+        std::thread                 m_thread;
+        std::mutex                  m_mx;
+        std::condition_variable     m_cv;
+        std::deque<TexIoHandle>     m_queue;
+        std::atomic<std::uint64_t>  m_held{ 0 };
+        bool                        m_stop = false;
+    };
+    TexIo g_texIo;   // defined BEFORE every queue holding a TexIoHandle: destroyed after them
+    TexIoRead::~TexIoRead() {
+        if (r.data) {
+            std::free(r.data);
+            g_texIo.release(r.size);
+        }
+    }
+    // Take a finished read's bytes out of its handle (the caller now owns and frees them).
+    inline FirstSightBytes takeBytes(TexIoRead& q) {
+        FirstSightBytes r = q.r;
+        if (q.r.data) { g_texIo.release(q.r.size); }
+        q.r.data = nullptr;
+        q.r.size = 0;
+        return r;
+    }
+
     // FIRST-SIGHT STREAMING (user, 2026-09-20: "same texture is already in DL and it can just be
     // reused until real texture is loaded, without a stall or hitch"). A cell load or a door used to
     // resolve 100-370 MB of textures in ONE frame and ship them in one blocking flush (texflush 50-105
@@ -1119,6 +1298,7 @@ namespace {
         std::uint32_t slot;
         std::string   name;
         bool          data;   // a _paramh: upload with kTexUploadData
+        TexIoHandle   io;     // its full-file read, once the stream lane has asked for it (P1)
     };
     std::deque<TexStreamJob>                  g_texStreamQueue;
     // A streamed texture's full file goes into a FRESH slot, not over its placeholder: the host is
@@ -1193,6 +1373,8 @@ namespace {
     struct GridTexJob {
         std::string name;   // normalized; for a param job, the base STEM
         bool        param;  // try <stem>_paramh.dds, then <stem>_paramh_np.dds (resolveParamSlot's order)
+        TexIoHandle io;     // its first-sight read (P1); for a param job, the _paramh one
+        TexIoHandle io2;    // param job only: the _paramh_np read
     };
     std::deque<GridTexJob>                    g_gridTexQueue;       // produce-owned
     std::unordered_set<std::string>           g_gridTexPins;        // under g_texResidencyMx
@@ -1235,7 +1417,10 @@ namespace {
     void flushGeometry();
     void flushTextures();
     std::uint32_t resolveTextureSlot(const char* textureName);
-    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss);
+    // supplied: a FINISHED first-sight read of this name (the prefetch's, off the I/O thread); its bytes
+    // are used instead of reading, when it was made under the same placeholder decision.
+    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss,
+                                       TexIoRead* supplied = nullptr);
 
     // --- DXVK Vulkan-interop seam ---
     // MW's MAIN device is DXVK (Vulkan-backed). DXVK exposes ID3D9VkInteropDevice, which
@@ -2262,6 +2447,20 @@ namespace {
         }
         LOG::logline(">> [tex-stream] async lane %s (MGE_TEX_STREAM_ASYNC=0 = full files in the sync flush)",
                      g_texStreamVec ? "ON" : "OFF");
+        // The texture I/O thread (see TexIo). It reads ahead for the stream lane and the prefetch, so
+        // with neither on it has nothing to do.
+        {
+            bool ioOn = true;
+            char e[16] = {};
+            if (GetEnvironmentVariableA("MGE_TEX_IO_THREAD", e, sizeof(e)) > 0) {
+                ioOn = std::strtoul(e, nullptr, 10) != 0;
+            }
+            if (ioOn && (g_texStreamBudgetMB != 0 || g_gridPrefetchMB != 0)) {
+                g_texIo.start();
+            }
+            LOG::logline(">> [tex-io] texture I/O thread %s (MGE_TEX_IO_THREAD=0 = reads inline in the build)",
+                         g_texIo.on() ? "ON" : "OFF");
+        }
     }
 
     // Normalize an NI SourceTexture::fileName to the bare name BSA::loadFileBytes expects
@@ -2331,7 +2530,8 @@ namespace {
     // quietMiss: a miss is the EXPECTED answer (probing for a companion file most textures do not
     //   have), so it must not spend the 20-line "not found (white)" budget — which exists to
     //   surface textures that SHOULD resolve — on files that were never there.
-    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss) {
+    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss,
+                                       TexIoRead* supplied) {
         if (!textureName || !*textureName || !g_texVec) {
             return 0;
         }
@@ -2340,50 +2540,64 @@ namespace {
             return 0;
         }
         // Serialise the whole residency mutation against the other thread (see g_texResidencyMx).
-        // The BSA disk load below runs under the lock — bounded (first-sight only), no IPC involved.
-        std::lock_guard<std::mutex> lk(g_texResidencyMx);
+        // ⚠ NOT ACROSS THE DISK READ (P1, tasks/forge-crossing-frame.md). It used to be: the build's
+        // first sights and the prefetch drain held the lock through every read, so main's
+        // captureAlphaDraw waited on the worker's disk I/O. BSA reads are positional now and need no
+        // lock, so the lookup takes the lock, the read runs without it, and the assignment takes it
+        // again and RE-CHECKS: the other thread may have resolved the same name meanwhile, and then
+        // its slot wins and these bytes are dropped.
         const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;   // client range [1, cap)
-        if (g_slotName.size() != IPC::kMaxTextures) {
-            g_slotName.assign(IPC::kMaxTextures, std::string());
-            g_slotLastUsed.assign(IPC::kMaxTextures, 0u);
-            g_slotBytes.assign(IPC::kMaxTextures, 0u);
-            g_slotStagedBatch.assign(IPC::kMaxTextures, 0u);
-        }
-        auto it = g_texSlot.find(name);
-        if (it != g_texSlot.end()) {
+        auto lookup = [&](std::uint32_t* out) {
+            if (g_slotName.size() != IPC::kMaxTextures) {
+                g_slotName.assign(IPC::kMaxTextures, std::string());
+                g_slotLastUsed.assign(IPC::kMaxTextures, 0u);
+                g_slotBytes.assign(IPC::kMaxTextures, 0u);
+                g_slotStagedBatch.assign(IPC::kMaxTextures, 0u);
+            }
+            auto it = g_texSlot.find(name);
+            if (it == g_texSlot.end()) { return false; }
             // A flip-book frame resolves to an ENCODED array slot, not an index into the LRU range —
             // subscripting g_slotLastUsed with it would run ~0x8000 past the end. Array-backed
             // textures are resident for the session and never recycled, so they have no LRU age.
             if (it->second != 0 && !IPC::isFlipSlot(it->second)) {
                 g_slotLastUsed[it->second] = g_frame;   // refresh LRU age
             }
-            return it->second;   // already resolved (slot, encoded flip slot, or cached-miss 0)
-        }
-
-        void* data = nullptr;
-        unsigned size = 0;
+            *out = it->second;   // already resolved (slot, encoded flip slot, or cached-miss 0)
+            return true;
+        };
         // First-sight streaming (see g_texStreamQueue): a texture the DL bake has a LOD copy of goes
         // in as that copy now and streams its full file later; a _paramh that exists is deferred with
-        // nothing to show. Both skip the full read here, which is the whole point.
-        bool deferred = false;
-        if (g_texStreamBudgetMB != 0 && g_frame != g_texSyncFrame) {   // a load's first build: full files
-            // The LOD library carries the PBR companions too since 2026-09-20, so a _paramh can have
-            // a stand-in like any base map — that is the difference between PBR being THERE at low
-            // resolution and PBR switching on a frame later. Bakes made before that have none, and a
-            // param map then falls back to deferring with nothing to show.
-            deferred = BSA::loadDistantLodBytes(name.c_str(), &data, &size) && data && size > 0;
-            if (!deferred && data) { std::free(data); data = nullptr; size = 0; }
-            if (!deferred && dataTexture) {
-                deferred = BSA::fileExists(name.c_str(), true);
+        // nothing to show. Both skip the full read here, which is the whole point. A load's first
+        // build (g_texSyncFrame) reads full files.
+        bool deferAllowed;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            std::uint32_t known = 0;
+            if (lookup(&known)) { return known; }
+            deferAllowed = g_texStreamBudgetMB != 0 && g_frame != g_texSyncFrame;
+        }
+        FirstSightBytes r;
+        if (supplied && supplied->done.load(std::memory_order_acquire) && supplied->deferAllowed == deferAllowed
+            && supplied->dataTexture == dataTexture && supplied->name == name) {
+            r = takeBytes(*supplied);
+        } else {
+            r = readFirstSight(name, dataTexture, deferAllowed);
+        }
+        void* data = r.data;
+        unsigned size = r.size;
+        const bool deferred = r.deferred;
+
+        std::lock_guard<std::mutex> lk(g_texResidencyMx);
+        {
+            std::uint32_t known = 0;
+            if (lookup(&known)) {
+                if (data) { std::free(data); }
+                return known;
             }
         }
-        // skipDistantStatics=true: the Forge near path must NOT pick the distantland\statics
-        // downscaled-LOD copies (they blur near geometry) — resolve loose Data Files -> BSA. (The
-        // placeholder above is the one sanctioned exception, and only until the real file lands.)
-        if (!deferred && (!BSA::loadFileBytes(name.c_str(), &data, &size, true) || !data || size == 0)) {
+        if (!r.found) {
             static int misses = 0;
             if (!quietMiss && misses < 20) { LOG::logline("!! [tex] not found: %s (white)", name.c_str()); ++misses; }
-            if (data) { std::free(data); }
             g_texSlot.emplace(name, 0);
             return 0;
         }
@@ -2769,9 +2983,9 @@ namespace {
     // Ship queued full textures (see g_texStreamQueue) into their slots, at most g_texStreamBudgetMB
     // per frame and always at least one, so a single 21 MB 4K map cannot starve behind the budget.
     // Called at the end of the BUILD (worker in the async modes, never the park fire on main), so the
-    // disk reads land where the draw-list build already pays for first-sight reads. The BSA reads stay
-    // under g_texResidencyMx: every BSA read shares one file handle per archive, and its seek position
-    // is not thread-safe — main's captureAlphaDraw resolves through the same loader under this lock.
+    // disk reads land where the draw-list build already pays for first-sight reads. (This sync path —
+    // MGE_TEX_STREAM_ASYNC=0 — still reads under g_texResidencyMx. That is no longer REQUIRED: BSA reads
+    // are positional since P1, so concurrent readers do not share a seek position.)
     // Placeholder slots whose name moved off kTexColdFrames ago: no draw list in flight names them
     // now. Release on the host (cold: no wait) and hand them back to the pool. Caller holds
     // g_texResidencyMx.
@@ -2925,15 +3139,21 @@ namespace {
     //      name to the fresh slot (the old slot retires kTexColdFrames later, as before). Landed but
     //      the placeholder was evicted/recycled meanwhile -> release the fresh slot. Not landed -> the
     //      fresh slot goes back untouched and the placeholder stays (degraded, never broken).
-    //   2. STAGE the next batch only when none is in flight: BSA reads under the lock as before, fresh
-    //      slots RESERVED (never named until confirmed), then — outside the lock — one gather into the
-    //      stream window and a non-blocking kick.
+    //   2. READ AHEAD: the queue's head reads on the I/O thread (TexIo), every call, in flight or not.
+    //   3. STAGE the next batch only when none is in flight, from FINISHED reads only, in queue order
+    //      (an unfinished head ends the batch): fresh slots RESERVED (never named until confirmed), then
+    //      — outside the lock — one gather of header + read buffer into the stream window and a
+    //      non-blocking kick. With MGE_TEX_IO_THREAD=0 the stage reads inline, as before.
     void streamPendingTexturesAsync() {
         MGE_ZoneScopedN("tex:stream");
         const std::size_t budget = (std::size_t)g_texStreamBudgetMB << 20;
         const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
         static std::vector<std::pair<std::uint32_t, std::uint32_t>> s_moved;
-        static std::vector<std::vector<std::uint8_t>> s_entries;   // the next batch, [TexUploadWire][dds]
+        // The next batch: each entry is its header plus the read that holds its bytes, gathered as two
+        // parts straight into the stream window — no intermediate [TexUploadWire][dds] vector (that copy,
+        // with its zero-fill, was ~5 ms per 21 MB map). Index i matches g_texStreamFlight[i].
+        struct BatchEntry { IPC::TexUploadWire hdr; TexIoHandle io; };
+        static std::vector<BatchEntry> s_entries;
         s_moved.clear();
         s_entries.clear();
         std::uint32_t confirmed = 0, failed = 0, stale = 0, shipped = 0, dropped = 0, inPlace = 0;
@@ -2997,6 +3217,17 @@ namespace {
             g_texStreamFlight.clear();
         }
 
+        // --- Read-ahead (P1): the head of the queue reads on the I/O thread while a batch is in flight
+        // or the window is busy, so the stage below finds finished reads instead of doing them. ---
+        if (g_texIo.on()) {
+            constexpr std::size_t kStreamReadAhead = 8;
+            std::size_t n = 0;
+            for (TexStreamJob& job : g_texStreamQueue) {
+                if (n++ >= kStreamReadAhead) { break; }
+                if (!job.io) { job.io = g_texIo.submit(job.name, TexIoRead::kFull); }
+            }
+        }
+
         // --- 2. The next batch ---
         if (!notReady && !g_client->streamUploadPending() && g_texStreamFlight.empty()) {
             MGE_ZoneScopedN("tex:stream stage");
@@ -3004,34 +3235,36 @@ namespace {
             std::size_t windowUsed = 0;
             while (!g_texStreamQueue.empty() && g_texStreamFlight.size() < IPC::kMaxStreamBatch
                    && (shipped + inPlace == 0 || staged < budget)) {
-                TexStreamJob job = std::move(g_texStreamQueue.front());
-                g_texStreamQueue.pop_front();
-                if (job.slot >= g_slotName.size() || g_slotName[job.slot] != job.name) {
+                TexStreamJob& head = g_texStreamQueue.front();
+                if (head.slot >= g_slotName.size() || g_slotName[head.slot] != head.name) {
+                    g_texStreamQueue.pop_front();   // drops its read too (abandoned if not started)
                     ++dropped;   // evicted or recycled while it waited
                     continue;
                 }
-                void* data = nullptr;
-                unsigned size = 0;
-                bool loaded;
-                {
-                    MGE_ZoneScopedN("tex:stream read");
-                    loaded = BSA::loadFileBytes(job.name.c_str(), &data, &size, true);
+                if (head.io && !head.io->done.load(std::memory_order_acquire)) {
+                    break;   // its read is still running: the batch goes with what is ready, in order
                 }
-                if (!loaded || !data || size == 0
-                    || sizeof(IPC::TexUploadWire) + size > windowBytes) {
+                TexStreamJob job = std::move(head);
+                g_texStreamQueue.pop_front();
+                if (!job.io) {
+                    // I/O thread off (MGE_TEX_IO_THREAD=0): read inline, as before P1.
+                    MGE_ZoneScopedN("tex:stream read");
+                    job.io = g_texIo.submit(job.name, TexIoRead::kFull);
+                }
+                const unsigned size = job.io->r.size;
+                if (!job.io->r.found || sizeof(IPC::TexUploadWire) + size > windowBytes) {
                     static std::uint32_t s_loadLogged = 0;
                     if (s_loadLogged++ < 8) {
                         LOG::logline("!! [tex-stream] full file for %s did not load (%u bytes) — keeping %s",
                                      job.name.c_str(), size, job.data ? "no param map" : "the LOD placeholder");
                     }
-                    if (data) { std::free(data); }
                     ++dropped;
                     continue;
                 }
+                const void* data = job.io->r.data;
                 const std::size_t entryBytes = sizeof(IPC::TexUploadWire) + size;
                 if (windowUsed + entryBytes > windowBytes) {
-                    // The window is full: this one leads the next batch.
-                    std::free(data);
+                    // The window is full: this one (and its finished read) leads the next batch.
                     g_texStreamQueue.push_front(std::move(job));
                     break;
                 }
@@ -3061,26 +3294,11 @@ namespace {
                         ++g_texStreamed;
                         g_texStreamedBytes += size;
                     }
-                    std::free(data);
-                    continue;
+                    continue;   // the read's bytes go with its handle
                 }
-                bool ok = true;
-                try {
-                    std::vector<std::uint8_t> entry(entryBytes);
-                    const IPC::TexUploadWire hdr{ slot | (job.data ? IPC::kTexUploadData : 0u)
-                                                  | IPC::kTexUploadCold, size, 0u };
-                    std::memcpy(entry.data(), &hdr, sizeof(hdr));
-                    std::memcpy(entry.data() + sizeof(hdr), data, size);
-                    s_entries.push_back(std::move(entry));
-                } catch (const std::bad_alloc&) {
-                    ok = false;
-                }
-                std::free(data);
-                if (!ok) {
-                    g_texFreeSlots.push_back(slot);
-                    g_texStreamQueue.push_front(std::move(job));   // retry once memory allows
-                    break;
-                }
+                const IPC::TexUploadWire hdr{ slot | (job.data ? IPC::kTexUploadData : 0u)
+                                              | IPC::kTexUploadCold, size, 0u };
+                s_entries.push_back(BatchEntry{ hdr, job.io });
                 g_slotLastUsed[slot] = 0xFFFFFFFFu;   // RESERVED: no name, out of the free list and the LRU
                 g_texStreamFlight.push_back(TexStreamFlight{ job.slot, slot, std::move(job.name), size, job.data });
                 windowUsed += entryBytes;
@@ -3101,39 +3319,51 @@ namespace {
             partSizes.clear();
             std::size_t bytes = 0;
             for (const auto& e : s_entries) {
-                parts.push_back(e.data());
-                partSizes.push_back((std::uint32_t)e.size());
-                bytes += e.size();
+                parts.push_back(&e.hdr);
+                partSizes.push_back((std::uint32_t)sizeof(e.hdr));
+                parts.push_back(e.io->r.data);
+                partSizes.push_back(e.io->r.size);
+                bytes += sizeof(e.hdr) + e.io->r.size;
             }
             MGE_ZoneScopedN("Forge texStream kick");
+            // The entry count is what the host walks: one per texture, not per gathered part.
             kicked = g_texStreamVec->assign_gather(parts.data(), partSizes.data(), (std::uint32_t)parts.size())
-                  && g_client->streamUploadKick(g_texStreamVec->id(), (std::uint32_t)parts.size(), (std::uint32_t)bytes);
+                  && g_client->streamUploadKick(g_texStreamVec->id(), (std::uint32_t)s_entries.size(), (std::uint32_t)bytes);
             if (kicked) {
                 ++g_texStreamBatches;
             } else {
-                // Could not hand it over: undo the reservations and put the jobs back, in order.
+                // Could not hand it over: undo the reservations and put the jobs back, in order, with
+                // their finished reads (s_entries[i] is g_texStreamFlight[i]).
                 std::lock_guard<std::mutex> lk2(g_texResidencyMx);
-                for (auto it = g_texStreamFlight.rbegin(); it != g_texStreamFlight.rend(); ++it) {
-                    unreserveStreamSlot(it->newSlot, false);
-                    g_texStreamQueue.push_front(TexStreamJob{ it->oldSlot, std::move(it->name), it->data });
+                for (std::size_t i = g_texStreamFlight.size(); i-- > 0;) {
+                    TexStreamFlight& f = g_texStreamFlight[i];
+                    unreserveStreamSlot(f.newSlot, false);
+                    g_texStreamQueue.push_front(TexStreamJob{ f.oldSlot, std::move(f.name), f.data,
+                                                              i < s_entries.size() ? s_entries[i].io : TexIoHandle{} });
                 }
                 g_texStreamFlight.clear();
                 static std::uint32_t s_kickLogged = 0;
                 if (s_kickLogged++ < 8) {
                     LOG::logline("!! [tex-stream] stream kick failed (%zu entries, %zu bytes) — requeued",
-                                 parts.size(), bytes);
+                                 s_entries.size(), bytes);
                 }
             }
+            s_entries.clear();   // the window holds the bytes now (or the requeued jobs do): free the reads
         }
         if (confirmed || failed || stale || shipped || dropped || inPlace) {
             static std::uint32_t s_logThrottle = 0;
             if ((s_logThrottle++ % 30) == 0 || (queued == 0 && !kicked) || failed || stale) {
                 LOG::logline("-- [tex-stream] async: confirmed %u, failed %u, stale %u | kicked %u (%.1f MB), %u in place,"
-                             " %u dropped, %zu queued | session: %llu batches, %llu confirmed, %llu failed, %llu stale",
+                             " %u dropped, %zu queued | session: %llu batches, %llu confirmed, %llu failed, %llu stale"
+                             " | io %s: %llu reads %.0f MB %.0f ms, %llu abandoned, held peak %.0f MB",
                              confirmed, failed, stale, kicked ? shipped : 0u, (double)staged / (1024.0 * 1024.0),
                              inPlace, dropped, queued,
                              (unsigned long long)g_texStreamBatches, (unsigned long long)g_texStreamConfirmed,
-                             (unsigned long long)g_texStreamFailed, (unsigned long long)g_texStreamStale);
+                             (unsigned long long)g_texStreamFailed, (unsigned long long)g_texStreamStale,
+                             g_texIo.on() ? "thread" : "inline", (unsigned long long)g_texIo.reads.load(),
+                             (double)g_texIo.readBytes.load() / (1024.0 * 1024.0), g_texIo.readMs.load(),
+                             (unsigned long long)g_texIo.abandoned.load(),
+                             (double)g_texIo.heldPeak.load() / (1024.0 * 1024.0));
             }
         }
     }
@@ -3270,14 +3500,43 @@ namespace {
         if (g_gridTexQueue.empty()) {
             return;
         }
-        // --- Drain: resolve until this frame has staged the budget, or spent its disk-read time. ---
+        // --- Drain: resolve until this frame has staged the budget, or spent its time cap. ---
         MGE_ZoneScopedN("tex:prefetch drain");
         const std::size_t budget = (std::size_t)g_gridPrefetchMB << 20;
         const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
+        // P1: with the I/O thread on, the reads run AHEAD of the drain — the head of the queue is
+        // submitted every frame, and the drain only resolves jobs whose reads have finished, in queue
+        // order. The time cap then bounds staging copies, not disk reads. The placeholder decision a
+        // read is made under is this frame's; a read made under the other one (a load's sync frame in
+        // between) is simply redone inline by the resolve.
+        bool deferAllowed;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            deferAllowed = g_texStreamBudgetMB != 0 && g_frame != g_texSyncFrame;
+        }
+        if (g_texIo.on()) {
+            constexpr std::size_t kPrefetchReadAhead = 16;
+            std::size_t n = 0;
+            for (GridTexJob& j : g_gridTexQueue) {
+                if (n++ >= kPrefetchReadAhead) { break; }
+                if (j.io) { continue; }
+                if (j.param) {
+                    j.io  = g_texIo.submit(j.name + "_paramh.dds",    TexIoRead::kFirstSight, true, deferAllowed);
+                    j.io2 = g_texIo.submit(j.name + "_paramh_np.dds", TexIoRead::kFirstSight, true, deferAllowed);
+                } else {
+                    j.io  = g_texIo.submit(j.name, TexIoRead::kFirstSight, false, deferAllowed);
+                }
+            }
+        }
+        auto ready = [](const GridTexJob& j) {
+            return (!j.io  || j.io->done.load(std::memory_order_acquire))
+                && (!j.io2 || j.io2->done.load(std::memory_order_acquire));
+        };
         const double t0 = nowMs();
         std::uint32_t done = 0;
         std::size_t bytes = 0;
-        while (!g_gridTexQueue.empty() && nowMs() - t0 < kGridPrefetchMaxMs) {
+        while (!g_gridTexQueue.empty() && nowMs() - t0 < kGridPrefetchMaxMs
+               && (!g_texIo.on() || ready(g_gridTexQueue.front()))) {
             std::size_t before;
             {
                 std::lock_guard<std::mutex> lk(g_texResidencyMx);
@@ -3296,11 +3555,11 @@ namespace {
             const GridTexJob j = std::move(g_gridTexQueue.front());
             g_gridTexQueue.pop_front();
             if (j.param) {
-                if (resolveTextureSlotEx((j.name + "_paramh.dds").c_str(), true, true) == 0) {
-                    resolveTextureSlotEx((j.name + "_paramh_np.dds").c_str(), true, true);
+                if (resolveTextureSlotEx((j.name + "_paramh.dds").c_str(), true, true, j.io.get()) == 0) {
+                    resolveTextureSlotEx((j.name + "_paramh_np.dds").c_str(), true, true, j.io2.get());
                 }
             } else {
-                resolveTextureSlotEx(j.name.c_str(), false, false);   // a miss logs, as the draw's would
+                resolveTextureSlotEx(j.name.c_str(), false, false, j.io.get());   // a miss logs, as the draw's would
             }
             {
                 std::lock_guard<std::mutex> lk(g_texResidencyMx);
@@ -9680,6 +9939,7 @@ namespace RenderProcess {
         // Tier 1b: stop the produce worker BEFORE draining/releasing anything it may touch —
         // no-op if it was never started (produce-off-main stayed OFF the whole session).
         g_produceWorker.stop();
+        g_texIo.stop();   // after the produce worker (its only submitter besides main): reads in flight finish
         // Never tear down with a host RenderFrame still pending (deferred or not):
         // drain it so the host isn't mid-frame and the window guard isn't latched
         // if the seam comes back up.

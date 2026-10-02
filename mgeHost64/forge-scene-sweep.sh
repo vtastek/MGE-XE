@@ -24,10 +24,12 @@ CLIENTLOG="/mnt/c/mgem/morrowind64/mgeXE.log"
 SAVES=(
   vjustsky.ess
   vjustwall.ess
+  ibowildernessmiddleofno.ess   # open-water floor: far from everything, only water (2026-10-02)
   vlightdense.ess
   vmanylights.ess
   vdensecity.ess
   vheavydistantland.ess
+  ibowestgashregion47.ess       # a few hills, yet slow: the unexplained case (2026-10-02)
 )
 
 mkdir -p "$OUT"
