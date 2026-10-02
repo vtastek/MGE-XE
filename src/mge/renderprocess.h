@@ -195,6 +195,11 @@ namespace RenderProcess {
     // this hands it over. Sticky until the purge consumes it.
     void noteLoadingBar(bool loading);
 
+    // A load happened that no produced frame has acted on yet (the latch above, unconsumed).
+    // frameSetupEarly's warm-up latch reads it: frameSetupEarly does not run while the bar is up,
+    // so isLoadingBar() alone never resets the latch on a save load.
+    bool loadPending();
+
     // FP1a first-person takeover: true when the seam is live AND compositing AND the player
     // is in FIRST person. Gates the cache's armCamera-root walk + the per-frame FP draw lists
     // + the FP camera crossing. False (3rd person / seam down) → MW's own first-person

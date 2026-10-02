@@ -110,6 +110,31 @@ void fseAccum(double lights, double cell, double view, double walk,
 static bool s_frameSetupEarly   = false;  // selectDistantCell + camera/fog setup done early
 static bool s_earlyKickedStatics = false; // cullDistantStatics_kickoff already issued early
 
+// The device projection is the one MW set from its camera frustum BEFORE this frame's
+// MWBridge::SetFOV (mged3d8device.cpp, BeginScene(0)) rewrote that frustum. Steady state they agree,
+// because SetFOV only writes when the frustum differs. But the engine resets the frustum to its own
+// 75 degrees at a load and at startup, so the first frame after either read 75 here while every
+// later frame read the configured FOV: a one-frame FOV jump in the Forge frame (in-game,
+// 2026-10-02, 105 configured). Apply the override the same way SetFOV does (frustum = +-tan(fov/2),
+// aspect kept), so the matrix every consumer reads is the one MW draws with from the next frame on.
+void DistantLand::applyScreenFOV(D3DMATRIX* proj) {
+    if (Configuration.ScreenFOV <= 0 || proj->_11 == 0.0f) {
+        return;
+    }
+    const float m11 = 1.0f / std::tan(Configuration.ScreenFOV * D3DX_PI / 360.0f);
+    const float k = m11 / proj->_11;
+    if (std::fabs(k - 1.0f) > 1.0e-3f) {
+        static unsigned s_logged = 0;
+        if (s_logged < 8) {
+            ++s_logged;
+            LOG::logline(">> [fov] device projection lagged the ScreenFOV override: %.1f -> %.1f deg",
+                         2.0 * std::atan(1.0 / proj->_11) * 180.0 / D3DX_PI, (double)Configuration.ScreenFOV);
+        }
+    }
+    proj->_11 = m11;
+    proj->_22 *= k;
+}
+
 // Run at BeginScene(scene 0), before the engine renders sky. The camera is
 // already this-frame-valid here (verified: BeginScene-vs-Stage0 view/proj
 // delta = 0), so we can run the distant-statics cull prerequisites and kick
@@ -162,6 +187,7 @@ void DistantLand::frameSetupEarly() {
     const double tCell = fseNowMs();
     device->GetTransform(D3DTS_VIEW, &mwView);
     device->GetTransform(D3DTS_PROJECTION, &mwProj);
+    applyScreenFOV(&mwProj);
     setView(&mwView);
     adjustFog();
     s_frameSetupEarly = true;
@@ -212,8 +238,15 @@ void DistantLand::frameSetupEarly() {
     // buildFrameLighting reads sun dir/diffuse/ambient LIVE from the scene graph now
     // (getSceneSunlight, interiors and exteriors both), so only the exterior D3DRS_AMBIENT global
     // (ambCol) is still captured state across a transition.
+    //
+    // A SAVE LOAD never shows this function the bar: frameSetupEarly does not run while MW loads, so
+    // isLoadingBar() is false on every frame it sees and the latch stayed up across the load. The
+    // first frame back then took the park path, whose parked payload the purge drops (epoch change),
+    // and the composite re-showed the last frame from BEFORE the load for ~3 frames (in-game,
+    // 2026-10-02). RenderProcess::loadPending() is the Present-latched flag the purge consumes, so it
+    // is still set here on exactly that first frame.
     static bool s_forgePrevEligible = false;
-    const bool loadingBar = mwBridge->isLoadingBar();
+    const bool loadingBar = mwBridge->isLoadingBar() || RenderProcess::loadPending();
     const bool forgeEligibleNow = RenderProcess::forgeOwnsFrame() && !loadingBar;
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
@@ -582,6 +615,7 @@ void DistantLand::renderStage0() {
     // Get Morrowind camera matrices
     device->GetTransform(D3DTS_VIEW, &mwView);
     device->GetTransform(D3DTS_PROJECTION, &mwProj);
+    applyScreenFOV(&mwProj);
 
     // Set variables derived from current game state and camera configuration.
     // setView/adjustFog re-run harmlessly even when frameSetupEarly already did

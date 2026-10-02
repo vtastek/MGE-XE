@@ -5881,6 +5881,9 @@ namespace {
         D3DXMATRIX view, proj;
         buildNiCameraView(dir, up, right, pos, &view);   // absolute eye == mwView's own form
         buildNiCameraProj(cd, &proj);
+        // mwProj carries the ScreenFOV override (frameSetupEarly); CameraData keeps the engine's own
+        // FOV. Compare like with like, or a configured FOV holds the FP pass off for good.
+        DistantLand::applyScreenFOV(&proj);
         const float* a  = (const float*)&view;
         const float* av = (const float*)&DistantLand::mwView;
         const float* b  = (const float*)&proj;
@@ -9224,6 +9227,10 @@ namespace RenderProcess {
         }
         s_prev = loading;
         if (loading) { g_sawLoadingBar = true; }
+    }
+
+    bool loadPending() {
+        return g_sawLoadingBar;
     }
 
     void discardPendingCaptures() {

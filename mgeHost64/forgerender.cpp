@@ -6887,6 +6887,12 @@ namespace {
     // readback of zeros and a sky that genuinely integrates to zero are the same 128 bytes, and one
     // of those is a bug that would publish a black ambient and look exactly like midnight.
     uint32_t g_atmosShLastRan = 0;
+    // A GATE frame's measurement, kept apart from g_atmosShLast. That array is the LIGHT, and a gate
+    // forces a reference sky nobody stands under; while the gate ran before the light was ever armed
+    // sharing one array was harmless, but the startup bootstrap (atmosBootstrapSync) arms the light
+    // first, and gate bytes landing in it afterwards would light the world from the reference sky.
+    float    g_atmosGateLast[kAtmosShUints] = {};
+    uint32_t g_atmosGateRan = 0;
     // Has each view's gSkyView ever been filled? ⚠ NOT COSMETIC. The main view's publish rides
     // inside the `if (pShadowMaskParamsCbv)` block that owns the camera's inverse viewProj, so on
     // the "shadow resources failed to allocate" path the cbuffer would stay at its zero init — and a
@@ -31460,6 +31466,14 @@ void destroyHostWindow(Renderer* R);
         static int  s_trace    = 0;
         // A DOOR: the next reading from this side places the adaptation (see the snap below).
         static bool s_doorPending = false;
+        // ⚠ THE FIRST CONTEXT OF A SESSION IS NOT A DOOR. s_traceExt starts false, so the first
+        // exterior reading after startup looked like interior -> exterior and was PLACED 2.5 stops
+        // over its target, then eased down: E 1 -> 4.38 -> 0.77 on the first frames of a fresh start
+        // (in-game, 2026-10-02, "first frame has exposure jump"). There is no previous place to adapt
+        // from, so the first reading is not placed at all: it eases (see s_coldStart below).
+        static bool s_haveCtx = false;
+        static bool s_coldStart = false;
+        if (!s_haveCtx) { s_haveCtx = true; s_traceExt = g_dlExterior; s_trace = 16; s_coldStart = true; }
         if (g_dlExterior != s_traceExt) { s_traceExt = g_dlExterior; s_trace = 16; s_doorPending = true; }
         // ...and an EXTERIOR frame lit without the physical sky (the first frames after a door, when
         // the bridge could not vouch for the old measurement) is lit by a placeholder ~4 stops off
@@ -31552,9 +31566,17 @@ void destroyHostWindow(Renderer* R);
         // exactly capDark under a darker place's target or capBright over a brighter one's, and
         // from there only the ease acts. Away from doors a snap is a safety net for errors far past
         // the cap (a load, a teleport), never the ordinary drift.
-        const bool door = s_doorPending;
+        const bool coldStart = s_coldStart;
+        s_coldStart = false;
+        const bool door = s_doorPending && !coldStart;
         s_doorPending = false;
         if (!door) { g_expDoorPredicted = false; }
+        if (coldStart) {
+            // Not placed, not snapped: the ordinary ease takes it from here (user, 2026-10-02: "if it
+            // eases, that's okay"). The event safety net below still catches an error far past the cap.
+            LOG::logline(">> [exp] COLD START: first reading eases from E %.4g toward %.4g (%+.2f stops, lvl %.1f vs %.0f-%.0f)",
+                         g_exposure, want, Lw - L, lvl, (double)ct.lo, (double)ct.hi);
+        }
         if (g_expSnap > 0.5f) {
             constexpr uint32_t kExpEventSnapFrames = 60;
             const bool afterEvent = (g_renderFrame - g_shadowCellChangeFrame) < kExpEventSnapFrames;
@@ -31839,7 +31861,9 @@ void destroyHostWindow(Renderer* R);
     void renderSkyVisMaps();     // Twister-style sky visibility: one direction's depth map per frame
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
-    void atmosDispatch();                // S2: the atmosphere's four-pass LUT chain, every frame
+    void atmosDispatch(Cmd* C);          // S2: the atmosphere's four-pass LUT chain, every frame
+    void atmosDrain(const uint32_t* ar); // S2: decode one landed SH readback (light, or a gate arm)
+    bool atmosBootstrapSync();           // the first exterior measurement, synchronously
     // S2b/S4a/S2l: the GATE, reported from settleFrameFence — one arm per forced frame.
     enum AtmosGateArm { kGateClear, kGateDeck, kGateHighSun };
     void atmosReportGate(AtmosGateArm arm);
@@ -32182,66 +32206,7 @@ void destroyHostWindow(Renderer* R);
         // constant is far longer, so nothing downstream can resolve it.
         if (ss.atmosShArmed && g_live.pAtmosShReadback
             && fbr(g_live.pAtmosShReadback)) {
-            const uint32_t* ar = (const uint32_t*)rbLane(g_live.pAtmosShReadback);
-            g_atmosShLastRan = ar[kAtmosShRan];
-            // Decoded ONCE, here, into a held copy. skyPhysicalMeasure runs at a completely
-            // different point in the frame and reading the GPU_TO_CPU buffer there would race the
-            // copy that fills it.
-            for (uint32_t i = 0; i < (uint32_t)kAtmosShRan; ++i) {
-                std::memcpy(&g_atmosShLast[i], &ar[i], sizeof(float));
-            }
-            // ...and the below-horizon probe, which sits PAST the "ran" tell and is therefore not
-            // covered by the loop above. Copied here rather than by widening the loop: slot 24 is a
-            // uint COUNT and reinterpreting it as a float would put a denormal on the [sky] line.
-            for (uint32_t i = 0; i < 3u; ++i) {
-                std::memcpy(&g_atmosShLast[kAtmosShBelow + i], &ar[kAtmosShBelow + i], sizeof(float));
-            }
-            // ...and S4a's multiscatter-ratio instrument, which sits past the tell for the same reason.
-            std::memcpy(&g_atmosShLast[kAtmosShMsF],  &ar[kAtmosShMsF],  sizeof(float));
-            std::memcpy(&g_atmosShLast[kAtmosShMsF0], &ar[kAtmosShMsF0], sizeof(float));
-            for (uint32_t i = 0; i < 3u; ++i) {
-                std::memcpy(&g_atmosShLast[kAtmosShMs0 + i], &ar[kAtmosShMs0 + i], sizeof(float));
-            }
-            // ⚠ "ran" IS NOT COSMETIC. A readback of zeros and a sky that genuinely integrates to
-            // zero are the same 128 bytes; without the tell, a dispatch that silently did nothing
-            // would publish a black ambient and look exactly like midnight. Only a reported run
-            // arms the lane, so the untouched case holds MW's authored lighting instead.
-            // ⚠ THE GATE FRAME'S MEASUREMENT IS NOT THE FRAME'S LIGHT, and that distinction is
-            // worth two lines. The gate FORCES the reference configuration into the params cbuffer
-            // for exactly one frame — Clear, albedo 0.10, sun at 41.34 degrees — so its readback
-            // describes a sky nobody is standing under. Arming the light from it would light the
-            // world with the reference atmosphere for a frame, at load, which is a small wrong
-            // thing that would look exactly like a large one if it ever coincided with a bug.
-            // The gate reads the bytes, reports, and the light waits one more frame for a
-            // measurement taken under the weather that is actually outside.
-            const bool gateBytes = (g_atmosGateState == 1 || g_atmosGateState == 3
-                                    || g_atmosGateState == 5);
-            if (g_atmosShLastRan == 1u && !gateBytes) {
-                if (!g_atmosShValid) {
-                    LOG::logline(">> [forge-atmos] first SH measurement landed (frame %u):"
-                                 " the sky-view LUT is now driving the ambient AND the sun."
-                                 " The light is a measurement of the DRAWN sky.", g_renderFrame);
-                    LOG::flush();
-                }
-                g_atmosShValid = true;
-            } else if (g_atmosShLastRan != 1u && gateBytes) {
-                LOG::logline("!! [forge-atmos] the SH/gate dispatch DID NOT RUN (ran=%u) — the"
-                             " atmosphere's light is UNVERIFIED and the ambient is holding MW's",
-                             g_atmosShLastRan);
-                LOG::flush();
-            }
-            // ...and if this was a GATE frame, report it. Twice per host session now: the clear
-            // reference, then the lid. State 2 re-arms atmosDispatch for the second configuration.
-            if (g_atmosGateState == 1) {
-                atmosReportGate(kGateClear);
-                g_atmosGateState = 2;
-            } else if (g_atmosGateState == 3) {
-                atmosReportGate(kGateDeck);
-                g_atmosGateState = 4;
-            } else if (g_atmosGateState == 5) {
-                atmosReportGate(kGateHighSun);
-                g_atmosGateState = 6;
-            }
+            atmosDrain((const uint32_t*)rbLane(g_live.pAtmosShReadback));
         }
 
         // Stage B (B2): GPU cull counters. [0] = frustum survivors (compare to the CPU cull's
@@ -36729,6 +36694,12 @@ void destroyHostWindow(Renderer* R);
             // fd[16..18]: the disc sits ~29 degrees off the light direction and, unlike the light,
             // it actually SETS. Both facts are load-bearing; see skyPhysicalMeasure.
             skyPhysicalMeasure(fd + 16, fd[19], fd[27]);
+            // No measurement and no door bridge: an exterior frame about to be lit by MW's placeholder.
+            // Measure this sky NOW and light the frame from it (see atmosBootstrapSync). The first call
+            // above already published the disc and the camera radius the dispatch is configured from.
+            if (!g_skyPhys.active && g_dlExterior && g_skyHw && !g_atmosShValid && atmosBootstrapSync()) {
+                skyPhysicalMeasure(fd + 16, fd[19], fd[27]);
+            }
             // ...and THEN aim MW's light at that same disc, for the half of the frame the sky model
             // does not cover. Ordering is load-bearing in both directions — see the ⚠ blocks on
             // aimSunLightAtDisc. This is what makes a sun overhead cast a shadow a sun overhead
@@ -40006,7 +39977,7 @@ void destroyHostWindow(Renderer* R);
         // Without the barriers the passes are free to overlap and each would read the PREVIOUS
         // frame's LUT — which would look almost right, all the time, and be wrong under a moving sun.
         gpuPhaseBegin(kGpuPhaseAtmos);
-        atmosDispatch();
+        atmosDispatch(g_live.pCmd);
         gpuPhaseEnd(kGpuPhaseAtmos);
 
         gpuPhaseBegin(kGpuPhaseCull);
@@ -47902,11 +47873,20 @@ void destroyHostWindow(Renderer* R);
     // (default white). Returns the number of textures successfully built. No-op if Forge/the
     // opaque path isn't live yet (textures arrive after the first scene builds the PerFrame set).
     unsigned uploadTextures(const void* blob, unsigned byteCount, unsigned count) {
-        // The PerFrame set (which owns the bindless array) is built lazily on the first
-        // renderScene. Until then, signal "not ready" (0xFFFFFFFF) so the client keeps the
-        // batch and retries next frame, rather than silently dropping textures.
+        // The persistent set (which owns the bindless array) comes from the lazy opaque-path build.
+        // Build it HERE when the first texture batch beats the first renderScene — which it always
+        // does: frame 0's tex flush precedes its RenderFrame. Answering "not ready" instead made the
+        // client keep the batch for the next frame, so the first frame of a session drew every
+        // texture as default white (in-game, 2026-10-02). The geometry flush has already run, so the
+        // reason the build is lazy (geometry first, on a clean resource loader) still holds.
+        if (g_live.pRenderer && !g_live.pOpaquePipeline) {
+            std::printf("[forge] uploadTextures: lazy buildOpaquePath (first textures before first frame)...\n");
+            if (!buildOpaquePath(g_live.pRenderer, g_live.allocWidth, g_live.allocHeight)) {
+                std::printf("[forge] lazy buildOpaquePath FAILED — scene path disabled\n");
+            }
+        }
         if (g_live.pRenderer && !g_live.pPersistentSet) {
-            return 0xFFFFFFFFu;
+            return 0xFFFFFFFFu;   // build failed: keep the client's batch (renderScene retries the build)
         }
         if (!g_live.pRenderer || !blob || !byteCount || !count) {
             return 0;
@@ -59272,7 +59252,7 @@ void destroyHostWindow(Renderer* R);
     // (which came from the S1 table, which is the one place a weather index becomes physics), fires
     // four dispatches in dependency order, and copies 128 bytes back. There is no sky model on this
     // side of the boundary any more, which is the structural change S2 exists for.
-    void atmosDispatch()
+    void atmosDispatch(Cmd* C)
     {
         g_atmosShArmed = false;
         if (!g_live.atmosReady) { return; }
@@ -59464,73 +59444,182 @@ void destroyHostWindow(Renderer* R);
         g_atmosPkValid = true;
         ++g_atmosBuilds;
 
-        cmdBeginDebugMarker(g_live.pCmd, 0.35f, 0.6f, 0.95f, "ATMOSPHERE LUTs");
+        cmdBeginDebugMarker(C, 0.35f, 0.6f, 0.95f, "ATMOSPHERE LUTs");
 
         auto toUav = [&](Texture* t) {
             TextureBarrier tb = {};
             tb.pTexture = t;
             tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
             tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            cmdResourceBarrier(C, 0, nullptr, 1, &tb, 0, nullptr);
         };
         auto toSrv = [&](Texture* t) {
             TextureBarrier tb = {};
             tb.pTexture = t;
             tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
             tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            cmdResourceBarrier(C, 0, nullptr, 1, &tb, 0, nullptr);
         };
 
         // 1. TRANSMITTANCE (256x64). Reads nothing; everything else is built on it.
         toUav(g_live.pAtmosTransmittance);
-        cmdBindPipeline(g_live.pCmd, g_live.pAtmosTransPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAtmosSet);
-        cmdDispatch(g_live.pCmd, (kAtmosTransW + 7u) / 8u, (kAtmosTransH + 7u) / 8u, 1);
+        cmdBindPipeline(C, g_live.pAtmosTransPipeline);
+        cmdBindDescriptorSet(C, 0, g_live.pAtmosSet);
+        cmdDispatch(C, (kAtmosTransW + 7u) / 8u, (kAtmosTransH + 7u) / 8u, 1);
         toSrv(g_live.pAtmosTransmittance);   // ⚠ the barrier IS the dependency — see the note above
 
         // 2. MULTIPLE SCATTERING (32x32). Reads the transmittance LUT.
         toUav(g_live.pAtmosMultiScatter);
-        cmdBindPipeline(g_live.pCmd, g_live.pAtmosMsPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pAtmosSet);
-        cmdDispatch(g_live.pCmd, (kAtmosMsRes + 7u) / 8u, (kAtmosMsRes + 7u) / 8u, 1);
+        cmdBindPipeline(C, g_live.pAtmosMsPipeline);
+        cmdBindDescriptorSet(C, 1, g_live.pAtmosSet);
+        cmdDispatch(C, (kAtmosMsRes + 7u) / 8u, (kAtmosMsRes + 7u) / 8u, 1);
         toSrv(g_live.pAtmosMultiScatter);
 
         // 3. SKY-VIEW (192x108). Reads both. This is the one the pixels come from AND the one the
         //    light comes from — see atmos_sh.comp below.
         toUav(g_live.pAtmosSkyView);
         toUav(g_live.pAtmosSkyViewClear);          // S2i: one dispatch, two outputs
-        cmdBindPipeline(g_live.pCmd, g_live.pAtmosSkyPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 2, g_live.pAtmosSet);
-        cmdDispatch(g_live.pCmd, (kAtmosSkyW + 7u) / 8u, (kAtmosSkyH + 7u) / 8u, 1);
+        cmdBindPipeline(C, g_live.pAtmosSkyPipeline);
+        cmdBindDescriptorSet(C, 2, g_live.pAtmosSet);
+        cmdDispatch(C, (kAtmosSkyW + 7u) / 8u, (kAtmosSkyH + 7u) / 8u, 1);
         toSrv(g_live.pAtmosSkyView);
         toSrv(g_live.pAtmosSkyViewClear);
 
         // 4. THE MEASUREMENT (one group of 128). Projects the sky-view LUT into SH-L1 over the full
         //    sphere and computes the scalar probes in the same pass.
         if (g_live.pAtmosShPipeline && g_live.pAtmosShOut && g_live.pAtmosShReadback) {
-            cmdBindPipeline(g_live.pCmd, g_live.pAtmosShPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 3, g_live.pAtmosSet);
-            cmdDispatch(g_live.pCmd, 1, 1, 1);
+            cmdBindPipeline(C, g_live.pAtmosShPipeline);
+            cmdBindDescriptorSet(C, 3, g_live.pAtmosSet);
+            cmdDispatch(C, 1, 1, 1);
             BufferBarrier bb = {};
             bb.pBuffer = g_live.pAtmosShOut;
             bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
             bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
-            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
-            g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+            cmdResourceBarrier(C, 1, &bb, 0, nullptr, 0, nullptr);
+            C->mDx.pCmdList->CopyBufferRegion(
                 g_live.pAtmosShReadback->mDx.pResource, rbLaneOff(), g_live.pAtmosShOut->mDx.pResource, 0,
                 (UINT64)sizeof(uint32_t) * kAtmosShUints);
             bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
             bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            cmdResourceBarrier(C, 1, &bb, 0, nullptr, 0, nullptr);
             g_atmosShArmed = true;
         }
 
-        cmdEndDebugMarker(g_live.pCmd);
+        cmdEndDebugMarker(C);
 
         if (gateFrame) {
             g_atmosGateState = gateDeck ? 3u : (gateHigh ? 5u : 1u);
             g_atmosGateFrame = g_renderFrame;
         }
+    }
+
+    // Decode one landed SH readback. Called by settleFrameFence for a frame that dispatched, and by
+    // atmosBootstrapSync for its own submit. A GATE arm's bytes go to g_atmosGateLast and are only
+    // reported; every other readback is the LIGHT and goes to g_atmosShLast.
+    void atmosDrain(const uint32_t* ar)
+    {
+        if (!ar) { return; }
+        // ⚠ THE GATE FRAME'S MEASUREMENT IS NOT THE FRAME'S LIGHT. The gate FORCES the reference
+        // configuration into the params cbuffer for exactly one dispatch — Clear, albedo 0.10, sun at
+        // 41.34 degrees — so its readback describes a sky nobody is standing under. It is reported and
+        // kept apart; the light waits for a measurement taken under the weather actually outside.
+        const bool gateBytes = (g_atmosGateState == 1 || g_atmosGateState == 3
+                                || g_atmosGateState == 5);
+        float* dst = gateBytes ? g_atmosGateLast : g_atmosShLast;
+        const uint32_t ran = ar[kAtmosShRan];
+        if (gateBytes) { g_atmosGateRan = ran; } else { g_atmosShLastRan = ran; }
+        // Decoded ONCE, here, into a held copy. skyPhysicalMeasure runs at a completely different
+        // point in the frame and reading the GPU_TO_CPU buffer there would race the copy that fills it.
+        for (uint32_t i = 0; i < (uint32_t)kAtmosShRan; ++i) {
+            std::memcpy(&dst[i], &ar[i], sizeof(float));
+        }
+        // ...and the below-horizon probe, which sits PAST the "ran" tell and is therefore not covered
+        // by the loop above. Copied here rather than by widening the loop: slot 24 is a uint COUNT and
+        // reinterpreting it as a float would put a denormal on the [sky] line.
+        for (uint32_t i = 0; i < 3u; ++i) {
+            std::memcpy(&dst[kAtmosShBelow + i], &ar[kAtmosShBelow + i], sizeof(float));
+        }
+        // ...and S4a's multiscatter-ratio instrument, which sits past the tell for the same reason.
+        std::memcpy(&dst[kAtmosShMsF],  &ar[kAtmosShMsF],  sizeof(float));
+        std::memcpy(&dst[kAtmosShMsF0], &ar[kAtmosShMsF0], sizeof(float));
+        for (uint32_t i = 0; i < 3u; ++i) {
+            std::memcpy(&dst[kAtmosShMs0 + i], &ar[kAtmosShMs0 + i], sizeof(float));
+        }
+        // ⚠ "ran" IS NOT COSMETIC. A readback of zeros and a sky that genuinely integrates to zero are
+        // the same 128 bytes; without the tell, a dispatch that silently did nothing would publish a
+        // black ambient and look exactly like midnight. Only a reported run arms the lane, so the
+        // untouched case holds MW's authored lighting instead.
+        if (ran == 1u && !gateBytes) {
+            if (!g_atmosShValid) {
+                LOG::logline(">> [forge-atmos] first SH measurement landed (frame %u):"
+                             " the sky-view LUT is now driving the ambient AND the sun."
+                             " The light is a measurement of the DRAWN sky.", g_renderFrame);
+                LOG::flush();
+            }
+            g_atmosShValid = true;
+        } else if (ran != 1u && gateBytes) {
+            LOG::logline("!! [forge-atmos] the SH/gate dispatch DID NOT RUN (ran=%u) — the"
+                         " atmosphere's light is UNVERIFIED and the ambient is holding MW's", ran);
+            LOG::flush();
+        }
+        // ...and if this was a GATE arm, report it. State 2/4 re-arm atmosDispatch for the next one.
+        if (g_atmosGateState == 1) {
+            atmosReportGate(kGateClear);
+            g_atmosGateState = 2;
+        } else if (g_atmosGateState == 3) {
+            atmosReportGate(kGateDeck);
+            g_atmosGateState = 4;
+        } else if (g_atmosGateState == 5) {
+            atmosReportGate(kGateHighSun);
+            g_atmosGateState = 6;
+        }
+    }
+
+    // ─── THE FIRST EXTERIOR MEASUREMENT, SYNCHRONOUSLY ──────────────────────────────────────────
+    // The light is a readback, so on its own it lands two frames after the first exterior frame
+    // (frames are 2-deep), plus one frame per gate arm on a verbose install. Until then the frame is
+    // lit by MW's authored pair, which under SUNNY 16 sits ~3.5 stops under the physical one: a fresh
+    // noon load opened on five DARK frames and then jumped (in-game, 2026-10-02 — f0-4 metered 9.4
+    // levels against a 75-98 target, f5 113). The door bridge covers a door under an unchanged sky;
+    // this covers everything it cannot (a load, the session's first exterior, a door into changed
+    // weather): run the chain on the aux cmd, wait for it, decode, and light THIS frame from it. One
+    // GPU round trip on a frame the user already accepts as late ("first frame being late is
+    // acceptable"). The gate arms run here too, back to back, so they no longer force a reference
+    // sky onto three visible frames.
+    bool atmosBootstrapSync()
+    {
+        if (!g_live.atmosReady || !g_live.pAuxCmd || !g_live.pAuxCmdPool || !g_live.pAuxFence
+            || !g_live.pAtmosShReadback || !g_live.pAtmosShReadback->pCpuMappedAddress) {
+            return false;
+        }
+        Renderer* R = g_live.pRenderer;
+        const double t0 = hostNowMs();
+        uint32_t passes = 0;
+        // 1 live pass, or up to 3 gate arms + 1 live pass. 5 = a margin that cannot loop forever.
+        while (!g_atmosShValid && passes < 5u) {
+            ++passes;
+            resetCmdPool(R, g_live.pAuxCmdPool);
+            beginCmd(g_live.pAuxCmd);
+            atmosDispatch(g_live.pAuxCmd);
+            endCmd(g_live.pAuxCmd);
+            const bool armed = g_atmosShArmed;
+            g_atmosShArmed = false;   // consumed below; the frame's own dispatch re-arms its own
+            QueueSubmitDesc sd = {};
+            sd.mCmdCount = 1;
+            sd.ppCmds = &g_live.pAuxCmd;
+            sd.pSignalFence = g_live.pAuxFence;
+            sd.mSubmitDone = true;
+            frameSubmit(&sd);   // the params cbuffer is a FrameBuf: its copy goes first
+            waitForFences(R, 1, &g_live.pAuxFence);
+            if (!armed) { break; }   // nothing dispatched (the cache skip may have re-armed the light)
+            atmosDrain((const uint32_t*)((const uint8_t*)g_live.pAtmosShReadback->pCpuMappedAddress
+                                         + rbLaneOff()));
+        }
+        LOG::logline(">> [forge-atmos] bootstrap: %s in %u pass%s, %.2f ms (frame %u) — this frame is"
+                     " lit by its own sky, not MW's placeholder",
+                     g_atmosShValid ? "light ARMED" : "light NOT armed", passes, passes == 1u ? "" : "es",
+                     hostNowMs() - t0, g_renderFrame);
+        return g_atmosShValid;
     }
 
     // ─── S2b/S4a — THE GATE, REPORTED ────────────────────────────────────────────────────────────
@@ -59576,7 +59665,7 @@ void destroyHostWindow(Renderer* R);
 
     void atmosReportGate(AtmosGateArm arm)
     {
-        const float* rb = g_atmosShLast;
+        const float* rb = g_atmosGateLast;
         float Esky[3] = { rb[kAtmosShEsky + 0], rb[kAtmosShEsky + 1], rb[kAtmosShEsky + 2] };
         float Esun[3] = { rb[kAtmosShEsun + 0], rb[kAtmosShEsun + 1], rb[kAtmosShEsun + 2] };
         float zen[3]  = { rb[kAtmosShZenith + 0], rb[kAtmosShZenith + 1], rb[kAtmosShZenith + 2] };
@@ -59607,7 +59696,7 @@ void destroyHostWindow(Renderer* R);
         // falsify anything, and it costs a log2.
         const double Lavg  = (EtotW / SceneCal::kPi) * 0.18 * 683.0;
         const double ev100 = (Lavg > 1.0e-9) ? std::log2(Lavg * 100.0 / 12.5) : 0.0;
-        const bool okRan = (g_atmosShLastRan != 0u);
+        const bool okRan = (g_atmosGateRan != 0u);
 
         // ─── THE ENERGY BUDGET, AND IT IS THE ONE ROW NO CALIBRATION CAN ARGUE WITH ──────────────
         // ⚠⚠ EVERY OTHER ROW HERE IS A COMPARISON AGAINST A MEASURED BAND, so every one of them can
@@ -59719,7 +59808,7 @@ void destroyHostWindow(Renderer* R);
                          sunPct, okSun ? "OK" : "OUT", SceneCal::kSunShareLo, SceneCal::kSunShareHi,
                          sunKlx, okKlx ? "OK" : "OUT",
                          lumSky * 683.0, lumSun * 683.0, fGnd, Fser, (double)g_atmosMs,
-                         g_atmosShLastRan);
+                         g_atmosGateRan);
             LOG::logline("%s [forge-atmos] gate MS SOURCE: L_ms(camera) = (%.2f, %.2f, %.2f) W/m2/sr"
                          " = L2 x F. ⚠ IT IS A MEAN RADIANCE OVER THE SPHERE, so it CANNOT exceed the"
                          " first-order field's own maximum — measured with msArm 0, that field peaks"
@@ -59843,11 +59932,11 @@ void destroyHostWindow(Renderer* R);
                      " | EV100 %.2f | ran=%u",
                      (okBeam && okEsky) ? ">>" : "!!",
                      sunKlx, okBeam ? "OK" : "OUT", EskyKlx, okEsky ? "OK" : "OUT",
-                     sunPct, q, ev100, g_atmosShLastRan);
+                     sunPct, q, ev100, g_atmosGateRan);
         // ⚠ THE CLAMP, READ RATHER THAN ASSUMED. 0.98 is where min(fms, 0.98) pins; at or above
         // it the geometric sum is sitting ON its ceiling (F = 50) and the LEVEL row is a statement
         // about that one line rather than about the cloud's optics.
-        const double msF    = (double)g_atmosShLast[kAtmosShMsF];
+        const double msF    = (double)g_atmosGateLast[kAtmosShMsF];
         const bool   pinned = (msF >= 0.98);
         LOG::logline("%s [forge-atmos] gate OVERCAST MS SERIES: f=%.5f at the deck (%.0f m) -> F=%.1f"
                      " [%s]. Clear air runs f~0.05 and the clamp never fires; a conservative lid"

@@ -229,6 +229,9 @@ public:
 
     static void setView(const D3DMATRIX* m);
     static void setProjection(D3DMATRIX* proj);
+    // Configuration.ScreenFOV applied to a main-view projection exactly as MWBridge::SetFOV applies
+    // it to the frustum (see the definition: the device matrix lags the override by a frame).
+    static void applyScreenFOV(D3DMATRIX* proj);
     static void setHorizonColour(const RGBVECTOR& c);
     static void setAmbientColour(const RGBVECTOR& c);
     static void setSunLight(const D3DLIGHT8* s);
