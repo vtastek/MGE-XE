@@ -31438,13 +31438,19 @@ void destroyHostWindow(Renderer* R);
         // The meter. Mean and geo arrive as 0..1 luma and are scaled to display levels; p90 is
         // already a display level, because the histogram bins ARE display levels — which is the unit
         // the calibration table is stated in, and the reason the histogram was built that way.
-        const double lvl = (g_expStat < 0.5f) ? ((double)(0.299f * g_lastApl[0] + 0.587f * g_lastApl[1]
-                                                        + 0.114f * g_lastApl[2]) * 255.0)
-                         : (g_expStat < 1.5f) ? (double)g_lastAplPct[2]
-                                              : (std::exp((double)g_lastApl[3]) * 255.0);
-        if (lvl < 0.5) {
-            return;   // a black frame carries no information about how bright it should be — HOLD
-        }
+        double lvl = (g_expStat < 0.5f) ? ((double)(0.299f * g_lastApl[0] + 0.587f * g_lastApl[1]
+                                                  + 0.114f * g_lastApl[2]) * 255.0)
+                   : (g_expStat < 1.5f) ? (double)g_lastAplPct[2]
+                                        : (std::exp((double)g_lastApl[3]) * 255.0);
+        // ⚠ A BLACK READING IS A BOUND, NOT "NO INFORMATION". This used to HOLD below 0.5 levels, and
+        // that is a deadlock: a scene underexposed far enough lands on the curve's black floor (mean
+        // 0.0004), the servo holds, E never rises, and the frame stays black. Seen live 2026-10-02: a
+        // sleep from day to night left E at 1.31 with the meter asking 37-65x for minutes, pitch black.
+        // A black frame says "at least this dark", so meter it AT the bound: the step it asks for is the
+        // smallest correct one, the next reading refines it, and the ceiling (night ceiling included)
+        // still caps how far it can go. Frames that are black by construction never reach here: loads
+        // produce no host frames, and MW's fades are drawn over the composite, not into the metered RT.
+        lvl = std::max(lvl, 0.5);
         // The reading is from a frame of the OTHER context (see g_expPublishedExt): its level is
         // judged against a row it was never exposed for. HOLD; the first reading from this side
         // makes the jump, and makes it to the right place.
@@ -31550,6 +31556,8 @@ void destroyHostWindow(Renderer* R);
         s_doorPending = false;
         if (!door) { g_expDoorPredicted = false; }
         if (g_expSnap > 0.5f) {
+            constexpr uint32_t kExpEventSnapFrames = 60;
+            const bool afterEvent = (g_renderFrame - g_shadowCellChangeFrame) < kExpEventSnapFrames;
             const double capDark   = std::max(0.0, (double)g_expResidDark);    // e > 0: brighten
             const double capBright = std::max(0.0, (double)g_expResidBright);  // e < 0: darken
             const double L0 = L;
@@ -31567,8 +31575,16 @@ void destroyHostWindow(Renderer* R);
                 // the flip-frame prediction now removes.)
                 L = (Lw >= L) ? (Lw - capDark) : (Lw + capBright);
             }
-            else if (Lw - L >  capDark   + 2.0) { L = Lw - capDark; }
-            else if (Lw - L < -capBright - 2.0) { L = Lw + capBright; }
+            // ⚠ THE SAFETY NET IS FOR EVENTS, NOT FOR LARGE ERRORS. It used to fire on any error past
+            // cap + 2 stops, which ordinary metering produces: walking up to a door in shadow took the
+            // frame mean from 97 to 12.5 levels (3.5 stops), so E JUMPED +2.5 stops instead of easing
+            // (user: "instead of easing, exposure jumps", 2026-10-02). A large error is only a reason to
+            // snap when the place itself changed discontinuously, and the client already says when:
+            // the cell epoch (lighting[19]) bumps on a cell change, a teleport and a save reload. So
+            // the net is armed for kExpEventSnapFrames after that (the readback lags a few frames, so
+            // the first readings from the new place land inside it); everything else eases.
+            else if (afterEvent && Lw - L >  capDark   + 2.0) { L = Lw - capDark; }
+            else if (afterEvent && Lw - L < -capBright - 2.0) { L = Lw + capBright; }
             if (L != L0) {
                 ++g_expSnaps;
                 g_expLastSnap = (float)(L - L0);
