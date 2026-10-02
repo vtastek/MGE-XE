@@ -8432,6 +8432,33 @@ namespace {
         }
     }
 
+    // P3 (tasks/forge-crossing-frame.md): the arena's update stream, submitted WITHOUT a CPU wait.
+    // flushTextureUploads' fence wait was 90% of all host geometry time — ~1.17 ms fixed per batch,
+    // 4-5.7 ms with the GPU busy — and it only existed to order the copy before any frame that draws
+    // it. The copy runs on the loader's own "UPLOAD" graphics queue, so the order is put where it
+    // belongs: the frame queue waits on the copy's semaphore GPU-side. Every later submit on
+    // g_live.pQueue (frames, aux, HiZ — the only queue that reads the arena; the texture-stream
+    // worker's queue never does) is ordered behind it; the IPC thread returns at once.
+    //
+    // The CPU wait was never what kept the staging ring safe: the loader's acquireCmd waits a
+    // set's own fence before it reuses it. Arena grows keep flushTextureUploads — growArenaBuffer
+    // copies the old buffer, so the staged updates must have LANDED before it reads it.
+    // arenaGpuWait=0 (MGE_HOST_KNOBS) = the CPU wait, for the A/B.
+    bool g_arenaGpuWait = true;
+    void flushArenaUploads(Renderer* R) {
+        FlushResourceUpdateDesc fd = {};
+        flushResourceUpdates(&fd);
+        Semaphore* s = fd.pOutSubmittedSemaphore;
+        if (!g_arenaGpuWait || !s || !g_live.pQueue || !g_live.pQueue->mDx.pQueue) {
+            if (fd.pOutFence) {
+                waitForFences(R, 1, &fd.pOutFence);
+            }
+            return;
+        }
+        // Read the value the flush's submit just signalled (queueSubmit pre-increments it).
+        g_live.pQueue->mDx.pQueue->Wait(s->mDx.pFence, s->mDx.mFenceValue);
+    }
+
     // Little-endian 32-bit read (DDS header fields). Defined here (ahead of the water loader AND
     // parseDds, both of which use it).
     static uint32_t ddsRd32(const uint8_t* p) {
@@ -23444,6 +23471,7 @@ namespace {
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
+            { "arenaGpuWait",       &g_arenaGpuWait       },
             { "sunny16",            &g_sunny16            },
             { "skyAOStatics",       &g_skyAOStatics       },
             { "skyAOBlur",          &g_skyAOBlur          },
@@ -61960,7 +61988,7 @@ void destroyHostWindow(Renderer* R);
             // waitForAllResourceLoads does NOT flush — must flushResourceUpdates + fence (same
             // gotcha as texture uploads), else arena geometry stays zero.
             const double t0 = hostNowMs();
-            flushTextureUploads(g_live.pRenderer);
+            flushArenaUploads(g_live.pRenderer);   // P3: GPU-side wait (see flushArenaUploads)
             tArenaMs = hostNowMs() - t0;
         }
         if (anyStatic || anyArena) {
