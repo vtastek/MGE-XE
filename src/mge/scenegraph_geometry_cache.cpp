@@ -3033,6 +3033,7 @@ namespace MGE::GeometryCache {
                     return;
                 }
                 if (g_windowCaptureBudget > 0) --g_windowCaptureBudget;
+                MGE_ZoneScopedN("GeomCache:capture");   // first sight only: separates capture from traversal
                 auto& e = g_cache[key];
                 ++g_captureTotal;   // the ONE first-sight insertion point (walk + ensureLive)
                 // Take the engine reference the moment the key enters the cache. `geom` is provably

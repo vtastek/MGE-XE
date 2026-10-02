@@ -165,6 +165,12 @@ namespace IPC {
         // matches it against the DL instances by placement origin, because the cell a reference's
         // POSITION falls in is not always the cell MW files — and loads, and draws — it under.
         UpdateNearRefs,
+
+        // Async texture streaming (tasks/forge-async-texture-stream.md): a batch of full files for
+        // FRESH, client-reserved slots, on its OWN third channel. The host hands the batch to a
+        // worker (parse, classify, create, copy on its own queue) and signals completion only once
+        // every entry is installed and bound, so the client never blocks on it.
+        StreamUpload,
     };
 
     struct NearRefWire {
@@ -705,6 +711,18 @@ namespace IPC {
         OUT std::uint32_t texturesUploaded;
     };
 
+    // Async stream batch: same blob layout as TexUploadParameters, at most kMaxStreamBatch entries
+    // (geomwire.h) so failedMask is exact per entry (bit i = entry i did not land). built =
+    // 0xFFFFFFFF: host not ready yet (no bindless set) — nothing was touched, the client retries.
+    struct StreamUploadParameters {
+        IN VecId blob;
+        IN std::uint32_t texCount;
+        IN std::uint32_t byteCount;
+
+        OUT std::uint32_t built;
+        OUT std::uint32_t failedMask;
+    };
+
 	struct Parameters {
         Command command;
         union {
@@ -721,6 +739,7 @@ namespace IPC {
             GeomUploadParameters geomUploadParams;
             TexUploadParameters texUploadParams;
             NearRefsParameters nearRefsParams;
+            StreamUploadParameters streamUploadParams;
         } params;
 	};
 }

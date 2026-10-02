@@ -67,7 +67,8 @@ namespace {
 
 namespace IPC {
 	Server::Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent,
-		HANDLE geomSharedMem, HANDLE geomRpcStartEvent, HANDLE geomRpcCompleteEvent) :
+		HANDLE geomSharedMem, HANDLE geomRpcStartEvent, HANDLE geomRpcCompleteEvent,
+		HANDLE streamSharedMem, HANDLE streamRpcStartEvent, HANDLE streamRpcCompleteEvent) :
 		m_sharedMem(sharedMem),
 		m_clientProcess(clientProcess),
 		m_rpcStartEvent(rpcStartEvent),
@@ -76,6 +77,11 @@ namespace IPC {
 		m_geomRpcStartEvent(geomRpcStartEvent),
 		m_geomRpcCompleteEvent(geomRpcCompleteEvent),
 		m_geomParameters(nullptr),
+		m_streamSharedMem(streamSharedMem),
+		m_streamRpcStartEvent(streamRpcStartEvent),
+		m_streamRpcCompleteEvent(streamRpcCompleteEvent),
+		m_streamParameters(nullptr),
+		m_streamPending(false),
 		m_ipcParameters(nullptr),
 		m_freeVecs()
 	{ }
@@ -100,6 +106,14 @@ namespace IPC {
 		CleanupHandle(m_geomSharedMem);
 		CleanupHandle(m_geomRpcStartEvent);
 		CleanupHandle(m_geomRpcCompleteEvent);
+
+		if (m_streamParameters != nullptr) {
+			UnmapViewOfFile(m_streamParameters);
+			m_streamParameters = nullptr;
+		}
+		CleanupHandle(m_streamSharedMem);
+		CleanupHandle(m_streamRpcStartEvent);
+		CleanupHandle(m_streamRpcCompleteEvent);
 	}
 
 	bool Server::complete() {
@@ -136,6 +150,18 @@ namespace IPC {
 			}
 		}
 
+		if (m_streamSharedMem != nullptr) {
+			if (m_streamParameters != nullptr) {
+				UnmapViewOfFile(m_streamParameters);
+				m_streamParameters = nullptr;
+			}
+			m_streamParameters = static_cast<Parameters*>(MapViewOfFile(m_streamSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Parameters)));
+			if (m_streamParameters == nullptr) {
+				LOG::winerror("Failed to map stream IPC parameters shared memory");
+				return false;
+			}
+		}
+
 		return true;
 	}
 
@@ -152,8 +178,18 @@ namespace IPC {
 		// Single thread services both — so geometry upload (addResource into g_meshes)
 		// can never race renderScene's draw, and the geometry channel just waits its turn
 		// behind an in-flight cull/scene RPC instead of starving the present-time flush.
-		HANDLE waits[3] = { m_clientProcess, m_rpcStartEvent, m_geomRpcStartEvent };
-		const DWORD waitCount = (m_geomRpcStartEvent != nullptr) ? 3 : 2;
+		// 3 = stream RPC start, 4 = the stream worker's done event (both only with a stream channel).
+		// Lowest index wins on WFMO, so a queued renderScene or geometry upload is never delayed by
+		// stream traffic, and the stream's own start/done are cheap (hand-off / install).
+		HANDLE waits[5] = { m_clientProcess, m_rpcStartEvent, m_geomRpcStartEvent, nullptr, nullptr };
+		DWORD waitCount = (m_geomRpcStartEvent != nullptr) ? 3 : 2;
+		if (waitCount == 3 && m_streamRpcStartEvent != nullptr && m_streamParameters != nullptr) {
+			waits[3] = m_streamRpcStartEvent;
+			waits[4] = ForgeRender::streamDoneEvent();
+			if (waits[4] != nullptr) {
+				waitCount = 5;
+			}
+		}
 
 		while (true) {
 			auto waitResult = WaitForMultipleObjects(waitCount, waits, FALSE, INFINITE);
@@ -165,6 +201,15 @@ namespace IPC {
 			if (waitResult == WAIT_OBJECT_0) {
 				LOG::logline("Morrowind process exited; exiting 64-bit host");
 				return true;
+			}
+
+			if (waitResult == WAIT_OBJECT_0 + 3) {
+				streamUploadStart();
+				continue;
+			}
+			if (waitResult == WAIT_OBJECT_0 + 4) {
+				streamUploadFinish();
+				continue;
 			}
 
 			if (waitResult == WAIT_OBJECT_0 + 2) {
@@ -846,5 +891,57 @@ namespace IPC {
 			LOG::logline("!! [tex] texUpload built %u/%u (%u bytes)",
 				params.texturesUploaded, params.texCount, bytes);
 		}
+	}
+
+	// Async stream batch: hand it to ForgeRender's worker and return at once. The client's window
+	// (the vec) stays the worker's until streamUploadFinish signals completion — the client only
+	// reuses it after its poll sees that. Rejected/not-ready batches complete immediately.
+	void Server::streamUploadStart() {
+		auto& params = m_streamParameters->params.streamUploadParams;
+		if (m_streamParameters->command != Command::StreamUpload) {
+			LOG::logline("Stream channel received unexpected command %u", m_streamParameters->command);
+			SetEvent(m_streamRpcCompleteEvent);
+			return;
+		}
+		if (m_streamPending) {
+			// The client kicks only after completion, so this is a protocol bug: refuse it whole.
+			LOG::logline("!! [texstream] stream start while a batch is still in flight — refused");
+			params.built = 0;
+			params.failedMask = 0xFFFFFFFFu;
+			SetEvent(m_streamRpcCompleteEvent);
+			return;
+		}
+		params.built = 0;
+		params.failedMask = 0;
+		const void* blob = nullptr;
+		std::uint32_t bytes = 0;
+		if (params.blob != InvalidVector && params.blob < m_vecs.size() && params.texCount != 0) {
+			auto& vec = getVec<IPC::GeomChunk>(params.blob);
+			const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+			bytes = params.byteCount;
+			if (bytes == 0 || bytes > availBytes) {
+				bytes = availBytes;
+			}
+			if (vec.size() != 0) {
+				blob = &vec[0];   // the host maps the whole reservation: stable for the worker
+			}
+		}
+		if (ForgeRender::streamTexturesBegin(blob, bytes, params.texCount, &params.built, &params.failedMask)) {
+			m_streamPending = true;   // completion comes from the worker's done event
+			return;
+		}
+		SetEvent(m_streamRpcCompleteEvent);
+	}
+
+	void Server::streamUploadFinish() {
+		if (!m_streamPending) {
+			return;   // a stray signal (e.g. a batch abandoned at re-init): nothing to answer
+		}
+		auto& params = m_streamParameters->params.streamUploadParams;
+		if (!ForgeRender::streamTexturesFinish(&params.built, &params.failedMask)) {
+			return;   // not finished after all (spurious wake) — keep waiting
+		}
+		m_streamPending = false;
+		SetEvent(m_streamRpcCompleteEvent);
 	}
 }

@@ -293,6 +293,9 @@ namespace IPC {
     // build stamps frame f, fires at f+1, and the host holds at most two frames — so f+4 is clear.
     // Twice that, for margin; it only delays when a streamed texture's old slot returns to the pool.
     constexpr std::uint32_t kTexColdFrames = 8;
+    // Async stream lane (Command::StreamUpload, tasks/forge-async-texture-stream.md): entries per
+    // batch, capped so the receipt's failedMask has one exact bit per entry.
+    constexpr std::uint32_t kMaxStreamBatch = 32;
 
     struct TexUploadWire {
         std::uint32_t slot;       // bindless slot (or encoded flip slot); bit 31 = kTexUploadData, bit 30 = kTexUploadRelease, bit 29 = kTexUploadCold

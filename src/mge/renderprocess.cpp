@@ -1135,6 +1135,39 @@ namespace {
     std::uint64_t                             g_texStreamed = 0;
     std::uint64_t                             g_texStreamedBytes = 0;
 
+    // ASYNC STREAM LANE (tasks/forge-async-texture-stream.md). The full files above used to ride the
+    // blocking sync flush: 5-7 ms of host ingest per 4K replacer inside the client's wait, and the
+    // host's next frame queued behind it (crossings: 45-69 ms frames). Now they go on the host's third
+    // IPC channel, where a host worker ingests them, and the client only POLLS for the receipt.
+    //   - The name moves on CONFIRMATION, not at stage time: the full file goes into a fresh COLD slot
+    //     that is RESERVED meanwhile (empty name, out of the free list, age pinned), the placeholder
+    //     keeps drawing, and the move happens in the first build after the host reports the slot bound.
+    //   - One batch in flight (<= IPC::kMaxStreamBatch entries, its own 32 MB window g_texStreamVec).
+    //   - A fresh slot must have NO unshipped sync traffic: a release staged for a free-list slot but
+    //     not yet flushed would land on the host AFTER the stream installed into it and blank the full
+    //     texture. g_slotStagedBatch[s] = the sync flush that carries s's last staged record;
+    //     g_texShippedSerial = the last flush fully consumed. Usable iff staged <= shipped.
+    //   - In-place streams (no cold slot to spare) stay on the SYNC path: an in-place upload landing
+    //     out of band could overwrite a slot the sync lane has since given to another texture.
+    // MGE_TEX_STREAM_ASYNC=0 = the previous path (full files staged into the sync flush).
+    struct TexStreamFlight {
+        std::uint32_t oldSlot;   // the placeholder's slot (the name stays on it until confirmed)
+        std::uint32_t newSlot;   // the reserved fresh slot the full file goes into
+        std::string   name;
+        std::uint32_t size;
+        bool          data;
+    };
+    bool                                      g_texStreamAsync = true;   // MGE_TEX_STREAM_ASYNC
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_texStreamVec;         // the stream lane's window
+    std::vector<TexStreamFlight>              g_texStreamFlight;          // under g_texResidencyMx
+    std::uint32_t                             g_texSwapSerial = 0;        // sync flushes started
+    std::uint32_t                             g_texShippedSerial = 0;     // ...and fully shipped
+    std::vector<std::uint32_t>                g_slotStagedBatch;          // slot -> carrying flush
+    std::uint64_t                             g_texStreamBatches = 0;     // session totals
+    std::uint64_t                             g_texStreamConfirmed = 0;
+    std::uint64_t                             g_texStreamFailed = 0;
+    std::uint64_t                             g_texStreamStale = 0;
+
     // GRID PREFETCH (tasks/forge-pipeline-depth.md "Fast-turn fps drop"). Textures reach the host on
     // FIRST SIGHT, so the first look behind you after a load resolved ~400 of them in 4 frames
     // (50-80 ms each on Dragonstar East): ~290 with no DL LOD copy shipped full-size, synchronously.
@@ -1680,8 +1713,15 @@ namespace {
     // subsystems. This reset is kept because it is correct and needed for the paths that DO re-init,
     // but it cannot make a full device re-creation safe on its own.
     void resetResidencyForReinit() {
+        // The stream lane's batch belongs to the OLD host frame state: let it finish (the host's
+        // worker answers it, or answers it failed if its renderer is torn down) before forgetting it.
+        if (g_client) { g_client->streamUploadDrain(); }
         {
             std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            g_texStreamFlight.clear();
+            g_slotStagedBatch.clear();
+            g_texSwapSerial = 0;
+            g_texShippedSerial = 0;
             g_texSlot.clear();
             g_slotName.clear();
             g_slotLastUsed.clear();
@@ -2197,7 +2237,23 @@ namespace {
             LOG::logline(">> [tex-prefetch] active-grid texture prefetch %s (%u MB per frame;"
                          " MGE_TEX_PREFETCH_MB overrides, 0 = off)",
                          g_gridPrefetchMB ? "ON" : "OFF", g_gridPrefetchMB);
+            if (GetEnvironmentVariableA("MGE_TEX_STREAM_ASYNC", e, sizeof(e)) > 0) {
+                g_texStreamAsync = std::strtoul(e, nullptr, 10) != 0;
+            }
         }
+        // The async stream lane's own window (see g_texStreamFlight). Only when the lane is on: it is
+        // 32 MB of address space in a 32-bit process.
+        if (g_texStreamAsync && g_texStreamBudgetMB != 0) {
+            auto stv = g_client->allocVecBlocking<IPC::GeomChunk>(
+                IPC::kTexChunks, IPC::kTexChunks, IPC::kTexChunks);
+            if (!stv) {
+                LOG::logline("!! [tex-stream] stream vec alloc failed — full files ride the sync flush");
+            } else {
+                g_texStreamVec.emplace(std::move(*stv));
+            }
+        }
+        LOG::logline(">> [tex-stream] async lane %s (MGE_TEX_STREAM_ASYNC=0 = full files in the sync flush)",
+                     g_texStreamVec ? "ON" : "OFF");
     }
 
     // Normalize an NI SourceTexture::fileName to the bare name BSA::loadFileBytes expects
@@ -2238,6 +2294,12 @@ namespace {
             g_texPendingBytes += entry.size();
             g_texPendingEntries.push_back(std::move(entry));
             ++g_texPendingCount;
+            // The stream lane may not take this slot until the flush carrying this record has
+            // shipped (see g_slotStagedBatch). The NEXT flush to start carries it.
+            const std::uint32_t s = hdr.slot & ~(IPC::kTexUploadData | IPC::kTexUploadRelease | IPC::kTexUploadCold);
+            if (!IPC::isFlipSlot(hdr.slot) && s < g_slotStagedBatch.size()) {
+                g_slotStagedBatch[s] = g_texSwapSerial + 1;
+            }
             return true;
         } catch (const std::bad_alloc&) {
             static std::uint32_t s_staged = 0;
@@ -2277,6 +2339,7 @@ namespace {
             g_slotName.assign(IPC::kMaxTextures, std::string());
             g_slotLastUsed.assign(IPC::kMaxTextures, 0u);
             g_slotBytes.assign(IPC::kMaxTextures, 0u);
+            g_slotStagedBatch.assign(IPC::kMaxTextures, 0u);
         }
         auto it = g_texSlot.find(name);
         if (it != g_texSlot.end()) {
@@ -2552,6 +2615,7 @@ namespace {
         // UNLOCKED — main's captureAlphaDraw keeps staging into a fresh g_texPendingEntries, and we
         // never hold g_texResidencyMx across a blocking RPC (that would be a new 60s-freeze class).
         std::deque<std::vector<std::uint8_t>> entries;
+        std::uint32_t swapSerial = 0;
         {
             std::lock_guard<std::mutex> lk(g_texResidencyMx);
             if (!g_texVec || g_texPendingEntries.empty()) {
@@ -2560,6 +2624,7 @@ namespace {
             entries.swap(g_texPendingEntries);   // main now stages into an empty deque, race-free
             g_texPendingBytes = 0;               // fresh totals for whatever main stages from here
             g_texPendingCount = 0;
+            swapSerial = ++g_texSwapSerial;      // this flush carries every record staged before now
         }
         // A0 sub-buckets (see flushGeometry): assign vs RPC wait, one line per >=1ms flush.
         const double tFlush0 = nowMs();
@@ -2621,6 +2686,12 @@ namespace {
         }
         // Fully consumed the local deque. Do NOT touch g_texPendingEntries/Bytes/Count here — they
         // now hold only what main staged during the unlocked RPC, kept for the next flush.
+        {
+            // Every record this flush carried is on the host now: the stream lane may use its slots.
+            // (The requeue path above returns before this — its records ship with a later flush.)
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            if (swapSerial > g_texShippedSerial) { g_texShippedSerial = swapSerial; }
+        }
         const double flushMs = nowMs() - tFlush0;
         if (flushMs >= 1.0) {
             LOG::logline("-- [texflush] %.2fms tex=%u bytes=%uKB assign=%.2f rpc=%.2f",
@@ -2693,20 +2764,10 @@ namespace {
     // disk reads land where the draw-list build already pays for first-sight reads. The BSA reads stay
     // under g_texResidencyMx: every BSA read shares one file handle per archive, and its seek position
     // is not thread-safe — main's captureAlphaDraw resolves through the same loader under this lock.
-    void streamPendingTextures() {
-        if (g_texStreamBudgetMB == 0 || !g_texVec) {
-            return;
-        }
-        const std::size_t budget = (std::size_t)g_texStreamBudgetMB << 20;
-        const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
-        std::size_t staged = 0;
-        std::uint32_t shipped = 0, dropped = 0;
-        // (old slot -> new slot) moves made below, applied to the per-key caches after the lock.
-        static std::vector<std::pair<std::uint32_t, std::uint32_t>> s_moved;
-        s_moved.clear();
-        std::unique_lock<std::mutex> lk(g_texResidencyMx);
-        // Placeholder slots whose name moved off kTexColdFrames ago: no draw list in flight names them
-        // now. Release on the host (cold: no wait) and hand them back to the pool.
+    // Placeholder slots whose name moved off kTexColdFrames ago: no draw list in flight names them
+    // now. Release on the host (cold: no wait) and hand them back to the pool. Caller holds
+    // g_texResidencyMx.
+    void retireStreamedPlaceholders() {
         while (!g_texRetireSlots.empty() && g_frame - g_texRetireSlots.front().frame >= IPC::kTexColdFrames) {
             const std::uint32_t s = g_texRetireSlots.front().slot;
             g_texRetireSlots.pop_front();
@@ -2721,6 +2782,42 @@ namespace {
             stageTexUpload(rel, nullptr, 0u);   // a failed stage only delays the host's free
             g_texFreeSlots.push_back(s);
         }
+    }
+
+    // Every cross-frame copy of a slot lives in a SlotInfo (see g_texFreeSlots). Point the ones naming
+    // a moved slot at its replacement directly — no epoch bump, so nothing else re-resolves.
+    // g_keySlot is produce-owned, and both callers run in the produce.
+    void retargetMovedSlots(const std::vector<std::pair<std::uint32_t, std::uint32_t>>& moved) {
+        if (moved.empty()) { return; }
+        for (auto& kv : g_keySlot) {
+            SlotInfo& si = kv.second;
+            for (const auto& mv : moved) {
+                if (si.baseSlot  == mv.first) { si.baseSlot  = mv.second; }
+                if (si.ovSlot    == mv.first) { si.ovSlot    = mv.second; }
+                if (si.paramSlot == mv.first) { si.paramSlot = mv.second; }
+            }
+        }
+    }
+
+    void streamPendingTexturesAsync();
+
+    void streamPendingTextures() {
+        if (g_texStreamBudgetMB == 0 || !g_texVec) {
+            return;
+        }
+        if (g_texStreamAsync && g_texStreamVec) {
+            streamPendingTexturesAsync();
+            return;
+        }
+        const std::size_t budget = (std::size_t)g_texStreamBudgetMB << 20;
+        const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
+        std::size_t staged = 0;
+        std::uint32_t shipped = 0, dropped = 0;
+        // (old slot -> new slot) moves made below, applied to the per-key caches after the lock.
+        static std::vector<std::pair<std::uint32_t, std::uint32_t>> s_moved;
+        s_moved.clear();
+        std::unique_lock<std::mutex> lk(g_texResidencyMx);
+        retireStreamedPlaceholders();
         const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
         while (!g_texStreamQueue.empty() && (shipped == 0 || staged < budget)) {
             TexStreamJob job = std::move(g_texStreamQueue.front());
@@ -2789,19 +2886,7 @@ namespace {
         }
         const std::size_t queued = g_texStreamQueue.size();
         lk.unlock();
-        // Every cross-frame copy of a slot lives in a SlotInfo (see g_texFreeSlots). Point the ones
-        // naming a moved slot at its replacement directly — no epoch bump, so nothing else
-        // re-resolves. g_keySlot is produce-owned, and this runs in the produce.
-        if (!s_moved.empty()) {
-            for (auto& kv : g_keySlot) {
-                SlotInfo& si = kv.second;
-                for (const auto& mv : s_moved) {
-                    if (si.baseSlot  == mv.first) { si.baseSlot  = mv.second; }
-                    if (si.ovSlot    == mv.first) { si.ovSlot    = mv.second; }
-                    if (si.paramSlot == mv.first) { si.paramSlot = mv.second; }
-                }
-            }
-        }
+        retargetMovedSlots(s_moved);
         if (shipped || dropped) {
             static std::uint32_t s_logThrottle = 0;
             if ((s_logThrottle++ % 30) == 0 || queued == 0) {
@@ -2809,6 +2894,238 @@ namespace {
                              " | session: %llu into fresh slots, %llu in place",
                              shipped, (double)staged / (1024.0 * 1024.0), dropped, queued,
                              (unsigned long long)g_texFreshStreams, (unsigned long long)g_texInPlaceStreams);
+            }
+        }
+    }
+
+    // A reserved fresh slot that will not receive its full file goes back to the pool. Its host slot
+    // is as the reservation found it (white or never used), unless `landed`: then the host holds the
+    // full texture and it must be released first. Caller holds g_texResidencyMx.
+    void unreserveStreamSlot(std::uint32_t s, bool landed) {
+        g_slotLastUsed[s] = 0;   // was pinned out of the LRU; released slots rest at 0
+        g_slotBytes[s] = 0;
+        if (landed) {
+            // Cold: a reserved slot was never named by any draw list.
+            const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease | IPC::kTexUploadCold, 0u, 0u };
+            stageTexUpload(rel, nullptr, 0u);
+        }
+        g_texFreeSlots.push_back(s);
+    }
+
+    // The async stream lane (see g_texStreamFlight). Produce context, like the sync path it replaces.
+    //   1. POLL the batch in flight. Per entry: landed AND the name still on its placeholder -> move the
+    //      name to the fresh slot (the old slot retires kTexColdFrames later, as before). Landed but
+    //      the placeholder was evicted/recycled meanwhile -> release the fresh slot. Not landed -> the
+    //      fresh slot goes back untouched and the placeholder stays (degraded, never broken).
+    //   2. STAGE the next batch only when none is in flight: BSA reads under the lock as before, fresh
+    //      slots RESERVED (never named until confirmed), then — outside the lock — one gather into the
+    //      stream window and a non-blocking kick.
+    void streamPendingTexturesAsync() {
+        MGE_ZoneScopedN("tex:stream");
+        const std::size_t budget = (std::size_t)g_texStreamBudgetMB << 20;
+        const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
+        static std::vector<std::pair<std::uint32_t, std::uint32_t>> s_moved;
+        static std::vector<std::vector<std::uint8_t>> s_entries;   // the next batch, [TexUploadWire][dds]
+        s_moved.clear();
+        s_entries.clear();
+        std::uint32_t confirmed = 0, failed = 0, stale = 0, shipped = 0, dropped = 0, inPlace = 0;
+        std::size_t staged = 0;
+        bool notReady = false;
+
+        std::uint32_t built = 0, failedMask = 0;
+        const bool completed = g_client->streamUploadPoll(&built, &failedMask);
+
+        std::unique_lock<std::mutex> lk(g_texResidencyMx);
+        if (g_slotName.size() != IPC::kMaxTextures) {
+            return;   // nothing has resolved yet, so nothing can be queued or in flight
+        }
+        retireStreamedPlaceholders();
+
+        // --- 1. The receipt ---
+        if (completed) {
+            if (built == 0xFFFFFFFFu) {
+                // Host not ready (first scene not built): nothing was touched. Unreserve and put the
+                // jobs back at the FRONT, in order, for the next attempt.
+                notReady = true;
+                for (auto it = g_texStreamFlight.rbegin(); it != g_texStreamFlight.rend(); ++it) {
+                    unreserveStreamSlot(it->newSlot, false);
+                    g_texStreamQueue.push_front(TexStreamJob{ it->oldSlot, std::move(it->name), it->data });
+                }
+            } else {
+                for (std::size_t i = 0; i < g_texStreamFlight.size(); ++i) {
+                    TexStreamFlight& f = g_texStreamFlight[i];
+                    const bool landed = (failedMask & (1u << i)) == 0u;
+                    const bool live = f.oldSlot < g_slotName.size() && g_slotName[f.oldSlot] == f.name;
+                    if (landed && live) {
+                        g_texSlot[f.name] = f.newSlot;
+                        g_slotName[f.newSlot] = f.name;
+                        g_slotLastUsed[f.newSlot] = g_frame;
+                        g_slotBytes[f.newSlot] = f.size;
+                        g_slotName[f.oldSlot].clear();
+                        g_slotLastUsed[f.oldSlot] = 0xFFFFFFFFu;   // pinned out of the LRU until it retires
+                        g_texRetireSlots.push_back(TexSlotRetire{ f.oldSlot, g_frame });
+                        s_moved.emplace_back(f.oldSlot, f.newSlot);
+                        ++confirmed;
+                        ++g_texFreshStreams;
+                        ++g_texStreamed;
+                        g_texStreamedBytes += f.size;
+                    } else if (landed) {
+                        unreserveStreamSlot(f.newSlot, true);
+                        ++stale;
+                    } else {
+                        unreserveStreamSlot(f.newSlot, false);
+                        ++failed;
+                        static std::uint32_t s_failLogged = 0;
+                        if (s_failLogged++ < 8) {
+                            LOG::logline("!! [tex-stream] host did not build %s (slot %u) — keeping %s",
+                                         f.name.c_str(), f.newSlot, f.data ? "no param map" : "the LOD placeholder");
+                        }
+                    }
+                }
+                g_texStreamConfirmed += confirmed;
+                g_texStreamFailed += failed;
+                g_texStreamStale += stale;
+            }
+            g_texStreamFlight.clear();
+        }
+
+        // --- 2. The next batch ---
+        if (!notReady && !g_client->streamUploadPending() && g_texStreamFlight.empty()) {
+            MGE_ZoneScopedN("tex:stream stage");
+            const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
+            std::size_t windowUsed = 0;
+            while (!g_texStreamQueue.empty() && g_texStreamFlight.size() < IPC::kMaxStreamBatch
+                   && (shipped + inPlace == 0 || staged < budget)) {
+                TexStreamJob job = std::move(g_texStreamQueue.front());
+                g_texStreamQueue.pop_front();
+                if (job.slot >= g_slotName.size() || g_slotName[job.slot] != job.name) {
+                    ++dropped;   // evicted or recycled while it waited
+                    continue;
+                }
+                void* data = nullptr;
+                unsigned size = 0;
+                bool loaded;
+                {
+                    MGE_ZoneScopedN("tex:stream read");
+                    loaded = BSA::loadFileBytes(job.name.c_str(), &data, &size, true);
+                }
+                if (!loaded || !data || size == 0
+                    || sizeof(IPC::TexUploadWire) + size > windowBytes) {
+                    static std::uint32_t s_loadLogged = 0;
+                    if (s_loadLogged++ < 8) {
+                        LOG::logline("!! [tex-stream] full file for %s did not load (%u bytes) — keeping %s",
+                                     job.name.c_str(), size, job.data ? "no param map" : "the LOD placeholder");
+                    }
+                    if (data) { std::free(data); }
+                    ++dropped;
+                    continue;
+                }
+                const std::size_t entryBytes = sizeof(IPC::TexUploadWire) + size;
+                if (windowUsed + entryBytes > windowBytes) {
+                    // The window is full: this one leads the next batch.
+                    std::free(data);
+                    g_texStreamQueue.push_front(std::move(job));
+                    break;
+                }
+                // A fresh COLD slot with no unshipped sync record (see g_slotStagedBatch), else grow.
+                std::uint32_t slot = 0;
+                for (std::size_t k = g_texFreeSlots.size(); k-- > 0;) {
+                    const std::uint32_t s = g_texFreeSlots[k];
+                    if (slotIsCold(s) && g_slotStagedBatch[s] <= g_texShippedSerial) {
+                        slot = s;
+                        g_texFreeSlots.erase(g_texFreeSlots.begin() + (std::ptrdiff_t)k);
+                        break;
+                    }
+                }
+                if (slot == 0 && g_nextTexSlot < cap && slotIsCold(g_nextTexSlot)) {
+                    slot = g_nextTexSlot++;
+                }
+                if (slot == 0) {
+                    // No fresh slot to spare: replace the placeholder in place on the SYNC path, as
+                    // before — never out of band (see g_texStreamFlight).
+                    const IPC::TexUploadWire hdr{ job.slot | (job.data ? IPC::kTexUploadData : 0u)
+                                                  | coldBit(job.slot), size, 0u };
+                    if (stageTexUpload(hdr, data, size)) {
+                        g_slotBytes[job.slot] = size;
+                        staged += size;   // the same per-frame budget as the async entries
+                        ++inPlace;
+                        ++g_texInPlaceStreams;
+                        ++g_texStreamed;
+                        g_texStreamedBytes += size;
+                    }
+                    std::free(data);
+                    continue;
+                }
+                bool ok = true;
+                try {
+                    std::vector<std::uint8_t> entry(entryBytes);
+                    const IPC::TexUploadWire hdr{ slot | (job.data ? IPC::kTexUploadData : 0u)
+                                                  | IPC::kTexUploadCold, size, 0u };
+                    std::memcpy(entry.data(), &hdr, sizeof(hdr));
+                    std::memcpy(entry.data() + sizeof(hdr), data, size);
+                    s_entries.push_back(std::move(entry));
+                } catch (const std::bad_alloc&) {
+                    ok = false;
+                }
+                std::free(data);
+                if (!ok) {
+                    g_texFreeSlots.push_back(slot);
+                    g_texStreamQueue.push_front(std::move(job));   // retry once memory allows
+                    break;
+                }
+                g_slotLastUsed[slot] = 0xFFFFFFFFu;   // RESERVED: no name, out of the free list and the LRU
+                g_texStreamFlight.push_back(TexStreamFlight{ job.slot, slot, std::move(job.name), size, job.data });
+                windowUsed += entryBytes;
+                staged += size;
+                ++shipped;
+            }
+        }
+        const std::size_t queued = g_texStreamQueue.size();
+        lk.unlock();
+        retargetMovedSlots(s_moved);
+
+        // --- Kick, outside the lock (the gather is the one copy; the RPC does not block) ---
+        bool kicked = false;
+        if (!s_entries.empty()) {
+            static std::vector<const void*>   parts;
+            static std::vector<std::uint32_t> partSizes;
+            parts.clear();
+            partSizes.clear();
+            std::size_t bytes = 0;
+            for (const auto& e : s_entries) {
+                parts.push_back(e.data());
+                partSizes.push_back((std::uint32_t)e.size());
+                bytes += e.size();
+            }
+            MGE_ZoneScopedN("Forge texStream kick");
+            kicked = g_texStreamVec->assign_gather(parts.data(), partSizes.data(), (std::uint32_t)parts.size())
+                  && g_client->streamUploadKick(g_texStreamVec->id(), (std::uint32_t)parts.size(), (std::uint32_t)bytes);
+            if (kicked) {
+                ++g_texStreamBatches;
+            } else {
+                // Could not hand it over: undo the reservations and put the jobs back, in order.
+                std::lock_guard<std::mutex> lk2(g_texResidencyMx);
+                for (auto it = g_texStreamFlight.rbegin(); it != g_texStreamFlight.rend(); ++it) {
+                    unreserveStreamSlot(it->newSlot, false);
+                    g_texStreamQueue.push_front(TexStreamJob{ it->oldSlot, std::move(it->name), it->data });
+                }
+                g_texStreamFlight.clear();
+                static std::uint32_t s_kickLogged = 0;
+                if (s_kickLogged++ < 8) {
+                    LOG::logline("!! [tex-stream] stream kick failed (%zu entries, %zu bytes) — requeued",
+                                 parts.size(), bytes);
+                }
+            }
+        }
+        if (confirmed || failed || stale || shipped || dropped || inPlace) {
+            static std::uint32_t s_logThrottle = 0;
+            if ((s_logThrottle++ % 30) == 0 || (queued == 0 && !kicked) || failed || stale) {
+                LOG::logline("-- [tex-stream] async: confirmed %u, failed %u, stale %u | kicked %u (%.1f MB), %u in place,"
+                             " %u dropped, %zu queued | session: %llu batches, %llu confirmed, %llu failed, %llu stale",
+                             confirmed, failed, stale, kicked ? shipped : 0u, (double)staged / (1024.0 * 1024.0),
+                             inPlace, dropped, queued,
+                             (unsigned long long)g_texStreamBatches, (unsigned long long)g_texStreamConfirmed,
+                             (unsigned long long)g_texStreamFailed, (unsigned long long)g_texStreamStale);
             }
         }
     }
@@ -2838,6 +3155,7 @@ namespace {
         const bool gridMoved = interiorCell != s_cell || gx != s_gx || gy != s_gy || g_cellEpoch != s_epoch;
         const bool cacheGrew = cacheMap.size() != s_cacheSize && g_frame - s_scanFrame >= kGridPrefetchRescanFrames;
         if (dh && (gridMoved || cacheGrew)) {
+            MGE_ZoneScopedN("tex:prefetch scan");
             // A CROSSING (user, 2026-09-30: "we can predict and load textures early in a relaxed way
             // during cell crossing"). An exterior grid slide loads a new row of cells, but under the
             // seam the cache fills only from what the camera sees, so the new row's names would reach
@@ -2945,6 +3263,7 @@ namespace {
             return;
         }
         // --- Drain: resolve until this frame has staged the budget, or spent its disk-read time. ---
+        MGE_ZoneScopedN("tex:prefetch drain");
         const std::size_t budget = (std::size_t)g_gridPrefetchMB << 20;
         const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
         const double t0 = nowMs();
@@ -9349,6 +9668,12 @@ namespace RenderProcess {
         if (g_hostZoneOpen) { MGE_TracyHostFrameEnd(g_hostZoneCtx); g_hostZoneOpen = false; }
         g_kick = KickState{};
         dropPendingCopy();   // a parked copy has nothing to copy into once this releases
+        // The stream lane's window is the host worker's until its batch completes.
+        if (g_client) { g_client->streamUploadDrain(); }
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            g_texStreamFlight.clear();
+        }
         releaseAll();
         g_geomVec.reset();
         g_drawVec.reset();
@@ -9362,6 +9687,7 @@ namespace RenderProcess {
         g_fpAlphaVec.reset();
         g_fpMultiMapVec.reset();
         g_texVec.reset();
+        g_texStreamVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
         g_drawScratch.clear();

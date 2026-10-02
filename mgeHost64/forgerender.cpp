@@ -2143,6 +2143,9 @@ namespace {
     bool         g_hostWindow = false;
     // Run the full alpha classification beside the sampled one and log disagreements (classifyAlpha).
     bool         g_texClassifyVerify = false;
+    // Async texture stream: fail every Nth streamed entry on purpose (0 = never), so the client's
+    // failedMask / fresh-slot-release path gets exercised — it is otherwise nearly unreachable.
+    float        g_streamFailEvery = 0.0f;
     HWND         g_hostHwnd = nullptr;
     SwapChain*   g_pHostSwapChain = nullptr;
     // Matches the swapchain's image count: the ring exists to let the submit for frame N stay in
@@ -22918,6 +22921,8 @@ namespace {
             // judged at midnight and the harness cannot click a checkbox at midnight either.
             { "dumpAtFrame",        &g_dumpAtFrame        },
             { "goboFadeBand",       &g_goboFadeBand       },
+            // Async texture stream fault injection (see g_streamFailEvery).
+            { "streamFailEvery",    &g_streamFailEvery    },
             // M1 step 4b THE UPSCALER (tasks/forge-upscale.md). ⚠ THE ONLY WAY THE HARNESS CAN RUN
             // THE REAL 4b TEST. Scale 1.0 is an exact identity by construction, so it proves nothing
             // about the seam; the test that does — `[rect] in=840x525 out=1680x1050`, APL within ~1%
@@ -47733,19 +47738,20 @@ void destroyHostWindow(Renderer* R);
 
     // Every classification goes through here. With the texClassifyVerify knob the full scan runs
     // beside the sampled one and any disagreement is logged — the oracle for the sampling.
-    uint64_t g_classifyChecked = 0, g_classifyMismatch = 0;
+    // Atomic: the stream worker classifies too, concurrently with the service thread's sync uploads.
+    std::atomic<uint64_t> g_classifyChecked{ 0 }, g_classifyMismatch{ 0 };
     static uint8_t classifyAlpha(const uint8_t* d, uint32_t size, const DdsInfo& info, const char* what) {
         const uint8_t kind = classifyDdsAlpha(d, size, info);
         if (g_texClassifyVerify) {
             const uint8_t full = classifyDdsAlpha(d, size, info, 0);
-            ++g_classifyChecked;
+            const uint64_t checked = ++g_classifyChecked;
             if (full != kind && g_classifyMismatch++ < 32) {
                 LOG::logline("!! [classify] %s %ux%u fmt=%u: sampled %u vs full %u",
                              what, info.width, info.height, (unsigned)info.fmt, kind, full);
             }
-            if ((g_classifyChecked & 255u) == 0) {
+            if ((checked & 255u) == 0) {
                 LOG::logline("-- [classify] verify: %llu checked, %llu mismatched",
-                             (unsigned long long)g_classifyChecked, (unsigned long long)g_classifyMismatch);
+                             (unsigned long long)checked, (unsigned long long)g_classifyMismatch.load());
             }
         }
         return kind;
@@ -48084,6 +48090,408 @@ void destroyHostWindow(Renderer* R);
         // textures would be attributed to whatever ran next.
         if (vram0) { g_vramTexBytes += (std::int64_t)vramNow(R) - (std::int64_t)vram0; }
         return built;
+    }
+
+    // ===================== ASYNC TEXTURE STREAM (tasks/forge-async-texture-stream.md) ==============
+    // A crossing's full files used to be ingested on THIS (service) thread between frames: 5-7 ms per
+    // 4K replacer, and the next frame could not start until it was done (the client's RT-copy wait at
+    // Balmora -> Caldera crossings, up to 43 ms). Now a worker does the ingest — parse, classify,
+    // create, copy — and the service thread only INSTALLS finished textures (pTextures, the ledgers,
+    // a cold bind), so every g_* texture table stays single-threaded.
+    //
+    // ⚠ THE WORKER HAS ITS OWN UPLOAD PATH (staging buffer, command pool/list, graphics queue, fence)
+    // and never touches The Forge's shared upload engine. flushTextureUploads = flushResourceUpdates +
+    // a wait on the ACTIVE set's fence; a worker flush landing between this thread's endUpdateResource
+    // and its flush would leave it waiting on a stale fence and drawing arena geometry before its copy
+    // finished. The engine mutex makes each CALL atomic, not that sequence. What the worker does share
+    // is thread-safe by construction: addTexture (D3D12MA without ALLOCATOR_FLAG_SINGLETHREADED, the
+    // descriptor heap's mutex) and LOG.
+    //
+    // The client only sends FRESH slots it has reserved (no draw names them, no sync traffic for them
+    // is unshipped), so installing them out of band is safe and every bind is cold.
+    struct StreamIn  { uint32_t slot; bool dataTex; bool cold; const uint8_t* dds; uint32_t len; };
+    struct StreamOut { Texture* tex; uint32_t landed; uint8_t kind; bool ok; };
+    struct TexStreamWorker {
+        std::thread       th;
+        HANDLE            jobEvent = nullptr;    // auto-reset: a batch is ready for the worker
+        HANDLE            doneEvent = nullptr;   // auto-reset: the batch finished (server WFMO slot 4)
+        std::atomic<bool> quit{ false };
+        std::atomic<int>  state{ 0 };            // 0 idle, 1 worker owns the batch, 2 finished
+        bool              abandoned = false;     // finished batch freed at teardown, never installed
+        bool              started = false;
+        uint32_t          count = 0;
+        StreamIn          in[IPC::kMaxStreamBatch] = {};
+        StreamOut         out[IPC::kMaxStreamBatch] = {};
+        // The worker's own upload path (see above).
+        Queue*            queue = nullptr;
+        CmdPool*          pool = nullptr;
+        Cmd*              cmd = nullptr;
+        Fence*            fence = nullptr;
+        Buffer*           staging = nullptr;
+        uint64_t          stagingCap = 0;
+        // Per-batch timing ([texstream]) and session totals.
+        double            msParse = 0, msClassify = 0, msCreate = 0, msCopy = 0, msGpu = 0, msTotal = 0;
+        uint32_t          submits = 0;
+        uint64_t          batchBytes = 0;
+        uint64_t          failCounter = 0;
+        uint64_t          batches = 0, textures = 0, failed = 0, bytes = 0;
+    };
+    TexStreamWorker g_ts;
+
+    void* streamDoneEvent() {
+        if (!g_ts.doneEvent) { g_ts.doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+        return g_ts.doneEvent;
+    }
+
+    static bool streamEnsureStaging(Renderer* R, uint64_t need) {
+        if (g_ts.staging && g_ts.stagingCap >= need) { return true; }
+        if (g_ts.staging) { removeResource(g_ts.staging); g_ts.staging = nullptr; g_ts.stagingCap = 0; }
+        const uint64_t cap = roundUp64(need > (32ull << 20) ? need : (32ull << 20), 1ull << 20);
+        BufferLoadDesc bd = {};
+        bd.mDesc.mSize = cap;
+        bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        bd.mDesc.mStartState = RESOURCE_STATE_GENERIC_READ;
+        bd.mDesc.pName = "mwTexStreamStaging";
+        Buffer* b = nullptr;
+        bd.ppBuffer = &b;
+        addResource(&bd, nullptr);   // no pData: a plain addBuffer, no loader thread, no upload engine
+        if (!b || !b->pCpuMappedAddress) {
+            LOG::logline("!! [texstream] staging buffer (%llu MB) could not be created", (unsigned long long)(cap >> 20));
+            if (b) { removeResource(b); }
+            return false;
+        }
+        (void)R;
+        g_ts.staging = b;
+        g_ts.stagingCap = cap;
+        return true;
+    }
+
+    static void streamSubmitAndWait(Renderer* R) {
+        endCmd(g_ts.cmd);
+        QueueSubmitDesc sd = {};
+        sd.mCmdCount = 1; sd.ppCmds = &g_ts.cmd; sd.pSignalFence = g_ts.fence; sd.mSubmitDone = true;
+        const double t0 = hostNowMs();
+        queueSubmit(g_ts.queue, &sd);
+        waitForFences(R, 1, &g_ts.fence);
+        g_ts.msGpu += hostNowMs() - t0;
+        ++g_ts.submits;
+    }
+
+    // One batch, on the worker thread. Results land in g_ts.out; nothing global is written.
+    static void streamRunBatch(Renderer* R) {
+        g_ts.msParse = g_ts.msClassify = g_ts.msCreate = g_ts.msCopy = g_ts.msGpu = 0.0;
+        g_ts.submits = 0;
+        g_ts.batchBytes = 0;
+        const double tBatch0 = hostNowMs();
+        uint64_t offset = 0;
+        bool recording = false;
+        ID3D12Device* dev = R->mDx.pDevice;
+        constexpr uint32_t kMaxMips = 16;
+        for (uint32_t i = 0; i < g_ts.count; ++i) {
+            const StreamIn& e = g_ts.in[i];
+            StreamOut& o = g_ts.out[i];
+            o = StreamOut{};
+            if (!e.dds) { continue; }   // refused at validation
+            // Fault injection: fail every Nth entry BEFORE anything is created, as a real failure would.
+            if (g_streamFailEvery >= 1.0f && (++g_ts.failCounter % (uint64_t)g_streamFailEvery) == 0) {
+                continue;
+            }
+            double t0 = hostNowMs();
+            DdsInfo info = parseDds(e.dds, e.len);
+            g_ts.msParse += hostNowMs() - t0;
+            if (!info.ok || info.mipLevels == 0 || info.mipLevels > kMaxMips) {
+                LOG::logline("!! [texstream] slot %u: unsupported DDS (%ux%u mips=%u) — not streamed",
+                             e.slot, info.width, info.height, info.mipLevels);
+                continue;
+            }
+            t0 = hostNowMs();
+            o.kind = e.dataTex ? (uint8_t)kTexAlphaOpaque : classifyAlpha(e.dds, e.len, info, "stream");
+            g_ts.msClassify += hostNowMs() - t0;
+
+            Texture* tex = nullptr;
+            TextureDesc td = {};
+            td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
+            td.mArraySize = 1; td.mMipLevels = info.mipLevels;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = e.dataTex ? info.fmt : toSceneTextureFormat(info.fmt);   // as uploadTextures
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = e.dataTex ? "mwParamTexture" : "mwTexture";
+            TextureLoadDesc tld = {};
+            tld.ppTexture = &tex;
+            tld.pDesc = &td;
+            t0 = hostNowMs();
+            addResource(&tld, nullptr);   // pDesc only: a synchronous addTexture, no loader queue
+            g_ts.msCreate += hostNowMs() - t0;
+            if (!tex) {
+                LOG::logline("!! [texstream] slot %u: addResource gave no texture for %ux%u fmt=%u mips=%u",
+                             e.slot, info.width, info.height, (unsigned)info.fmt, info.mipLevels);
+                continue;
+            }
+
+            // The staging layout is D3D12's own (GetCopyableFootprints), the same one
+            // cmdUpdateSubresource asks for per mip — rows padded to 256, mips placed at 512.
+            D3D12_RESOURCE_DESC rd = tex->mDx.pResource->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[kMaxMips] = {};
+            UINT rows[kMaxMips] = {};
+            UINT64 rowBytes[kMaxMips] = {};
+            UINT64 total = 0;
+            dev->GetCopyableFootprints(&rd, 0, info.mipLevels, 0, fp, rows, rowBytes, &total);
+            uint64_t base = roundUp64(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            if (base + total > g_ts.stagingCap) {
+                if (recording) { streamSubmitAndWait(R); recording = false; }
+                offset = 0; base = 0;
+                if (!streamEnsureStaging(R, total)) {
+                    o.tex = tex;   // freed on the service thread at install
+                    continue;
+                }
+            }
+
+            t0 = hostNowMs();
+            uint8_t* mapped = (uint8_t*)g_ts.staging->pCpuMappedAddress + base;
+            const uint8_t* src = e.dds + info.dataOffset;
+            const uint8_t* ddsEnd = e.dds + e.len;
+            uint32_t mipsCopied = 0;
+            for (uint32_t m = 0; m < info.mipLevels; ++m) {
+                const uint64_t mipBytes = rowBytes[m] * rows[m];
+                if (src + mipBytes > ddsEnd) {
+                    LOG::logline("!! [texstream] slot %u: DDS short at mip %u of %u (%ux%u, %u bytes)"
+                                 " — remaining mips not uploaded", e.slot, m, info.mipLevels,
+                                 info.width, info.height, e.len);
+                    break;
+                }
+                uint8_t* dst = mapped + fp[m].Offset;
+                for (UINT r = 0; r < rows[m]; ++r) {
+                    std::memcpy(dst + (size_t)r * fp[m].Footprint.RowPitch, src + (size_t)r * rowBytes[m], (size_t)rowBytes[m]);
+                }
+                src += mipBytes;
+                ++mipsCopied;
+            }
+            g_ts.msCopy += hostNowMs() - t0;
+
+            if (!recording) {
+                resetCmdPool(R, g_ts.pool);
+                beginCmd(g_ts.cmd);
+                recording = true;
+            }
+            TextureBarrier tb = { tex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_DEST };
+            cmdResourceBarrier(g_ts.cmd, 0, nullptr, 1, &tb, 0, nullptr);
+            ID3D12GraphicsCommandList* cl = g_ts.cmd->mDx.pCmdList;
+            for (uint32_t m = 0; m < mipsCopied; ++m) {
+                D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+                dstLoc.pResource = tex->mDx.pResource;
+                dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dstLoc.SubresourceIndex = m;
+                D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+                srcLoc.pResource = g_ts.staging->mDx.pResource;
+                srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                srcLoc.PlacedFootprint = fp[m];
+                srcLoc.PlacedFootprint.Offset += base;
+                cl->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+            }
+            tb = { tex, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_SHADER_RESOURCE };
+            cmdResourceBarrier(g_ts.cmd, 0, nullptr, 1, &tb, 0, nullptr);
+            offset = base + total;
+
+            o.tex = tex;
+            o.landed = (uint32_t)(src - (e.dds + info.dataOffset));
+            o.ok = true;
+            g_ts.batchBytes += e.len;
+        }
+        if (recording) { streamSubmitAndWait(R); }
+        g_ts.msTotal = hostNowMs() - tBatch0;
+    }
+
+    static void streamWorkerMain() {
+        for (;;) {
+            WaitForSingleObject(g_ts.jobEvent, INFINITE);
+            if (g_ts.quit.load()) { break; }
+            if (g_ts.state.load() != 1) { continue; }
+            streamRunBatch(g_live.pRenderer);
+            g_ts.state.store(2);
+            SetEvent(g_ts.doneEvent);
+        }
+    }
+
+    static bool startStreamWorker(Renderer* R) {
+        if (g_ts.started) { return true; }
+        if (!streamDoneEvent()) { return false; }
+        if (!g_ts.jobEvent) { g_ts.jobEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+        if (!g_ts.jobEvent) { return false; }
+        QueueDesc qd = {};
+        qd.mType = QUEUE_TYPE_GRAPHICS;   // graphics, not transfer: no queue-ownership / state-decay rules
+        initQueue(R, &qd, &g_ts.queue);
+        if (g_ts.queue) {
+            CmdPoolDesc pd = {}; pd.pQueue = g_ts.queue;
+            initCmdPool(R, &pd, &g_ts.pool);
+        }
+        if (g_ts.pool) {
+            CmdDesc cd = {}; cd.pPool = g_ts.pool;
+            initCmd(R, &cd, &g_ts.cmd);
+        }
+        if (g_ts.cmd) { initFence(R, &g_ts.fence); }
+        if (!g_ts.fence || !streamEnsureStaging(R, 32ull << 20)) {
+            LOG::logline("!! [texstream] worker upload path could not be created (queue=%p pool=%p cmd=%p fence=%p)",
+                         (void*)g_ts.queue, (void*)g_ts.pool, (void*)g_ts.cmd, (void*)g_ts.fence);
+            if (g_ts.staging) { removeResource(g_ts.staging); g_ts.staging = nullptr; g_ts.stagingCap = 0; }
+            if (g_ts.fence) { exitFence(R, g_ts.fence); g_ts.fence = nullptr; }
+            if (g_ts.cmd)   { exitCmd(R, g_ts.cmd); g_ts.cmd = nullptr; }
+            if (g_ts.pool)  { exitCmdPool(R, g_ts.pool); g_ts.pool = nullptr; }
+            if (g_ts.queue) { exitQueue(R, g_ts.queue); g_ts.queue = nullptr; }
+            return false;
+        }
+        g_ts.quit.store(false);
+        g_ts.state.store(0);
+        g_ts.abandoned = false;
+        g_ts.th = std::thread(streamWorkerMain);
+        g_ts.started = true;
+        LOG::logline(">> [texstream] worker up: own graphics queue + %llu MB staging", (unsigned long long)(g_ts.stagingCap >> 20));
+        return true;
+    }
+
+    // Teardown (shutdown, and init's re-init through it). The worker finishes the batch it holds —
+    // its copies are on its own queue and must settle before the device goes — then any finished
+    // but uninstalled textures are freed and the batch is answered as failed when the service thread
+    // next sees the done event, so the client's in-flight record cannot hang.
+    static void stopStreamWorker() {
+        if (!g_ts.started) { return; }
+        Renderer* R = g_live.pRenderer;
+        g_ts.quit.store(true);
+        SetEvent(g_ts.jobEvent);
+        if (g_ts.th.joinable()) { g_ts.th.join(); }
+        // A batch handed over just before quit was never run: answer it as failed too.
+        if (g_ts.state.load() == 1) {
+            for (uint32_t i = 0; i < g_ts.count; ++i) { g_ts.out[i] = StreamOut{}; }
+            g_ts.state.store(2);
+        }
+        if (g_ts.state.load() == 2) {
+            for (uint32_t i = 0; i < g_ts.count; ++i) {
+                if (g_ts.out[i].tex) { removeResource(g_ts.out[i].tex); g_ts.out[i].tex = nullptr; }
+            }
+            g_ts.abandoned = true;
+            SetEvent(g_ts.doneEvent);
+        }
+        if (R) {
+            if (g_ts.staging) { removeResource(g_ts.staging); }
+            if (g_ts.fence)   { exitFence(R, g_ts.fence); }
+            if (g_ts.cmd)     { exitCmd(R, g_ts.cmd); }
+            if (g_ts.pool)    { exitCmdPool(R, g_ts.pool); }
+            if (g_ts.queue)   { exitQueue(R, g_ts.queue); }
+        }
+        g_ts.staging = nullptr; g_ts.stagingCap = 0;
+        g_ts.fence = nullptr; g_ts.cmd = nullptr; g_ts.pool = nullptr; g_ts.queue = nullptr;
+        g_ts.started = false;
+    }
+
+    bool streamTexturesBegin(const void* blob, unsigned byteCount, unsigned count,
+                             unsigned* outBuilt, unsigned* outFailedMask) {
+        const uint32_t all = (count >= 32u) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+        *outBuilt = 0;
+        *outFailedMask = all;
+        if (g_live.pRenderer && !g_live.pPersistentSet) {
+            *outBuilt = 0xFFFFFFFFu;   // not ready: nothing touched, the client retries the batch
+            *outFailedMask = 0;
+            return false;
+        }
+        if (!g_live.pRenderer || !blob || !byteCount || count == 0 || count > IPC::kMaxStreamBatch) {
+            if (count > IPC::kMaxStreamBatch) {
+                LOG::logline("!! [texstream] batch of %u exceeds %u — refused", count, IPC::kMaxStreamBatch);
+            }
+            return false;
+        }
+        if (g_ts.state.load() != 0) {
+            LOG::logline("!! [texstream] batch start while the worker still holds one — refused");
+            return false;
+        }
+        if (!startStreamWorker(g_live.pRenderer)) {
+            return false;
+        }
+        // Validate every header here, on the service thread: the worker then only ever sees entries
+        // whose bytes lie inside the window and whose slot is a plain client slot.
+        const uint8_t* p   = (const uint8_t*)blob;
+        const uint8_t* end = p + byteCount;
+        for (uint32_t i = 0; i < count; ++i) {
+            StreamIn& e = g_ts.in[i];
+            e = StreamIn{};
+            if (p + sizeof(IPC::TexUploadWire) > end) { continue; }
+            IPC::TexUploadWire hdr;
+            std::memcpy(&hdr, p, sizeof(hdr));
+            const uint8_t* dds = p + sizeof(hdr);
+            if (dds + hdr.byteLen > end) { p = end; continue; }
+            p = dds + hdr.byteLen;
+            e.dataTex = (hdr.slot & IPC::kTexUploadData) != 0u;
+            e.cold    = (hdr.slot & IPC::kTexUploadCold) != 0u;
+            const bool release = (hdr.slot & IPC::kTexUploadRelease) != 0u;
+            const uint32_t slot = hdr.slot & ~(IPC::kTexUploadData | IPC::kTexUploadRelease | IPC::kTexUploadCold);
+            if (release || slot == 0 || slot >= kMaxTextures || IPC::isFlipSlot(slot) || hdr.byteLen == 0) {
+                LOG::logline("!! [texstream] entry %u: slot 0x%08x is not a streamable slot — refused", i, hdr.slot);
+                continue;
+            }
+            e.slot = slot;
+            e.dds = dds;
+            e.len = hdr.byteLen;
+        }
+        g_ts.count = count;
+        g_ts.state.store(1);
+        SetEvent(g_ts.jobEvent);
+        return true;
+    }
+
+    bool streamTexturesFinish(unsigned* outBuilt, unsigned* outFailedMask) {
+        if (g_ts.state.load() != 2) { return false; }
+        Renderer* R = g_live.pRenderer;
+        const double t0 = hostNowMs();
+        uint32_t built = 0, failedMask = 0;
+        for (uint32_t i = 0; i < g_ts.count; ++i) {
+            const StreamIn& e = g_ts.in[i];
+            StreamOut& o = g_ts.out[i];
+            if (g_ts.abandoned || !o.ok || !R) {
+                if (o.tex && R) { removeResource(o.tex); }
+                o.tex = nullptr;
+                failedMask |= 1u << i;
+                continue;
+            }
+            // Install — exactly uploadTextures' tail for one slot, on this thread.
+            if (g_live.pTextures[e.slot] != g_live.pDefaultWhite) {
+                g_texRetire.push_back({ g_live.pTextures[e.slot], g_frameSerial });
+            }
+            g_live.pTextures[e.slot] = o.tex;
+            if (e.slot + 1 > g_live.texHigh) { g_live.texHigh = e.slot + 1; }
+            g_texResidentBytes -= g_texSlotBytes[e.slot];
+            g_texSlotBytes[e.slot] = o.landed;
+            g_texResidentBytes += o.landed;
+            g_texAlphaKind[e.slot] = o.kind;
+            bindTextureSlot(R, e.slot, e.cold);
+            g_texIsData[e.slot] = e.dataTex ? 1u : 0u;
+            o.tex = nullptr;
+            ++built;
+        }
+        const double installMs = hostNowMs() - t0;
+        if (!g_ts.abandoned) {
+            ++g_ts.batches;
+            g_ts.textures += built;
+            g_ts.failed += g_ts.count - built;
+            g_ts.bytes += g_ts.batchBytes;
+            if (g_ts.msTotal >= 5.0 || failedMask) {
+                LOG::logline("-- [texstream] worker %.2f ms: %u/%u tex %.1f MB | parse %.2f classify %.2f create %.2f copy %.2f"
+                             " gpu %.2f (%u submits) | install %.2f ms | failed 0x%08x",
+                             g_ts.msTotal, built, g_ts.count, (double)g_ts.batchBytes / (1024.0 * 1024.0),
+                             g_ts.msParse, g_ts.msClassify, g_ts.msCreate, g_ts.msCopy, g_ts.msGpu,
+                             g_ts.submits, installMs, failedMask);
+            }
+            if ((g_ts.batches & 63u) == 0) {
+                LOG::logline(">> [texstream] session: %llu batches, %llu textures, %llu failed, %.1f MB",
+                             (unsigned long long)g_ts.batches, (unsigned long long)g_ts.textures,
+                             (unsigned long long)g_ts.failed, (double)g_ts.bytes / (1024.0 * 1024.0));
+            }
+        }
+        *outBuilt = built;
+        *outFailedMask = failedMask;
+        g_ts.count = 0;
+        g_ts.abandoned = false;
+        g_ts.state.store(0);
+        return true;
     }
 
     // ===================== Phase 1a: host-owned distant land =============================
@@ -61409,6 +61817,9 @@ void destroyHostWindow(Renderer* R);
     }
 
     void shutdown() {
+        // The stream worker first: its copies run on its own queue and must settle before anything
+        // below goes, and a finished-but-uninstalled batch is freed here (see stopStreamWorker).
+        stopStreamWorker();
         Renderer* R = g_live.pRenderer;
         if (!R) {
             freeMeshStore();

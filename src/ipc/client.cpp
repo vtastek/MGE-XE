@@ -41,10 +41,17 @@ namespace IPC {
 		m_geomRpcStartEvent(INVALID_HANDLE_VALUE),
 		m_geomRpcCompleteEvent(INVALID_HANDLE_VALUE),
 		m_geomParameters(nullptr),
-		m_geomRpcPending(false)
+		m_geomRpcPending(false),
+		m_streamSharedMem(INVALID_HANDLE_VALUE),
+		m_streamRpcStartEvent(INVALID_HANDLE_VALUE),
+		m_streamRpcCompleteEvent(INVALID_HANDLE_VALUE),
+		m_streamParameters(nullptr),
+		m_streamRpcPending(false)
 	{
 		m_geomWaitHandles[0] = INVALID_HANDLE_VALUE;
 		m_geomWaitHandles[1] = INVALID_HANDLE_VALUE;
+		m_streamWaitHandles[0] = INVALID_HANDLE_VALUE;
+		m_streamWaitHandles[1] = INVALID_HANDLE_VALUE;
 	}
 
 	Client::~Client() {
@@ -71,6 +78,14 @@ namespace IPC {
 		CleanupHandle(m_geomSharedMem);
 		CleanupHandle(m_geomRpcStartEvent);
 		CleanupHandle(m_geomRpcCompleteEvent);
+
+		if (m_streamParameters != nullptr) {
+			UnmapViewOfFile(m_streamParameters);
+			m_streamParameters = nullptr;
+		}
+		CleanupHandle(m_streamSharedMem);
+		CleanupHandle(m_streamRpcStartEvent);
+		CleanupHandle(m_streamRpcCompleteEvent);
 	}
 
 	bool Client::isServerActive() {
@@ -254,8 +269,33 @@ namespace IPC {
 			goto failedOnGeomCompleteEvent;
 		}
 
-		std::sprintf(strHandles, "%p %p %p %p %p %p %p", m_sharedMem, thisProcess, m_rpcStartEvent, m_rpcCompleteEvent,
-			m_geomSharedMem, m_geomRpcStartEvent, m_geomRpcCompleteEvent);
+		// --- Async texture STREAM channel: third Parameters region + start/complete events ---
+		m_streamSharedMem = CreateFileMappingA(INVALID_HANDLE_VALUE, &attrsAllowInherit, PAGE_READWRITE, 0, sizeof(Parameters), NULL);
+		if (m_streamSharedMem == NULL) {
+			LOG::winerror("Failed to create stream shared memory region");
+			goto failedOnStreamMapping;
+		}
+		m_streamParameters = static_cast<Parameters*>(MapViewOfFile(m_streamSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+		if (m_streamParameters == nullptr) {
+			LOG::winerror("Failed to map stream shared memory region");
+			goto failedOnStreamMap;
+		}
+		ZeroMemory(m_streamParameters, sizeof(Parameters));
+		m_streamRpcStartEvent = CreateEventA(&attrsAllowInherit, FALSE, FALSE, NULL);
+		if (m_streamRpcStartEvent == NULL) {
+			LOG::winerror("Failed to create stream RPC start event");
+			goto failedOnStreamStartEvent;
+		}
+		m_streamRpcCompleteEvent = CreateEventA(&attrsAllowInherit, FALSE, FALSE, NULL);
+		if (m_streamRpcCompleteEvent == NULL) {
+			LOG::winerror("Failed to create stream RPC complete event");
+			goto failedOnStreamCompleteEvent;
+		}
+		m_streamRpcPending = false;
+
+		std::sprintf(strHandles, "%p %p %p %p %p %p %p %p %p %p", m_sharedMem, thisProcess, m_rpcStartEvent, m_rpcCompleteEvent,
+			m_geomSharedMem, m_geomRpcStartEvent, m_geomRpcCompleteEvent,
+			m_streamSharedMem, m_streamRpcStartEvent, m_streamRpcCompleteEvent);
 		if (!CreateProcessA(executable, strHandles, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &startupInfo, &processInfo)) {
 			LOG::winerror("Failed to start 64-bit host process %s", executable);
 			goto failedOnCreateProcess;
@@ -266,6 +306,8 @@ namespace IPC {
 		CloseHandle(processInfo.hThread);
 		m_geomWaitHandles[0] = m_process;
 		m_geomWaitHandles[1] = m_geomRpcCompleteEvent;
+		m_streamWaitHandles[0] = m_process;
+		m_streamWaitHandles[1] = m_streamRpcCompleteEvent;
 
 		LOG::logline("64-bit host process started (PID %u)", processInfo.dwProcessId);
 
@@ -279,6 +321,16 @@ namespace IPC {
 		LOG::logline("Failed waiting for 64-bit host process to initialize");
 
 	failedOnCreateProcess:
+		CleanupHandle(m_streamRpcCompleteEvent);
+	failedOnStreamCompleteEvent:
+		CleanupHandle(m_streamRpcStartEvent);
+	failedOnStreamStartEvent:
+		UnmapViewOfFile(m_streamParameters);
+		m_streamParameters = nullptr;
+	failedOnStreamMap:
+		CloseHandle(m_streamSharedMem);
+		m_streamSharedMem = INVALID_HANDLE_VALUE;
+	failedOnStreamMapping:
 		CleanupHandle(m_geomRpcCompleteEvent);
 	failedOnGeomCompleteEvent:
 		CleanupHandle(m_geomRpcStartEvent);
@@ -896,5 +948,51 @@ namespace IPC {
 				return WakeReason::Error;
 			}
 		}
+	}
+
+	bool Client::streamUploadKick(VecId blob, std::uint32_t texCount, std::uint32_t byteCount) {
+		if (m_streamParameters == nullptr || m_streamRpcPending) {
+			return false;
+		}
+		auto& params = m_streamParameters->params.streamUploadParams;
+		params.blob = blob;
+		params.texCount = texCount;
+		params.byteCount = byteCount;
+		params.built = 0;
+		params.failedMask = 0;
+		ResetEvent(m_streamRpcCompleteEvent);
+		m_streamParameters->command = Command::StreamUpload;
+		if (!SetEvent(m_streamRpcStartEvent)) {
+			LOG::winerror("Failed to set stream RPC start event");
+			return false;
+		}
+		m_streamRpcPending = true;
+		return true;
+	}
+
+	bool Client::streamUploadPoll(std::uint32_t* outBuilt, std::uint32_t* outFailedMask) {
+		if (!m_streamRpcPending) {
+			return false;
+		}
+		const DWORD r = WaitForMultipleObjects(2, m_streamWaitHandles, FALSE, 0);
+		if (r != WAIT_OBJECT_0 + 1) {
+			// Still in flight (timeout), or the host is gone (handle 0) — the latter surfaces on the
+			// other channels' next RPC; the batch simply never completes here.
+			return false;
+		}
+		m_streamRpcPending = false;
+		const auto& params = m_streamParameters->params.streamUploadParams;
+		if (outBuilt) { *outBuilt = params.built; }
+		if (outFailedMask) { *outFailedMask = params.failedMask; }
+		return true;
+	}
+
+	bool Client::streamUploadDrain() {
+		if (!m_streamRpcPending) {
+			return true;
+		}
+		const DWORD r = WaitForMultipleObjects(2, m_streamWaitHandles, FALSE, MaxWait);
+		m_streamRpcPending = false;   // completed, or the host is gone: either way nothing is in flight
+		return r == WAIT_OBJECT_0 + 1;
 	}
 }

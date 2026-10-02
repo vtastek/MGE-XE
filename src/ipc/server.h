@@ -38,6 +38,14 @@ namespace IPC {
 		HANDLE m_geomRpcStartEvent;
 		HANDLE m_geomRpcCompleteEvent;
 		Parameters* m_geomParameters;
+		// Async texture STREAM channel (tasks/forge-async-texture-stream.md). The start is cheap
+		// (validate + hand to ForgeRender's worker); completion is signalled when the worker's done
+		// event fires and the finished textures have been installed on THIS thread.
+		HANDLE m_streamSharedMem;
+		HANDLE m_streamRpcStartEvent;
+		HANDLE m_streamRpcCompleteEvent;
+		Parameters* m_streamParameters;
+		bool m_streamPending;
 		std::vector<Vec<char>*> m_vecs;
 		std::queue<VecId> m_freeVecs;
 		Parameters* m_ipcParameters;
@@ -60,10 +68,13 @@ namespace IPC {
 		void renderFrame();
 		void geomUpload();
 		void texUpload();
+		void streamUploadStart();
+		void streamUploadFinish();
 
 	public:
 		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent,
-			HANDLE geomSharedMem = nullptr, HANDLE geomRpcStartEvent = nullptr, HANDLE geomRpcCompleteEvent = nullptr);
+			HANDLE geomSharedMem = nullptr, HANDLE geomRpcStartEvent = nullptr, HANDLE geomRpcCompleteEvent = nullptr,
+			HANDLE streamSharedMem = nullptr, HANDLE streamRpcStartEvent = nullptr, HANDLE streamRpcCompleteEvent = nullptr);
 		~Server();
 		Server(const Server&) = delete;
 		Server& operator=(const Server&) = delete;

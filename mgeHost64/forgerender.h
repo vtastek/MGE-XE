@@ -154,6 +154,18 @@ namespace ForgeRender {
     // (PerFrame set) exists. The sampler is built from the AF level passed to init().
     unsigned uploadTextures(const void* blob, unsigned byteCount, unsigned count);
 
+    // Async texture STREAM (tasks/forge-async-texture-stream.md). Begin validates a batch of
+    // [TexUploadWire][dds]* (<= IPC::kMaxStreamBatch entries, fresh client-reserved slots) and hands
+    // it to the stream worker, which parses, classifies, creates and copies on its OWN queue. Returns
+    // true when accepted (completion pending: the worker signals streamDoneEvent()); false when it
+    // completed at once, with outBuilt/outFailedMask filled (0xFFFFFFFF built = not ready yet).
+    // Finish runs on the service thread at the done event: installs every finished texture
+    // (g_live.pTextures, ledgers, cold bind) and fills the receipt; false = not finished yet.
+    void* streamDoneEvent();   // HANDLE; auto-reset, created on first call
+    bool streamTexturesBegin(const void* blob, unsigned byteCount, unsigned count,
+                             unsigned* outBuilt, unsigned* outFailedMask);
+    bool streamTexturesFinish(unsigned* outBuilt, unsigned* outFailedMask);
+
     // Render one frame (clear + triangle) into the shared RT and leave it in a
     // state MW's D3D9Ex StretchRect can read (COMMON). Blocking: waits on the GPU
     // fence before returning, so the RPC reply implies the frame is ready.

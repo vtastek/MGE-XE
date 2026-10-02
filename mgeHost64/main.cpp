@@ -338,13 +338,21 @@ int main(int argc, char** argv) {
 	HANDLE geomSharedMem = nullptr;
 	HANDLE geomRpcStartEvent = nullptr;
 	HANDLE geomRpcCompleteEvent = nullptr;
-	const int parsed = std::sscanf(GetCommandLineA(), "%p %p %p %p %p %p %p",
+	// Async texture stream channel (third shared-mem + start/complete events); 10-handle form only.
+	HANDLE streamSharedMem = nullptr;
+	HANDLE streamRpcStartEvent = nullptr;
+	HANDLE streamRpcCompleteEvent = nullptr;
+	const int parsed = std::sscanf(GetCommandLineA(), "%p %p %p %p %p %p %p %p %p %p",
 		&sharedMem, &clientProcess, &rpcStartEvent, &rpcCompleteEvent,
-		&geomSharedMem, &geomRpcStartEvent, &geomRpcCompleteEvent);
-	if (parsed != 7 && parsed != 4) {
+		&geomSharedMem, &geomRpcStartEvent, &geomRpcCompleteEvent,
+		&streamSharedMem, &streamRpcStartEvent, &streamRpcCompleteEvent);
+	if (parsed != 10 && parsed != 7 && parsed != 4) {
 		LOG::logline("Expected handles not found on command line (parsed %d)", parsed);
 		LOG::flush();
 		return 1;
+	}
+	if (parsed < 10) {
+		streamSharedMem = streamRpcStartEvent = streamRpcCompleteEvent = nullptr;
 	}
 	if (parsed == 4) {
 		geomSharedMem = geomRpcStartEvent = geomRpcCompleteEvent = nullptr;
@@ -364,7 +372,8 @@ int main(int argc, char** argv) {
 	}
 
 	IPC::Server server(sharedMem, clientProcess, rpcStartEvent, rpcCompleteEvent,
-		geomSharedMem, geomRpcStartEvent, geomRpcCompleteEvent);
+		geomSharedMem, geomRpcStartEvent, geomRpcCompleteEvent,
+		streamSharedMem, streamRpcStartEvent, streamRpcCompleteEvent);
 	if (!server.init()) {
 		LOG::logline("!! Server initialization failed");
 		LOG::flush();

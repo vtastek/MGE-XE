@@ -114,6 +114,17 @@ namespace IPC {
 		Parameters* m_geomParameters;
 		bool m_geomRpcPending;
 
+		// Third channel: async texture STREAM (tasks/forge-async-texture-stream.md). Its own
+		// Parameters + events, one batch in flight, polled — never waited on in a frame. Not
+		// subject to the RenderFrame window rule: the host does not run the batch on its service
+		// thread (a worker does), so a kick cannot serialise behind the host frame.
+		HANDLE m_streamSharedMem;
+		HANDLE m_streamRpcStartEvent;
+		HANDLE m_streamRpcCompleteEvent;
+		HANDLE m_streamWaitHandles[2];   // {m_process, m_streamRpcCompleteEvent}
+		Parameters* m_streamParameters;
+		bool m_streamRpcPending;
+
 		bool beginRpc(Command command);
 		bool beginGeomRpc(Command command);
 		WakeReason waitGeomCompletion(DWORD ms = MaxWait);
@@ -416,6 +427,15 @@ namespace IPC {
 		*/
 		bool geomUploadBlocking(VecId blob, std::uint32_t partCount, std::uint32_t byteCount, std::uint32_t* outUploaded = nullptr);
 		bool texUploadBlocking(VecId blob, std::uint32_t texCount, std::uint32_t byteCount, std::uint32_t* outUploaded = nullptr);
+
+		// Async stream lane (third channel). Kick refuses while a batch is in flight. Poll never
+		// blocks: false = still in flight (or nothing pending); true = the batch completed and
+		// built/failedMask hold its receipt. Drain blocks until any pending batch completes (shutdown,
+		// device re-init) and discards the receipt. False from Kick/Drain = host gone or channel down.
+		bool streamUploadKick(VecId blob, std::uint32_t texCount, std::uint32_t byteCount);
+		bool streamUploadPoll(std::uint32_t* outBuilt, std::uint32_t* outFailedMask);
+		bool streamUploadDrain();
+		bool streamUploadPending() const { return m_streamRpcPending; }
 
 		// True if an RPC has been issued and not yet awaited. Use this to avoid
 		// issuing a blocking RPC that would drain (steal) a pending async RPC's
