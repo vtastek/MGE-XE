@@ -128,6 +128,11 @@ namespace RenderProcess {
     // seam is live and wants static opaque geometry. Avoids any cost when off.
     bool wantsGeometryCapture();
 
+    // Provenance for the [geomflush] batch shape (tasks/forge-crossing-frame.md P0): the cache sets
+    // it around the post-load window walk, so a flush reports how much of what it ships is the
+    // window's (off-screen) captures vs this frame's draws. Measurement only — changes nothing shipped.
+    void setWindowCapture(bool on);
+
     // Register a NiFlipController's whole frame list as one gFlipArrays Texture2DArray, so a flip
     // book costs ONE bindless descriptor instead of one slot per frame (a 300-frame book was a
     // third of the client's whole residency). Names are NI SourceTexture::fileName; the call is

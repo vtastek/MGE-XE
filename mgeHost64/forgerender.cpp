@@ -61262,6 +61262,18 @@ void destroyHostWindow(Renderer* R);
         // the right component. One line per >=1ms upload.
         const double tUp0 = hostNowMs();
         double tLoopMs = 0.0, tStaticMs = 0.0, tArenaMs = 0.0;
+        // [geomup] split of the loop (tasks/forge-crossing-frame.md P0: the frame after a crossing
+        // spends 10.5-15.6 ms in this RPC). Per-part step times + the batch shape, so P3 knows
+        // whether the cost scales with parts/bytes or is a fixed step (grow, fence).
+        double tRelMs = 0.0, tAliasMs = 0.0, tBoundsMs = 0.0, tDynMs = 0.0;
+        double tAllocMs = 0.0, tGrowMs = 0.0, tCopyMs = 0.0, tPerMeshMs = 0.0;
+        unsigned nRel = 0, nAlias = 0, nDyn = 0, nArena = 0, nPerMesh = 0, nGrow = 0;
+        uint64_t arenaBytes = 0, perMeshBytes = 0;
+        struct StepTimer {   // adds its scope's time to `acc` on every exit, `continue` included
+            double& acc; const double t0;
+            explicit StepTimer(double& a) : acc(a), t0(hostNowMs()) {}
+            ~StepTimer() { acc += hostNowMs() - t0; }
+        };
         const uint8_t* p   = (const uint8_t*)blobBytes;
         const uint8_t* end = p + byteCount;
         const uint64_t vramGeo0 = vramNow(g_live.pRenderer);   // bracket: this call only
@@ -61300,6 +61312,8 @@ void destroyHostWindow(Renderer* R);
             // The in-flight-resource hazard that justified the exemption is answered, not ignored:
             // releaseMeshBuffers PARKS them in g_bufRetire, drained only after the frame fence.
             if (hdr.flags & IPC::kGeomFlagRelease) {
+                StepTimer st(tRelMs);
+                ++nRel;
                 if (hdr.slot < g_meshHigh) {
                     HostMesh& rm = g_meshes[hdr.slot];
                     // Precise invalidation: dirty only the slots that were shadowing this caster so
@@ -61340,6 +61354,8 @@ void destroyHostWindow(Renderer* R);
             // block hdr.block. Point the slot at the block's range and take a ref — no bytes, no
             // arena alloc. Like Release it is consumed whatever happens (a re-send cannot help).
             if (hdr.flags & IPC::kGeomFlagAlias) {
+                StepTimer st(tAliasMs);
+                ++nAlias;
                 ++built;
                 if (!ensureMeshSlot(hdr.slot)) {
                     ++skippedParts;
@@ -61430,6 +61446,7 @@ void destroyHostWindow(Renderer* R);
             // vertex format starts with float3 pos, so one stride-walk covers all three. Runs on
             // every upload (morph re-uploads refresh it too — cheap next to the memcpy itself).
             {
+                StepTimer st(tBoundsMs);
                 float mn[3] = {  3.4e38f,  3.4e38f,  3.4e38f };
                 float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
                 const uint8_t* vp = (const uint8_t*)verts;
@@ -61474,6 +61491,8 @@ void destroyHostWindow(Renderer* R);
             }
 
             if (sameShape) {
+                StepTimer st(tDynMs);   // ring memcpy / promotion / same-shape release before rebuild
+                ++nDyn;
                 m.uploadStreak    = consecutive ? (uint16_t)(m.uploadStreak + 1) : 0;
                 m.lastUploadFrame = g_renderFrame;
 
@@ -61584,9 +61603,12 @@ void destroyHostWindow(Renderer* R);
 
             if (!isSkinned && !isMultiMap) {
                 // Sub-allocate the mega VB + IB; write the sub-ranges via BufferUpdateDesc.
+                const double tAlloc0 = hostNowMs();
                 uint64_t vbo = g_arenaVB.alloc(vbBytes);
                 uint64_t ibo = g_arenaIB.alloc(ibBytes);
                 if (vbo == UINT64_MAX || ibo == UINT64_MAX) {
+                    StepTimer gt(tGrowMs);   // mid-batch flush + reclaim + grow-by-copy (also inside alloc)
+                    ++nGrow;
                     // Arena full: grow-by-copy (doubling) and retry once. Settle any staged
                     // arena updates from earlier parts in THIS batch first — the loader's
                     // update stream still targets the old Buffer*, and the grow deletes it.
@@ -61615,6 +61637,7 @@ void destroyHostWindow(Renderer* R);
                         ibo = g_arenaIB.alloc(ibBytes);
                     }
                 }
+                tAllocMs += hostNowMs() - tAlloc0;
                 if (vbo == UINT64_MAX || ibo == UINT64_MAX) {
                     // Grow failed (GPU memory exhausted) — terminal skip, counted and logged
                     // per upload call below (was a once-per-process warn that hid the scale).
@@ -61628,6 +61651,9 @@ void destroyHostWindow(Renderer* R);
                     skippedIB += ibBytes;
                     continue;   // part won't draw this slot — logged, no fallback (PD1)
                 }
+                const double tCopy0 = hostNowMs();
+                ++nArena;
+                arenaBytes += vbBytes + ibBytes;
                 BufferUpdateDesc uv = {};
                 uv.pBuffer    = g_live.pArenaVB;
                 uv.mDstOffset = vbo;
@@ -61643,6 +61669,7 @@ void destroyHostWindow(Renderer* R);
                 beginUpdateResource(&ui);
                 std::memcpy(ui.pMappedData, indices, (size_t)ibBytes);
                 endUpdateResource(&ui);
+                tCopyMs += hostNowMs() - tCopy0;
 
                 m.inArena = true;
                 m.vbOff   = vbo;
@@ -61695,6 +61722,9 @@ void destroyHostWindow(Renderer* R);
                     skippedIB += ibBytes;
                     continue;
                 }
+                StepTimer st(tPerMeshMs);
+                ++nPerMesh;
+                perMeshBytes += vbBytes + ibBytes;
                 m.inArena = false;
                 BufferLoadDesc vbDesc = {};
                 vbDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -61776,23 +61806,10 @@ void destroyHostWindow(Renderer* R);
             // (logDeviceRemoved measured free — 0.00ms.)
             logDeviceRemoved(g_live.pRenderer, "uploadGeometry/flush");
         }
-        // A1 geom-flush cut (probe-sized 2026-07-17): the per-upload LOGF (~3.2ms — The-Forge
-        // logger fsyncs) + std::printf (~1.5ms console write) were ~4.7ms of the ~5ms geom-RPC
-        // turnaround the CLIENT blocks on — every steady-state frame ships a 1-part KB-sized
-        // revision bump, so this tail log was a per-frame client tax, not a load-burst log.
-        // Log load bursts only; the client's [geomflush] line still covers steady state.
-        // NightDaySwitch addendum: 200+ tiny ARENA parts re-shipping EVERY frame pass the
-        // partCount>=16 "burst" test and keep anyArena true — cap at ~1 line/s as well.
-        static double s_lastBuiltLogMs = 0.0;
-        const double nowLogMs = hostNowMs();
-        if ((anyStatic || anyArena) && (partCount >= 16 || byteCount >= (256u << 10))
-            && (nowLogMs - s_lastBuiltLogMs >= 1000.0)) {
-            s_lastBuiltLogMs = nowLogMs;
-            LOGF(eINFO, "[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u",
-                 built, partCount, byteCount, g_meshHigh);
-            std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
-                        built, partCount, byteCount, g_meshHigh);
-        }
+        // No LOGF/printf "built" line here any more. A1 (2026-07-17) measured it at ~4.7 ms (The-Forge
+        // logger fsyncs + console write) and cut it to load bursts at ~1/s — which is exactly the
+        // crossing frame's first >=16-part batch: P0 of tasks/forge-crossing-frame.md found a 5-7.5 ms
+        // untimed tail on those RPCs. [geomup] below carries built/meshHigh instead (plain logline).
         if (skippedParts) {
             g_skippedPartsTotal += skippedParts;
             g_skippedVBTotal    += skippedVB;
@@ -61806,8 +61823,19 @@ void destroyHostWindow(Renderer* R);
         }
         const double totalMs = hostNowMs() - tUp0;
         if (totalMs >= 1.0) {
-            LOG::logline("-- [forge] uploadGeometry SLOW %.2fms (loop=%.2f staticWait=%.2f arenaFlush=%.2f) parts=%u bytes=%u",
-                         totalMs, tLoopMs, tStaticMs, tArenaMs, partCount, byteCount);
+            // Was "uploadGeometry SLOW (loop/staticWait/arenaFlush)". The loop is now split by step;
+            // `other` = the loop's untimed remainder (header walk, slot setup, uvAnim, bookkeeping).
+            const double tOtherMs = tLoopMs - (tRelMs + tAliasMs + tBoundsMs + tDynMs + tAllocMs
+                                               + tCopyMs + tPerMeshMs);
+            LOG::logline("-- [geomup] %.2f ms: %u/%u parts %.1f MB meshHigh %u | rel %u/%.2f alias %u/%.2f bounds %.2f dyn %u/%.2f"
+                         " | arena %u parts %.1f MB alloc %.2f (grow %u/%.2f) copy %.2f flush %.2f"
+                         " | perMesh %u parts %.1f MB create %.2f wait %.2f | other %.2f",
+                         totalMs, built, partCount, (double)byteCount / (1024.0 * 1024.0), g_meshHigh,
+                         nRel, tRelMs, nAlias, tAliasMs, tBoundsMs, nDyn, tDynMs,
+                         nArena, (double)arenaBytes / (1024.0 * 1024.0), tAllocMs, nGrow, tGrowMs,
+                         tCopyMs, tArenaMs,
+                         nPerMesh, (double)perMeshBytes / (1024.0 * 1024.0), tPerMeshMs, tStaticMs,
+                         tOtherMs);
         }
         // The other half: mesh arenas + per-part buffers. `pools:` already tracks arena BYTES, so a
         // divergence between that and this is itself a finding (driver overhead, or buffers living

@@ -605,6 +605,14 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpMultiMapVec;    // persistent per-frame FP multi-map draw-list vec (FP1e)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
+    // [geomflush] batch shape (setWindowCapture): parts/bytes appended while the post-load window
+    // walk ran, since the last flush. Measurement only.
+    bool                                      g_windowCapture = false;
+    std::uint32_t                             g_windowParts   = 0;
+    std::uint64_t                             g_windowBytes   = 0;
+    inline void noteWindowPart(std::size_t bytes) {
+        if (g_windowCapture) { ++g_windowParts; g_windowBytes += bytes; }
+    }
     // Cache key -> host slot, plus per-key cached bindless texture slots so the
     // per-frame draw-list build doesn't re-run resolveTextureSlot's normalize
     // (heap string) + string-hash find for every item every frame. A cached slot
@@ -3727,9 +3735,14 @@ namespace {
 
         const double flushMs = nowMs() - tFlush0;
         if (flushMs >= 1.0) {
-            LOG::logline("-- [geomflush] %.2fms parts=%u bytes=%uKB chunks=%u drain=%.2f assign=%.2f rpc=%.2f",
-                         flushMs, shippedParts, total >> 10, chunkCount, drainMs, assignMs, rpcMs);
+            // window= the share appended by the post-load window walk (off-screen captures) since
+            // the last flush; the rest is this frame's draws + releases (tasks/forge-crossing-frame.md P0).
+            LOG::logline("-- [geomflush] %.2fms parts=%u bytes=%uKB chunks=%u drain=%.2f assign=%.2f rpc=%.2f window=%u/%lluKB",
+                         flushMs, shippedParts, total >> 10, chunkCount, drainMs, assignMs, rpcMs,
+                         g_windowParts, (unsigned long long)(g_windowBytes >> 10));
         }
+        g_windowParts = 0;
+        g_windowBytes = 0;
     }
 
     // Mid-walk drain (see kPendingFlushBytes): called by the capture functions before they
@@ -8905,6 +8918,10 @@ namespace RenderProcess {
         return g_initOk && g_geomVec.has_value();
     }
 
+    void setWindowCapture(bool on) {
+        g_windowCapture = on;
+    }
+
     bool registerFlipBook(const char* const* names, std::uint32_t count) {
         return registerFlipBookImpl(names, count);
     }
@@ -9528,6 +9545,7 @@ namespace RenderProcess {
                 g_pendingBlob.resize(at + sizeof(ah));
                 memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
                 ++g_pendingParts;
+                noteWindowPart(sizeof(ah));
                 ++bc->second.refs;
                 g_slotBlock.emplace(slot, ck);
                 g_uploadedRev[key] = { modelId, vertexCount, revision };
@@ -9551,6 +9569,7 @@ namespace RenderProcess {
         if (hdr.uvAnimBytes) { memcpy(dst, uvAnim, hdr.uvAnimBytes); }
 
         ++g_pendingParts;
+        noteWindowPart(sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         g_uploadedRev[key] = { modelId, vertexCount, revision };
         noteContent(0, key, verts, vbBytes, indices, ibBytes);
     }
@@ -9599,6 +9618,7 @@ namespace RenderProcess {
         memcpy(dst, indices, ibBytes);
 
         ++g_pendingParts;
+        noteWindowPart(sizeof(hdr) + vbBytes + ibBytes);
         g_uploadedRev[key] = { modelId, vertexCount, revision };
         noteContent(1, key, verts, vbBytes, indices, ibBytes);
     }
@@ -9651,6 +9671,7 @@ namespace RenderProcess {
         if (hdr.uvAnimBytes) { memcpy(dst, uvAnim, hdr.uvAnimBytes); }
 
         ++g_pendingParts;
+        noteWindowPart(sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         g_uploadedRev[key] = { modelId, vertexCount, revision };
         noteContent(2, key, verts, vbBytes, indices, ibBytes);
     }

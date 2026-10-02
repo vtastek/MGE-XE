@@ -4664,6 +4664,7 @@ namespace MGE::GeometryCache {
             g_deepDisabledSkips = 0;   // per-frame, so the receipt reports the cell's steady count
             g_deepDisabledShapes = 0;
             g_windowCaptureBudget = kPostLoadCaptureBudget;
+            RenderProcess::setWindowCapture(true);   // [geomflush] window= provenance (measurement)
             if (g_captureInteriorCell) {
                 MGE_ZoneScopedN("GeomCache:postPurgeCapture");
                 // INTERIOR (bug #2, the RE-ENTRY case). On a fresh save-load MW's own full-scene
@@ -4713,6 +4714,7 @@ namespace MGE::GeometryCache {
                 ensureFullWalk();
             }
             g_windowCaptureBudget = -1;   // disarm before the sky/FP walks below
+            RenderProcess::setWindowCapture(false);
             ++g_postLoadFramesUsed;
 
             // The window's job is "the cell is resident", not "N frames elapsed". While the budget

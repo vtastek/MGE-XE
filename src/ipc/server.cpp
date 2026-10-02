@@ -43,7 +43,6 @@ namespace {
                     samples, sumRange[0] / n, sumRange[1] / n, sumRange[2] / n,
                     (sumRange[0] + sumRange[1] + sumRange[2]) / n, sumSort / n, sumTotal / n,
                     maxTotal, sumMeshes / static_cast<unsigned long long>(samples));
-                LOG::flush();
                 samples = 0;
                 sumRange[0] = sumRange[1] = sumRange[2] = 0;
                 sumSort = sumTotal = maxTotal = 0;
@@ -673,10 +672,11 @@ namespace IPC {
 			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
+			// Not flushed (here or at DONE): logline is a direct WriteFile and survives a process
+			// crash; a FlushFileBuffers every 60 frames was a disk sync inside the frame RPC.
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u skinnedCount=%u skinnedBytes=%u mmCount=%u lightCount=%u",
 					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes, params.multiMapCount, params.lightCount);
-				LOG::flush();
 			}
 			// FP1a first-person bundle: resolve the fp vec pointers only when the client
 			// enabled the pass this frame. Byte counts clamp to the mapped windows like
@@ -787,7 +787,6 @@ namespace IPC {
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
 					(int)ok, ForgeRender::lastDrawn(), ForgeRender::lastSkinnedDrawn());
-				LOG::flush();
 			}
 		} else {
 			ok = ForgeRender::renderFrame(params.frameIndex);
@@ -839,8 +838,11 @@ namespace IPC {
 		if (bytes >= sizeof(h0)) {
 			std::memcpy(&h0, p, sizeof(h0));
 		}
-		// Log BEFORE the call (flushed): if the matching "built" line below never
-		// appears, uploadGeometry crashed/hung on this input. Only for multi-part batches
+		// Log BEFORE the call: if the matching "built" line below never appears,
+		// uploadGeometry crashed/hung on this input. NOT flushed: logline is a direct WriteFile,
+		// so the line survives a process crash; FlushFileBuffers only guards an OS crash, and
+		// it cost this client-blocking RPC two disk syncs per logged call (P0 of
+		// tasks/forge-crossing-frame.md: the ~10 ms 2-part geom RPCs). Only for multi-part batches
 		// (cell-load bursts — the risky path). A single-part upload every frame is the
 		// steady animated-mesh re-upload; logging it spammed the host log (partsUploaded
 		// is 0 pre-call, so the old `!= partCount` test was always true for partCount=1).
@@ -857,12 +859,10 @@ namespace IPC {
 			LOG::logline(">> [geom] geomUpload ENTER: partCount=%u size=%u availBytes=%u byteCount=%u bytes=%u p0{slot=%u rev=%u v=%u i=%u}",
 				params.partCount, vec.size(), availBytes, params.byteCount, bytes,
 				h0.slot, h0.revisionID, h0.vertexCount, h0.indexCount);
-			LOG::flush();
 		}
 		params.partsUploaded = ForgeRender::uploadGeometry(p, bytes, params.partCount);
 		if (logThis || params.partsUploaded != params.partCount) {
 			LOG::logline(">> [geom] geomUpload DONE: built %u/%u", params.partsUploaded, params.partCount);
-			LOG::flush();
 		}
 	}
 
