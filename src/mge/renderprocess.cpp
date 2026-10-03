@@ -9700,6 +9700,81 @@ namespace RenderProcess {
         ++g_contentWin.parts[kind][cls];
     }
 
+    // 1b-0 SOURCE-SHARING probe (tasks/forge-geometry-dedup.md, rides MGE_GEOM_CONTENT_PROBE). The
+    // per-source memo plan assumes the placed copies of one NIF share their NiTriShapeData (modelId).
+    // Per window, over the first uploads the dedup hash runs on: distinct sources {modelId, vc} against
+    // distinct content keys; instances whose source was already seen with the SAME key (the hashes a
+    // memo would skip, and how many of those land on a live block, skipping the wire build too); and
+    // sources that produced MORE than one key — per-instance wire inputs (baseUV, vcol routing, sky
+    // unblend) or a pointer freed and recycled inside the window. Those are what a memo would get WRONG.
+    struct SrcSeen { ContentKey ck; std::uint32_t instances; bool multi; };
+    struct SrcProbe {
+        std::unordered_map<std::uint64_t, SrcSeen>               bySrc;
+        std::unordered_set<ContentKey, ContentKeyHash>           keys;
+        std::uint32_t hashed = 0, memoHits = 0, memoOnBlock = 0, multiSrc = 0;
+        std::uint64_t hashedBytes = 0, memoBytes = 0;
+        double        hashMs = 0.0, memoHashMs = 0.0;
+        double        gateFirstMs = 0.0, gateRepeatMs = 0.0, wireMs = 0.0;
+        std::uint32_t gateFirstN = 0, gateRepeatN = 0, wireN = 0;
+    };
+    SrcProbe      g_srcProbe;
+    std::uint32_t g_srcMultiLogged = 0;   // session-wide cap on the per-source examples
+
+    double contentProbeClockMs() { return nowMs(); }
+
+    void noteCaptureCostMs(bool firstSight, double gateHashMs, double wireBuildMs) {
+        if (firstSight) { g_srcProbe.gateFirstMs += gateHashMs; ++g_srcProbe.gateFirstN; }
+        else            { g_srcProbe.gateRepeatMs += gateHashMs; ++g_srcProbe.gateRepeatN; }
+        if (wireBuildMs >= 0.0) { g_srcProbe.wireMs += wireBuildMs; ++g_srcProbe.wireN; }
+    }
+
+    void noteSrcProbe(std::uint32_t key, std::uint32_t modelId, const ContentKey& ck, double hashMs,
+                      bool blockLive, std::size_t bytes) {
+        if (!contentProbeOn()) {
+            return;
+        }
+        SrcProbe& p = g_srcProbe;
+        ++p.hashed;
+        p.hashedBytes += bytes;
+        p.hashMs += hashMs;
+        p.keys.insert(ck);
+        const std::uint64_t src = ((std::uint64_t)modelId << 32) | ck.vc;
+        auto it = p.bySrc.find(src);
+        if (it == p.bySrc.end()) {
+            p.bySrc.emplace(src, SrcSeen{ ck, 1u, false });
+            return;
+        }
+        ++it->second.instances;
+        if (it->second.ck == ck) {
+            ++p.memoHits;
+            p.memoBytes += bytes;
+            p.memoHashMs += hashMs;
+            if (blockLive) { ++p.memoOnBlock; }
+            return;
+        }
+        if (!it->second.multi) {
+            it->second.multi = true;
+            ++p.multiSrc;
+        }
+        if (g_srcMultiLogged < 16) {
+            ++g_srcMultiLogged;
+            LOG::logline("   [geom-src] multi-key source data=%08X vc=%u ic %u vs %u, hash %016llX vs %016llX, key=%08X (instance %u)",
+                         modelId, ck.vc, it->second.ck.ic, ck.ic,
+                         (unsigned long long)it->second.ck.hash, (unsigned long long)ck.hash, key,
+                         it->second.instances);
+        }
+    }
+
+    void srcProbeWindowEnd() {
+        const SrcProbe& p = g_srcProbe;
+        LOG::logline(">> [geom-src] window %u: dedup hash %u first sights %.1f MB %.2f ms | sources %zu, content keys %zu, multi-key sources %u | memo would skip %u hashes (%.1f MB, %.2f ms), %u onto a live block | gate hash %.2f ms / %u first sights, %.2f ms / %u re-uploads | wire build %.2f ms / %u",
+                     g_contentWindowId, p.hashed, p.hashedBytes / 1048576.0, p.hashMs,
+                     p.bySrc.size(), p.keys.size(), p.multiSrc,
+                     p.memoHits, p.memoBytes / 1048576.0, p.memoHashMs, p.memoOnBlock,
+                     p.gateFirstMs, p.gateFirstN, p.gateRepeatMs, p.gateRepeatN, p.wireMs, p.wireN);
+        g_srcProbe = SrcProbe{};
+    }
+
     void noteContentAliased(std::size_t bytes) {
         if (!contentProbeOn()) {
             return;
@@ -9739,6 +9814,7 @@ namespace RenderProcess {
                          g_contentWin.bytes[k][3] / 1048576.0, g_contentWin.parts[k][3],
                          g_contentWin.bytes[k][4] / 1048576.0, g_contentWin.parts[k][4]);
         }
+        srcProbeWindowEnd();
         g_contentWin = ContentWindow{};
         ++g_contentWindowId;
     }
@@ -9796,12 +9872,18 @@ namespace RenderProcess {
         dropBlockRef(slot);
         if (firstUpload && !forceReupload && !hdr.uvAnimBytes && geomAliasOn()) {
             const double tHash0 = nowMs();
-            ContentHasher hasher;
-            hasher.update(verts, vbBytes);
-            hasher.update(indices, ibBytes);
-            const ContentKey ck{ hasher.finish(), vertexCount, indexCount };
-            g_aliasStats.hashMs += nowMs() - tHash0;
+            ContentKey ck;
+            {
+                MGE_ZoneScopedN("geom:contentHash");
+                ContentHasher hasher;
+                hasher.update(verts, vbBytes);
+                hasher.update(indices, ibBytes);
+                ck = ContentKey{ hasher.finish(), vertexCount, indexCount };
+            }
+            const double hashMs = nowMs() - tHash0;
+            g_aliasStats.hashMs += hashMs;
             auto bc = g_blockByContent.find(ck);
+            noteSrcProbe(key, modelId, ck, hashMs, bc != g_blockByContent.end(), vbBytes + ibBytes);
             if (bc != g_blockByContent.end()) {
                 IPC::GeomPartWire ah = {};
                 ah.slot       = slot;

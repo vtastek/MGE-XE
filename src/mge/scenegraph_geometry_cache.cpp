@@ -1900,7 +1900,36 @@ namespace MGE::GeometryCache {
             // arrays; identical content ⇒ consume the revision stamp and skip everything.
             // Real animation (morph heads, sky vcol fades) hashes differently and passes
             // through unchanged, so this can never drop a genuine update.
-            {
+            // 1b-0 probe (MGE_GEOM_CONTENT_PROBE): this gate's hash and the wire build below are
+            // timed and reported per load next to the dedup hash ([geom-src]).
+            const bool probeOn = RenderProcess::contentProbeOn();
+            double gateMs = 0.0, wireMs = -1.0;
+            // Skip only if the content is unchanged AND the one output a consumer still
+            // wants is already produced: the host ship (if wantsGeometryCapture).
+            // (S5b: a second term covered the DX9 mirror VB, which no longer exists.)
+            const bool haveHost = e.hostUploaded || !RenderProcess::wantsGeometryCapture();
+            const bool gateFirst = !haveHost;
+
+            struct ContentSig { uint64_t h; uint64_t hc[5]; uint32_t lastChangeWalk; bool loggedDiff; bool valid; };
+            static std::unordered_map<uint32_t, ContentSig> s_contentSig;
+            // LAZY GATE (geometry dedup 1b-2, tasks/forge-geometry-dedup.md). Without the host ship
+            // the skip above can never fire, so on a first sight the hash only STORED a reference
+            // for the next bump — 130 ms of byte-FNV per exterior return, 37 ms of it on the return
+            // frame (1b-0). Instead, mark any stored sig stale and hash nothing; the first bump
+            // after the ship then has nothing to compare against, so it ships once and stores the
+            // reference (one extra reship per spurious-bump mesh per load). The sig is kept, not
+            // erased, so its once-per-mesh [reship-diff] latch survives loads.
+            // MGE_GATE_LAZY=0 = the old eager hash (A/B arm).
+            static const bool s_lazyGate = [] {
+                char v[8] = {};
+                const bool off = GetEnvironmentVariableA("MGE_GATE_LAZY", v, sizeof(v)) > 0 && v[0] == '0';
+                LOG::logline(">> [gate] content gate on first sight: %s", off ? "EAGER (MGE_GATE_LAZY=0)" : "lazy");
+                return !off;
+            }();
+            auto it = s_contentSig.find(key);
+            if (s_lazyGate && !haveHost) {
+                if (it != s_contentSig.end()) { it->second.valid = false; }
+            } else {
                 auto fnv = [](const void* p, size_t n, uint64_t h) {
                     const uint8_t* b = static_cast<const uint8_t*>(p);
                     for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
@@ -1911,39 +1940,40 @@ namespace MGE::GeometryCache {
                 // the [reship-diff] log WHICH array a per-frame animator actually rewrites
                 // (pos/nrm/vcol/uv/tri) — the artist-facing answer.
                 uint64_t hc[5] = { kFnvBasis, kFnvBasis, kFnvBasis, kFnvBasis, kFnvBasis };
-                hc[0] = fnv(mv, vertexCount * sizeof(mv[0]), hc[0]);
-                if (data->normal) hc[1] = fnv(data->normal, vertexCount * sizeof(data->normal[0]), hc[1]);
-                if (data->color)  hc[2] = fnv(data->color,  vertexCount * sizeof(data->color[0]), hc[2]);
-                if (data->textureCoords) {
-                    for (uint8_t s = 0; s < uvSetCount; ++s) {
-                        hc[3] = fnv(data->textureCoords + (uint32_t)s * storedVerts,
-                                    vertexCount * sizeof(data->textureCoords[0]), hc[3]);
+                uint64_t h;
+                const double tGate0 = probeOn ? RenderProcess::contentProbeClockMs() : 0.0;
+                {
+                    MGE_ZoneScopedN("GeomCache:gateHash");
+                    hc[0] = fnv(mv, vertexCount * sizeof(mv[0]), hc[0]);
+                    if (data->normal) hc[1] = fnv(data->normal, vertexCount * sizeof(data->normal[0]), hc[1]);
+                    if (data->color)  hc[2] = fnv(data->color,  vertexCount * sizeof(data->color[0]), hc[2]);
+                    if (data->textureCoords) {
+                        for (uint8_t s = 0; s < uvSetCount; ++s) {
+                            hc[3] = fnv(data->textureCoords + (uint32_t)s * storedVerts,
+                                        vertexCount * sizeof(data->textureCoords[0]), hc[3]);
+                        }
+                    }
+                    if (const auto* tl = data->getTriList()) hc[4] = fnv(tl, (size_t)triCount * 6u, hc[4]);
+                    const uint32_t counts[3] = { vertexCount, triCount, uvSetCount };
+                    h = fnv(counts, sizeof(counts), kFnvBasis);
+                    // NiUVController takeover: the host animates this shape's UVs from the shipped
+                    // key track, so the engine's per-tick UV rewrites must NOT read as "content
+                    // changed" — exclude the UV component from the skip hash. hc[3] is still
+                    // computed for the [reship-diff] component log.
+                    for (int c = 0; c < 5; ++c) {
+                        if (c == 3 && hasUVAnim) { continue; }
+                        h = fnv(&hc[c], sizeof(hc[c]), h);
                     }
                 }
-                if (const auto* tl = data->getTriList()) hc[4] = fnv(tl, (size_t)triCount * 6u, hc[4]);
-                const uint32_t counts[3] = { vertexCount, triCount, uvSetCount };
-                uint64_t h = fnv(counts, sizeof(counts), kFnvBasis);
-                // NiUVController takeover: the host animates this shape's UVs from the shipped
-                // key track, so the engine's per-tick UV rewrites must NOT read as "content
-                // changed" — exclude the UV component from the skip hash. hc[3] is still
-                // computed for the [reship-diff] component log.
-                for (int c = 0; c < 5; ++c) {
-                    if (c == 3 && hasUVAnim) { continue; }
-                    h = fnv(&hc[c], sizeof(hc[c]), h);
-                }
 
-                struct ContentSig { uint64_t h; uint64_t hc[5]; uint32_t lastChangeWalk; bool loggedDiff; };
-                static std::unordered_map<uint32_t, ContentSig> s_contentSig;
-                auto it = s_contentSig.find(key);
-                // Skip only if the content is unchanged AND the one output a consumer still
-                // wants is already produced: the host ship (if wantsGeometryCapture).
-                // (S5b: a second term covered the DX9 mirror VB, which no longer exists.)
-                const bool haveHost = e.hostUploaded || !RenderProcess::wantsGeometryCapture();
-                if (it != s_contentSig.end() && it->second.h == h && haveHost) {
+                if (probeOn) { gateMs = RenderProcess::contentProbeClockMs() - tGate0; }
+                const bool sigValid = (it != s_contentSig.end()) && it->second.valid;
+                if (sigValid && it->second.h == h && haveHost) {
                     e.revisionID = data->revisionID;   // consume the spurious bump
+                    if (probeOn) { RenderProcess::noteCaptureCostMs(false, gateMs, -1.0); }
                     return;
                 }
-                if (it != s_contentSig.end()) {
+                if (sigValid) {
                     // Part A: tag the dominant changed component for the upload breakdown. uv first
                     // (a uv change here after the takeover is the unmigrated remainder / leak), then
                     // pos (morph + particle regen), vcol, tri, normals.
@@ -1974,11 +2004,22 @@ namespace MGE::GeometryCache {
                     std::memcpy(it->second.hc, hc, sizeof(hc));
                     it->second.lastChangeWalk = g_walkSerial;
                 } else {
-                    ContentSig sig = {};
-                    sig.h = h;
-                    std::memcpy(sig.hc, hc, sizeof(hc));
-                    sig.lastChangeWalk = g_walkSerial;
-                    s_contentSig.emplace(key, sig);
+                    // No reference to compare: a first sight (eager), or the first bump after a lazy
+                    // first sight — that one is a RESHIP, so it is not booked as new.
+                    if (e.hostUploaded) { uploadCat = RenderProcess::kUpOther; }
+                    if (it != s_contentSig.end()) {
+                        it->second.h = h;
+                        std::memcpy(it->second.hc, hc, sizeof(hc));
+                        it->second.lastChangeWalk = g_walkSerial;
+                        it->second.valid = true;
+                    } else {
+                        ContentSig sig = {};
+                        sig.h = h;
+                        std::memcpy(sig.hc, hc, sizeof(hc));
+                        sig.lastChangeWalk = g_walkSerial;
+                        sig.valid = true;
+                        s_contentSig.emplace(key, sig);
+                    }
                 }
             }
 
@@ -2203,18 +2244,23 @@ namespace MGE::GeometryCache {
                     // Base-map UV: set e.baseUV (set-major, uvs[set*storedVerts + i]). Most static
                     // meshes use set 0; honour the captured base map's true set for correctness.
                     const uint32_t uvBase = (uint32_t)e.baseUV * storedVerts;
-                    for (uint32_t i = 0; i < vertexCount; ++i) {
-                        auto& w = scratch[i];
-                        w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
-                        if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
-                        else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
-                        if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
-                        else        { w.u = 0.0f;                 w.v = 0.0f; }
-                        // Shared UV array (see above): this VB carries ONE set and the host's shader
-                        // adds the delta to it regardless of setIndex, so take it unconditionally.
-                        if (uvShare) { w.u = (*uvShare)[i * 2 + 0]; w.v = (*uvShare)[i * 2 + 1]; }
-                        w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
+                    const double tWire0 = probeOn ? RenderProcess::contentProbeClockMs() : 0.0;
+                    {
+                        MGE_ZoneScopedN("GeomCache:wireBuild");
+                        for (uint32_t i = 0; i < vertexCount; ++i) {
+                            auto& w = scratch[i];
+                            w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
+                            if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
+                            else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
+                            if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
+                            else        { w.u = 0.0f;                 w.v = 0.0f; }
+                            // Shared UV array (see above): this VB carries ONE set and the host's shader
+                            // adds the delta to it regardless of setIndex, so take it unconditionally.
+                            if (uvShare) { w.u = (*uvShare)[i * 2 + 0]; w.v = (*uvShare)[i * 2 + 1]; }
+                            w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
+                        }
                     }
+                    if (probeOn) { wireMs = RenderProcess::contentProbeClockMs() - tWire0; }
                     if (triList) {
                         // NI::Triangle is 3 packed uint16 indices (== the IB byte layout used above
                         // via memcpy(.., triCount*6)). SK1 dome: NO forced re-upload anymore. The host
@@ -2240,6 +2286,7 @@ namespace MGE::GeometryCache {
             // content-identity gate's "already produced" state now that the dead DX9 mirror VB
             // no longer serves as that proxy in Forge play. Cleared by releaseEntry on invalidation.
             e.hostUploaded = true;
+            if (probeOn) { RenderProcess::noteCaptureCostMs(gateFirst, gateMs, wireMs); }
 
             ++g_uploadedThisFrame;
         }

@@ -293,4 +293,11 @@ namespace RenderProcess {
         kUpCount
     };
     void noteUpload(std::uint8_t cat, std::uint32_t bytes);
+
+    // Geometry dedup 1b-0 probe (MGE_GEOM_CONTENT_PROBE=1, tasks/forge-geometry-dedup.md). The cache
+    // times its content-identity gate hash and its wire build per upload; the costs land in the
+    // per-load [geom-src] line next to the dedup hash. Off: contentProbeOn() is false and nothing is timed.
+    bool contentProbeOn();
+    double contentProbeClockMs();
+    void noteCaptureCostMs(bool firstSight, double gateHashMs, double wireBuildMs);
 }
