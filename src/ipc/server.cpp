@@ -267,6 +267,12 @@ namespace IPC {
 			case Command::RenderInit:
 				renderInit();
 				break;
+			case Command::DlPrewarm:
+				// Acknowledge FIRST: the client goes straight on (MW loads the save meanwhile) and
+				// anything it sends next simply queues behind the load on this single thread.
+				SetEvent(m_rpcCompleteEvent);
+				ForgeRender::dlPrewarm();
+				continue;
 			case Command::RenderFrame:
 				renderFrame();
 				break;

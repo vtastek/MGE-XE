@@ -56885,6 +56885,76 @@ void destroyHostWindow(Renderer* R);
         uint32_t               lodBias;     // ADDED to the terrain's per-cell LOD pick. 0 = the camera's.
     };
 
+    // One-time distant-land resident load: land + statics library + grid + rings (+ grass field, GPU cull
+    // resources, glow path, gobos). It does addResource/updateDescriptorSet, so it must run outside any
+    // command-buffer recording: either at the top of the PRIMARY cull (the first exterior frame) or from
+    // dlPrewarm at startup (tasks/startup-time.md S1), whichever comes first. Returns false only when
+    // the terrain itself fails (distant land is then off for that frame, and the next one retries,
+    // as before).
+    bool dlResidentInit(Renderer* R) {
+        if (g_dlLiveInit) { return true; }
+        // Host-owned terrain (tasks/forge-terrain.md): the real LAND heightfield. Since T4 there
+        // is no DL world bake to fall back to — this IS the world's surface, so a failure here
+        // disables distant land outright rather than quietly degrading to something else.
+        if (!buildTerrainPath(R) || !loadTerrainResidency(R)) {
+            std::printf("[forge][terrain] resident load FAILED — distant land disabled\n");
+            return false;
+        }
+        dlLoadBakedLights();
+        g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R)
+                        && buildStaticsTextureArrays(R) && dlCreateLiveRings(R);
+        if (g_staticsLiveOk) {
+            buildStaticsGrid();
+            // G3: the grass DENSITY FIELD, in place of the placements usage.data no longer
+            // carries. Must follow buildStaticsGrid — it joins on that function's def -> compact
+            // grass-subset remap. Non-fatal: without it g_grassFieldReady stays false and the
+            // grass lane simply draws nothing, exactly as an install with no grass bake does.
+            loadGrassField();
+            // Stage B (B2): upload g_cullInst + create the GPU cull pipeline (validation only;
+            // non-fatal — the CPU cull stays authoritative until B3's draw cutover).
+            dlCreateCullResources(R);
+        }
+        else { std::printf("[forge][dl] live statics unavailable — land only\n"); }
+        // Phase F: build the glow-billboard path now that dlLoadBakedLights has populated
+        // g_dlBakedLights (the instance buffer is sized from it). Non-fatal (glowReady gates the pass).
+        buildGlowPath(R);
+        // Fixture gobos (tasks/forge-light-gobo.md G1): one-shot, own command list. Needs the
+        // statics texture arrays (fixture textures ride in them) and the fixture library that
+        // dlLoadBakedLights loaded. Non-fatal: without it distant lights stay plain spheres.
+        if (g_staticsLiveOk) { goboBake(R); }
+        g_dlLiveInit = true;
+        std::printf("[forge][dl] live init done (terrain cells=%u, statics=%d)\n",
+                    Terrain::cellCount(), (int)g_staticsLiveOk);
+        return true;
+    }
+
+    void dlPrewarm() {
+        Renderer* R = g_live.pRenderer;
+        if (!R || g_dlLiveInit) { return; }
+        const double t0 = hostNowMs();
+        // Nothing should be in flight before the first scene, but the resident load rewrites
+        // descriptor sets a submitted frame could still be reading; make that impossible.
+        if (g_live.pQueue) { waitQueueIdle(g_live.pQueue); }
+        // The resident load writes the per-frame/persistent descriptor sets, which the opaque-path
+        // build creates. That build is otherwise lazy (first texture batch or first renderScene), so
+        // at startup the sets are still null: updateDescriptorSet AV'd here (2026-10-03). Build it
+        // first, exactly as the standalone viewer does before the same load.
+        if (!g_live.pOpaquePipeline) {
+            if (!buildOpaquePath(R, g_live.allocWidth, g_live.allocHeight)) {
+                LOG::logline("!! [startup] host DL prewarm: buildOpaquePath FAILED, prewarm skipped");
+                return;
+            }
+        }
+        const double tOpaque = hostNowMs();
+        const bool ok = dlResidentInit(R);
+        // The lazy opaque build exists so geometry upload starts on a clean resource loader. Keep
+        // that: drain every load this prewarm queued before the first geometry RPC is serviced.
+        waitForAllResourceLoads();
+        LOG::logline(">> [startup] host DL resident load (prewarm) %.1f ms (opaque path %.1f, resident %.1f), %s",
+                     hostNowMs() - t0, tOpaque - t0, hostNowMs() - tOpaque,
+                     ok ? "ok" : "FAILED (retried on the first exterior frame)");
+    }
+
     // Per-frame cull + ring fill (the PRIMARY call runs BEFORE command recording — it lazily creates GPU
     // resources + loads newly-visible textures, which must not happen mid-command-buffer). Fills
     // T.instRing/T.argRing, and (primary only) writes the DL fields of gFrameData. viewProj
@@ -56922,42 +56992,11 @@ void destroyHostWindow(Renderer* R);
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
 
-        // Lazy one-time resident load (first exterior frame): land + statics library + grid + rings.
+        // Lazy one-time resident load (first exterior frame) unless dlPrewarm already ran it at startup.
         // PRIMARY only — it does addResource/updateDescriptorSet, illegal mid-command-buffer. The reflect
         // cull runs INSIDE the command buffer, so it relies on the primary cull having already run.
         if (T.primary && !g_dlLiveInit) {
-            // Host-owned terrain (tasks/forge-terrain.md): the real LAND heightfield. Since T4 there
-            // is no DL world bake to fall back to — this IS the world's surface, so a failure here
-            // disables distant land outright rather than quietly degrading to something else.
-            if (!buildTerrainPath(R) || !loadTerrainResidency(R)) {
-                std::printf("[forge][terrain] resident load FAILED — distant land disabled\n");
-                g_dlExterior = false; return;
-            }
-            dlLoadBakedLights();
-            g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R)
-                            && buildStaticsTextureArrays(R) && dlCreateLiveRings(R);
-            if (g_staticsLiveOk) {
-                buildStaticsGrid();
-                // G3: the grass DENSITY FIELD, in place of the placements usage.data no longer
-                // carries. Must follow buildStaticsGrid — it joins on that function's def -> compact
-                // grass-subset remap. Non-fatal: without it g_grassFieldReady stays false and the
-                // grass lane simply draws nothing, exactly as an install with no grass bake does.
-                loadGrassField();
-                // Stage B (B2): upload g_cullInst + create the GPU cull pipeline (validation only;
-                // non-fatal — the CPU cull stays authoritative until B3's draw cutover).
-                dlCreateCullResources(R);
-            }
-            else { std::printf("[forge][dl] live statics unavailable — land only\n"); }
-            // Phase F: build the glow-billboard path now that dlLoadBakedLights has populated
-            // g_dlBakedLights (the instance buffer is sized from it). Non-fatal (glowReady gates the pass).
-            buildGlowPath(R);
-            // Fixture gobos (tasks/forge-light-gobo.md G1): one-shot, own command list. Needs the
-            // statics texture arrays (fixture textures ride in them) and the fixture library that
-            // dlLoadBakedLights loaded. Non-fatal: without it distant lights stay plain spheres.
-            if (g_staticsLiveOk) { goboBake(R); }
-            g_dlLiveInit = true;
-            std::printf("[forge][dl] live init done (terrain cells=%u, statics=%d)\n",
-                        Terrain::cellCount(), (int)g_staticsLiveOk);
+            if (!dlResidentInit(R)) { g_dlExterior = false; return; }
         }
         if (!g_dlLiveInit) { return; }   // reflect cull before the primary init ran → nothing to do
 

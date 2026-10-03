@@ -266,6 +266,14 @@ namespace IPC {
 		bool setWorldSpaceBlocking(const std::string& cellname);
 
 		/**
+		* @brief Ask the Forge host to load its distant-land residency now rather than on the first
+		*        exterior frame (DlPrewarm). The host acknowledges before doing the work, so this returns
+		*        at once; the next RPC on any channel queues behind the load.
+		* @return Whether the RPC was issued successfully.
+		*/
+		bool dlPrewarm();
+
+		/**
 		* @brief Asynchronously do a coarse search for visible meshes.
 		* @param visibleSet ID of a shared vector of RenderMesh objects which will be populated with the results of the search.
 		* @param viewFrustum The camera's current view frustum.

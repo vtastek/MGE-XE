@@ -235,6 +235,14 @@ bool DistantLand::init() {
     }
     stage("distant statics");
 
+    // S1 (tasks/startup-time.md): the host's distant-land residency (~3.1 s) loads NOW, while MW
+    // loads the save, instead of inside the first exterior frame. This is the client's last init
+    // RPC; the host acknowledges before it starts, so nothing here waits on it.
+    if (RenderProcess::wantsGeometryCapture()) {
+        ipcClient.dlPrewarm();
+        LOG::logline(">> [startup] host DL prewarm sent at %.1f ms since launch", LOG::sinceLaunchMs());
+    }
+
 
     // MSOC retirement D2/D3/D5: MGE owns the CullShow traversal that produces the
     // engine-driven discovery feed (tasks/msoc-detour-absorb.md). The visible-geom
@@ -507,7 +515,11 @@ bool DistantLand::initShader() {
         }
     }
 
-    if (!createCoreEffectWithMods("XE Main.fx", device, features, effectPool, &effect, true)) {
+    // The shared-uniform carrier (tasks/startup-time.md S2): setupCommonEffect writes the pool's
+    // shared uniforms through `effect`, and XE FixedFuncEmu.fx reads them. This was XE Main.fx, whose
+    // DX9 distant-land/water/grass/sky techniques nothing draws any more, ~2.9 s of compile at the
+    // "Loading MGE XE..." bar. XE Shared.fx declares the same parameters (it is XE Common.fx).
+    if (!createCoreEffectWithMods("XE Shared.fx", device, features, effectPool, &effect, true)) {
         return false;
     }
 
@@ -554,6 +566,25 @@ bool DistantLand::initShader() {
     ehWindVec = effect->GetParameterByName(0, "windVec");
     ehNiceWeather = effect->GetParameterByName(0, "niceWeather");
     ehTime = effect->GetParameterByName(0, "time");
+
+    // Every handle setupCommonEffect writes must resolve in the carrier; a null one would silently
+    // stop feeding the pool. (The light-data handles above are resolved but never written here.)
+    {
+        const struct { D3DXHANDLE h; const char* name; } written[] = {
+            { ehView, "view" }, { ehProj, "proj" }, { ehEyePos, "eyePos" }, { ehSunVec, "sunVec" },
+            { ehSunVecView, "sunVecView" }, { ehSunCol, "sunCol" }, { ehSunAmb, "sunAmb" },
+            { ehSunPos, "sunPos" }, { ehSunVis, "sunVis" }, { ehFogStart, "fogStart" },
+            { ehFogRange, "fogRange" }, { ehFogNearStart, "nearFogStart" }, { ehFogNearRange, "nearFogRange" },
+            { ehSkyCol, "skyCol" }, { ehFogColNear, "fogColNear" }, { ehFogColFar, "fogColFar" },
+            { ehNearViewRange, "nearViewRange" }, { ehNiceWeather, "niceWeather" }, { ehWindVec, "windVec" },
+            { ehFootPos, "footPos" }, { ehTime, "time" }, { ehRcpRes, "rcpRes" },
+        };
+        for (const auto& w : written) {
+            if (!w.h) {
+                LOG::logline("!! [shared-fx] carrier effect has no parameter '%s'", w.name);
+            }
+        }
+    }
 
     D3DVIEWPORT9 vp;
     device->GetViewport(&vp);

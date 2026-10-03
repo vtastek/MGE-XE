@@ -461,6 +461,12 @@ namespace IPC {
 		return params.cellFound;
 	}
 
+	bool Client::dlPrewarm() {
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		return beginRpc(Command::DlPrewarm);
+	}
+
 	bool Client::getVisibleMeshesCoarse(VecId visibleSet, const ViewFrustum& viewFrustum, DWORD setFlags, VisibleSetSort sort) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 

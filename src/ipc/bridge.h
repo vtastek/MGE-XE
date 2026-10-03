@@ -171,6 +171,13 @@ namespace IPC {
         // worker (parse, classify, create, copy on its own queue) and signals completion only once
         // every entry is installed and bound, so the client never blocks on it.
         StreamUpload,
+
+        // Startup (tasks/startup-time.md S1): load the host's distant-land residency (terrain,
+        // statics library + texture arrays, grid, rings, gobos) NOW, instead of lazily on the first
+        // exterior frame where it cost ~3.1 s. Sent once at the end of DistantLand::init, after the
+        // client's last init RPC. The host signals completion BEFORE doing the work, so the client
+        // goes straight on (MW then loads the save meanwhile); any later RPC queues behind the load.
+        DlPrewarm,
     };
 
     struct NearRefWire {

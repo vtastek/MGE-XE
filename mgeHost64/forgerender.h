@@ -78,6 +78,11 @@ namespace ForgeRender {
     struct NearRef { float x, y, z; int cellX, cellY; };
     void setNearRefs(const NearRef* refs, unsigned count, unsigned version);
 
+    // Startup S1 (tasks/startup-time.md): run the distant-land resident load now (IPC DlPrewarm),
+    // not on the first exterior frame. Idempotent; the first-frame call stays for a session that
+    // never sent it.
+    void dlPrewarm();
+
     // The exported NT shared-RT handle of frame slot `slot` (0/1) — valid in the HOST process. Null
     // until a successful init(). The IPC server DuplicateHandles both into MW's process. The host
     // renders frame N into slot (N & 1)'s RT so the client can still copy N while N+1 is drawn.
