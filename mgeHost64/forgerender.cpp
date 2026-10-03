@@ -17044,12 +17044,15 @@ namespace {
         uint32_t vertexCount, indexCount;
         float    localCenter[3];
         float    localRadius;
-        uint32_t refs;
+        uint32_t refs;     // holder SLOTS only (the tripwire scans exactly these)
+        bool     pinned;   // phase 2: the client keeps it past its last holder (kGeomFlagPinned)
     };
     std::unordered_map<uint32_t, ArenaBlock> g_arenaBlocks;
     uint64_t g_blockRefTotal   = 0;   // sum of refs, maintained incrementally (heartbeat tripwire)
     uint64_t g_aliasMissing    = 0;   // alias records naming a block the host does not hold
     uint64_t g_blockDupCreates = 0;   // block uploads whose id already existed (replayed chunk)
+    uint64_t g_unpinUnknown    = 0;   // unpins naming a block the host does not hold
+    uint64_t g_unpinFreed      = 0;   // blocks freed by an unpin (cold, kept across a load, then capped)
 
     // ─── FRAME SLOT STATE ───────────────────────────────────────────────────────────────────────
     // g_frameSerial counts RECORDED frames (beginFrameSlot); frame F records into slot F & 1.
@@ -26891,7 +26894,9 @@ namespace {
                     lastHolder = false;
                 } else {
                     if (g_blockRefTotal) { --g_blockRefTotal; }
-                    if (--it->second.refs != 0) {
+                    if (--it->second.refs != 0 || it->second.pinned) {
+                        // Still held — by another slot, or by the client's pin (a COLD block,
+                        // freed only by its unpin record).
                         lastHolder = false;
                     } else {
                         g_arenaBlocks.erase(it);
@@ -27264,8 +27269,11 @@ namespace {
             drainRetired(UINT64_MAX);
             tf_free(g_meshes);
         }
-        if (!g_arenaBlocks.empty()) {
-            LOG::logline("!! [geom-alias] %zu blocks still held after releasing every slot", g_arenaBlocks.size());
+        // COLD blocks (refs 0, pinned) legitimately outlive every slot; the arena goes with the device.
+        size_t heldBlocks = 0;
+        for (const auto& kv : g_arenaBlocks) { if (kv.second.refs != 0) { ++heldBlocks; } }
+        if (heldBlocks) {
+            LOG::logline("!! [geom-alias] %zu blocks still held after releasing every slot", heldBlocks);
         }
         g_arenaBlocks.clear();
         g_blockRefTotal = 0;
@@ -34945,22 +34953,31 @@ void destroyHostWindow(Renderer* R);
                 // mismatch means a release path dropped (or skipped) a ref, i.e. a range will leak or be
                 // parked under a live holder.
                 {
-                    uint64_t sharedBytes = 0;
+                    uint64_t sharedBytes = 0, coldBytes = 0, coldBlocks = 0, pinnedBlocks = 0;
                     for (const auto& kv : g_arenaBlocks) {
-                        sharedBytes += (uint64_t)(kv.second.refs - 1)
-                                     * ((uint64_t)kv.second.vertexCount * sizeof(IPC::GeomVertexWire)
-                                        + (uint64_t)kv.second.indexCount * sizeof(uint16_t));
+                        const uint64_t bytes = (uint64_t)kv.second.vertexCount * sizeof(IPC::GeomVertexWire)
+                                             + (uint64_t)kv.second.indexCount * sizeof(uint16_t);
+                        if (kv.second.pinned) { ++pinnedBlocks; }
+                        if (kv.second.refs == 0) {   // COLD: held only by the client's pin
+                            ++coldBlocks;
+                            coldBytes += bytes;
+                        } else {
+                            sharedBytes += (uint64_t)(kv.second.refs - 1) * bytes;
+                        }
                     }
                     uint64_t blockSlots = 0;
                     for (uint32_t s = 0; s < g_meshHigh; ++s) {
                         const HostMesh& hm = g_meshes[s];
                         if (hm.valid && hm.inArena && hm.blockId) { ++blockSlots; }
                     }
-                    LOG::logline(">> [forge-hb] geom-alias: blocks=%zu aliasSlots=%llu shared=%.1f MB missing=%llu dupCreates=%llu",
+                    LOG::logline(">> [forge-hb] geom-alias: blocks=%zu aliasSlots=%llu shared=%.1f MB missing=%llu dupCreates=%llu | kept: pinned=%llu cold=%llu (%.1f MB) unpinFreed=%llu unpinUnknown=%llu",
                                  g_arenaBlocks.size(),
-                                 (unsigned long long)(g_blockRefTotal - (uint64_t)g_arenaBlocks.size()),
+                                 (unsigned long long)(g_blockRefTotal - ((uint64_t)g_arenaBlocks.size() - coldBlocks)),
                                  (double)sharedBytes / (1024.0 * 1024.0),
-                                 (unsigned long long)g_aliasMissing, (unsigned long long)g_blockDupCreates);
+                                 (unsigned long long)g_aliasMissing, (unsigned long long)g_blockDupCreates,
+                                 (unsigned long long)pinnedBlocks, (unsigned long long)coldBlocks,
+                                 (double)coldBytes / (1024.0 * 1024.0),
+                                 (unsigned long long)g_unpinFreed, (unsigned long long)g_unpinUnknown);
                     if (blockSlots != g_blockRefTotal) {
                         LOG::logline("!! [geom-alias] ref tripwire: refs=%llu but %llu valid slots hold a block",
                                      (unsigned long long)g_blockRefTotal, (unsigned long long)blockSlots);
@@ -61710,6 +61727,37 @@ void destroyHostWindow(Renderer* R);
                 continue;
             }
 
+            // UNPIN (header-only, no slot): the client dropped a COLD block from its kept-across-loads
+            // LRU (dedup phase 2). Clear the pin; if no slot holds the block either, park its range
+            // exactly as a last-holder release would. Idempotent — a replayed chunk finds the pin
+            // already clear and does nothing — so it can never free a range a slot still draws.
+            if (hdr.flags & IPC::kGeomFlagUnpin) {
+                ++built;
+                auto it = g_arenaBlocks.find(hdr.block);
+                if (it == g_arenaBlocks.end()) {
+                    if (g_unpinUnknown++ < 32) {
+                        LOG::logline("!! [geom-alias] unpin of unknown block %u (total %llu)",
+                                     hdr.block, (unsigned long long)g_unpinUnknown);
+                    }
+                    continue;
+                }
+                ArenaBlock& b = it->second;
+                if (!b.pinned) {
+                    continue;
+                }
+                b.pinned = false;
+                if (b.refs == 0) {
+                    const uint64_t vbB = (uint64_t)b.vertexCount * sizeof(IPC::GeomVertexWire);
+                    const uint64_t ibB = (uint64_t)b.indexCount * sizeof(uint16_t);
+                    g_arenaRetire.push_back({ b.vbOff, vbB, b.ibOff, ibB, g_frameSerial });
+                    g_geoArena.destroyedBytes += vbB + ibB;
+                    ++g_geoArena.destroys;
+                    ++g_unpinFreed;
+                    g_arenaBlocks.erase(it);
+                }
+                continue;
+            }
+
             const bool isSkinned  = (hdr.flags & IPC::kGeomFlagSkinned) != 0;
             const bool isMultiMap = (hdr.flags & IPC::kGeomFlagMultiMap) != 0;
             const uint64_t vStride = isSkinned  ? sizeof(IPC::SkinnedVertexWire)
@@ -62007,6 +62055,7 @@ void destroyHostWindow(Renderer* R);
                         b.localCenter[2] = m.localCenter[2];
                         b.localRadius = m.localRadius;
                         b.refs = 1;
+                        b.pinned = (hdr.flags & IPC::kGeomFlagPinned) != 0;
                         g_arenaBlocks.emplace(hdr.block, b);
                         m.blockId = hdr.block;
                         ++g_blockRefTotal;

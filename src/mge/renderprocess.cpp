@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <deque>
+#include <list>
 #include <memory>
 #include <new>
 #include <optional>
@@ -670,10 +671,24 @@ namespace {
             return (std::size_t)(k.hash ^ (k.hash >> 32) ^ ((std::uint64_t)k.vc * 0x9E3779B1u) ^ k.ic);
         }
     };
-    struct BlockRef { std::uint32_t block; std::uint32_t refs; };
+    // PHASE 2 — COLD BLOCKS. A pinned block whose last holder slot went away stays in the host arena
+    // and in this table with refs = 0, on g_coldBlocks (front = cold longest). An instance shipped
+    // after a later load aliases it like any live block and takes it off the list. Past the byte cap
+    // the front is dropped and UNPINNED on the host (g_pendingUnpins, shipped at the next flush).
+    struct BlockRef {
+        std::uint32_t block;
+        std::uint32_t refs;
+        std::uint32_t bytes;    // vertex + index bytes the block holds in the host arena
+        bool          pinned;   // created with kGeomFlagPinned: the host keeps it at refs 0
+        bool          cold;     // refs == 0 and on g_coldBlocks at coldIt
+        std::list<ContentKey>::iterator coldIt;
+    };
     std::unordered_map<ContentKey, BlockRef, ContentKeyHash> g_blockByContent;
     std::unordered_map<std::uint32_t, ContentKey>            g_slotBlock;     // host slot -> the block it holds a ref on
     std::uint32_t                                            g_nextBlock = 0; // never reused (0 = none)
+    std::list<ContentKey>                                    g_coldBlocks;    // LRU, front = oldest
+    std::uint64_t                                            g_coldBytes = 0;
+    std::vector<std::uint32_t>                               g_pendingUnpins; // block ids, shipped next flush
 
     // MGE_GEOM_ALIAS=0 is the kill switch (the A/B oracle arm). Default ON.
     bool geomAliasOn() {
@@ -684,12 +699,28 @@ namespace {
         return on;
     }
 
+    // MGE_GEOM_KEEP_MB: the byte cap on cold blocks (phase 2). 0 = phase 1 (a block dies with its last
+    // holder). A SUM bound on what the host keeps for nobody — [[feedback_content_sized_staging_buffer]].
+    // The host arena starts at 256 MB with ~15-60 MB live, so the default fits without a grow.
+    std::uint64_t geomKeepBytes() {
+        static const std::uint64_t bytes = [] {
+            const char* e = std::getenv("MGE_GEOM_KEEP_MB");
+            const long mb = e ? std::atol(e) : 96;
+            return (std::uint64_t)(mb > 0 ? mb : 0) << 20;
+        }();
+        return geomAliasOn() ? bytes : 0;
+    }
+
     // Per load window (logged at the load that ends it): what dedup did, and what the hash cost.
     struct AliasStats {
         std::uint32_t blocks = 0;        // first sights shipped as a new block
         std::uint32_t aliases = 0;       // instances shipped as a header-only alias
         std::uint64_t aliasedBytes = 0;  // vertex+index bytes those aliases did not ship
         double        hashMs = 0.0;      // content hashing, all first uploads
+        std::uint32_t revived = 0;       // of `aliases`: onto a COLD block (phase 2 — kept across a load)
+        std::uint64_t revivedBytes = 0;
+        std::uint32_t unpinned = 0;      // cold blocks dropped at the cap
+        std::uint64_t unpinnedBytes = 0;
     };
     AliasStats g_aliasStats;
 
@@ -697,13 +728,18 @@ namespace {
         if (!geomAliasOn()) {
             return;
         }
-        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu",
+        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu | kept: %u revived (%.1f MB), %u unpinned (%.1f MB), cold now %zu (%.1f / %llu MB)",
                      frame, g_aliasStats.blocks, g_aliasStats.aliases, g_aliasStats.aliasedBytes / 1048576.0,
-                     g_aliasStats.hashMs, g_blockByContent.size(), g_slotBlock.size());
+                     g_aliasStats.hashMs, g_blockByContent.size(), g_slotBlock.size(),
+                     g_aliasStats.revived, g_aliasStats.revivedBytes / 1048576.0,
+                     g_aliasStats.unpinned, g_aliasStats.unpinnedBytes / 1048576.0,
+                     g_coldBlocks.size(), g_coldBytes / 1048576.0,
+                     (unsigned long long)(geomKeepBytes() >> 20));
         g_aliasStats = AliasStats{};
     }
 
-    // Drop `slot`'s block ref, if it holds one; the block entry dies with its last ref.
+    // Drop `slot`'s block ref, if it holds one. At refs 0 a pinned block goes COLD (kept, host and
+    // here); an unpinned one dies with its last ref, as in phase 1.
     void dropBlockRef(std::uint32_t slot) {
         auto sb = g_slotBlock.find(slot);
         if (sb == g_slotBlock.end()) {
@@ -711,9 +747,66 @@ namespace {
         }
         auto it = g_blockByContent.find(sb->second);
         if (it != g_blockByContent.end() && --it->second.refs == 0) {
-            g_blockByContent.erase(it);
+            BlockRef& b = it->second;
+            if (b.pinned) {
+                b.cold   = true;
+                b.coldIt = g_coldBlocks.insert(g_coldBlocks.end(), it->first);
+                g_coldBytes += b.bytes;
+            } else {
+                g_blockByContent.erase(it);
+            }
         }
         g_slotBlock.erase(sb);
+    }
+
+    // Trim the cold list to the cap, oldest first, queueing an UNPIN per dropped block. Run at FLUSH
+    // time, after the frame's build, never at the load's bulk release: a door return makes the
+    // interior cold at the same moment the exterior starts to revive, and trimming before the build
+    // would drop the older exterior — the very blocks the return is about to alias.
+    // HELD while the post-load window walk runs (setWindowCapture, ~50 budgeted frames): the cell
+    // revives across those frames, not in the first one. The hold has a hard ceiling of twice the cap
+    // so the sum stays bounded however long a window stays open.
+    unsigned g_coldHoldFrame = 0;   // last frame a post-load window walk ran
+    void enforceColdCap() {
+        const std::uint64_t cap  = geomKeepBytes();
+        const bool          hold = (g_frame - g_coldHoldFrame) <= 1u;
+        const std::uint64_t lim  = hold ? 2 * cap : cap;
+        while (g_coldBytes > lim && !g_coldBlocks.empty()) {
+            auto it = g_blockByContent.find(g_coldBlocks.front());
+            g_coldBlocks.pop_front();
+            if (it == g_blockByContent.end()) {
+                continue;   // cannot happen: a cold entry is erased only here
+            }
+            g_coldBytes -= it->second.bytes;
+            g_pendingUnpins.push_back(it->second.block);
+            ++g_aliasStats.unpinned;
+            g_aliasStats.unpinnedBytes += it->second.bytes;
+            g_blockByContent.erase(it);
+        }
+    }
+
+    // Ship the queued unpins as header-only records. Unbounded per flush: an unpin only parks a range
+    // the host already holds, no caster or slot work, and the queue is bounded by the cold list.
+    void appendUnpinRecords() {
+        for (std::uint32_t block : g_pendingUnpins) {
+            IPC::GeomPartWire hdr = {};
+            hdr.flags = IPC::kGeomFlagUnpin;   // vertexCount = indexCount = 0 -> header-only
+            hdr.block = block;
+            const std::size_t at = g_pendingBlob.size();
+            g_pendingBlob.resize(at + sizeof(hdr));
+            memcpy(g_pendingBlob.data() + at, &hdr, sizeof(hdr));
+            ++g_pendingParts;
+        }
+        g_pendingUnpins.clear();
+    }
+
+    // Forget every block (a fresh host has an empty table).
+    void clearBlocks() {
+        g_blockByContent.clear();
+        g_slotBlock.clear();
+        g_coldBlocks.clear();
+        g_coldBytes = 0;
+        g_pendingUnpins.clear();
     }
     // Deferred host-slot release queue. Evicted keys resolve to their (old, monotonic, never-reused)
     // host slot immediately in drainReleasedSlots, but the release SENTINEL is shipped a bounded
@@ -1931,8 +2024,7 @@ namespace {
         }
         g_keySlot.clear();
         g_uploadedRev.clear();
-        g_blockByContent.clear();              // the fresh host has an empty block table
-        g_slotBlock.clear();
+        clearBlocks();                         // the fresh host has an empty block table
         g_nextSlot = 0;
         g_pendingBlob.clear();                 // drop geom staged for the OLD host
         g_pendingParts = 0;
@@ -3873,6 +3965,8 @@ namespace {
             const double t0 = nowMs();
             drainReleasedSlots();          // resolve evictions → release queue (cheap, unbounded)
             appendBoundedReleaseRecords(); // ship <=kMaxReleasesPerFlush sentinels before the empty check
+            enforceColdCap();              // dedup phase 2: after the build, so a load revives first
+            appendUnpinRecords();
             drainMs = nowMs() - t0;
         }
         if (!g_geomVec || g_pendingBlob.empty() || g_pendingParts == 0) {
@@ -9191,6 +9285,9 @@ namespace RenderProcess {
 
     void setWindowCapture(bool on) {
         g_windowCapture = on;
+        if (on) {
+            g_coldHoldFrame = g_frame;   // dedup phase 2: hold the cold-block trim (enforceColdCap)
+        }
     }
 
     bool registerFlipBook(const char* const* names, std::uint32_t count) {
@@ -9903,6 +10000,14 @@ namespace RenderProcess {
                 memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
                 ++g_pendingParts;
                 noteWindowPart(sizeof(ah));
+                if (bc->second.cold) {
+                    // Kept across a load (phase 2): the host still holds it under its pin.
+                    g_coldBlocks.erase(bc->second.coldIt);
+                    g_coldBytes -= bc->second.bytes;
+                    bc->second.cold = false;
+                    ++g_aliasStats.revived;
+                    g_aliasStats.revivedBytes += vbBytes + ibBytes;
+                }
                 ++bc->second.refs;
                 g_slotBlock.emplace(slot, ck);
                 g_uploadedRev[key] = { modelId, vertexCount, revision };
@@ -9912,7 +10017,12 @@ namespace RenderProcess {
                 return;
             }
             hdr.block = ++g_nextBlock;
-            g_blockByContent.emplace(ck, BlockRef{ hdr.block, 1u });
+            const bool pin = geomKeepBytes() != 0;
+            if (pin) {
+                hdr.flags |= IPC::kGeomFlagPinned;
+            }
+            g_blockByContent.emplace(ck, BlockRef{ hdr.block, 1u, (std::uint32_t)(vbBytes + ibBytes),
+                                                   pin, false, {} });
             g_slotBlock.emplace(slot, ck);
             ++g_aliasStats.blocks;
         }
@@ -10098,8 +10208,7 @@ namespace RenderProcess {
         g_texPendingCount = 0;
         g_keySlot.clear();
         g_uploadedRev.clear();
-        g_blockByContent.clear();
-        g_slotBlock.clear();
+        clearBlocks();
         g_texSlot.clear();
         g_slotName.clear();
         g_slotLastUsed.clear();

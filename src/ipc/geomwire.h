@@ -78,6 +78,15 @@ namespace IPC {
     // model-space, so every placed copy of a rock/tree/wall used to ship identical bytes (85% of the
     // geometry shipped in an AutoZip stress run was such duplicates).
     constexpr std::uint16_t kGeomFlagAlias    = 0x10;
+    // DEDUP PHASE 2 — blocks kept across loads. A block-creating upload (block != 0) with PINNED set
+    // carries one extra hold that is not a slot: the host keeps the range when its last holder slot
+    // releases, so an instance shipped after a later load can alias it instead of re-shipping it. The
+    // client owns the decision: it keeps a byte-capped LRU of blocks no slot holds and sends UNPIN
+    // (header-only, `block` = the id, `slot` unused) for the ones it drops. The host frees a block's
+    // range only when it is unpinned AND no slot holds it. Unpin is idempotent (a replayed chunk
+    // cannot drop the pin twice).
+    constexpr std::uint16_t kGeomFlagPinned   = 0x20;
+    constexpr std::uint16_t kGeomFlagUnpin    = 0x40;
 
     // Per-part header preceding the part's vertex+index data in the batch blob. When
     // (flags & kGeomFlagSkinned), the part's vertices are SkinnedVertexWire (stride 44)
