@@ -601,7 +601,7 @@ float4 PS_MAIN( VSOutput In )
     // metalness kill happens rather than 25 lines later where the specular uses it.
     if (pbrOn && gShadowParams.pbrShade2.z > 0.0f)
     {
-        const float3 kE = pbrKdEnergy(pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x),
+        const float3 kE = pbrKdEnergy(waterImmersedF0(pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x), In.WorldPos),
                                       pbrNoV, pbrRough, gShadowParams.pbrShade2.z);
         d *= kE; a *= kE;
     }
@@ -636,7 +636,7 @@ float4 PS_MAIN( VSOutput In )
     float3 dbgSpec = float3(0.0f, 0.0f, 0.0f);
     if (pbrOn)
     {
-        const float3 f0 = pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x);
+        const float3 f0 = waterImmersedF0(pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x), In.WorldPos);
         // The environment is the sky the ambient term already integrates, evaluated in the MIRROR
         // direction: the same SH (and the same sky AO) that lights the surface is what it reflects,
         // so the two cannot drift apart. L1 is blurry by nature — right for rough surfaces, soft for

@@ -382,6 +382,37 @@ float3 waterAmbTransmit(float3 worldPosRel)
     return submergedAmbT(depth, k, strength);
 }
 
+// A SUBMERGED SURFACE'S F0 is set against WATER, not air. Fresnel at normal incidence depends on the
+// ratio of the two indices, ((n - n_w)/(n + n_w))^2, and the material's index is recovered from its
+// authored in-air F0 by inverting ((n - 1)/(n + 1))^2: n = (1 + sqrt F0)/(1 - sqrt F0). Per channel,
+// so a metal's coloured F0 goes through the same inversion.
+//
+//     in-air F0   n       in-water F0   ratio
+//     0.04        1.500   0.0035        0.087   (standard dielectric)
+//     0.01        1.222   0.0019        0.19    (this project's default 0.04*b^2 decode, b = 0.5)
+//     0.90       37.97    0.869         0.97    (a metal barely notices)
+//
+// The interface is the MATERIAL's, so the answer depends on where the fragment is and on nothing
+// about the camera: the same F0 whether the eye is above the surface looking down through it or
+// down in the water with the object. Graded in over kWaterSurfaceBlend so a shoreline does not step,
+// the same ramp as kWaterSkyTransmit. Exactly f0 above the surface and with no water in the cell.
+//
+// ⚠ ONLY F0 MOVES. Schlick's grazing half (1 - F0)*(1 - VoH)^5 still runs to 1, and for a
+// low-contrast interface (n/n_w = 1.125) the exact Fresnel stays near zero far longer than Schlick
+// says — at 60 deg the exact value is 0.018 against Schlick's 0.035. The highlight itself sits at
+// VoH near 1, where that term is ~1e-5, so the damping there is the whole F0 ratio above; what
+// survives too bright is the rim, and mostly in the environment term.
+float3 waterImmersedF0(float3 f0, float3 worldPosRel)
+{
+    if (!waterFogActive()) { return f0; }
+    float w = saturate(waterFogDepthBelow(worldPosRel) / kWaterSurfaceBlend);
+    if (w <= 0.0f) { return f0; }
+    float3 s = min(sqrt(saturate(f0)), f3(0.999f));
+    float3 n = (f3(1.0f) + s) / (f3(1.0f) - s);
+    float3 r = (n - f3(kWaterIOR)) / (n + f3(kWaterIOR));
+    return lerp(f0, r * r, w);
+}
+
 void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
 {
     tSun = float3(1.0f, 1.0f, 1.0f);

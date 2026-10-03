@@ -1271,7 +1271,7 @@ float4 PS_MAIN( VSOutput In )
         // `result` is now the WHOLE diffuse+ambient response (sun, ambient and both point-light
         // arms), which is exactly what a metal does not have — so the metallic kill is ONE multiply
         // here rather than one per term. pbrKd is exactly 1.0 when this branch is not taken.
-        const float3 f0 = pbrF0(pbrMat, albedo, gShadowParams.pbrShade2.x);
+        const float3 f0 = waterImmersedF0(pbrF0(pbrMat, albedo, gShadowParams.pbrShade2.x), In.WorldPos);
         // THE DIELECTRIC'S SHARE, taken out of diffuse before the specular below adds it back.
         // ⚠ SCALED BY COVERAGE, like every other PBR term in this file: where only part of the
         // blend carries a `_paramh`, only that part has a specular lobe to pay for, and a split

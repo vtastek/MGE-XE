@@ -441,7 +441,7 @@ PSOut PS_MAIN( VSOutput In )
         // than an oversight: statics.vert folds ambient and emissive into ONE interpolator (Color),
         // so this frag cannot tell them apart. It only bites where a glowing subset ALSO ships a
         // metallic `_paramh`, which the lit-window and ghostfence sets do not.
-        const float3 f0 = pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x);
+        const float3 f0 = waterImmersedF0(pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x), In.WorldPos);
         // THE DIELECTRIC'S SHARE, taken out of diffuse before the specular below adds it back.
         // Folded into pbrKd rather than applied separately so the metallic kill and the energy
         // split stay ONE multiply on each of the two terms, and so it lands HERE — after the
