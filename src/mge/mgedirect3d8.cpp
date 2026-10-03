@@ -219,6 +219,7 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
     realDevice->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, (Configuration.AALevel > 0));
 
     LOG::logline("-- D3D Proxy Device OK");
+    LOG::logline(">> [startup] device ready at %.1f ms since launch", LOG::sinceLaunchMs());
     return D3D_OK;
 }
 

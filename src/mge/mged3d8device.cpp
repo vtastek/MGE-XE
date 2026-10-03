@@ -1165,6 +1165,8 @@ void initOnLoad() {
     }
 
     std::snprintf(buffer, sizeof(buffer), "%.*s MGE XE...", firstWordLength, loadingMessage);
+    const double tBar0 = LOG::sinceLaunchMs();
+    LOG::logline(">> [startup] \"%s\" bar up at %.1f ms since launch", buffer, tBar0);
     mwBridge->showLoadingBar(buffer, 95.0);
 
     // Initialize distant land
@@ -1181,7 +1183,11 @@ void initOnLoad() {
     // Clean up loading bar menu, otherwise it persists in the background
     mwBridge->destroyLoadingBar();
 
+    const double tVideo0 = LOG::sinceLaunchMs();
     VideoPatch::start(DistantLand::device);
+    const double tEnd = LOG::sinceLaunchMs();
+    LOG::logline(">> [startup] \"MGE XE...\" bar total %.1f ms (VideoPatch %.1f ms), done at %.1f ms since launch",
+                 tEnd - tBar0, tEnd - tVideo0, tEnd);
 }
 
 // detectMenu

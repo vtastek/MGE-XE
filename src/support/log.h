@@ -15,4 +15,7 @@ namespace LOG {
     // developer-only dumps and self-tests on it; everything else is budgeted per tag regardless.
     bool verbose();
     void close();
+    // Wall-clock milliseconds since this PROCESS was created (GetProcessTimes): the [startup]
+    // timeline's clock, so its marks line up across DLL load, init, menu and first world frame.
+    double sinceLaunchMs();
 };

@@ -6671,6 +6671,11 @@ namespace RenderProcess {
     double compositeBlitMainTex(IDirect3DDevice9* device) {
         MGE_ZoneScopedN("Forge composite blit");
         const double t0 = nowMs();
+        static bool s_firstBlit = true;
+        if (s_firstBlit) {
+            s_firstBlit = false;
+            LOG::logline(">> [startup] first Forge frame on screen at %.1f ms since launch", LOG::sinceLaunchMs());
+        }
         IDirect3DStateBlock9* sb = nullptr;
         device->CreateStateBlock(D3DSBT_ALL, &sb);
 
@@ -7234,6 +7239,9 @@ namespace RenderProcess {
             LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d reloaded=%d first=%d cached=%u",
                          g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
                          (int)reloaded, (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
+            if (firstEval) {
+                LOG::logline(">> [startup] first world scene at %.1f ms since launch", LOG::sinceLaunchMs());
+            }
             g_texSyncFrame = g_frame;   // this build's first sights load full files (see g_texSyncFrame)
             contentProbeWindowEnd(frame);   // MGE_GEOM_CONTENT_PROBE: the window up to this load
             aliasWindowEnd(frame);          // geometry dedup: the same window

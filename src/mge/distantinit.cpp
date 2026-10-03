@@ -191,32 +191,49 @@ bool DistantLand::init() {
     }
 
     LOG::logline(">> Starting Distant Land init");
+    // [startup] timeline: each stage's own ms and where it ends on the since-launch clock, so
+    // startup work can be priced before it is retired (tasks/startup-time.md).
+    double tStage = LOG::sinceLaunchMs();
+    const double tInit0 = tStage;
+    auto stage = [&tStage](const char* name) {
+        const double t = LOG::sinceLaunchMs();
+        LOG::logline(">> [startup] %-24s %8.1f ms  (at %8.1f ms since launch)", name, t - tStage, t);
+        tStage = t;
+    };
+    LOG::logline(">> [startup] DL init begins at %.1f ms since launch", tInit0);
     MGE::GeometryCache::init(device);
     BSA::init();
+    stage("cache + BSA");
 
     if (Configuration.UseSharedMemory && !initIpc()) {
         return false;
     }
+    stage("IPC + render process");
 
     if (!initShader()) {
         return false;
     }
+    stage("DL effect");
 
     if (!FixedFunctionShader::init(device, effectPool)) {
         return false;
     }
+    stage("FFE shaders");
 
     if (!PostShaders::init(device)) {
         return false;
     }
+    stage("post shaders");
 
     if (!initLandscape()) {
         return false;
     }
+    stage("landscape");
 
     if (!initDistantStaticsClient()) {
         return false;
     }
+    stage("distant statics");
 
 
     // MSOC retirement D2/D3/D5: MGE owns the CullShow traversal that produces the
@@ -231,6 +248,8 @@ bool DistantLand::init() {
     MGE::EngineCull::install();
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
+    stage("engine cull + patches");
+    LOG::logline(">> [startup] DL init total %.1f ms", tStage - tInit0);
 
     LOG::logline("<< Completed Distant Land init");
     ready = true;

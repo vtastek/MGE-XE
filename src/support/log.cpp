@@ -250,4 +250,15 @@ namespace LOG {
         handle = INVALID_HANDLE_VALUE;
     }
 
+    double sinceLaunchMs() {
+        FILETIME created, exited, kernel, user, now;
+        if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+            return -1.0;
+        }
+        GetSystemTimePreciseAsFileTime(&now);
+        const ULONGLONG c = ((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime;
+        const ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        return (double)(LONGLONG)(n - c) / 10000.0;   // 100 ns ticks -> ms
+    }
+
 }
