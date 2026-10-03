@@ -850,6 +850,7 @@ namespace {
     };
     std::vector<PlayerPatch>                  g_playerPatch;
     double                                    g_playerBake[3] = {};
+    float                                     g_playerBakeM[9] = {};   // root rotation x scale at build (pos*M)
     bool                                      g_playerBakeValid = false;
     std::uint64_t                             g_buildCacheFrame = 0;   // cache frame the build read
     unsigned                                  g_seamSkipRun = 0;       // consecutive no-payload seam skips
@@ -4666,7 +4667,7 @@ namespace {
         // transforms that ride it come from the same instant.
         g_playerPatch.clear();
         g_buildCacheFrame = MGE::GeometryCache::currentFrame();
-        g_playerBakeValid = MGE::GeometryCache::playerRootOrigin(g_playerBake);
+        g_playerBakeValid = MGE::GeometryCache::playerRootXform(g_playerBake, g_playerBakeM);
 
         g_drawScratch.clear();
         g_drawScratch.reserve((foldKeys ? foldKeys->size() : keys.size()) * sizeof(IPC::DrawItemWire));
@@ -7560,15 +7561,47 @@ namespace RenderProcess {
         // a new artifact in place of the old one. Pose is deliberately NOT corrected: the limbs are
         // one frame stale and stay that way, because that error is small and uncorrelated.
         //
+        // ⚠ THE DELTA IS THE NODE'S WHOLE RIGID MOTION, NOT ITS TRANSLATION. A 3rd-person mouse turn
+        // YAWS the player node while the camera orbits it; translation-only left the body facing
+        // where it faced at BUILD time under a camera aimed with the FIRE-time yaw, so every turn
+        // showed the body one frame behind the orbit — and with a varying build->fire gap that
+        // reads as jitter on rotation (user, 2026-10-03: "player rotation clearly shows the
+        // jitter, MW doesn't have it with f11"). Each player-owned matrix W (pos*W) becomes
+        // W * Mb^-1 * Mn about the root: rows * D with D = Mb^-1 Mn, and the translation rotated
+        // about the root origin, all in the payload's camera-relative space (bakeEye).
+        //
         // On the serial paths build and fire are the same instant, so the delta is exactly zero and
         // every byte matches the pre-correction code.
         if (!g_playerPatch.empty() && g_playerBakeValid) {
             double now[3];
-            if (MGE::GeometryCache::playerRootOrigin(now)) {
+            float  mn[9];
+            if (MGE::GeometryCache::playerRootXform(now, mn)) {
                 const float dx = static_cast<float>(now[0] - g_playerBake[0]);
                 const float dy = static_cast<float>(now[1] - g_playerBake[1]);
                 const float dz = static_cast<float>(now[2] - g_playerBake[2]);
-                if (dx != 0.0f || dy != 0.0f || dz != 0.0f) {
+                // D = Mb^-1 Mn. Mb = s*Q with Q orthonormal, so Mb^-1 = Mb^T / s^2.
+                const float* mb = g_playerBakeM;
+                const float  sb2 = mb[0] * mb[0] + mb[1] * mb[1] + mb[2] * mb[2];
+                float D[9];
+                bool  rotated = false;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        // (Mb^T Mn)[r][c] = sum_k Mb[k][r] * Mn[k][c]
+                        float v = mb[0 * 3 + r] * mn[0 * 3 + c] + mb[1 * 3 + r] * mn[1 * 3 + c]
+                                + mb[2 * 3 + r] * mn[2 * 3 + c];
+                        v = sb2 > 0.0f ? v / sb2 : (r == c ? 1.0f : 0.0f);
+                        D[r * 3 + c] = v;
+                    }
+                }
+                for (int i = 0; i < 9; ++i) {
+                    if (mb[i] != mn[i]) { rotated = true; break; }
+                }
+                // The root in the payload's camera-relative space: c = bakeEye - rootBake, so a
+                // shipped translation T sits at T + c relative to the root (all small numbers).
+                const float cx = static_cast<float>(bakeEye[0] - g_playerBake[0]);
+                const float cy = static_cast<float>(bakeEye[1] - g_playerBake[1]);
+                const float cz = static_cast<float>(bakeEye[2] - g_playerBake[2]);
+                if (rotated || dx != 0.0f || dy != 0.0f || dz != 0.0f) {
                     for (const PlayerPatch& p : g_playerPatch) {
                         std::vector<std::uint8_t>* s =
                             (p.scratch == 0) ? &g_drawScratch     :
@@ -7582,9 +7615,27 @@ namespace RenderProcess {
                         if (p.count == 0 || need > s->size()) continue;
                         auto* t = reinterpret_cast<float*>(s->data() + p.at);
                         for (std::uint32_t i = 0; i < p.count; ++i) {
-                            t[i * 16 + 0] += dx;
-                            t[i * 16 + 1] += dy;
-                            t[i * 16 + 2] += dz;
+                            float* T = t + i * 16;   // translation row (12..14)
+                            if (rotated) {
+                                // `at` points at row 3, so the 3x3 rows sit 12 floats before it.
+                                // The offset is never < 48 bytes: every patched matrix follows a
+                                // header (item world, or the skinned item before its palette).
+                                float* Rw = T - 12;
+                                for (int r = 0; r < 3; ++r) {
+                                    const float a = Rw[r * 4 + 0], b = Rw[r * 4 + 1], c = Rw[r * 4 + 2];
+                                    Rw[r * 4 + 0] = a * D[0] + b * D[3] + c * D[6];
+                                    Rw[r * 4 + 1] = a * D[1] + b * D[4] + c * D[7];
+                                    Rw[r * 4 + 2] = a * D[2] + b * D[5] + c * D[8];
+                                }
+                                const float x = T[0] + cx, y = T[1] + cy, z = T[2] + cz;
+                                T[0] = x * D[0] + y * D[3] + z * D[6] - cx + dx;
+                                T[1] = x * D[1] + y * D[4] + z * D[7] - cy + dy;
+                                T[2] = x * D[2] + y * D[5] + z * D[8] - cz + dz;
+                            } else {
+                                T[0] += dx;
+                                T[1] += dy;
+                                T[2] += dz;
+                            }
                         }
                     }
                 }

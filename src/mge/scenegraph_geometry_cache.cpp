@@ -6143,6 +6143,18 @@ namespace MGE::GeometryCache {
         return true;
     }
 
+    bool playerRootXform(double t[3], float m[9]) {
+        if (!playerRootOrigin(t)) return false;
+        auto* node = MWBridge::get()->getPlayer3rdPersonNode();
+        // Same layout as buildD3DFromTransform's upper 3x3 (pos*M rows = s * R^T).
+        const float s = node->worldTransform.scale;
+        const auto& R = node->worldTransform.rotation;
+        m[0] = s * R.m0.x; m[1] = s * R.m1.x; m[2] = s * R.m2.x;
+        m[3] = s * R.m0.y; m[4] = s * R.m1.y; m[5] = s * R.m2.y;
+        m[6] = s * R.m0.z; m[7] = s * R.m1.z; m[8] = s * R.m2.z;
+        return true;
+    }
+
     const char* enchantGlowTexture() {
         return g_enchantGlowTex;
     }

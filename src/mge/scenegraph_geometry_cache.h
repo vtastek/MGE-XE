@@ -591,6 +591,10 @@ namespace MGE::GeometryCache {
     // False if there is no player node yet (menus, load). Exact (ExactPos::worldT) under the
     // rigid ExactPos mode, the stored float translation widened otherwise.
     bool playerRootOrigin(double out[3]);
+    // ...plus the node's world rotation x scale as a pos*M 3x3 (row-major, the upper-left of
+    // buildD3DFromTransform). A 3rd-person mouse turn YAWS this node; the park-lag correction needs
+    // that as much as the translation.
+    bool playerRootXform(double t[3], float m[9]);
 
     // "The engine did not draw this shape this frame — is it merely off-screen, or is it GONE?"
     // The same vtable-validated parent climb the eviction sweep votes with, asked on demand at the
