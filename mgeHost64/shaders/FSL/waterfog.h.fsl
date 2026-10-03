@@ -53,8 +53,8 @@ float waterFogPlaneRelZ()
 // sun's slant factor at 1.512, and kWaterDiffuse = 2/(1 + cosCrit) is the Lambertian mean secant
 // through that window (air's familiar equivalent is 1.66). Derived in full at waterLightTransmit —
 // they live up here only because the fog TARGET needs them too.
-#define kWaterIOR      1.333f
-#define kWaterCosCrit  0.6612f
+// kWaterIOR and kWaterCosCrit are DEFINED in waterplane.h.fsl (included above): skyamb.h.fsl needs
+// the same Snell window for its underwater sky AO and is included before this header.
 #define kWaterDiffuse  1.2039f
 
 // --- W9b: THE TWO IN-SCATTER COEFFICIENTS, derived (see waterColumn for the working) ------------
@@ -335,16 +335,60 @@ float3 waterFogColor(float3 worldPosRel)
 // POINT LIGHTS ARE DELIBERATELY NOT A CALLER. Their path is light->fragment, not surface->fragment;
 // a torch carried underwater is not dimmed by the column above it. That is a different (and much
 // shorter) correction, not this one.
+//
+// ⚠ EVERY SHADER THAT LIGHTS SUBMERGED GEOMETRY CALLS THIS (or waterAmbTransmit below): opaque,
+// terrain, alpha, multimap, multimap_alpha, and — since 2026-10-03 — the DISTANT statics
+// (statics.vert/.frag) and grass (grass.vert/.frag). Those last two were missing for a long time,
+// which is why far statics and underwater grass stayed bright and caustic-free while the near rock
+// beside them went blue: "statics come through opaque" below is true of NEAR statics only.
+
+// The water column above a submerged fragment: its depth, the downwelling spectrum K, and the
+// feature strength. False above the surface, with the feature off, or at zero strength — then
+// both transmittances are exactly 1. Shared by the two transmittance functions below so they can
+// never disagree about the medium.
+bool submergedColumn(float3 worldPosRel, out float depth, out float3 k, out float strength)
+{
+    depth    = 0.0f;
+    k        = float3(0.0f, 0.0f, 0.0f);
+    strength = gShadowParams.waterFogLight.w;
+    if (!waterFogActive() || strength <= 0.0f) { return false; }
+
+    depth = waterFogDepthBelow(worldPosRel);
+    if (depth <= 0.0f) { return false; }
+
+    // ONE MEDIUM, ONE SPECTRUM — see the note in waterLightTransmit: this is K_d (W8e).
+    k = lerp(gShadowParams.waterFogLight.rgb, gShadowParams.waterFogKd.rgb,
+             gShadowParams.waterFogExt.w);
+    return true;
+}
+
+// The SKY AMBIENT's transmittance to a point `depth` below the surface: through the interface
+// (kWaterSkyTransmit, the diffuse Fresnel transmission — graded in over kWaterSurfaceBlend so a
+// shoreline does not step), then down the column (K_d over the diffuse mean path). The ONE
+// expression both callers below use, so the vertex-baked and per-pixel ambients cannot disagree.
+float3 submergedAmbT(float depth, float3 k, float strength)
+{
+    float  entry = lerp(1.0f, kWaterSkyTransmit, saturate(depth / kWaterSurfaceBlend));
+    return lerp(float3(1.0f, 1.0f, 1.0f), exp(-k * depth * kWaterDiffuse) * entry, strength);
+}
+
+// W7b, AMBIENT ONLY — exactly the tAmb waterLightTransmit returns, for a VERTEX stage that bakes its
+// ambient apart from its sun (statics.vert, grass.vert). No sun path and no caustic taps: caustics
+// modulate the sun, and those shaders take the sun's transmittance per pixel in their frag.
+float3 waterAmbTransmit(float3 worldPosRel)
+{
+    float depth, strength; float3 k;
+    if (!submergedColumn(worldPosRel, depth, k, strength)) { return float3(1.0f, 1.0f, 1.0f); }
+    return submergedAmbT(depth, k, strength);
+}
+
 void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
 {
     tSun = float3(1.0f, 1.0f, 1.0f);
     tAmb = tSun;
 
-    float strength = gShadowParams.waterFogLight.w;
-    if (!waterFogActive() || strength <= 0.0f) { return; }
-
-    float depth = waterFogDepthBelow(worldPosRel);
-    if (depth <= 0.0f) { return; }
+    float depth, strength; float3 k;
+    if (!submergedColumn(worldPosRel, depth, k, strength)) { return; }
 
     // ONE MEDIUM, ONE SPECTRUM — but the DOWNWELLING spectrum, which is K_d and not sigma_t (W8e).
     // The light a surface receives and the light the column in front of it scatters must not disagree
@@ -358,8 +402,7 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
     // is the whole DOWNWELLING FIELD. A photon deflected 10 degrees on its way down is still on its
     // way down. Losing it counts a photon as absorbed that is still in the water and still heading
     // here. See publishWaterFog for how K_d is derived from the same sigma_a/sigma_s.
-    float3 k = lerp(gShadowParams.waterFogLight.rgb, gShadowParams.waterFogKd.rgb,
-                    gShadowParams.waterFogExt.w);
+    // (`k` itself now comes from submergedColumn above, which waterAmbTransmit shares.)
 
     // Refracted sun: cos in AIR is |sunDir.z| (sunDir is the travel direction), and the bound above
     // means this sqrt can never go negative and the divide can never explode.
@@ -368,13 +411,13 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
     float pathSun  = depth / max(cosWater, kWaterCosCrit);
 
     tSun = lerp(tSun, exp(-k * pathSun),                 strength);
-    tAmb = lerp(tAmb, exp(-k * depth * kWaterDiffuse),   strength);
+    tAmb = submergedAmbT(depth, k, strength);   // + the surface's diffuse transmission (waterplane.h)
 
     // ─── W23: CAUSTICS ───────────────────────────────────────────────────────────────────────────
     // Folded into tSun HERE rather than at the five call sites, because this function already IS the
     // single place the sun is attenuated on submerged geometry: opaque.frag, terrain.frag,
-    // alpha.frag, multimap.frag and multimap_alpha.frag all call it identically, and statics come
-    // through opaque. One edit, six shaders, no call-site churn.
+    // alpha.frag, multimap.frag, multimap_alpha.frag, statics.frag and grass.frag all call it
+    // identically (NEAR statics come through opaque; the distant ones are statics.frag).
     //
     // ⚠⚠ AND IT LANDS IN THE RIGHT PLACE BY AN EXISTING DECISION, NOT BY LUCK. opaque.frag already
     // documents that this call must sit BEFORE the point-light loop — "A torch carried underwater is

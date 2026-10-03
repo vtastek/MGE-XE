@@ -13,6 +13,26 @@
 #ifndef WATER_PLANE_H
 #define WATER_PLANE_H
 
+// The water's optics, ONE definition for every reader: waterfog.h.fsl (absorption, the sun's slant,
+// the fog target) and skyamb.h.fsl (the underwater sky AO only sees the Snell window). n = 1.333 puts
+// the whole sky inside a cone of half-angle asin(1/n) = 48.6 deg; kWaterCosCrit is its cosine.
+// Derived in full at waterfog.h.fsl's waterLightTransmit.
+#define kWaterIOR      1.333f
+#define kWaterCosCrit  0.6612f
+
+// SKY LIGHT CROSSING THE SURFACE: the interface's DIFFUSE transmittance, the Fresnel transmission
+// averaged over a uniform sky (cosine-weighted, air -> water, n = 1.333): calm water reflects ~6.6%
+// of an overcast sky, so 0.934 gets in. NOT the 0.98 of normal incidence — that is the sun at the
+// zenith only; grazing sky light reflects far more. And NOT a 1/n^2 = 0.5625 "window" darkening:
+// the radiance inside the Snell cone is n^2 higher, which cancels the narrower cone exactly, so the
+// irradiance a submerged surface receives is conserved up to this loss (waterfog.h.fsl's energy
+// check, at the in-scatter coefficients).
+#define kWaterSkyTransmit  0.934f
+// Depth over which a submerged point takes on the surface's optics (the transmission above, and
+// skyamb.h.fsl's Snell window), so a shoreline grades into the water instead of stepping at it.
+// = skyvis.comp.fsl's SKYVIS_SNELL_BLEND (that pass has its own SRT and cannot include this).
+#define kWaterSurfaceBlend 32.0f
+
 // Is the unified water fog live at all? The host clears waterFogPlane.y when the feature is off, so
 // everything downstream collapses to the pre-feature image through this one test.
 bool waterFogActive()

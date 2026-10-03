@@ -183,6 +183,12 @@ PSOut PS_MAIN( VSOutput In )
     // Same expression, so this is not a change: `normalize(In.WorldNormal)` either way.
     const float3 nGeom = normalize(In.WorldNormal);
     float sunVis = sunShadowVisibility(In.WorldPos, nGeom);
+    // W7b + W23 — the water column above a SUBMERGED distant static (waterfog.h.fsl): the sun's
+    // transmittance along its refracted path, with the caustic gain folded in. Exactly 1 above the
+    // surface. Multiplies every SUN term below (diffuse, EON, specular) and nothing else; the
+    // vertex-baked ambient took its own share in statics.vert, and point lights take none.
+    float3 tSun, tAmb;
+    waterLightTransmit(In.WorldPos, tSun, tAmb);
 
     // ─── DISTANT-STATICS PBR (tasks/forge-dl-lod-textures.md; pbrmaterial.h.fsl) ──────────────────
     // ⚠ `nGeom` STAYS GEOMETRIC AND IS NOT PERTURBED — the split opaque.frag makes between pbrNg and
@@ -301,26 +307,26 @@ PSOut PS_MAIN( VSOutput In )
             if (pbrSigma > 0.0f)
             {
                 const float nlb = saturate(dot(nShade, -gFrameData.sunDir.xyz));
-                pbrDiffMs += (sunTerm * sunVis) * eonMsWeight(nlb);
+                pbrDiffMs += (sunTerm * sunVis * tSun) * eonMsWeight(nlb);
                 sunTerm *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV), nlb);
             }
             // Sun specular. sunCol directly, NOT through SunLight: a dielectric's highlight is not
             // tinted by the diffuse colour the vertex baked into that lane (the same reason
             // statics.vert keeps emissive outside its own multiply).
             const float2 st = pbrSpecTerms(nShade, -gFrameData.sunDir.xyz, pbrV, ndlS, pbrNoV, pbrAlpha2);
-            const float3 w  = gFrameData.sunCol.rgb * (ndlS * sunVis);
+            const float3 w  = gFrameData.sunCol.rgb * (ndlS * sunVis) * tSun;
             pbrSpecA += clampSceneTerm(w * st.x);   // headroom (scenemax.h.fsl) — see opaque.frag
             pbrSpecB += clampSceneTerm(w * st.y);
         }
     }
 
-    float3 result = tex.rgb * (In.Color.rgb + sunTerm * sunVis);
+    float3 result = tex.rgb * (In.Color.rgb + sunTerm * sunVis * tSun);
     // The FACTOR `tex.rgb` multiplies, for F12 5/6/7 — accumulated in parallel rather than obtained
     // by refactoring `result` into `tex.rgb * (a + b)`: `a*b + a*c` is not bit-identical to
     // `a*(b+c)`. Same expression tree as above, so the initialiser folds away as a common
     // subexpression: MEASURED at +3 DXIL instructions for the whole of modes 5/6/7 here
     // (3246 -> 3249), i.e. exactly the one vector add below. See terrain.frag for the full note.
-    float3 litTerm = In.Color.rgb + sunTerm * sunVis;
+    float3 litTerm = In.Color.rgb + sunTerm * sunVis * tSun;
 
     // Phase C: baked DISTANT point lights (same camera-relative gLights set the distant land loops).
     // Statics carry their SUN+ambient per-vertex in Color; this ADDS point diffuse modulated by the
@@ -451,7 +457,9 @@ PSOut PS_MAIN( VSOutput In )
         // skyAmbFactor — statics.vert's own ambient source), evaluated in the mirror direction, so
         // what lights a distant static and what it reflects cannot drift apart.
         const float3 R = reflect(-pbrV, nShade);
-        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy);
+        // ...and through the same water column as that ambient (tAmb == statics.vert's
+        // waterAmbTransmit; opaque.frag's pbrTAmb does the same for the near mesh).
+        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * tAmb;
         result += (f0 * pbrSpecA + pbrSpecB) + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
         // MULTIPLE-SCATTERING SPECULAR, as the DIFFERENCE from the line above (W32 gobo rule).
         if (gShadowParams.pbrShade.w > 0.0f)

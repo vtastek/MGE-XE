@@ -2019,7 +2019,43 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 }
 #line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyoracle.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
-#line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+bool waterFogActive()
+{
+    return gShadowParams.waterFogPlane.y >= 0.5f;
+}
+#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+bool waterCameraSubmerged()
+{
+    return gShadowParams.waterFogPlane.z > 0.5f;
+}
+
+
+
+
+
+bool waterPlaneValid()
+{
+    return gShadowParams.waterFogPlane.w > 0.5f;
+}
+
+
+
+
+float waterPlaneRelZ()
+{
+    return gShadowParams.waterFogPlane.x - gFrameData.lodEye.z;
+}
+
+
+bool waterFogCameraSubmerged()
+{
+    return waterFogActive() && waterCameraSubmerged();
+}
+#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 90 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyAOVisibility(float3 worldAbs)
 {
     float4 m = gShadowParams.skyAOMap;
@@ -2042,7 +2078,7 @@ float skyAOVisibility(float3 worldAbs)
 
     float logRatio = log2(max(outer / max(inner, 1.0f), 1.0f));
     float myH = worldAbs.z;
-#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     float selfH = SampleLvlTex2D(gSkyHeight, gSamplerPointClamp, uv, 0).r;
     float above = selfH - myH;
     float trust = 1.0f - (1.0f - gShadowParams.skyAO2.z)
@@ -2089,6 +2125,24 @@ float skyAOVisibility(float3 worldAbs)
     float s4 = saturate(maxS4);
     float4 vis = f4(1.0f) - s * s;
     float vis4 = 1.0f - s4 * s4;
+
+
+
+
+
+
+
+
+    if (waterPlaneValid())
+    {
+        float under = saturate((gShadowParams.waterFogPlane.x - myH) /  32.0f );
+        if (under > 0.0f)
+        {
+            const float n2 =  1.333f  *  1.333f ;
+            vis = lerp(vis, min(vis * n2, f4(1.0f)), under);
+            vis4 = lerp(vis4, min(vis4 * n2, 1.0f), under);
+        }
+    }
     float ao = (dot(vis, f4(1.0f)) + vis4) * 0.2f;
 
 
@@ -2100,7 +2154,7 @@ float skyAOVisibility(float3 worldAbs)
 
     return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
 }
-#line 208 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 233 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyAOTerm(float3 N, float3 worldPosRel)
 {
     return (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
@@ -2165,7 +2219,7 @@ float skyAOTermPx(float3 N, float3 worldPosRel, float2 svPos)
 
 float3 skyAmbFactorAO(float3 N, float ao)
 {
-#line 283 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 308 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     float ambL = dot(gFrameData.ambCol.rgb, float3(0.299f, 0.587f, 0.114f));
     float fl = (ambL > 1.0e-6f) ? min(gShadowParams.skyAOFloor.x / ambL, gShadowParams.skyAOFloor.y) : 0.0f;
     float fill = fl * (1.0f - ao);

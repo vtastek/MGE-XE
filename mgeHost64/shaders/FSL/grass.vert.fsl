@@ -642,7 +642,13 @@ VSOutput VS_MAIN( VSInput In )
     // them as tex.rgb * (ambient + sun*vis), and tinting only one half would make a blade change
     // colour as a cloud shadow crossed it.
     float3 tint     = grassTint(varHue, varVal);
-    float3 ambient  = tint * rootAO * gFrameData.lodSunAmb.rgb * skyAmbFactor(nFace, worldPos.xyz);
+    // W7b — a SUBMERGED blade receives its sky light through the water column above it
+    // (waterfog.h.fsl), like the terrain it grows from; exactly 1 above the surface. The sun's share,
+    // with its caustics, is taken per pixel in grass.frag.
+    // ⚠ THE SKY FACTOR IS NOT HERE ANY MORE: grass.frag takes it PER PIXEL (skyAmbFactorPx), the
+    // same sky AO terrain reads. Here it was the per-vertex height-map march, which ignored the
+    // direction maps, so with them on a blade stayed bright on ground they had darkened.
+    float3 ambient  = tint * rootAO * gFrameData.lodSunAmb.rgb * waterAmbTransmit(worldPos.xyz);
     Out.SunLight    = tint * gFrameData.sunCol.rgb * lambert;
     Out.WorldNormal = nFace;   // the FACING normal — what the shadow receiver and the AO want too
 

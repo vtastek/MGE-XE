@@ -997,6 +997,13 @@ namespace {
     // at all. A FRAME NUMBER and not a timer: frames only tick while the world is rendering, so it
     // counts gameplay rather than loading, which is the quantity a settle delay is actually about.
     float g_dumpAtFrame = 0.0f;
+    // A SERIES of spaced dumps: once dumpAtFrame fires, re-arm it dumpEvery frames later until
+    // dumpCount dumps were taken. For a sweep a script drives in-game (a camera stepped down through
+    // the water surface): each dump's sidecar carries the eye, so the pictures order themselves by
+    // where they were taken rather than by when. 0 = the one-shot behaviour.
+    float    g_dumpEvery      = 0.0f;
+    float    g_dumpCount      = 0.0f;
+    uint32_t g_dumpSeriesDone = 0;
     // Knob "dumpBurst": K > 0 dumps K CONSECUTIVE frames each time the near/far ownership key changes
     // (MW's grid shifted, a cell finished loading, the held-reference list moved) — the one-frame
     // handover blip is only attributable from the frames around that event. Each dump stalls its frame.
@@ -6227,6 +6234,8 @@ namespace {
     // oracle scored best (0.034) and the one chosen (skyoracle_0011_svm32.png). Both refinements
     // were tried per fragment and each cost accuracy (tasks/forge-skyao-oracle.md S2).
     float    g_svmBias      = 16.0f;
+    bool     g_svmSnell     = true;          // A/B: the underwater Snell window in skyvis.comp (0 = whole dome)
+    float    g_svmDebugMap  = 0.0f;          // diagnostic: k+1 -> the screen pass emits map k's raw depths
     // Screen pass: the compare's filter half-width in map texels, (2R+1)^2 bilinear taps, (R+1)^2
     // gathers per map. 2 = the oracle-scored look (skyoracle_0011_svm32.png).
     float    g_svmPcf       = 2.0f;
@@ -22831,7 +22840,14 @@ namespace {
                                             "27 PBR specular only",
                                             // 28: who drew the pixel — DL statics magenta, MW's
                                             // near path green. Lands with the client's `% 29`.
-                                            "28 near/far producer" };
+                                            "28 near/far producer",
+                                            // 29: the sky AO factor exactly as the ambient applies it
+                                            // (skyAOTermPx — direction maps, else the march), grey:
+                                            // white = open sky. Terrain + near meshes.
+                                            "29 sky AO (applied)",
+                                            // 30: the raw direction-map texel on terrain: R vis,
+                                            // G coverage, B distance-matched.
+                                            "30 sky vis maps (raw)" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -22966,6 +22982,8 @@ namespace {
             // (the `atmos=` cost dial), and the two night lanes, whose whole point is that they are
             // judged at midnight and the harness cannot click a checkbox at midnight either.
             { "dumpAtFrame",        &g_dumpAtFrame        },
+            { "dumpEvery",          &g_dumpEvery          },   // re-arm the dump this many frames later...
+            { "dumpCount",          &g_dumpCount          },   // ...until this many were taken
             { "goboFadeBand",       &g_goboFadeBand       },
             // Async texture stream fault injection (see g_streamFailEvery).
             { "streamFailEvery",    &g_streamFailEvery    },
@@ -23061,6 +23079,9 @@ namespace {
             { "skyAOOverhangFloor", &g_skyAOOverhangFloor },
             { "skyAOMinRadius",     &g_skyAOMinRadius     },
             { "waterInscatterGain", &g_waterInscatterGain },
+            { "waterLightAbsorb",   &g_waterLightAbsorb   },   // W7b: light reaching submerged surfaces (0 = off)
+            { "waterLightCancel",   &g_waterLightCancel   },   // W7a: undo MW's underwater sun/amb blend (0 = MW's values)
+            { "svmDebugMap",        &g_svmDebugMap        },   // k+1: skyvis.comp emits map k's raw depths (terrain mode 30)
             { "waterScatterRatio",  &g_waterScatterRatio  },
             { "waterMsSimilarity",  &g_waterMsSimilarity  },
             { "waterSunEnter",      &g_waterSunEnter      },
@@ -23460,6 +23481,9 @@ namespace {
             // now: reflect re-renders the world into pReflectColor every frame and was the second
             // largest exterior phase with no way for a minimized harness to switch it off.
             { "waterNoReflect",     &g_waterNoReflect     },
+            { "drawWater",          &g_drawWater          },   // F7 / "Draw: water" — 0 reads the seabed bare
+            { "waterFog",           &g_waterFog           },   // the unified water fog (view path + light model)
+            { "svmSnell",           &g_svmSnell           },   // underwater Snell window in the direction maps
             { "drawReflect",        &g_drawReflect        },
             { "drawReflectGeo",     &g_drawReflectGeo     },
             { "drawReflectNear",    &g_drawReflectNear    },
@@ -46474,6 +46498,10 @@ void destroyHostWindow(Renderer* R);
         if (g_dumpAtFrame > 0.0f && g_renderFrame >= (uint32_t)g_dumpAtFrame) {
             g_dumpAtFrame = 0.0f;
             armHdrDump();
+            // Spaced series (dumpEvery/dumpCount): re-arm until the count is reached.
+            if (g_dumpEvery >= 1.0f && (float)(++g_dumpSeriesDone) < g_dumpCount) {
+                g_dumpAtFrame = (float)(g_renderFrame + (uint32_t)g_dumpEvery);
+            }
             // ...and with dumpBurst set (no proximity radius) the frame starts a run of consecutive
             // dumps instead: the only way to catch a flicker that exists BETWEEN frames.
             if (g_dumpBurst > 1.0f && g_dumpBurstR <= 0.0f) { g_dumpBurstLeft = (uint32_t)g_dumpBurst - 1u; }
@@ -50715,6 +50743,20 @@ void destroyHostWindow(Renderer* R);
             if (g_live.pPerFrameSetSun) {
                 for (uint32_t c = 0; c < kSunCascades; ++c) {
                     updateDescriptorSet(R, c, g_live.pPerFrameSetSun, nTp, tp);
+                }
+            }
+            // ...and the SKY-HEIGHT set, every instance: the sky-visibility maps draw terrain.vert
+            // under instance 1+k (renderSkyVisMaps), and buildOpaquePath's binding of this set
+            // carries no terrain buffers. The fourth instance of the lesson, found 2026-10-03: every
+            // direction map held a FLAT SHEET AT ABSOLUTE HEIGHT 0 — the water level — so the land
+            // never shadowed itself in the maps (only statics did), and every submerged point sat
+            // under the sheet and read fully occluded. Underwater that was a pitch-black seabed out
+            // to the maps' reach around the camera, growing as the camera came down — near dark,
+            // far bright, and camera-dependent, the signature that found it (terrain mode 30 +
+            // svmDebugMap showed the stored surface flat at ~0 over a basin).
+            if (g_live.pPerFrameSetSkyHeight) {
+                for (uint32_t si = 0; si <= 32; ++si) {
+                    updateDescriptorSet(R, si, g_live.pPerFrameSetSkyHeight, nTp, tp);
                 }
             }
         }
@@ -58802,6 +58844,12 @@ void destroyHostWindow(Renderer* R);
         mp[kSunNoiseFloat + 3] = 0.0f;
     }
 
+    // What the screen pass last received for the underwater Snell window — echoed in the [svm] line,
+    // so "did the window engage" is a log read and not a guess from a picture.
+    float    g_svmWaterRelZ  = 0.0f;
+    bool     g_svmWaterArmed = false;
+    uint32_t g_svmInWindow   = 0;
+
     // THE SCREEN PASS (skyvis.comp): after the linearize, before the colour pass. Fills the params
     // (the camera's inverse matrix, the dims, and per map its clip rows + eye relative to THIS
     // frame's camera) and dispatches over the half-res rect. Leaves pSvmScreen in SHADER_RESOURCE.
@@ -58822,6 +58870,25 @@ void destroyHostWindow(Renderer* R);
         // Past the corner of the maps' box (half-width ext, redrawn around an eye that may have
         // moved since) no map covers the point: skip the loop and let the frag march.
         f[24] = g_svmBuilt[2] * 1.5f; f[25] = 0.0f; f[26] = 0.0f; f[27] = 0.0f;
+        // UNDERWATER: the water plane, so a submerged point averages only the maps inside the Snell
+        // window (skyvis.comp). From the SAME two host values publishWaterFog writes into the lit
+        // frags' lane (waterFogPlane.x = g_waterFogZ, .w = g_waterFogOn = "this cell has a water
+        // plane"), relative to the eye the tiles below are relative to. The geometric gate, not the
+        // fog-feature one — the window is optics, not a look choice.
+        // ⚠ NOT READ BACK OUT OF pShadowMaskParamsCbv. The first version did, and the window never
+        // engaged: this pass runs before publishSunShadowParams fills this frame's slot of that ring,
+        // and it is write-combined memory besides ([[project_forge_wc_read_trap]]). Every submerged
+        // point then kept the plain dome average — in a basin the shore blocks every low direction,
+        // so an OPEN seabed read 18/32 = 0.56 (the in-window share of the maps, = 1/n^2): a flat,
+        // uniform Snell darkening that stopped at the maps' reach, where the march (which did have
+        // the window) took over.
+        if (g_waterFogOn && g_svmSnell) {
+            f[25] = (float)((double)g_waterFogZ - (double)g_dlEye[2]);
+            f[26] = 1.0f;
+        }
+        g_svmWaterRelZ = f[25];
+        g_svmWaterArmed = f[26] > 0.5f;
+        f[27] = std::max(0.0f, g_svmDebugMap);   // diagnostic: k+1 -> map k's raw depths (skyvis.comp)
         float* t = f + 28;
         for (uint32_t i = 0; i < K; ++i) {
             const SvmTile& T = g_svmTile[i];
@@ -58835,7 +58902,13 @@ void destroyHostWindow(Renderer* R);
             t[i * 16 + 12] = (float)((double)T.eye[0] - (double)g_dlEye[0]);
             t[i * 16 + 13] = (float)((double)T.eye[1] - (double)g_dlEye[1]);
             t[i * 16 + 14] = (float)((double)T.eye[2] - (double)g_dlEye[2]);
-            t[i * 16 + 15] = 0.0f;
+            // cos(zenith) of the direction this map looks down (the same skyHemiDir renderSkyVisMaps
+            // drew it with): which maps lie inside the Snell window for a submerged point.
+            float dir[3];
+            skyHemiDir(i, K, 0.0, 1.0, dir);
+            t[i * 16 + 15] = -dir[2];
+            if (i == 0) { g_svmInWindow = 0; }
+            if (-dir[2] >= 0.6612f) { ++g_svmInWindow; }
         }
 
         cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, "SKY-VISIBILITY SCREEN");
@@ -58980,10 +59053,12 @@ void destroyHostWindow(Renderer* R);
         static uint32_t s_svmLog = 0;
         if ((s_svmLog++ % 300) == 0) {
             LOG::logline(">> [svm] dir %u/%u res=%u ext=%.0f texel=%.2f depthHalf=%.0f drawn=%u"
-                         " terrainCells=%u travel=(%.3f,%.3f,%.3f) | gpu redraw=%.3f screen=%.3f ms",
+                         " terrainCells=%u travel=(%.3f,%.3f,%.3f) | gpu redraw=%.3f screen=%.3f ms"
+                         " | snell window: armed=%d waterRelZ=%.1f inWindow=%u/%u",
                          lastK, K, res, ext, texel, dh, g_svmDrawn, g_terrainSvmV[lastK].cells,
                          lastT[0], lastT[1], lastT[2],
-                         g_lastGpuPhaseMs[kGpuPhaseSkyVis], g_lastGpuPhaseMs[kGpuPhaseSkyVisScreen]);
+                         g_lastGpuPhaseMs[kGpuPhaseSkyVis], g_lastGpuPhaseMs[kGpuPhaseSkyVisScreen],
+                         (int)g_svmWaterArmed, g_svmWaterRelZ, g_svmInWindow, K);
         }
     }
 

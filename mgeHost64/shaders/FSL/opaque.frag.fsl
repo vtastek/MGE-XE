@@ -697,6 +697,10 @@ float4 PS_MAIN( VSOutput In )
         RETURN(float4(aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags), 1.0f));
     }
     if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN
+    if (dbg == 29u) {   // mode 29: the sky AO factor the ambient applies (skyAOTermPx), white = open sky
+        const float skyV = skyAOTermPx(In.Normal, In.WorldPos, In.Position.xy);
+        RETURN(float4(skyV, skyV, skyV, 1.0f));
+    }
     if (dbg == 27u) {   // mode 27: the PBR SPECULAR, alone — the term nothing could see
         // ⚠ THIS IS THE ADDEND, NOT A RATIO. 5 albedo, 6 lit and 7 ambient all show pieces of the
         // DIFFUSE product; specular is the one term that is ADDED to it, so its size relative to

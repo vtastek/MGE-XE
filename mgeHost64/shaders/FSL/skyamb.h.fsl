@@ -66,6 +66,13 @@
 #ifndef SKY_AMB_H
 #define SKY_AMB_H
 
+#include "waterplane.h.fsl"   // waterPlaneValid() + kWaterIOR — the underwater Snell window below
+
+// UNDERWATER, the sky is only the SNELL WINDOW (see skyAOVisibility). Depth over which a point
+// blends from the dome to the window, so the waterline carries no seam — waterplane.h.fsl's one
+// surface-optics blend.
+#define SKY_SNELL_BLEND kWaterSurfaceBlend
+
 // The five azimuths, 72 degrees apart, phase-shifted 9 degrees off the axes:
 //     9, 81, 153, 225, 297 degrees.
 // 9 is not arbitrary. Five directions spaced 72 land on five DISTINCT offsets mod 90 (0,18,36,54,72
@@ -180,6 +187,24 @@ float skyAOVisibility(float3 worldAbs)
     float  s4  = saturate(maxS4);
     float4 vis = f4(1.0f) - s * s;          // cos^2(horizon) per direction
     float  vis4 = 1.0f - s4 * s4;
+
+    // UNDERWATER: only the Snell window carries sky. A submerged point sees the sky through the cone
+    // within asin(1/n) = 48.6 deg of vertical — elevation >= 41.4 deg — and a horizon below that cone
+    // blocks nothing that was reaching it. The cosine-weighted share of the dome above elevation e is
+    // cos^2(e), so the window is cos^2(41.4 deg) = 1/n^2 of it, and the part of the window left above
+    // a horizon h is cos^2(max(h, 41.4 deg)) / (1/n^2) = min(1, cos^2(h) * n^2). Exact, per wedge,
+    // nothing tuned. Blended in over SKY_SNELL_BLEND of depth; exactly the dome above the surface.
+    // skyvis.comp.fsl applies the same window to the direction maps.
+    if (waterPlaneValid())
+    {
+        float under = saturate((gShadowParams.waterFogPlane.x - myH) / SKY_SNELL_BLEND);
+        if (under > 0.0f)
+        {
+            const float n2 = kWaterIOR * kWaterIOR;
+            vis  = lerp(vis,  min(vis * n2, f4(1.0f)), under);
+            vis4 = lerp(vis4, min(vis4 * n2, 1.0f),    under);
+        }
+    }
     float  ao  = (dot(vis, f4(1.0f)) + vis4) * 0.2f;   // average the five hemispherical wedges
 
     // Overhang correction (see the note above the self tap): fold the march's answer back toward open

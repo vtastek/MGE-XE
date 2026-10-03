@@ -153,7 +153,12 @@ VSOutput VS_MAIN( VSInput In )
     // evaluation would have kept. EMISSIVE stays outside the multiply for the same reason it stays
     // outside the vertex colour above — it is an independent FFE term, not ambient.
     float3 sunlit  = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
-    Out.Color    = float4(vcol * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz) + emissive, In.Color.a);
+    // W7b — the sky's light crosses the water column above a SUBMERGED distant static to reach it
+    // (waterfog.h.fsl), exactly as for the near rock beside it; exactly 1 above the surface. The
+    // AMBIENT only — emissive is not received light — and the sun's share (with its caustics) is
+    // taken per pixel in statics.frag.
+    Out.Color    = float4(vcol * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz)
+                          * waterAmbTransmit(worldPos.xyz) + emissive, In.Color.a);
     // ⚠ THE SUN LANE CARRIES ONE OF TWO THINGS, and `pbrStatics.z` picks which.
     //
     // OFF — the MGE-faithful per-VERTEX product `vcol * sunCol * saturate(dot(nWorld, -sunDir))`.

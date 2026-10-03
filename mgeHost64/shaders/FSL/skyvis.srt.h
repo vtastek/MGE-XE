@@ -17,8 +17,9 @@ STRUCT(SkyVisParams)
     DATA(float4x4, invViewProj, None);   // device depth -> camera-relative world (the GTAO matrix)
     DATA(float4,   dims,        None);   // xy = full render w,h ; zw = half (output) w,h
     DATA(float4,   params,      None);   // x = K, y = map res, z = depth bias (map units), w = PCF radius (texels)
-    DATA(float4,   params2,     None);   // x = reach: no map covers a point farther than this; yzw spare
-    DATA(float4,   tiles[SKYVIS_MAX_DIRS * 4], None);
+    DATA(float4,   params2,     None);   // x = reach: no map covers a point farther than this;
+                                         // y = water plane Z, camera-relative; z = 1 if the cell has one; w spare
+    DATA(float4,   tiles[SKYVIS_MAX_DIRS * 4], None);   // per map: 3 clip rows, then (eye rel, cos zenith)
 };
 
 BEGIN_SRT(SkyVisSrtData)

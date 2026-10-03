@@ -42,6 +42,7 @@
 #include "opaque.srt.h"
 #include "a2c.h.fsl"        // a2cCoverageMaskFaded() — SHARED cutout coverage, plus the G1 fade
 #include "msmrecv.h.fsl"    // sunShadowVisibility() — MSM sun-shadow receiver
+#include "skyamb.h.fsl"     // skyAmbFactorPx() — the per-pixel sky AO terrain reads (direction maps)
 #include "tonemap.h.fsl"    // tonemap() — the shared semi-HDR curve
 #include "linearize.h.fsl"  // srgbToLinear() — the scene's transfer function
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag
@@ -186,14 +187,25 @@ PSOut PS_MAIN( VSOutput In )
     if (smode > 0u) {
         sunVis = sunShadowVisibilityMode(shadowPos, nFace, (smode == 1u) ? 1 : 0);
     }
-    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+    // W7b + W23 — a SUBMERGED blade: the sun's transmittance down the water column to it, caustic
+    // gain folded in (waterfog.h.fsl). Exactly 1 above the surface. The blade's OWN position, not the
+    // dropped shadow lookup: the light it receives crossed the water above the blade. The ambient
+    // took its share in grass.vert; point lights take none.
+    float3 tSun, tAmb;
+    waterLightTransmit(In.WorldPos, tSun, tAmb);
+    float3 sunLit = In.SunLight * sunVis * tSun;
+    // Sky AO PER PIXEL, the same term terrain reads: the direction maps where they cover this pixel,
+    // else the height-map march (skyamb.h.fsl). grass.vert used to bake the march per vertex, which
+    // never saw the maps — the blade stayed bright on ground they had darkened.
+    float3 ambient = In.Color.rgb * skyAmbFactorPx(nFace, In.WorldPos, In.Position.xy);
+    float3 result = tex.rgb * (ambient + sunLit);
     // The FACTOR `tex.rgb` multiplies, for F12 5/6/7 — accumulated in parallel rather than obtained
     // by refactoring `result` into `tex.rgb * (a + b)`, because `a*b + a*c` is not bit-identical to
     // `a*(b+c)` and grass is a large-area surface. Same expression tree as the one above, so the
     // initialiser folds away as a common subexpression: MEASURED at +3 DXIL instructions for the
     // whole of modes 5/6/7 here (3514 -> 3517), i.e. exactly the one vector add below and nothing
     // for this line. See terrain.frag for the full note.
-    float3 litTerm = In.Color.rgb + In.SunLight * sunVis;
+    float3 litTerm = ambient + sunLit;
 
     // Point lights, off the same camera-relative sets every other host surface reads.
     //
@@ -236,7 +248,7 @@ PSOut PS_MAIN( VSOutput In )
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     // Ambient here is grass.vert's In.Color, which already carries the root-AO darkening — so this
     // is also the view that shows that term on its own.
-    if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
+    if (dbg == 7u) { Out.Color = float4(ambient, 1.0f);      RETURN(Out); }
     Out.Color = float4(result, 1.0f);
     RETURN(Out);
 }

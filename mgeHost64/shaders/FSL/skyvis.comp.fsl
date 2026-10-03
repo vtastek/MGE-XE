@@ -14,7 +14,24 @@
 // not in the prepass (alpha, water, another camera) never borrows the value of what is behind it.
 // coverage = the fraction of the maps whose box holds the point; the fragment hands the rest to the
 // height-map march.
+//
+// UNDERWATER — ONLY THE SNELL WINDOW. A submerged point receives the sky only through the cone of
+// half-angle asin(1/n) = 48.6 deg about the vertical; a ray leaving it lower than that ends on the
+// underside of the surface, where it is totally internally reflected, and never meets the sky. So
+// the dome average over-darkened every seabed whose LOW directions are blocked (a channel's banks)
+// — directions that carry no sky down there anyway. Below the surface each map's weight blends from
+// 1 to "inside the window" over the first SKY_SNELL_BLEND units of depth (no seam at the waterline).
+// The direction set is cosine-weighted, so the plain average over the in-window maps is the
+// cosine-weighted visibility of the window: the same quantity skyamb.h.fsl's march computes in closed
+// form, min(1, cos^2(horizon) * n^2).
+// Straight rays, as above water: the refraction bend at the surface is not modelled, which only
+// matters for an occluder ABOVE the water seen from below it.
 #include "skyvis.srt.h"
+
+// = waterplane.h.fsl's kWaterCosCrit, and skyamb.h.fsl's SKY_SNELL_BLEND. This pass has its own SRT
+// and cannot include the lit headers.
+#define SKYVIS_WATER_COS_CRIT  0.6612f
+#define SKYVIS_SNELL_BLEND     32.0f
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
@@ -47,7 +64,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             int   R    = (int)gSkyVisParams.params.w;
             float n    = float(2 * R + 1);
             float norm = 1.0f / (n * n);
-            float sumL = 0.0f, cov = 0.0f;
+            float sumL = 0.0f, cov = 0.0f, covW = 0.0f;
+            // 0 above the surface (and in a cell with no water), 1 once SKYVIS_SNELL_BLEND below it.
+            float under = (gSkyVisParams.params2.z > 0.5f)
+                              ? saturate((gSkyVisParams.params2.y - p.z) / SKYVIS_SNELL_BLEND) : 0.0f;
             for (int i = 0; i < K; ++i)
             {
                 float4 c0 = gSkyVisParams.tiles[i * 4 + 0];
@@ -83,11 +103,36 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                         acc += lit.w * wx0 * wy0 + lit.z * wx1 * wy0 + lit.x * wx0 * wy1 + lit.y * wx1 * wy1;
                     }
                 }
-                sumL += acc * norm * inside;
+                // The window weight scales this map's share of the AVERAGE only. Coverage stays
+                // geometric: it says how much of the answer the maps own versus the frag's march, and
+                // a submerged point covered by every map is fully covered, window or not.
+                float wWin = lerp(1.0f, (gSkyVisParams.tiles[i * 4 + 3].w >= SKYVIS_WATER_COS_CRIT) ? 1.0f : 0.0f,
+                                  under);
+                sumL += acc * norm * inside * wWin;
+                covW += inside * wWin;
                 cov  += inside;
             }
-            o.x = (cov > 1.0e-4f) ? sumL / cov : 1.0f;
+            o.x = (covW > 1.0e-4f) ? sumL / covW : 1.0f;
             o.z = cov / max(float(K), 1.0f);
+            // DIAGNOSTIC (params2.w = k + 1): replace (vis, coverage) by map k's STORED depth at this
+            // point's texel and the point's own REFERENCE depth (bias included), both reverse-Z map
+            // units (x 2*depthHalf = world units, larger = nearer the sky). Read by terrain mode 30.
+            if (gSkyVisParams.params2.w >= 1.0f)
+            {
+                int    dk = (int)gSkyVisParams.params2.w - 1;
+                float4 d0 = gSkyVisParams.tiles[dk * 4 + 0];
+                float4 d1 = gSkyVisParams.tiles[dk * 4 + 1];
+                float4 d2 = gSkyVisParams.tiles[dk * 4 + 2];
+                float3 dr = p - gSkyVisParams.tiles[dk * 4 + 3].xyz;
+                float3 dc = float3(dot(dr, d0.xyz) + d0.w, dot(dr, d1.xyz) + d1.w, dot(dr, d2.xyz) + d2.w);
+                // Same gather the loop above uses (SampleLvlTex2DArray is mistyped in this Forge —
+                // [[project_forge_fsl_lvl_array_sampler_typed_3d]]); .w is the texel at floor(tc).
+                float2 dtc = (dc.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f)) * res - 0.5f;
+                float4 dg  = GatherRedTex2D(gSvMaps, gSamplerPointClamp, float3((floor(dtc) + 1.0f) / res, float(dk)));
+                float  stored = dg.w;
+                o.x = stored;
+                o.z = dc.z + gSkyVisParams.params.z;
+            }
         }
     }
     Write2D(gSvOut, h, o);

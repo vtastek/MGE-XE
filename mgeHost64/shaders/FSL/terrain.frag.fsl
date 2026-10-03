@@ -1380,6 +1380,19 @@ float4 PS_MAIN( VSOutput In )
         // answer can agree with itself and disagree with the frame).
         RETURN(float4(pbrHeightVis, pbrHeightVis, pbrHeightVis, 1.0f));
     }
+    if (dbg == 29u) {   // mode 29: the sky AO factor the ambient applies (skyAOTermPx), white = open sky
+        const float skyV = skyAOTermPx(normal, In.WorldPos, In.Position.xy);
+        RETURN(float4(skyV, skyV, skyV, 1.0f));
+    }
+    if (dbg == 30u) {   // mode 30: the RAW direction-map texel under this pixel (skyvis.comp's output)
+        // R = the maps' visibility, G = their coverage, B = 1 where the texel's distance matches this
+        // fragment within skyAOTermPx's tolerance (else the frag would not have used it).
+        const int2   ti  = int2(floor((In.Position.xy - 0.5f) * 0.5f));
+        const float4 svs = LoadTex2D(gSkyVisScreen, NO_SAMPLER, ti, 0);
+        const float  myD = length(In.WorldPos);
+        const float  tol = myD * gShadowParams.skyVis.y + gShadowParams.skyVis.z;
+        RETURN(float4(svs.x, svs.z, (abs(svs.y - myD) <= tol) ? 1.0f : 0.0f, 1.0f));
+    }
     if (dbg == 24u) {   // mode 24: the FOOTPRINT's ANISOTROPY RATIO — why the tiles exist
         // ⚠ THIS IS THE VIEW THAT TESTS THE MECHANISM, and mode 22 alone cannot.
         //
