@@ -158,6 +158,7 @@ struct ConfigurationStruct {
 
     struct {
         bool AltCombat;
+        bool MouseSmoothing;
         char Macros[4096];
         char Triggers[4096];
         char Remap[4096];

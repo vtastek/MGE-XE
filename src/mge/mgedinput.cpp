@@ -1,6 +1,11 @@
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <windows.h>
+#include <mmsystem.h>
 #include "support/log.h"
 #include "mgedinput.h"
 #include "configuration.h"
@@ -403,16 +408,388 @@ public:
 };
 
 
+// Mouse read trace (MGE_MOUSE_TRACE=1, or a mgeXE_mouse_trace.txt marker beside Morrowind.exe for a
+// hand-launched session): one CSV row per GetDeviceState — QPC ms, lX, lY, result —
+// to mgeXE-mouse.csv beside Morrowind.exe. Same clock as the MouseProbe MWSE mod, so each read lines
+// up with the frame that consumed it (mgexe-devkit/tools/mouse-probe.py). Answers whether a lumpy
+// per-frame count comes from WHEN MW reads or from how the input arrives.
+static FILE* mouseTraceFile() {
+    static FILE* f = nullptr;
+    static bool checked = false;
+    if (!checked) {
+        checked = true;
+        const char* env = std::getenv("MGE_MOUSE_TRACE");
+        if ((env && env[0] == '1') || GetFileAttributesA("mgeXE_mouse_trace.txt") != INVALID_FILE_ATTRIBUTES) {
+            f = std::fopen("mgeXE-mouse.csv", "w");
+            if (f) {
+                std::fputs("qpc_ms,lX,lY,hr\n", f);
+            }
+        }
+    }
+    return f;
+}
+
+static double qpcMs() {
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return double(c.QuadPart) * 1000.0 / double(freq.QuadPart);
+}
+
+// ---- Mouse smoothing ---------------------------------------------------------------------------
+// WHY: MW turns the view by exactly the raw count DirectInput hands it at its once-per-frame read.
+// A 125 Hz mouse sends a report every 8 ms (and skips polls: 15-30 ms gaps), so a ~17 ms frame
+// catches one, two or three reports and the per-frame turn swings by +-50% under a steady hand —
+// visible as jumps, worst while running (movement advances on MW's steady clock beside it).
+// Measured with the MouseProbe mod + rawmouse-probe.ps1: DirectInput's count equals Windows' raw
+// stream exactly, frame pacing is even to 2%, MW maps count -> yaw with no scaling. The lumps are the
+// report cadence beating against the frame cadence, so only a re-timing can remove them.
+//
+// WHAT: a 1 kHz poll thread reads the real device and timestamps every report on arrival (QPC). Each
+// report's counts accumulated in the sensor since the previous report, so they are spread evenly over
+// that span (one nominal report interval when the mouse was idle before). MW's read receives the
+// cumulative motion reconstructed at (read time - one report interval): each frame's turn then matches
+// the time the hand actually spent moving in it. EXACT conservation: MW receives integer differences of
+// the reconstructed total, so over any run it gets every count the mouse sent, no more, no less.
+// COST: about one report interval of added delay (8 ms at 125 Hz; ~1-2 ms for a 1000 Hz mouse, where
+// the effect is also small). Buttons and the wheel pass through; a click shorter than a frame is held
+// until MW has seen it.
+#pragma comment(lib, "winmm.lib")
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+class MouseSmoother {
+public:
+    explicit MouseSmoother(IDirectInputDevice8* dev) : dev(dev) {
+        InitializeCriticalSection(&cs);
+        const char* d = std::getenv("MGE_MOUSE_SMOOTH_DELAY_MS");   // dev knob: fixed delay instead of auto
+        fixedDelayMs = d ? std::atof(d) : 0.0;
+    }
+
+    // Every call MW makes on the real device goes through here, so the poll thread never races it.
+    struct Lock {
+        CRITICAL_SECTION* c;
+        explicit Lock(CRITICAL_SECTION* c) : c(c) { EnterCriticalSection(c); }
+        ~Lock() { LeaveCriticalSection(c); }
+    };
+    CRITICAL_SECTION* lock() { return &cs; }
+
+    // Device acquired by MW. NOTHING pending is discarded: counts inside the smoothing window are real
+    // motion (at most one delay's worth) and DirectInput itself drops what happens while unacquired.
+    // The first build reset the window here, and MW Acquires far more often than it loses the device,
+    // so every call threw the window away: "sensitivity is incredibly low".
+    void onAcquired() {
+        ++acquireCalls;
+        if (!acquired && ++acquireTransitions <= 8) {
+            LOG::logline("-- Mouse smoothing: acquired (transition %u, %u Acquire calls so far)",
+                         acquireTransitions, acquireCalls);
+        }
+        acquired = true;
+        pendingErr = DI_OK;
+        if (!thread) {
+            thread = CreateThread(NULL, 0, threadMain, this, 0, NULL);
+            if (thread) {
+                SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+            }
+        }
+    }
+    void onUnacquired() { acquired = false; }
+    void onDeviceGone() { acquired = false; dead = true; }
+    bool running() const { return thread != NULL && !dead; }
+
+    // MW's read (caller holds the lock). Returns the error the poll thread saw, if any, so MW's own
+    // lost-device handling (re-Acquire) runs as it would without us.
+    HRESULT read(DIMOUSESTATE2* out) {
+        if (pendingErr != DI_OK) {
+            HRESULT hr = pendingErr;
+            pendingErr = DI_OK;
+            return hr;
+        }
+        if (!acquired) {
+            // Not ours to smooth until MW re-Acquires: the real device answers (and errors) as usual.
+            return dev->GetDeviceState(sizeof(DIMOUSESTATE2), out);
+        }
+        // Pick up anything that arrived since the thread's last poll, with this read's timestamp.
+        pollLocked();
+        if (pendingErr != DI_OK) {
+            HRESULT hr = pendingErr;
+            pendingErr = DI_OK;
+            return hr;
+        }
+
+        double tau = qpcMs() - delayMs();
+        double cx, cy;
+        evaluate(tau, cx, cy);
+        long long ix = (long long)std::floor(cx + 0.5), iy = (long long)std::floor(cy + 0.5);
+        out->lX = LONG(ix - emittedX);
+        out->lY = LONG(iy - emittedY);
+        emittedX = ix;
+        emittedY = iy;
+        out->lZ = wheel;
+        wheel = 0;
+        for (int i = 0; i < 8; ++i) {
+            out->rgbButtons[i] = latched[i];
+            latched[i] = now[i];
+        }
+        // Drop reports the reconstruction has fully passed.
+        int drop = 0;
+        while (drop < count && at(drop).t <= tau) {
+            ++drop;
+        }
+        head = (head + drop) % kRing;
+        count -= drop;
+        if (++reads % 3000 == 0 && reads <= 30000) {
+            LOG::logline("-- Mouse smoothing: %u reads, %u Acquire calls, report interval %.2f ms, delay %.2f ms, "
+                         "pending %lld,%lld counts", reads, acquireCalls, interval, delayMs(),
+                         cumX - emittedX, cumY - emittedY);
+        }
+        return DI_OK;
+    }
+
+    double intervalMs() const { return interval; }
+
+private:
+    struct Report {
+        double t, s;              // arrival, start of the span its counts accumulated in
+        long long px, py, cx, cy; // cumulative counts before / after it
+    };
+    static const int kRing = 1024;   // 8 s of a 125 Hz mouse between two MW reads (a load screen)
+    static const int kGaps = 32;
+
+    IDirectInputDevice8* dev;
+    CRITICAL_SECTION cs;
+    HANDLE thread = NULL;
+    volatile bool dead = false;
+    bool acquired = false;
+    HRESULT pendingErr = DI_OK;
+    Report ring[kRing];
+    int head = 0, count = 0;
+    long long cumX = 0, cumY = 0, emittedX = 0, emittedY = 0;
+    LONG wheel = 0;
+    BYTE now[8] = {}, latched[8] = {};
+    double lastT = -1e30;
+    double gaps[kGaps] = {};
+    int gapN = 0, gapHead = 0;
+    double interval = 8.0;           // median report gap; 125 Hz until measured
+    double fixedDelayMs = 0.0;
+    unsigned acquireCalls = 0, acquireTransitions = 0, reads = 0;
+
+    Report& at(int i) { return ring[(head + i) % kRing]; }
+
+    double delayMs() const {
+        // One report interval plus a millisecond of arrival jitter: the newest report then almost
+        // always lies past the reconstruction point, so a frame is not starved waiting for it.
+        return fixedDelayMs > 0.0 ? fixedDelayMs : interval + 1.0;
+    }
+
+    void addReport(double t, LONG dx, LONG dy) {
+        double gap = t - lastT;
+        if (gap > 0.0 && gap < 50.0) {
+            gaps[gapHead] = gap;
+            gapHead = (gapHead + 1) % kGaps;
+            if (gapN < kGaps) {
+                ++gapN;
+            }
+            double s[kGaps];
+            std::memcpy(s, gaps, sizeof(double) * gapN);
+            std::nth_element(s, s + gapN / 2, s + gapN);
+            interval = (std::min)(20.0, (std::max)(0.5, s[gapN / 2]));
+        }
+        // A skipped poll (a gap of a few intervals) still carries the counts of the whole gap; a report
+        // after the mouse sat still carries one interval's worth.
+        double span = (gap > 0.0 && gap <= 4.0 * interval) ? gap : interval;
+
+        if (count == kRing) {   // MW stopped reading: forget the oldest, its counts stay in the totals
+            head = (head + 1) % kRing;
+            --count;
+        }
+        Report& r = ring[(head + count) % kRing];
+        r.t = t;
+        r.s = t - span;
+        r.px = cumX;
+        r.py = cumY;
+        cumX += dx;
+        cumY += dy;
+        r.cx = cumX;
+        r.cy = cumY;
+        ++count;
+        lastT = t;
+    }
+
+    // Cumulative motion at time tau: reports are ordered and their spans do not overlap.
+    void evaluate(double tau, double& x, double& y) {
+        if (count == 0) {
+            x = double(cumX);
+            y = double(cumY);
+            return;
+        }
+        x = double(at(0).px);
+        y = double(at(0).py);
+        for (int i = 0; i < count; ++i) {
+            const Report& r = at(i);
+            if (tau >= r.t) {
+                x = double(r.cx);
+                y = double(r.cy);
+                continue;
+            }
+            if (tau > r.s) {
+                double f = (tau - r.s) / (r.t - r.s);
+                x = double(r.px) + double(r.cx - r.px) * f;
+                y = double(r.py) + double(r.cy - r.py) * f;
+            }
+            break;
+        }
+    }
+
+    void pollLocked() {
+        if (!acquired || dead || pendingErr != DI_OK) {
+            return;
+        }
+        DIMOUSESTATE2 st;
+        HRESULT hr = dev->GetDeviceState(sizeof(DIMOUSESTATE2), &st);
+        if (hr != DI_OK) {
+            pendingErr = hr;   // handed to MW's next read, which re-Acquires
+            acquired = false;
+            return;
+        }
+        if (st.lX || st.lY) {
+            addReport(qpcMs(), st.lX, st.lY);
+        }
+        wheel += st.lZ;
+        for (int i = 0; i < 8; ++i) {
+            now[i] = st.rgbButtons[i];
+            latched[i] |= st.rgbButtons[i];
+        }
+    }
+
+    static DWORD WINAPI threadMain(void* p) {
+        MouseSmoother* self = (MouseSmoother*)p;
+        HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        bool coarse = false;
+        if (!timer) {
+            // Pre-1803 Windows: a 1 ms Sleep needs the 1 ms system timer.
+            coarse = true;
+            timeBeginPeriod(1);
+        }
+        LOG::logline("-- Mouse smoothing: poll thread up (%s timer)", coarse ? "timeBeginPeriod" : "high-resolution");
+        while (!self->dead) {
+            if (timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -10000;   // 1 ms, relative
+                SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(timer, 100);
+            } else {
+                Sleep(1);
+            }
+            Lock l(&self->cs);
+            self->pollLocked();
+        }
+        if (timer) {
+            CloseHandle(timer);
+        } else {
+            timeEndPeriod(1);
+        }
+        return 0;
+    }
+};
+
 // MGEProxyMouse: Maps mouse buttons to macro trigger inputs
 class MGEProxyMouse : public ProxyInputDevice {
 public:
     DWORD deviceType;
+    MouseSmoother* smoother = nullptr;
 
-    MGEProxyMouse(IDirectInputDevice8* device) : ProxyInputDevice(device) {}
+    MGEProxyMouse(IDirectInputDevice8* device) : ProxyInputDevice(device) {
+        if (Configuration.Input.MouseSmoothing) {
+            smoother = new MouseSmoother(device);
+        }
+        LOG::logline("-- Mouse smoothing %s", smoother ? "on" : "off");
+    }
+
+    HRESULT _stdcall SetCooperativeLevel(HWND a, DWORD b) {
+        LOG::logline("-- Mouse cooperative level 0x%x (%s%s%s)", b,
+                     (b & DISCL_EXCLUSIVE) ? "exclusive " : "", (b & DISCL_NONEXCLUSIVE) ? "nonexclusive " : "",
+                     (b & DISCL_FOREGROUND) ? "foreground" : "background");
+        if (!smoother) {
+            return realDevice->SetCooperativeLevel(a, b);
+        }
+        MouseSmoother::Lock l(smoother->lock());
+        return realDevice->SetCooperativeLevel(a, b);
+    }
+
+    HRESULT _stdcall Acquire() {
+        if (!smoother) {
+            return realDevice->Acquire();
+        }
+        MouseSmoother::Lock l(smoother->lock());
+        HRESULT hr = realDevice->Acquire();
+        if (SUCCEEDED(hr)) {
+            smoother->onAcquired();
+        }
+        return hr;
+    }
+
+    HRESULT _stdcall Unacquire() {
+        if (!smoother) {
+            return realDevice->Unacquire();
+        }
+        MouseSmoother::Lock l(smoother->lock());
+        smoother->onUnacquired();
+        return realDevice->Unacquire();
+    }
+
+    ULONG _stdcall Release() {
+        if (!smoother) {
+            return realDevice->Release();
+        }
+        MouseSmoother::Lock l(smoother->lock());
+        ULONG r = realDevice->Release();
+        if (r == 0) {
+            smoother->onDeviceGone();   // the poll thread sees it under the lock and exits
+        }
+        return r;
+    }
+
+    HRESULT _stdcall SetDataFormat(const DIDATAFORMAT* a) {
+        if (!smoother) {
+            return realDevice->SetDataFormat(a);
+        }
+        MouseSmoother::Lock l(smoother->lock());
+        return realDevice->SetDataFormat(a);
+    }
+
+    HRESULT _stdcall SetProperty(REFGUID a, const DIPROPHEADER* b) {
+        if (!smoother) {
+            return realDevice->SetProperty(a, b);
+        }
+        MouseSmoother::Lock l(smoother->lock());
+        return realDevice->SetProperty(a, b);
+    }
 
     HRESULT _stdcall GetDeviceState(DWORD a, LPVOID b) {
         DIMOUSESTATE2* mouseState = (DIMOUSESTATE2*)b;
-        HRESULT hr = realDevice->GetDeviceState(sizeof(DIMOUSESTATE2), mouseState);
+        HRESULT hr;
+        if (smoother && smoother->running()) {
+            MouseSmoother::Lock l(smoother->lock());
+            hr = smoother->read(mouseState);
+        } else if (smoother) {
+            MouseSmoother::Lock l(smoother->lock());
+            hr = realDevice->GetDeviceState(sizeof(DIMOUSESTATE2), mouseState);
+        } else {
+            hr = realDevice->GetDeviceState(sizeof(DIMOUSESTATE2), mouseState);
+        }
+        if (FILE* f = mouseTraceFile()) {
+            std::fprintf(f, "%.3f,%ld,%ld,0x%lx\n", qpcMs(), hr == DI_OK ? mouseState->lX : 0L,
+                         hr == DI_OK ? mouseState->lY : 0L, (unsigned long)hr);
+            static unsigned n = 0;
+            if (++n % 256 == 0) {
+                std::fflush(f);
+            }
+        }
         if (hr != DI_OK) {
             return hr;
         }

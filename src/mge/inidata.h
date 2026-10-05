@@ -273,6 +273,7 @@ const iniSetting iniSettings[] = {
 
     // Input
     {&Configuration.Input.AltCombat, t_bool, 1, siniMisc, "Daggerfall Combat Controls", "False", &dictBool, DICTONLY|DONT_SAVE, 0, 0},
+    {&Configuration.Input.MouseSmoothing, t_bool, 1, siniMisc, "Mouse Smoothing", "False", &dictBool, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.Input.Macros, t_set, sizeof(Configuration.Input.Macros), siniMacros, NULL, NULL, NULL, DONT_SAVE, 0, 0},
     {&Configuration.Input.Triggers, t_set, sizeof(Configuration.Input.Triggers), siniTriggers, NULL, NULL, NULL, DONT_SAVE, 0, 0},
     {&Configuration.Input.Remap, t_set, sizeof(Configuration.Input.Remap), siniRemap, NULL, NULL, NULL, DONT_SAVE, 0, 0},
