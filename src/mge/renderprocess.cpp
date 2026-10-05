@@ -3372,16 +3372,19 @@ namespace {
                     ++dropped;   // evicted or recycled while it waited
                     continue;
                 }
-                if (head.io && !head.io->done.load(std::memory_order_acquire)) {
+                if (!head.io) {
+                    // Past the read-ahead (it covers the first kStreamReadAhead jobs, a batch can take
+                    // more) or re-queued without its read. With the I/O thread on this only QUEUES the
+                    // read — consuming it before `done` read found=false and dropped a file that exists,
+                    // leaving its LOD placeholder for good. With the thread off it reads inline, as before P1.
+                    MGE_ZoneScopedN("tex:stream read");
+                    head.io = g_texIo.submit(head.name, TexIoRead::kFull);
+                }
+                if (!head.io->done.load(std::memory_order_acquire)) {
                     break;   // its read is still running: the batch goes with what is ready, in order
                 }
                 TexStreamJob job = std::move(head);
                 g_texStreamQueue.pop_front();
-                if (!job.io) {
-                    // I/O thread off (MGE_TEX_IO_THREAD=0): read inline, as before P1.
-                    MGE_ZoneScopedN("tex:stream read");
-                    job.io = g_texIo.submit(job.name, TexIoRead::kFull);
-                }
                 const unsigned size = job.io->r.size;
                 if (!job.io->r.found || sizeof(IPC::TexUploadWire) + size > windowBytes) {
                     static std::uint32_t s_loadLogged = 0;
