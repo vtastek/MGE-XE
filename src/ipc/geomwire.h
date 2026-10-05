@@ -72,11 +72,12 @@ namespace IPC {
     // scrolls the UVs in-shader — the engine's per-tick vertex-UV rewrites no longer reship.
     constexpr std::uint16_t kGeomFlagUVAnim   = 0x8;
     // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md): this slot is another INSTANCE of a mesh whose
-    // bytes are already in the host arena as BLOCK `GeomPartWire::block`. Header-only (vertexCount =
-    // indexCount = 0, no payload), like Release. The host points the slot at the block's VB/IB range
-    // and refcounts it; the range is parked only when its last holder releases. Vertices are
-    // model-space, so every placed copy of a rock/tree/wall used to ship identical bytes (85% of the
-    // geometry shipped in an AutoZip stress run was such duplicates).
+    // bytes the host already holds as BLOCK `GeomPartWire::block` — an arena range for a plain static,
+    // or a per-mesh VB/IB pair for a skinned or multimap part (phase 3; the slot takes the block's
+    // kind). Header-only (vertexCount = indexCount = 0, no payload), like Release. The host points the
+    // slot at the block's storage and refcounts it; the storage is retired only when its last holder
+    // releases. Vertices are model-space, so every placed copy of a rock/tree/wall/body part used to
+    // ship identical bytes (85% of the geometry shipped in an AutoZip stress run was such duplicates).
     constexpr std::uint16_t kGeomFlagAlias    = 0x10;
     // DEDUP PHASE 2 — blocks kept across loads. A block-creating upload (block != 0) with PINNED set
     // carries one extra hold that is not a slot: the host keeps the range when its last holder slot
@@ -104,10 +105,11 @@ namespace IPC {
         // wire, so old blobs parse identically). Both part-boundary walkers (client chunker
         // flushGeometry, host parser uploadGeometry) add it to the part size.
         std::uint16_t uvAnimBytes;
-        // GEOMETRY DEDUP block id (client-assigned, monotonic, never reused; 0 = none). On a plain
-        // static arena upload: nonzero = the host registers this part's arena range as that block,
-        // so later kGeomFlagAlias records can share it. On an alias: the block to share. 0 for every
-        // part that is not a block (skinned, multimap, uvAnim, forced and re-uploads).
+        // GEOMETRY DEDUP block id (client-assigned, monotonic, never reused; 0 = none). On a static,
+        // skinned or multimap upload: nonzero = the host registers this part's storage (arena range,
+        // or per-mesh buffers for skinned/multimap) as that block, so later kGeomFlagAlias records can
+        // share it. On an alias: the block to share. 0 for every part that is not a block (uvAnim,
+        // forced and re-uploads).
         std::uint32_t block;
     };
     static_assert(sizeof(GeomPartWire) == 24, "GeomPartWire changed size: client and host must ship together");

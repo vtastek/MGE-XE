@@ -17034,19 +17034,32 @@ namespace {
     struct RetiredRange { uint64_t vbOff, vbBytes, ibOff, ibBytes, serial; };
     std::vector<RetiredRange> g_arenaRetire;
 
-    // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md): one arena VB+IB range per unique mesh, shared by
-    // every slot that is an instance of it. Created by a plain static upload carrying a nonzero
+    // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md): one copy of the VB+IB per unique mesh, shared by
+    // every slot that is an instance of it. Created by an upload carrying a nonzero
     // GeomPartWire::block, joined by kGeomFlagAlias records, and refcounted by the slots holding it.
-    // Ids are client-assigned and never reused. The geometry fields are copied into each holder's
-    // HostMesh, so no draw path knows blocks exist.
+    // Ids are client-assigned and never reused. The storage is an ARENA range for a plain static
+    // (kind 0), or a per-mesh GPU_ONLY buffer pair for a skinned / multimap part (phase 3). The
+    // geometry fields are copied into each holder's HostMesh, so no draw path knows blocks exist.
+    enum : uint8_t { kBlockArena = 0, kBlockSkinned = 1, kBlockMultiMap = 2 };
     struct ArenaBlock {
-        uint64_t vbOff, ibOff;
+        uint8_t  kind;          // kBlock*
+        uint64_t vbOff, ibOff;  // kBlockArena
+        Buffer*  vb;            // per-mesh kinds: the shared buffers (owned by the block)
+        Buffer*  ib;
+        uint64_t bufBytes;      // per-mesh kinds: the budget charge the block carries (g_meshBufBytes)
         uint32_t vertexCount, indexCount;
         float    localCenter[3];
         float    localRadius;
         uint32_t refs;     // holder SLOTS only (the tripwire scans exactly these)
         bool     pinned;   // phase 2: the client keeps it past its last holder (kGeomFlagPinned)
     };
+    // Bytes the block's geometry occupies, at its kind's vertex stride.
+    uint64_t blockBytes(const ArenaBlock& b) {
+        const uint64_t vStride = b.kind == kBlockSkinned  ? sizeof(IPC::SkinnedVertexWire)
+                               : b.kind == kBlockMultiMap ? sizeof(IPC::GeomVertexWireMM)
+                                                          : sizeof(IPC::GeomVertexWire);
+        return (uint64_t)b.vertexCount * vStride + (uint64_t)b.indexCount * sizeof(uint16_t);
+    }
     std::unordered_map<uint32_t, ArenaBlock> g_arenaBlocks;
     uint64_t g_blockRefTotal   = 0;   // sum of refs, maintained incrementally (heartbeat tripwire)
     uint64_t g_aliasMissing    = 0;   // alias records naming a block the host does not hold
@@ -26874,43 +26887,59 @@ namespace {
     // Release every buffer a slot owns. Static slots own vb/ib directly; dynamic slots own
     // the ring (dynVb/dynIb[]) and vb/ib merely alias the current ring entry, so the ring is
     // the authority — null vb/ib first to avoid a double-free of an aliased pointer.
+    // Free a block's storage once nothing holds it — no slot and no client pin. Every path that ends
+    // a block comes through here (last-holder release, unpin, teardown), so the two storage kinds
+    // can never be retired two different ways. Both are PARKED, not freed: an in-flight frame may
+    // still read them. A per-mesh block also hands back the budget charge it took at creation.
+    void retireBlockStorage(const ArenaBlock& b) {
+        if (b.kind == kBlockArena) {
+            const uint64_t vbB = (uint64_t)b.vertexCount * sizeof(IPC::GeomVertexWire);
+            const uint64_t ibB = (uint64_t)b.indexCount * sizeof(uint16_t);
+            g_arenaRetire.push_back({ b.vbOff, vbB, b.ibOff, ibB, g_frameSerial });
+            g_geoArena.destroyedBytes += vbB + ibB;
+            ++g_geoArena.destroys;
+        } else {
+            if (b.vb) { g_bufRetire.push_back({ b.vb, g_frameSerial }); }
+            if (b.ib) { g_bufRetire.push_back({ b.ib, g_frameSerial }); }
+            g_geoStatic.destroyedBytes += b.bufBytes; ++g_geoStatic.destroys;
+            g_meshBufBytes = (g_meshBufBytes > b.bufBytes) ? (g_meshBufBytes - b.bufBytes) : 0ull;
+        }
+    }
+
     void releaseMeshBuffers(HostMesh& m) {
         // Ledger credit uses m.bufBytes — the SAME figure the create site charged and the budget
         // hands back below — so created/destroyed can never drift apart through a re-upload that
         // changed the shape in between. Credited in the branch that actually frees, so a slot
         // charged to one bucket cannot be credited to another.
-        if (m.inArena) {
-            // Arena parts own no D3D12 resources — the suballocations are PARKED (g_arenaRetire)
-            // until every frame that could still read them has retired. A SHARED range (blockId) is
-            // parked only by its last holder; every other holder just detaches from it.
-            bool lastHolder = true;
-            if (m.blockId) {
-                auto it = g_arenaBlocks.find(m.blockId);
-                if (it == g_arenaBlocks.end()) {
-                    // Cannot happen while refs are balanced; parking here would double-free a range
-                    // some other holder may still draw, so detach and say so instead.
-                    LOG::logline("!! [geom-alias] release of slot holding UNKNOWN block %u — detached, range not parked",
-                                 m.blockId);
-                    lastHolder = false;
-                } else {
-                    if (g_blockRefTotal) { --g_blockRefTotal; }
-                    if (--it->second.refs != 0 || it->second.pinned) {
-                        // Still held — by another slot, or by the client's pin (a COLD block,
-                        // freed only by its unpin record).
-                        lastHolder = false;
-                    } else {
-                        g_arenaBlocks.erase(it);
-                    }
+        if (m.blockId) {
+            // A SHARED block (any kind): the holder only detaches. The storage is retired by the
+            // last holder, and only if the client does not pin it (a COLD block, freed by its unpin
+            // record). The block carries the budget charge, so m.bufBytes is 0 here.
+            auto it = g_arenaBlocks.find(m.blockId);
+            if (it == g_arenaBlocks.end()) {
+                // Cannot happen while refs are balanced; retiring here would double-free storage
+                // some other holder may still draw, so detach and say so instead.
+                LOG::logline("!! [geom-alias] release of slot holding UNKNOWN block %u — detached, storage not retired",
+                             m.blockId);
+            } else {
+                if (g_blockRefTotal) { --g_blockRefTotal; }
+                if (--it->second.refs == 0 && !it->second.pinned) {
+                    retireBlockStorage(it->second);
+                    g_arenaBlocks.erase(it);
                 }
-                m.blockId = 0;
             }
-            if (lastHolder) {
-                g_arenaRetire.push_back({ m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire),
-                                          m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t), g_frameSerial });
-                g_geoArena.destroyedBytes += (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire)
-                                          + (uint64_t)m.indexCount  * sizeof(uint16_t);
-                ++g_geoArena.destroys;
-            }
+            m.blockId = 0;
+            m.inArena = false;
+            m.vbOff = m.ibOff = 0;
+            m.vb = m.ib = nullptr;   // the block's, never this slot's
+        } else if (m.inArena) {
+            // Arena parts own no D3D12 resources — the suballocation is PARKED (g_arenaRetire)
+            // until every frame that could still read it has retired.
+            g_arenaRetire.push_back({ m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire),
+                                      m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t), g_frameSerial });
+            g_geoArena.destroyedBytes += (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire)
+                                      + (uint64_t)m.indexCount  * sizeof(uint16_t);
+            ++g_geoArena.destroys;
             m.inArena = false;
             m.vbOff = m.ibOff = 0;
         } else if (m.dynamic) {
@@ -27263,15 +27292,22 @@ namespace {
                     releaseMeshBuffers(g_meshes[i]);
                 }
             }
+        }
+        // COLD blocks (refs 0, pinned) legitimately outlive every slot. An arena range goes with the
+        // device, but a per-mesh block owns its buffers — retire every block here, BEFORE the drain,
+        // or those leak past shutdown. (A still-held block is a ref leak; its storage goes too.)
+        size_t heldBlocks = 0;
+        for (const auto& kv : g_arenaBlocks) {
+            if (kv.second.refs != 0) { ++heldBlocks; }
+            retireBlockStorage(kv.second);
+        }
+        if (g_meshes) {
             // Teardown: releaseMeshBuffers PARKS into the retire lists, and there is no next frame
             // to drain them — free here or the whole store leaks past shutdown. Callers have already
             // waited the frame fences (shutdown()) or never submitted anything, so this is safe.
             drainRetired(UINT64_MAX);
             tf_free(g_meshes);
         }
-        // COLD blocks (refs 0, pinned) legitimately outlive every slot; the arena goes with the device.
-        size_t heldBlocks = 0;
-        for (const auto& kv : g_arenaBlocks) { if (kv.second.refs != 0) { ++heldBlocks; } }
         if (heldBlocks) {
             LOG::logline("!! [geom-alias] %zu blocks still held after releasing every slot", heldBlocks);
         }
@@ -34954,9 +34990,11 @@ void destroyHostWindow(Renderer* R);
                 // parked under a live holder.
                 {
                     uint64_t sharedBytes = 0, coldBytes = 0, coldBlocks = 0, pinnedBlocks = 0;
+                    uint64_t skinBlocks = 0, mmBlocks = 0;
                     for (const auto& kv : g_arenaBlocks) {
-                        const uint64_t bytes = (uint64_t)kv.second.vertexCount * sizeof(IPC::GeomVertexWire)
-                                             + (uint64_t)kv.second.indexCount * sizeof(uint16_t);
+                        const uint64_t bytes = blockBytes(kv.second);
+                        if (kv.second.kind == kBlockSkinned)  { ++skinBlocks; }
+                        if (kv.second.kind == kBlockMultiMap) { ++mmBlocks; }
                         if (kv.second.pinned) { ++pinnedBlocks; }
                         if (kv.second.refs == 0) {   // COLD: held only by the client's pin
                             ++coldBlocks;
@@ -34968,10 +35006,11 @@ void destroyHostWindow(Renderer* R);
                     uint64_t blockSlots = 0;
                     for (uint32_t s = 0; s < g_meshHigh; ++s) {
                         const HostMesh& hm = g_meshes[s];
-                        if (hm.valid && hm.inArena && hm.blockId) { ++blockSlots; }
+                        if (hm.valid && hm.blockId) { ++blockSlots; }
                     }
-                    LOG::logline(">> [forge-hb] geom-alias: blocks=%zu aliasSlots=%llu shared=%.1f MB missing=%llu dupCreates=%llu | kept: pinned=%llu cold=%llu (%.1f MB) unpinFreed=%llu unpinUnknown=%llu",
+                    LOG::logline(">> [forge-hb] geom-alias: blocks=%zu (skin=%llu mm=%llu) aliasSlots=%llu shared=%.1f MB missing=%llu dupCreates=%llu | kept: pinned=%llu cold=%llu (%.1f MB) unpinFreed=%llu unpinUnknown=%llu",
                                  g_arenaBlocks.size(),
+                                 (unsigned long long)skinBlocks, (unsigned long long)mmBlocks,
                                  (unsigned long long)(g_blockRefTotal - ((uint64_t)g_arenaBlocks.size() - coldBlocks)),
                                  (double)sharedBytes / (1024.0 * 1024.0),
                                  (unsigned long long)g_aliasMissing, (unsigned long long)g_blockDupCreates,
@@ -61672,9 +61711,10 @@ void destroyHostWindow(Renderer* R);
                 continue;
             }
 
-            // ALIAS (header-only, no payload): another instance of a mesh already in the arena as
-            // block hdr.block. Point the slot at the block's range and take a ref — no bytes, no
-            // arena alloc. Like Release it is consumed whatever happens (a re-send cannot help).
+            // ALIAS (header-only, no payload): another instance of a mesh the host already holds as
+            // block hdr.block. Point the slot at the block's storage (arena range, or per-mesh
+            // buffers for skinned/multimap) and take a ref — no bytes, no alloc. Like Release it is
+            // consumed whatever happens (a re-send cannot help).
             if (hdr.flags & IPC::kGeomFlagAlias) {
                 StepTimer st(tAliasMs);
                 ++nAlias;
@@ -61702,12 +61742,13 @@ void destroyHostWindow(Renderer* R);
                     continue;
                 }
                 ArenaBlock& b = it->second;
-                m.skinned  = false;
-                m.multimap = false;
-                m.inArena  = true;
-                m.vbOff    = b.vbOff;
-                m.ibOff    = b.ibOff;
-                m.vb = m.ib = nullptr;
+                m.skinned  = b.kind == kBlockSkinned;
+                m.multimap = b.kind == kBlockMultiMap;
+                m.inArena  = b.kind == kBlockArena;
+                m.vbOff    = m.inArena ? b.vbOff : 0;
+                m.ibOff    = m.inArena ? b.ibOff : 0;
+                m.vb       = m.inArena ? nullptr : b.vb;   // borrowed: the block owns them
+                m.ib       = m.inArena ? nullptr : b.ib;
                 m.bufBytes = 0;
                 m.blockId  = hdr.block;
                 m.localCenter[0] = b.localCenter[0];
@@ -61728,9 +61769,9 @@ void destroyHostWindow(Renderer* R);
             }
 
             // UNPIN (header-only, no slot): the client dropped a COLD block from its kept-across-loads
-            // LRU (dedup phase 2). Clear the pin; if no slot holds the block either, park its range
+            // LRU (dedup phase 2). Clear the pin; if no slot holds the block either, retire its storage
             // exactly as a last-holder release would. Idempotent — a replayed chunk finds the pin
-            // already clear and does nothing — so it can never free a range a slot still draws.
+            // already clear and does nothing — so it can never free storage a slot still draws.
             if (hdr.flags & IPC::kGeomFlagUnpin) {
                 ++built;
                 auto it = g_arenaBlocks.find(hdr.block);
@@ -61747,11 +61788,7 @@ void destroyHostWindow(Renderer* R);
                 }
                 b.pinned = false;
                 if (b.refs == 0) {
-                    const uint64_t vbB = (uint64_t)b.vertexCount * sizeof(IPC::GeomVertexWire);
-                    const uint64_t ibB = (uint64_t)b.indexCount * sizeof(uint16_t);
-                    g_arenaRetire.push_back({ b.vbOff, vbB, b.ibOff, ibB, g_frameSerial });
-                    g_geoArena.destroyedBytes += vbB + ibB;
-                    ++g_geoArena.destroys;
+                    retireBlockStorage(b);
                     ++g_unpinFreed;
                     g_arenaBlocks.erase(it);
                 }
@@ -62046,6 +62083,7 @@ void destroyHostWindow(Renderer* R);
                         }
                     } else {
                         ArenaBlock b = {};
+                        b.kind  = kBlockArena;
                         b.vbOff = vbo;
                         b.ibOff = ibo;
                         b.vertexCount = hdr.vertexCount;
@@ -62104,6 +62142,37 @@ void destroyHostWindow(Renderer* R);
                 g_geoStatic.createdBytes += m.bufBytes; ++g_geoStatic.creates;
                 if (g_meshBufBytes > g_meshBufPeak) { g_meshBufPeak = g_meshBufBytes; }
                 anyStatic = true;
+                // GEOMETRY DEDUP phase 3: register the pair as a shareable block. The BLOCK owns the
+                // buffers and carries the budget charge taken just above (once), so the slot's
+                // bufBytes goes to 0 and releaseMeshBuffers never hands it back twice. A replayed id
+                // keeps this copy private, exactly as the arena path does.
+                m.blockId = 0;
+                if (hdr.block != 0) {
+                    if (g_arenaBlocks.count(hdr.block)) {
+                        if (g_blockDupCreates++ < 32) {
+                            LOG::logline("!! [geom-alias] block %u uploaded again (slot %u, per-mesh) — kept private",
+                                         hdr.block, hdr.slot);
+                        }
+                    } else {
+                        ArenaBlock b = {};
+                        b.kind = isSkinned ? kBlockSkinned : kBlockMultiMap;
+                        b.vb = m.vb;
+                        b.ib = m.ib;
+                        b.bufBytes = m.bufBytes;
+                        b.vertexCount = hdr.vertexCount;
+                        b.indexCount  = hdr.indexCount;
+                        b.localCenter[0] = m.localCenter[0];
+                        b.localCenter[1] = m.localCenter[1];
+                        b.localCenter[2] = m.localCenter[2];
+                        b.localRadius = m.localRadius;
+                        b.refs = 1;
+                        b.pinned = (hdr.flags & IPC::kGeomFlagPinned) != 0;
+                        g_arenaBlocks.emplace(hdr.block, b);
+                        m.blockId  = hdr.block;
+                        m.bufBytes = 0;
+                        ++g_blockRefTotal;
+                    }
+                }
             }
 
             // NiUVController takeover: parse/store the key track for this (re)built mesh.

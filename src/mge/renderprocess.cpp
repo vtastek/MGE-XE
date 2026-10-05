@@ -657,18 +657,26 @@ namespace {
     std::uint32_t                             g_nextSlot = 0;
     // GEOMETRY DEDUP (tasks/forge-geometry-dedup.md). Vertices ship model-space, so every placed copy
     // of a mesh is byte-identical; the host keeps one arena range (a BLOCK) per unique content and
-    // further instances send a header-only kGeomFlagAlias record. Keyed on {hash, vc, ic} so a 64-bit
-    // collision must also match both sizes. `refs` counts the slots holding the block (owner + aliases)
-    // and is dropped when a slot is QUEUED for release (drainReleasedSlots) or re-uploads — always no
-    // later than the host drops it, so an alias is only ever sent for a block the host still holds.
+    // further instances send a header-only kGeomFlagAlias record. Keyed on {hash, vc, ic, kind} so a
+    // 64-bit collision must also match both sizes, and a skinned / multimap / static mesh never aliases
+    // another kind (different vertex formats, different host storage). `refs` counts the slots holding
+    // the block (owner + aliases) and is dropped when a slot is QUEUED for release (drainReleasedSlots)
+    // or re-uploads — always no later than the host drops it, so an alias is only ever sent for a
+    // block the host still holds. Phase 3: skinned and multimap parts share blocks too (per-mesh
+    // buffers on the host instead of an arena range).
+    enum : std::uint8_t { kContentStatic = 0, kContentSkinned = 1, kContentMultiMap = 2 };
     struct ContentKey {
         std::uint64_t hash;
         std::uint32_t vc, ic;
-        bool operator==(const ContentKey& o) const { return hash == o.hash && vc == o.vc && ic == o.ic; }
+        std::uint8_t  kind;   // kContent*
+        bool operator==(const ContentKey& o) const {
+            return hash == o.hash && vc == o.vc && ic == o.ic && kind == o.kind;
+        }
     };
     struct ContentKeyHash {
         std::size_t operator()(const ContentKey& k) const {
-            return (std::size_t)(k.hash ^ (k.hash >> 32) ^ ((std::uint64_t)k.vc * 0x9E3779B1u) ^ k.ic);
+            return (std::size_t)(k.hash ^ (k.hash >> 32) ^ ((std::uint64_t)k.vc * 0x9E3779B1u) ^ k.ic
+                                 ^ ((std::uint64_t)k.kind << 29));
         }
     };
     // PHASE 2 — COLD BLOCKS. A pinned block whose last holder slot went away stays in the host arena
@@ -699,6 +707,16 @@ namespace {
         return on;
     }
 
+    // MGE_GEOM_ALIAS_SKIN=0 turns off phase 3 only (skinned + multimap blocks), so it A/Bs against
+    // phase 1/2. MGE_GEOM_ALIAS=0 still turns every kind off.
+    bool geomAliasKindOn(std::uint8_t kind) {
+        static const bool skinOn = [] {
+            const char* e = std::getenv("MGE_GEOM_ALIAS_SKIN");
+            return !(e && e[0] == '0');
+        }();
+        return geomAliasOn() && (kind == kContentStatic || skinOn);
+    }
+
     // MGE_GEOM_KEEP_MB: the byte cap on cold blocks (phase 2). 0 = phase 1 (a block dies with its last
     // holder). A SUM bound on what the host keeps for nobody — [[feedback_content_sized_staging_buffer]].
     // The host arena starts at 256 MB with ~15-60 MB live, so the default fits without a grow.
@@ -721,6 +739,9 @@ namespace {
         std::uint64_t revivedBytes = 0;
         std::uint32_t unpinned = 0;      // cold blocks dropped at the cap
         std::uint64_t unpinnedBytes = 0;
+        std::uint32_t kindBlocks[3] = {};    // `blocks` / `aliases` split by kContent*
+        std::uint32_t kindAliases[3] = {};
+        std::uint64_t kindAliasedBytes[3] = {};
     };
     AliasStats g_aliasStats;
 
@@ -728,13 +749,17 @@ namespace {
         if (!geomAliasOn()) {
             return;
         }
-        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu | kept: %u revived (%.1f MB), %u unpinned (%.1f MB), cold now %zu (%.1f / %llu MB)",
-                     frame, g_aliasStats.blocks, g_aliasStats.aliases, g_aliasStats.aliasedBytes / 1048576.0,
-                     g_aliasStats.hashMs, g_blockByContent.size(), g_slotBlock.size(),
-                     g_aliasStats.revived, g_aliasStats.revivedBytes / 1048576.0,
-                     g_aliasStats.unpinned, g_aliasStats.unpinnedBytes / 1048576.0,
+        const AliasStats& s = g_aliasStats;
+        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu | kept: %u revived (%.1f MB), %u unpinned (%.1f MB), cold now %zu (%.1f / %llu MB) | blocks/aliases (MB): static %u/%u (%.1f) skin %u/%u (%.1f) mm %u/%u (%.1f)",
+                     frame, s.blocks, s.aliases, s.aliasedBytes / 1048576.0,
+                     s.hashMs, g_blockByContent.size(), g_slotBlock.size(),
+                     s.revived, s.revivedBytes / 1048576.0,
+                     s.unpinned, s.unpinnedBytes / 1048576.0,
                      g_coldBlocks.size(), g_coldBytes / 1048576.0,
-                     (unsigned long long)(geomKeepBytes() >> 20));
+                     (unsigned long long)(geomKeepBytes() >> 20),
+                     s.kindBlocks[0], s.kindAliases[0], s.kindAliasedBytes[0] / 1048576.0,
+                     s.kindBlocks[1], s.kindAliases[1], s.kindAliasedBytes[1] / 1048576.0,
+                     s.kindBlocks[2], s.kindAliases[2], s.kindAliasedBytes[2] / 1048576.0);
         g_aliasStats = AliasStats{};
     }
 
@@ -9999,12 +10024,12 @@ namespace RenderProcess {
         g_srcProbe = SrcProbe{};
     }
 
-    void noteContentAliased(std::size_t bytes) {
+    void noteContentAliased(std::uint8_t kind, std::size_t bytes) {
         if (!contentProbeOn()) {
             return;
         }
-        g_contentWin.bytes[0][4] += bytes;
-        ++g_contentWin.parts[0][4];
+        g_contentWin.bytes[kind][4] += bytes;
+        ++g_contentWin.parts[kind][4];
     }
 
     // One line per window, at the load that ends it.
@@ -10041,6 +10066,75 @@ namespace RenderProcess {
         srcProbeWindowEnd();
         g_contentWin = ContentWindow{};
         ++g_contentWindowId;
+    }
+
+    // GEOMETRY DEDUP, every kind: hash the part's content and either ship a header-only ALIAS onto the
+    // live (or cold) block holding it — returns true, the caller ships nothing more — or make this
+    // upload the block's owner (hdr.block + kGeomFlagPinned set; the caller ships the payload). The
+    // caller decides eligibility (a key's first upload, no uvAnim, not forced) and must already have
+    // run drainPendingIfFull and dropBlockRef(slot), so the lookup sees the post-flush block table.
+    bool aliasOrRegister(std::uint8_t kind, std::uint32_t key, std::uint32_t slot,
+                         std::uint16_t revision, std::uint32_t modelId,
+                         const void* verts, std::size_t vbBytes,
+                         const std::uint16_t* indices, std::size_t ibBytes,
+                         std::uint32_t vertexCount, std::uint32_t indexCount,
+                         IPC::GeomPartWire& hdr) {
+        if (!geomAliasKindOn(kind)) {
+            return false;
+        }
+        const double tHash0 = nowMs();
+        ContentKey ck;
+        {
+            MGE_ZoneScopedN("geom:contentHash");
+            ContentHasher hasher;
+            hasher.update(verts, vbBytes);
+            hasher.update(indices, ibBytes);
+            ck = ContentKey{ hasher.finish(), vertexCount, indexCount, kind };
+        }
+        const double hashMs = nowMs() - tHash0;
+        g_aliasStats.hashMs += hashMs;
+        auto bc = g_blockByContent.find(ck);
+        noteSrcProbe(key, modelId, ck, hashMs, bc != g_blockByContent.end(), vbBytes + ibBytes);
+        if (bc != g_blockByContent.end()) {
+            IPC::GeomPartWire ah = {};
+            ah.slot       = slot;
+            ah.revisionID = revision;
+            ah.flags      = IPC::kGeomFlagAlias;   // vertexCount = indexCount = 0 -> header-only
+            ah.block      = bc->second.block;
+            const std::size_t at = g_pendingBlob.size();
+            g_pendingBlob.resize(at + sizeof(ah));
+            memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
+            ++g_pendingParts;
+            noteWindowPart(sizeof(ah));
+            if (bc->second.cold) {
+                // Kept across a load (phase 2): the host still holds it under its pin.
+                g_coldBlocks.erase(bc->second.coldIt);
+                g_coldBytes -= bc->second.bytes;
+                bc->second.cold = false;
+                ++g_aliasStats.revived;
+                g_aliasStats.revivedBytes += vbBytes + ibBytes;
+            }
+            ++bc->second.refs;
+            g_slotBlock.emplace(slot, ck);
+            g_uploadedRev[key] = { modelId, vertexCount, revision };
+            ++g_aliasStats.aliases;
+            g_aliasStats.aliasedBytes += vbBytes + ibBytes;
+            ++g_aliasStats.kindAliases[kind];
+            g_aliasStats.kindAliasedBytes[kind] += vbBytes + ibBytes;
+            noteContentAliased(kind, vbBytes + ibBytes);
+            return true;
+        }
+        hdr.block = ++g_nextBlock;
+        const bool pin = geomKeepBytes() != 0;
+        if (pin) {
+            hdr.flags |= IPC::kGeomFlagPinned;
+        }
+        g_blockByContent.emplace(ck, BlockRef{ hdr.block, 1u, (std::uint32_t)(vbBytes + ibBytes),
+                                               pin, false, {} });
+        g_slotBlock.emplace(slot, ck);
+        ++g_aliasStats.blocks;
+        ++g_aliasStats.kindBlocks[kind];
+        return false;
     }
 
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
@@ -10094,56 +10188,10 @@ namespace RenderProcess {
         // morphing mesh keeps the sameShape/streak path it always had. Only a key's FIRST upload
         // (no prior g_uploadedRev entry) may share: a block is plain, unanimated static content.
         dropBlockRef(slot);
-        if (firstUpload && !forceReupload && !hdr.uvAnimBytes && geomAliasOn()) {
-            const double tHash0 = nowMs();
-            ContentKey ck;
-            {
-                MGE_ZoneScopedN("geom:contentHash");
-                ContentHasher hasher;
-                hasher.update(verts, vbBytes);
-                hasher.update(indices, ibBytes);
-                ck = ContentKey{ hasher.finish(), vertexCount, indexCount };
-            }
-            const double hashMs = nowMs() - tHash0;
-            g_aliasStats.hashMs += hashMs;
-            auto bc = g_blockByContent.find(ck);
-            noteSrcProbe(key, modelId, ck, hashMs, bc != g_blockByContent.end(), vbBytes + ibBytes);
-            if (bc != g_blockByContent.end()) {
-                IPC::GeomPartWire ah = {};
-                ah.slot       = slot;
-                ah.revisionID = revision;
-                ah.flags      = IPC::kGeomFlagAlias;   // vertexCount = indexCount = 0 -> header-only
-                ah.block      = bc->second.block;
-                const std::size_t at = g_pendingBlob.size();
-                g_pendingBlob.resize(at + sizeof(ah));
-                memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
-                ++g_pendingParts;
-                noteWindowPart(sizeof(ah));
-                if (bc->second.cold) {
-                    // Kept across a load (phase 2): the host still holds it under its pin.
-                    g_coldBlocks.erase(bc->second.coldIt);
-                    g_coldBytes -= bc->second.bytes;
-                    bc->second.cold = false;
-                    ++g_aliasStats.revived;
-                    g_aliasStats.revivedBytes += vbBytes + ibBytes;
-                }
-                ++bc->second.refs;
-                g_slotBlock.emplace(slot, ck);
-                g_uploadedRev[key] = { modelId, vertexCount, revision };
-                ++g_aliasStats.aliases;
-                g_aliasStats.aliasedBytes += vbBytes + ibBytes;
-                noteContentAliased(vbBytes + ibBytes);
-                return;
-            }
-            hdr.block = ++g_nextBlock;
-            const bool pin = geomKeepBytes() != 0;
-            if (pin) {
-                hdr.flags |= IPC::kGeomFlagPinned;
-            }
-            g_blockByContent.emplace(ck, BlockRef{ hdr.block, 1u, (std::uint32_t)(vbBytes + ibBytes),
-                                                   pin, false, {} });
-            g_slotBlock.emplace(slot, ck);
-            ++g_aliasStats.blocks;
+        if (firstUpload && !forceReupload && !hdr.uvAnimBytes &&
+            aliasOrRegister(kContentStatic, key, slot, revision, modelId, verts, vbBytes,
+                            indices, ibBytes, vertexCount, indexCount, hdr)) {
+            return;
         }
 
         const std::size_t at = g_pendingBlob.size();
@@ -10192,10 +10240,19 @@ namespace RenderProcess {
         hdr.vertexCount = vertexCount;
         hdr.indexCount  = indexCount;
         hdr.numBones    = static_cast<std::uint16_t>(numBones);
+        // Latched BEFORE drainPendingIfFull (its flush can erase g_uploadedRev entries) — see captureGeometry.
+        const bool firstUpload = (rev == g_uploadedRev.end());
 
         drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::SkinnedVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
+        // GEOMETRY DEDUP phase 3: the bind-pose VB+IB is per-mesh content (bone count and palette
+        // travel per DRAW), so every NPC wearing the same part shares one host buffer pair.
+        if (firstUpload &&
+            aliasOrRegister(kContentSkinned, key, slot, revision, modelId, verts, vbBytes,
+                            indices, ibBytes, vertexCount, indexCount, hdr)) {
+            return;
+        }
         const std::size_t at = g_pendingBlob.size();
         g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes);
         std::uint8_t* dst = g_pendingBlob.data() + at;
@@ -10244,10 +10301,18 @@ namespace RenderProcess {
             hdr.flags      |= IPC::kGeomFlagUVAnim;
             hdr.uvAnimBytes = uvAnimBytes;
         }
+        // Latched BEFORE drainPendingIfFull (its flush can erase g_uploadedRev entries) — see captureGeometry.
+        const bool firstUpload = (rev == g_uploadedRev.end());
 
         drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWireMM);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
+        // GEOMETRY DEDUP phase 3 — uvAnim parts stay private, as uvAnim statics do.
+        if (firstUpload && !hdr.uvAnimBytes &&
+            aliasOrRegister(kContentMultiMap, key, slot, revision, modelId, verts, vbBytes,
+                            indices, ibBytes, vertexCount, indexCount, hdr)) {
+            return;
+        }
         const std::size_t at = g_pendingBlob.size();
         g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         std::uint8_t* dst = g_pendingBlob.data() + at;
