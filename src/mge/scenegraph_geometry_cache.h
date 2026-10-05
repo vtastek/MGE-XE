@@ -458,6 +458,17 @@ namespace MGE::GeometryCache {
     // are re-captured lazily on first sight.
     void purgeAll();
 
+    // KEEP THE LAST EXTERIOR across an interior hop (MGE_KEEP_EXTERIOR; renderprocess decides).
+    // parkExterior moves every exterior entry (and its engine pin and fixture groups) out of the
+    // cache, keeping its host slot, and is called just BEFORE purgeAll on the way in. restoreParked
+    // runs just AFTER purgeAll on the way out: within 1.5 cells of the parked eye it moves the
+    // entries MW reattached back and releases the rest; further away it releases them all.
+    // releaseParked routes every parked key through the eviction channel (purgeAll's). Each returns
+    // the entry count it acted on. Callers drain released keys before the next capture.
+    uint32_t parkExterior(const float eye[3]);
+    uint32_t restoreParked(void* dataHandler, const float eye[3]);
+    uint32_t releaseParked(const char* why);
+
     // Arm the post-load residency window: a few frames of forced full-cell capture, so the whole
     // active cell (interior) / active-cell grid (exterior) is captured and host-resident before the
     // player can turn around. Without it the cache fills only from the engine's FRUSTUM-limited

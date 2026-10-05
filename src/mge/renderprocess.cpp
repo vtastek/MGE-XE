@@ -7353,7 +7353,34 @@ namespace RenderProcess {
             contentProbeWindowEnd(frame);   // MGE_GEOM_CONTENT_PROBE: the window up to this load
             aliasWindowEnd(frame);          // geometry dedup: the same window
             if (!firstEval) {
+                // KEEP THE LAST EXTERIOR (MGE_KEEP_EXTERIOR=0 turns it off). MW keeps the exterior
+                // loaded across an interior visit, so on the way in its entries are parked rather than
+                // purged (host slots kept), and on the way back out they are restored instead of
+                // re-captured shape by shape over a 64-frame window. Interior -> interior keeps them
+                // parked (guild hall -> sub-room -> out). The loading-bar flag cannot tell a door from a
+                // save load (door hops raise it too), so restoreParked validates every entry against
+                // MW's live roots instead and releases whatever was not reattached.
+                static int s_keepExt = -1;
+                if (s_keepExt < 0) {
+                    char e[16] = {};
+                    s_keepExt = (GetEnvironmentVariableA("MGE_KEEP_EXTERIOR", e, sizeof(e)) > 0 && e[0] == '0') ? 0 : 1;
+                    LOG::logline(">> [park] keep the last exterior across an interior hop: %s "
+                                 "(MGE_KEEP_EXTERIOR=0 turns it off)", s_keepExt ? "ON" : "OFF");
+                }
+                const bool wasExterior = (s_lastInteriorCell == nullptr);
+                const bool nowExterior = (interiorCell == nullptr);
+                if (s_keepExt && wasExterior && !nowExterior) {
+                    // The LAST exterior eye: on this frame `eye` is already inside.
+                    MGE::GeometryCache::parkExterior(s_lastEye);
+                } else if (!nowExterior && interiorCell == s_lastInteriorCell) {
+                    // Reloaded in place inside: the save load tore the parked exterior down too.
+                    MGE::GeometryCache::releaseParked("reload");
+                }
                 MGE::GeometryCache::purgeAll();
+                if (nowExterior) {
+                    if (!wasExterior) MGE::GeometryCache::restoreParked(dh, eye);
+                    else              MGE::GeometryCache::releaseParked("exterior teleport/reload");
+                }
                 // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
                 // deferred drain in flushGeometry(). The purge just released our engine refs, so
                 // the old shapes are freed and the allocator will hand the SAME ADDRESSES to the

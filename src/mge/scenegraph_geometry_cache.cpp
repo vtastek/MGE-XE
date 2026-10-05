@@ -410,6 +410,40 @@ namespace MGE::GeometryCache {
         // in the same frame are never gated). -1 = unlimited, >= 0 = captures still allowed.
         int       g_windowCaptureBudget   = -1;
         uint32_t  g_windowCaptureDeferred = 0;   // first-sight keys the budget turned away this frame
+        // RESUMABLE WINDOW WALK (MGE_WALK_RESUME, default on). The budget only gated captures: every
+        // window frame still traversed the whole grid and refreshed every cached shape (~7 ms on an
+        // exterior return, 64 frames of it). Instead the window walks the world roots' CHILDREN (the
+        // cell roots) itself, and stops the moment the budget is spent:
+        //  - g_winStopAtBudget arms walk()'s early return; g_winStopped reports that it fired.
+        //  - g_winCursor is the cell root the last frame stopped in. A POINTER, not an index: the
+        //    child arrays change while cells stream. Gone = restart from the first child.
+        //  - g_winDone holds the roots finished without a stop. Once capture is done, the trailing
+        //    frames visit only roots not in it (late background-loaded cells).
+        // Only a frame that visited EVERY root without a stop may stamp g_walkRanFrame (the frustum
+        // fallback and the sweep trust that stamp to mean "every reachable entry is fresh").
+        int       g_walkResume            = -1;  // -1 = env not read yet
+        bool      g_winStopAtBudget       = false;
+        bool      g_winStopped            = false;
+        uint64_t  g_winDeferFrame         = 0;   // frame whose window walk stopped at the budget
+        const void* g_winCursor           = nullptr;
+        std::unordered_set<const void*> g_winDone;
+        struct WinUnit { NI::AVObject* root; uint8_t kind; };   // kind: 0 obj, 1 pick, 2 land
+        std::vector<WinUnit> g_winUnits;    // this frame's unit list (scratch)
+        uint32_t  g_winUnitsWalked        = 0;   // receipt: units walked over the window
+        uint32_t  g_winRecheck            = 0;   // round-robin index of the trailing re-walk
+        constexpr uint32_t kWindowVisitBudget = 2048;   // shapes visited per window frame (~1.5 ms)
+        // KEEP THE LAST EXTERIOR across an interior hop (MGE_KEEP_EXTERIOR, default on; the decision
+        // lives in renderprocess checkCellEpochAndPurge). MW keeps the exterior loaded while the
+        // player is inside, so its entries are still valid on the way out: they wait here instead of
+        // being purged and re-captured. Parked entries are OUT of g_cache and every derived set, so
+        // no emit path or sweep can see them inside, but their host slots stay (no g_evictedKeys, no
+        // releaseEntry) and their pins stay (no address can recycle while parked).
+        std::unordered_map<uint32_t, CachedGeometry>                    g_parked;
+        std::unordered_map<uint32_t, NI::Pointer<NI::TriBasedGeometry>> g_parkedRefs;
+        float     g_parkEye[3]            = {};
+        std::vector<uint32_t> g_parkDropped;   // receipt: keys the last restore released
+
+        constexpr float kParkRestoreDist  = 12288.0f;   // 1.5 cells: "the same exterior"
         uint32_t  g_deepDisabledSkips     = 0;   // DISABLED reference subtrees the deep walk refused
         uint32_t  g_deepDisabledShapes    = 0;   // shapes under them (the refusal's collateral)
         int       g_postLoadFramesUsed    = 0;   // frames the current window has actually consumed
@@ -938,6 +972,10 @@ namespace MGE::GeometryCache {
             std::vector<std::uint32_t> members;       // g_cache keys — see above, NEVER pointers
         };
         std::unordered_map<std::uint64_t, EmisGroup> g_emisGroups;
+        // Groups whose members are ALL parked exterior entries (see g_parked): they wait with them,
+        // so a restored fixture keeps the gain it had instead of re-deriving it against whatever
+        // light snapshot is current on the way out (the interior's, on the async path).
+        std::unordered_map<std::uint64_t, EmisGroup> g_parkedGroups;
 
         std::uint64_t emisGroupKey(const void* light, const char* tex) {
             std::uint64_t h = (std::uint64_t)(std::uintptr_t)light * 0x9E3779B97F4A7C15ull;
@@ -3361,6 +3399,12 @@ namespace MGE::GeometryCache {
         void walk(NI::AVObject* av, bool inCharacter = false, bool bypassCull = false,
                   bool bypassCullDeep = false) {
             if (!av) return;
+            // Resumable window walk: the budget is spent, so stop traversing (the next frame resumes
+            // at this cell root). Counted as one deferral, which holds the window open.
+            if (g_winStopAtBudget && g_windowCaptureBudget == 0) {
+                if (!g_winStopped) { g_winStopped = true; ++g_windowCaptureDeferred; }
+                return;
+            }
             const bool culled = av->getAppCulled();
             if (culled && !bypassCull && !bypassCullDeep) return;
             // A bypass is in effect and this node is app-culled — so ask WHY it is culled before
@@ -3812,6 +3856,7 @@ namespace MGE::GeometryCache {
         // (S5b: entries also held D3D9 vertex/index buffers of their own, and a skinned vertex
         // declaration was created here. All of that went with the mirror.)
         if (g_device && g_device != device) {
+            releaseParked("device re-created");
             purgeAll();
             LOG::logline(">> [gc] device re-created — geometry cache purged (stale D3D9 resources dropped)");
         }
@@ -4356,6 +4401,106 @@ namespace MGE::GeometryCache {
     // directly off its world root, this frame cannot claim to cover what the full walk would reach,
     // so it takes the full walk instead (counted in the receipt).
     //
+    // MGE_WALK_RESUME=0: every window frame takes the full walk, as before the resumable walk.
+    static bool walkResumeOn() {
+        if (g_walkResume < 0) {
+            char e[16];
+            g_walkResume = 1;
+            if (GetEnvironmentVariableA("MGE_WALK_RESUME", e, sizeof(e)) > 0) {
+                g_walkResume = std::strtoul(e, nullptr, 10) != 0 ? 1 : 0;
+            }
+            LOG::logline(">> [postload-walk] resumable window walk %s (MGE_WALK_RESUME=0 = full walk "
+                         "every window frame)", g_walkResume ? "ON" : "OFF");
+        }
+        return g_walkResume != 0;
+    }
+
+    // A world root's children as window units, after the checks walk() applies to the ROOT itself
+    // before it descends: app-cull (bypassed by the deep walk) and the active-cell gate. The world
+    // roots carry no reference, no collision or shadow name and no skinned child, so walk()'s other
+    // root-level branches cannot fire on them.
+    static void appendRootChildren(NI::Node* root, uint8_t kind, bool deep) {
+        if (!root) return;
+        if (root->getAppCulled() && !deep) return;
+        if (g_gateThisFrame) {
+            const float dx = root->worldBoundOrigin.x - g_gateEye[0];
+            const float dy = root->worldBoundOrigin.y - g_gateEye[1];
+            const float dz = root->worldBoundOrigin.z - g_gateEye[2];
+            const float reach = g_gateRadius + root->worldBoundRadius;
+            if (dx * dx + dy * dy + dz * dz > reach * reach) {
+                ++g_gateSkipsThisFrame;
+                return;
+            }
+        }
+        const auto count = root->children.getEndIndex();
+        for (size_t i = 0; i < count; ++i) {
+            if (NI::AVObject* c = root->children.at(i).get()) g_winUnits.push_back({ c, kind });
+        }
+    }
+
+    // The resumable window walk over g_winUnits: start at the cursor, skip finished roots, stop when
+    // the budget is spent. Returns true only for a COMPLETE walk (every unit walked this frame, no
+    // stop), the one case that may stamp g_walkRanFrame.
+    //
+    // A cell root freed and re-allocated at the same address inside one window would read as done;
+    // the cost is that cell's off-screen shapes arriving through ensureLive on sight, as in steady
+    // play, instead of through the window.
+    static bool walkWindowUnits(bool deep) {
+        const size_t n = g_winUnits.size();
+        size_t start = 0;
+        if (g_winCursor) {
+            for (size_t i = 0; i < n; ++i) {
+                if (g_winUnits[i].root == g_winCursor) { start = i; break; }
+            }
+            g_winCursor = nullptr;
+        }
+        bool skipped = false;
+        g_winStopped = false;
+        g_winStopAtBudget = true;
+        const uint32_t visitStart = g_visitedThisFrame;
+        bool walkedAny = false;
+        for (size_t k = 0; k < n; ++k) {
+            const WinUnit& u = g_winUnits[(start + k) % n];
+            if (g_winDone.count(u.root)) { skipped = true; continue; }
+            // Visit budget, checked only BETWEEN roots so a root larger than the budget still
+            // finishes. A restored exterior captures ~nothing, so the capture budget never stops it,
+            // and its first frame would refresh all ~12k cached shapes at once (8-9 ms on main).
+            if (walkedAny && g_visitedThisFrame - visitStart >= kWindowVisitBudget) {
+                g_winStopped = true;
+                ++g_windowCaptureDeferred;   // holds the window open, like a capture deferral
+                g_winCursor = u.root;
+                break;
+            }
+            walkedAny = true;
+            g_walkingPick = (u.kind == 1);
+            g_walkingLandscape = (u.kind == 2);
+            walk(u.root, false, false, deep);
+            g_walkingPick = false;
+            g_walkingLandscape = false;
+            ++g_winUnitsWalked;
+            if (g_winStopped) { g_winCursor = u.root; break; }
+            g_winDone.insert(u.root);
+        }
+        // A trailing frame with no new root re-walks ONE finished root, round-robin. MW attaches some
+        // shapes to a cell root after the window has already finished it (the old window re-walked
+        // every root every frame and caught them; without this the reload + 360 harness settled ~10
+        // entries short). One root is ~1/30 of the grid, and the 30 trailing frames cover every root
+        // about once.
+        if (!walkedAny && !g_winStopped && n) {
+            const WinUnit& u = g_winUnits[g_winRecheck++ % n];
+            g_walkingPick = (u.kind == 1);
+            g_walkingLandscape = (u.kind == 2);
+            walk(u.root, false, false, deep);
+            g_walkingPick = false;
+            g_walkingLandscape = false;
+            ++g_winUnitsWalked;
+            if (g_winStopped) --g_winRecheck;   // a capture burst: the same root again next frame
+        }
+        g_winStopAtBudget = false;
+        if (g_winStopped) g_winDeferFrame = g_frame;
+        return !g_winStopped && !skipped;
+    }
+
     // Deliberately does NOT stamp g_walkRanFrame: it says nothing about the old cells, so the
     // eviction sweep must not read it as the authoritative "unvisited == gone" walk.
     static void walkCrossingCells(void* dh) {
@@ -4408,6 +4553,19 @@ namespace MGE::GeometryCache {
         const double t0 = gcNowMs();
         const bool objCulled = g_objRoot->getAppCulled();
         const bool pickCulled = !g_pickRoot || g_pickRoot->getAppCulled();
+        if (walkResumeOn()) {
+            // Same cells, as resumable units (see walkWindowUnits). The landscape root's children
+            // join as units too: they finish on the first frame and cost nothing after.
+            g_winUnits.clear();
+            for (uint32_t k = 0; k < n; ++k) {
+                if (!objCulled && newStatic[k]) g_winUnits.push_back({ newStatic[k], 0 });
+                if (!pickCulled && newPick[k])  g_winUnits.push_back({ newPick[k], 1 });
+            }
+            appendRootChildren(g_landRoot, 2, /*deep=*/false);
+            walkWindowUnits(/*deep=*/false);
+            g_gcAccum.obj += gcNowMs() - t0;
+            return;
+        }
         for (uint32_t k = 0; k < n; ++k) {
             if (!objCulled) walk(newStatic[k]);
             if (!pickCulled) {
@@ -4836,8 +4994,12 @@ namespace MGE::GeometryCache {
             // Armed ONLY around the walk below and disarmed straight after: the sky and FP walks run
             // later in this same frame and must never be starved of captures by an exhausted budget.
             g_windowCaptureDeferred = 0;
-            g_deepDisabledSkips = 0;   // per-frame, so the receipt reports the cell's steady count
-            g_deepDisabledShapes = 0;
+            if (!walkResumeOn() || g_postLoadFramesUsed == 0) {
+                // Per-frame, so the receipt reports the cell's steady count. The resumable walk
+                // visits each root once per window instead, so it counts over the whole window.
+                g_deepDisabledSkips = 0;
+                g_deepDisabledShapes = 0;
+            }
             g_windowCaptureBudget = kPostLoadCaptureBudget;
             RenderProcess::setWindowCapture(true);   // [geomflush] window= provenance (measurement)
             if (g_captureInteriorCell) {
@@ -4865,11 +5027,18 @@ namespace MGE::GeometryCache {
                 // classify like the normal pick pass.
                 const bool savedGate = g_gateThisFrame;
                 g_gateThisFrame = false;
-                walk(g_objRoot, false, /*bypassCull=*/false, /*bypassCullDeep=*/true);
-                if (g_pickRoot) {
-                    g_walkingPick = true;
-                    walk(g_pickRoot, false, /*bypassCull=*/false, /*bypassCullDeep=*/true);
-                    g_walkingPick = false;
+                if (walkResumeOn()) {
+                    g_winUnits.clear();
+                    appendRootChildren(g_objRoot, 0, /*deep=*/true);
+                    appendRootChildren(g_pickRoot, 1, /*deep=*/true);
+                    walkWindowUnits(/*deep=*/true);
+                } else {
+                    walk(g_objRoot, false, /*bypassCull=*/false, /*bypassCullDeep=*/true);
+                    if (g_pickRoot) {
+                        g_walkingPick = true;
+                        walk(g_pickRoot, false, /*bypassCull=*/false, /*bypassCullDeep=*/true);
+                        g_walkingPick = false;
+                    }
                 }
                 g_gateThisFrame = savedGate;
             } else if (g_postLoadScoped) {
@@ -4890,12 +5059,31 @@ namespace MGE::GeometryCache {
                 // costs nothing — and it stamps g_walkRanFrame, which makes the eviction sweep's
                 // walkAuthoritative verdict true for every window frame (strictly more precise
                 // gone-detection, and the sweep's own ensureFullWalk below becomes free).
-                ensureFullWalk();
+                //
+                // Resumable (walkWindowUnits): the same walk, root by root, stopping at the budget.
+                // Only a complete pass stamps; a DX9 frame that already walked keeps the skip.
+                if (!walkResumeOn()) {
+                    ensureFullWalk();
+                } else if (g_walkRanFrame != g_frame) {
+                    const double t0 = gcNowMs();
+                    g_winUnits.clear();
+                    appendRootChildren(g_objRoot, 0, /*deep=*/false);
+                    appendRootChildren(g_pickRoot, 1, /*deep=*/false);
+                    appendRootChildren(g_landRoot, 2, /*deep=*/false);
+                    if (walkWindowUnits(/*deep=*/false)) g_walkRanFrame = g_frame;
+                    g_gcAccum.obj += gcNowMs() - t0;
+                }
             }
             g_windowCaptureBudget = -1;   // disarm before the sky/FP walks below
             RenderProcess::setWindowCapture(false);
             ++g_postLoadFramesUsed;
-            windowScopedIdle = g_postLoadScoped && !g_captureInteriorCell && g_captureTotal == capturesBefore;
+            // A window frame that captured nothing left the cache, and so the caster set, unchanged:
+            // the forced sweep below would only re-climb every entry. The scoped walk always had this
+            // exemption; the resumable walk's trailing frames get it too, but never the FIRST frame
+            // (a restored exterior captures ~nothing, and its caster set still has to be rebuilt).
+            windowScopedIdle = g_captureTotal == capturesBefore
+                && (g_postLoadScoped ? !g_captureInteriorCell
+                                     : (walkResumeOn() && g_postLoadFramesUsed > 1));
 
             // The window's job is "the cell is resident", not "N frames elapsed". While the budget
             // is still deferring captures there is grid left to bring in, so hold the window open
@@ -4907,14 +5095,24 @@ namespace MGE::GeometryCache {
             if (!stillCapturing && --g_postPurgeCaptureFrames == 0) {
                 LOG::logline(">> [postload-walk] %s done: frames=%d/%d cache=%u->%u captures=%u "
                              "lastDeferred=%u disabledSkipped=%u/%ushapes gateR=%.0f "
-                             "scoped=%d cells=%u fullFallback=%u rootExtra=%u",
+                             "scoped=%d cells=%u fullFallback=%u rootExtra=%u resume=%d units=%u/%u",
                              g_postLoadInterior ? "interior" : "exterior",
                              g_postLoadFramesUsed, g_postLoadFramesArmed,
                              g_postLoadCacheAtArm, (unsigned)g_cache.size(),
                              (unsigned)(g_captureTotal - g_postLoadCapturesAtArm),
                              g_windowCaptureDeferred, g_deepDisabledSkips, g_deepDisabledShapes,
                              g_gateRadius, (int)g_postLoadScoped, g_scopedCellsLast,
-                             g_scopedFullFallback, g_scopedRootExtra);
+                             g_scopedFullFallback, g_scopedRootExtra, (int)walkResumeOn(),
+                             (unsigned)g_winDone.size(), g_winUnitsWalked);
+                if (!g_parkDropped.empty()) {
+                    // Released at restore (not attached under MW's roots at that moment). Back in the
+                    // cache by now = MW reattached it later, and the window caught it again.
+                    uint32_t back = 0;
+                    for (uint32_t k : g_parkDropped) back += g_cache.count(k) ? 1u : 0u;
+                    LOG::logline(">> [park] restore receipt: %u released at restore, %u back in the cache "
+                                 "by window end", (unsigned)g_parkDropped.size(), back);
+                    g_parkDropped.clear();
+                }
                 g_postLoadScoped = false;
             }
         }
@@ -5867,6 +6065,10 @@ namespace MGE::GeometryCache {
         g_scopedCellsLast       = 0;
         g_scopedFullFallback    = 0;
         g_scopedRootExtra       = 0;
+        g_winDone.clear();
+        g_winCursor             = nullptr;
+        g_winUnitsWalked        = 0;
+        g_winRecheck            = 0;
     }
 
     void armCrossingWalk(int oldGridX, int oldGridY) {
@@ -5935,6 +6137,137 @@ namespace MGE::GeometryCache {
         // window of full-cell capture (see onFrameReady). Armed AFTER the clear so the window's
         // cache=/captures= baseline is the empty cache it actually starts from.
         armPostLoadWalk();
+    }
+
+    // ---- Keep the last exterior across an interior hop (see g_parked) -----------------------------
+
+    uint32_t releaseParked(const char* why) {
+        if (g_parked.empty()) return 0;
+        // The purge's channel: the Forge feed resolves each key to its host slot and releases it.
+        // The caller drains BEFORE anything can re-capture, and the pins drop only here, so no
+        // released address can have been handed to a new shape yet.
+        for (auto& kv : g_parked) {
+            g_evictedKeys.push_back(kv.first);
+            releaseEntry(kv.second);
+        }
+        const uint32_t n = (uint32_t)g_parked.size();
+        g_parked.clear();
+        g_parkedGroups.clear();
+        g_parkedRefs.clear();   // NI::Pointer dtors → DecRef every parked shape
+        LOG::logline(">> [park] released=%u (%s)", n, why);
+        return n;
+    }
+
+    uint32_t parkExterior(const float eye[3]) {
+        releaseParked("replaced");   // one parked exterior at a time (never expected to fire)
+        // Fixture groups first, while every member still resolves: a group whose members are ALL
+        // parked waits with them. A group shared with an entry that stays (never seen; a sky or FP
+        // piece would have to share a light and texture with world geometry) loses its parked
+        // members instead, and those re-derive their gain on the way out (see restoreParked).
+        for (auto it = g_emisGroups.begin(); it != g_emisGroups.end(); ) {
+            bool allParked = !it->second.members.empty();
+            for (uint32_t k : it->second.members) {
+                auto cit = g_cache.find(k);
+                if (cit == g_cache.end()) continue;   // dead member: emisRederive drops it anyway
+                const auto& e = cit->second;
+                if (e.homeInteriorCell || e.isSky || e.isFP) { allParked = false; break; }
+            }
+            if (allParked) {
+                g_parkedGroups.emplace(it->first, std::move(it->second));
+                it = g_emisGroups.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = g_cache.begin(); it != g_cache.end(); ) {
+            auto& e = it->second;
+            if (e.homeInteriorCell || e.isSky || e.isFP) { ++it; continue; }
+            if (e.emissiveGroup && !g_parkedGroups.count(e.emissiveGroup)) {
+                emisUngroup(it->first, e);
+                e.emisOwnRetry = 60;   // re-derive against the exterior's lights on the way out
+            }
+            auto rit = g_geomRefs.find(it->first);
+            if (rit != g_geomRefs.end()) {
+                g_parkedRefs.emplace(it->first, std::move(rit->second));
+                g_geomRefs.erase(rit);
+            }
+            g_parked.emplace(it->first, std::move(e));
+            it = g_cache.erase(it);
+        }
+        g_parkEye[0] = eye[0]; g_parkEye[1] = eye[1]; g_parkEye[2] = eye[2];
+        LOG::logline(">> [park] parked=%u groups=%u at (%.0f,%.0f,%.0f)", (unsigned)g_parked.size(),
+                     (unsigned)g_parkedGroups.size(), eye[0], eye[1], eye[2]);
+        return (uint32_t)g_parked.size();
+    }
+
+    uint32_t restoreParked(void* dataHandler, const float eye[3]) {
+        if (g_parked.empty()) return 0;
+        const float dx = eye[0] - g_parkEye[0], dy = eye[1] - g_parkEye[1], dz = eye[2] - g_parkEye[2];
+        const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!dataHandler || dist > kParkRestoreDist) {
+            releaseParked("different exterior");
+            return 0;
+        }
+        // Validate against the CURRENT roots (onFrameReady may not have re-read them yet this frame).
+        // A shape MW did not reattach — a save load in between tore the exterior down, or the object
+        // left the world — fails the same parent climb the sweep uses and is released right here,
+        // before it can draw a single frame as a ghost.
+        g_objRoot  = MGE::DataHandlerView::worldObjectRoot(dataHandler);
+        g_pickRoot = MGE::DataHandlerView::worldPickObjectRoot(dataHandler);
+        g_landRoot = MGE::DataHandlerView::worldLandscapeRoot(dataHandler);
+        NI::Node* const armRoot = MWBridge::get()->getArmCameraRoot();
+        for (auto& kv : g_parkedGroups) g_emisGroups.emplace(kv.first, std::move(kv.second));
+        g_parkedGroups.clear();
+        ClimbCounters climb;
+        uint32_t restored = 0, dropped = 0;
+        // Two passes: every survivor is back in g_cache BEFORE any dropped entry leaves its group,
+        // because emisUngroup re-derives the group through g_cache and would otherwise discard
+        // survivors that simply had not been moved back yet.
+        for (auto it = g_parked.begin(); it != g_parked.end(); ) {
+            const uint32_t key = it->first;
+            auto rit = g_parkedRefs.find(key);
+            NI::TriBasedGeometry* geom = (rit != g_parkedRefs.end()) ? rit->second.get() : nullptr;
+            int verdict = 1;
+            if (geom && g_objRoot) {
+                NI::Node* p = geom->parentNode;
+                verdict = p ? climbParents(p, armRoot, climb) : 1;
+            }
+            if (verdict != 0) { ++it; continue; }   // second pass
+            CachedGeometry& dst = g_cache[key];
+            dst = std::move(it->second);
+            dst.lastFrame = g_frame - 1;   // young, but not "seen this frame"
+            g_geomRefs[key] = std::move(rit->second);
+            g_parkedRefs.erase(rit);
+            updateDerivedMembership(key, dst);
+            ++restored;
+            it = g_parked.erase(it);
+        }
+        g_parkDropped.clear();
+        for (auto& kv : g_parked) {
+            emisUngroup(kv.first, kv.second);   // out of its (restored) group before the entry dies
+            releaseEntry(kv.second);
+            g_evictedKeys.push_back(kv.first);
+            g_parkDropped.push_back(kv.first);
+            if (dropped < 6) {
+                auto rit = g_parkedRefs.find(kv.first);
+                const NI::TriBasedGeometry* g = (rit != g_parkedRefs.end()) ? rit->second.get() : nullptr;
+                const char* nm = g ? g->getName() : nullptr;
+                LOG::logline(">> [park] released '%s' parent=%p skinned=%d live=%d pick=%d",
+                             (nm && *nm) ? nm : "?", g ? (void*)g->parentNode : nullptr,
+                             (int)kv.second.isSkinned, (int)kv.second.isLive, (int)kv.second.isPickRoot);
+            }
+            ++dropped;
+        }
+        // The dropped pins go now. Their keys are queued in g_evictedKeys, and the caller drains
+        // them to their old host slots before this frame's build can capture anything.
+        g_parked.clear();
+        g_parkedRefs.clear();
+        // Re-arm so the window's cache=/captures= baseline is the restored cache. With the grid
+        // already resident it captures ~nothing, and its forced sweeps rebuild the caster sets.
+        armPostLoadWalk();
+        LOG::logline(">> [park] restored=%u released=%u (dist=%.0f vtBad=%u disabled=%u depthCap=%u)",
+                     restored, dropped, dist, climb.vtBad, climb.disabled, climb.depthCap);
+        return restored;
     }
 
     const CachedGeometry* ensureLive(uint32_t key) {
@@ -6073,6 +6406,19 @@ namespace MGE::GeometryCache {
     void ensureFullWalk() {
         if (g_walkRanFrame == g_frame) return;
         if (!g_device || !g_objRoot) return;
+        // This frame's resumable window walk stopped at its budget, so a caller that needs every
+        // entry fresh (the frustum fallback) gets the full REFRESH, but no captures: unbudgeted, it
+        // would take the rest of the cell in one frame, which is what the budget exists to prevent.
+        // The old window took its whole walk under the budget, so this matches it.
+        if (g_winDeferFrame == g_frame) {
+            const int      savedBudget   = g_windowCaptureBudget;
+            const uint32_t savedDeferred = g_windowCaptureDeferred;
+            g_windowCaptureBudget = 0;
+            runRefreshWalks();
+            g_windowCaptureBudget   = savedBudget;
+            g_windowCaptureDeferred = savedDeferred;
+            return;
+        }
         runRefreshWalks();
     }
 
