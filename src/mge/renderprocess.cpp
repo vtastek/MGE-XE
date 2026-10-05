@@ -3761,7 +3761,9 @@ namespace {
         // name-map lock; the two are never nested). A name Morrowind re-created before we got here is
         // live again and stays.
         static std::vector<std::string> s_cands;
+        static std::vector<const char*> s_candRaw;   // the dropped spelling, for the held-skip log
         s_cands.clear();
+        s_candRaw.clear();
         for (const char* p : g_mwDroppedNames) {
             if (MGE::GeometryCache::textureNameLive(p)) { continue; }
             std::string n = normalizeTextureName(p);
@@ -3771,12 +3773,32 @@ namespace {
             const std::size_t sep = stem.find_last_of('\\');
             if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) { stem.erase(dot); }
             s_cands.push_back(std::move(n));
+            s_candRaw.push_back(p);
             if (!stem.empty()) {
                 s_cands.push_back(stem + "_paramh.dds");
                 s_cands.push_back(stem + "_paramh_np.dds");
+                s_candRaw.push_back(p);
+                s_candRaw.push_back(p);
             }
         }
         g_mwDroppedNames.clear();
+        // A LIVE PART STILL NAMING THE SLOT HOLDS IT (white rock flash at a crossing). Liveness above
+        // counts Morrowind's textures per RAW file-name spelling, so a cell unloading the last texture
+        // under one spelling dropped the normalized name while the parts around the player still drew
+        // it under another. The slot was released under them, re-resolved as a first sight into the
+        // same (LIFO) slot one frame after the host blanked it — a white frame — and the full file
+        // re-streamed into a new slot, every crossing. The cache is the truth for what is on screen:
+        // a slot any SlotInfo names stays, and age eviction frees it once no part does (the same
+        // holder scan evictStaleTextures makes). g_keySlot is produce-owned, as this function is.
+        static std::vector<std::uint8_t> s_held;
+        s_held.assign(IPC::kMaxTextures, 0u);
+        for (const auto& kv : g_keySlot) {
+            const SlotInfo& si = kv.second;
+            const std::uint32_t held[3] = { si.baseSlot, si.ovSlot, si.paramSlot };
+            for (std::uint32_t s : held) {
+                if (s != 0 && s < IPC::kMaxTextures) { s_held[s] = 1u; }
+            }
+        }
         static std::vector<std::uint8_t> s_gone;
         s_gone.assign(IPC::kMaxTextures, 0u);
         std::uint32_t released = 0;
@@ -3786,13 +3808,25 @@ namespace {
             if (g_slotName.size() != IPC::kMaxTextures) {
                 return;
             }
-            for (const std::string& n : s_cands) {
-                g_gridTexPins.erase(n);
+            for (std::size_t ci = 0; ci < s_cands.size(); ++ci) {
+                const std::string& n = s_cands[ci];
                 const auto it = g_texSlot.find(n);
-                if (it == g_texSlot.end()) { continue; }
+                if (it == g_texSlot.end()) { g_gridTexPins.erase(n); continue; }
                 const std::uint32_t s = it->second;
-                if (s == 0) { continue; }   // a cached miss stays (g_texRetryMiss): the file is still absent
-                if (IPC::isFlipSlot(s) || s >= IPC::kMaxTextures || g_slotName[s] != n) { continue; }
+                if (s == 0) { g_gridTexPins.erase(n); continue; }   // a cached miss stays (g_texRetryMiss)
+                if (IPC::isFlipSlot(s) || s >= IPC::kMaxTextures || g_slotName[s] != n) {
+                    g_gridTexPins.erase(n);
+                    continue;
+                }
+                if (s_held[s]) {
+                    static std::uint32_t s_heldLog = 0;
+                    if (s_heldLog++ < 32) {
+                        LOG::logline("-- [tex-mirror] kept slot %u '%s': Morrowind dropped '%s' but a live part"
+                                     " still draws it", s, n.c_str(), s_candRaw[ci] ? s_candRaw[ci] : "?");
+                    }
+                    continue;   // the grid pin stays too: the name is still on screen
+                }
+                g_gridTexPins.erase(n);
                 const std::uint32_t cold = coldBit(s);
                 g_texSlot.erase(it);
                 g_slotName[s].clear();

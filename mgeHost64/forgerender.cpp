@@ -8386,6 +8386,14 @@ namespace {
     // saturation/LRU machinery is solving a problem that does not exist.
     uint32_t g_texSeenBits[(MAX_TEXTURES + 31) / 32] = {};
     unsigned g_lastUniqueTex = 0;
+    // WHITE-HIT DETECTOR (white rock flash at a crossing, tasks/todo.md): a draw that names a nonzero
+    // slot still holding the default white, caught on the FRAME it happens. The 300-frame triage in
+    // the heartbeat only sees slots white at the window's end, so a few-frame flash never showed.
+    // Logged at the next renderScene, with the frame each slot was last installed / released.
+    uint32_t g_texWhiteHitBits[(MAX_TEXTURES + 31) / 32] = {};
+    bool     g_texWhiteHitAny = false;
+    uint32_t g_texInstallFrame[MAX_TEXTURES] = {};   // g_renderFrame of the last texture install
+    uint32_t g_texReleaseFrame[MAX_TEXTURES] = {};   // ...and of the last release (back to white)
 
     inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef, uint32_t vColSource = 0u,
                                  uint32_t clampMode = 3u, bool twoSided = false) {
@@ -8395,7 +8403,13 @@ namespace {
         // a gTextures slot; 0x8000 >> 5 runs off the end).
         const bool flip = IPC::isFlipSlot(texIndex);
         const uint32_t tex = flip ? texIndex : (texIndex < kMaxTextures ? texIndex : 0u);
-        if (!flip) { g_texSeenBits[tex >> 5] |= (1u << (tex & 31u)); }
+        if (!flip) {
+            g_texSeenBits[tex >> 5] |= (1u << (tex & 31u));
+            if (tex != 0 && g_live.pDefaultWhite && g_live.pTextures[tex] == g_live.pDefaultWhite) {
+                g_texWhiteHitBits[tex >> 5] |= (1u << (tex & 31u));
+                g_texWhiteHitAny = true;
+            }
+        }
         float r = alphaRef < 0.0f ? 0.0f : (alphaRef > 1.0f ? 1.0f : alphaRef);
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
         // Bit 28 = two-sided (DRAW_BOTH) flag: opaque.vert forwards it as ClampMode bit2, alpha.frag
@@ -36426,6 +36440,30 @@ void destroyHostWindow(Renderer* R);
         // Take this frame's slot BEFORE anything below writes per-frame data: waits the slot's
         // previous frame (F-2) and drains whatever has finished. Every return past here submits.
         beginFrameSlot(R);
+        if (g_texWhiteHitAny) {
+            // The frame just recorded drew these slots as the default white (WHITE-HIT DETECTOR).
+            static unsigned s_lines = 0;
+            if (s_lines < 400) {
+                ++s_lines;
+                char list[480]; int n = 0; unsigned hits = 0;
+                for (unsigned w = 0; w < (unsigned)((MAX_TEXTURES + 31) / 32); ++w) {
+                    for (uint32_t b = g_texWhiteHitBits[w]; b; b &= b - 1u) {
+                        unsigned long bit = 0;
+                        _BitScanForward(&bit, b);
+                        const unsigned s = w * 32u + (unsigned)bit;
+                        ++hits;
+                        if (n < 400) {
+                            n += snprintf(list + n, sizeof(list) - (size_t)n, "%s%u(inst %u rel %u)",
+                                          n ? " " : "", s, g_texInstallFrame[s], g_texReleaseFrame[s]);
+                        }
+                    }
+                }
+                LOG::logline("!! [white-hit] frame %u: %u slot(s) drawn as DEFAULT WHITE: %s",
+                             g_renderFrame, hits, list);
+            }
+            std::memset(g_texWhiteHitBits, 0, sizeof(g_texWhiteHitBits));
+            g_texWhiteHitAny = false;
+        }
         ++g_renderFrame;   // drives the dynamic-promote consecutive-frame streak in uploadGeometry
         // ─── THE RENDER-FRAME INTERVAL, IN MILLISECONDS ─────────────────────────────────────────
         // MB-2 needs this to convert a PER-FRAME motion vector into a PER-SECOND velocity. The
@@ -48103,6 +48141,7 @@ void destroyHostWindow(Renderer* R);
                         g_live.pTextures[hdr.slot] = g_live.pDefaultWhite;
                         bindTextureSlot(R, hdr.slot, cold);
                         ++g_texReleased;
+                        g_texReleaseFrame[hdr.slot] = g_renderFrame;
                     }
                     // References earlier in the heartbeat window predate the release and were served
                     // by the old texture; without this the WHITE-TEXTURE TRIAGE reports every slot a
@@ -48218,6 +48257,7 @@ void destroyHostWindow(Renderer* R);
                 g_texRetire.push_back({ g_live.pTextures[hdr.slot], g_frameSerial });
             }
             g_live.pTextures[hdr.slot] = tex;
+            g_texInstallFrame[hdr.slot] = g_renderFrame;
             if (hdr.slot + 1 > g_live.texHigh) { g_live.texHigh = hdr.slot + 1; }
             {   // ledger: this slot now holds exactly the mips that were copied above
                 const uint32_t landed = (uint32_t)(src - (dds + info.dataOffset));
@@ -48623,6 +48663,7 @@ void destroyHostWindow(Renderer* R);
                 g_texRetire.push_back({ g_live.pTextures[e.slot], g_frameSerial });
             }
             g_live.pTextures[e.slot] = o.tex;
+            g_texInstallFrame[e.slot] = g_renderFrame;
             if (e.slot + 1 > g_live.texHigh) { g_live.texHigh = e.slot + 1; }
             g_texResidentBytes -= g_texSlotBytes[e.slot];
             g_texSlotBytes[e.slot] = o.landed;
@@ -49239,6 +49280,7 @@ void destroyHostWindow(Renderer* R);
         // bindless table. settleFrameFence drains this once the frame fence has signalled.
         if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back({ g_live.pTextures[slot], g_frameSerial }); }
         g_live.pTextures[slot] = tex;
+        g_texInstallFrame[slot] = g_renderFrame;
         g_texIsData[slot] = 0u;   // a host-owned texture (atlas, cloud, sun) is never a param map
         if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
         DescriptorData dd = {};
