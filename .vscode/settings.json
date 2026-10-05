@@ -1,0 +1,50 @@
+{
+    // --- C/C++ INDEXER & CPU CONTROLS ---
+    // Low priority prevents cpptools from hijacking your CPU threads
+    "C_Cpp.workspaceParsingPriority": "low",
+    // Limits the parser to only scan headers explicitly included in your source code
+    "C_Cpp.default.browse.limitSymbolsToIncludedHeaders": true,
+    // Automatically fall back to a simpler engine if IntelliSense hits a memory/CPU wall
+    "C_Cpp.intelliSenseEngineFallback": "Enabled",
+    // --- FILE EXCLUSIONS FOR THE C++ INDEXER ---
+    // This stops cpptools from scanning massive build files and dependency trees
+    "C_Cpp.files.exclude": {
+        "**/.git": true,
+        "**/build/**": true,
+        "**/.build/**": true,
+        "**/bin/**": true,
+        "**/out/**": true,
+        "**/node_modules/**": true,
+        "**/.cmake/**": true,
+        "**/CMakeFiles/**": true
+    },
+    // --- GLOBAL VS CODE FILE WATCHER EXCLUSIONS ---
+    // Stops the main VS Code engine from wasting file-system sync loops in WSL
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/node_modules/*/**": true,
+        "**/build/**": true,
+        "**/.cmake/**": true
+    },
+    // --- C++ CODE STYLE & QUALITY OF LIFE (OPTIONAL) ---
+    // Automatically formats your C++ code on file save using clang-format
+    "editor.formatOnSave": true,
+    // Ensures basic code completion pops up quickly
+    "editor.quickSuggestions": {
+        "other": "on",
+        "comments": "off",
+        "strings": "off"
+    },
+    // TURBO EXCLUSIONS FOR AGENTS: Completely hide entire directories from VS Code
+    "files.exclude": {
+        "**/build": true,
+        "**/dist": true,
+        "**/*.o": true,
+        "**/*.a": true
+    },
+    // Stops the extension from automatically scanning files when they are modified
+    "C_Cpp.autocomplete": "disabled",
+    // Switch the engine to "Tag Parser" (much lighter on CPU than full IntelliSense)
+    "C_Cpp.intelliSenseEngine": "Tag Parser"
+}
