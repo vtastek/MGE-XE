@@ -229,6 +229,59 @@ namespace MGE::GeometryCache {
         // while we still own a reference to the old one. The dataPtr identity guards stay as
         // belt-and-braces (a live setModelData swap still needs them).
         std::unordered_map<uint32_t, NI::Pointer<NI::TriBasedGeometry>> g_geomRefs;
+        // GEOMETRY DEDUP 1b-1 (tasks/forge-geometry-dedup.md): the content hash per SOURCE mesh, so a
+        // repeat instance aliases its block (RenderProcess::captureAliasKnown) without the wire build,
+        // the hash, or (skinned) the weight inversion. The key holds everything that shapes the wire
+        // bytes: the source arrays (data, skin), their revision and counts, the kind, and the
+        // per-instance inputs (`variant`: base UV set or UV-set count, plus the vcol routing bit).
+        // Sky (unblended vcol), landscape (unique per patch) and uvAnim parts (shared UV arrays) never
+        // enter it. The strong refs pin the addresses — a freed NiTriShapeData cannot recycle into a
+        // live key, as with g_geomRefs. Cleared at purgeAll and wholesale past kSourceMemoCap: a SUM
+        // bound on what it keeps alive. MGE_GEOM_MEMO=0 turns it off.
+        struct SourceKey {
+            uint32_t data, skin, vc, tc;
+            uint16_t rev;
+            uint8_t  kind, variant;
+            bool operator==(const SourceKey& o) const {
+                return data == o.data && skin == o.skin && vc == o.vc && tc == o.tc && rev == o.rev
+                    && kind == o.kind && variant == o.variant;
+            }
+        };
+        struct SourceKeyHash {
+            size_t operator()(const SourceKey& k) const {
+                return (size_t)(k.data * 0x9E3779B1u) ^ k.skin ^ (k.vc << 7) ^ (k.tc << 13)
+                     ^ ((uint32_t)k.rev << 17) ^ ((uint32_t)k.kind << 27) ^ ((uint32_t)k.variant << 21);
+            }
+        };
+        struct MemoEntry {
+            uint64_t                 hash;
+            NI::Pointer<NI::Object>  dataRef, skinRef;
+        };
+        std::unordered_map<SourceKey, MemoEntry, SourceKeyHash> g_sourceMemo;
+        constexpr size_t kSourceMemoCap = 16384;
+
+        bool geomMemoOn() {
+            static const bool on = [] {
+                const char* e = std::getenv("MGE_GEOM_MEMO");
+                return !(e && e[0] == '0');
+            }();
+            return on;
+        }
+
+        // A memo hit that aliased (or found the part already shipped): the caller skips its build.
+        bool memoAlias(const SourceKey& sk, uint32_t key) {
+            auto it = g_sourceMemo.find(sk);
+            return it != g_sourceMemo.end()
+                && RenderProcess::captureAliasKnown(sk.kind, key, sk.rev, sk.data, sk.vc, sk.tc * 3u,
+                                                    it->second.hash);
+        }
+
+        // After a capture: keep the hash the dedup computed (0 = it did not hash this part).
+        void memoStore(const SourceKey& sk, uint64_t hash, NI::Object* data, NI::Object* skin) {
+            if (!hash) return;
+            if (g_sourceMemo.size() >= kSourceMemoCap) g_sourceMemo.clear();
+            g_sourceMemo[sk] = MemoEntry{ hash, data, skin };
+        }
         // Keys evicted by the sweep since the last drain (object left the world within a cell).
         // The Forge feed drains these each frame (takeEvictedKeys) to release the matching host
         // mesh slot so its shadow-caster record stops ghosting. Only the "genuinely gone" sweep
@@ -2239,7 +2292,24 @@ namespace MGE::GeometryCache {
                 const bool isMultiMap = !g_walkingLandscape
                     && (e.d3dDark || e.d3dDetail || e.d3dGlow);
 
-                if (isMultiMap && triList) {
+                // Dedup 1b-1: a repeat instance of a memoised source aliases its block — no wire
+                // build, no hash (g_sourceMemo). Variant = the per-instance inputs to the wire bytes.
+                const bool memoOk = triList && !g_walkingSky && !g_walkingLandscape && !hasUVAnim
+                    && geomMemoOn();
+                const SourceKey sk{ reinterpret_cast<uint32_t>(data), 0u, vertexCount, triCount,
+                    data->revisionID,
+                    (uint8_t)(isMultiMap ? RenderProcess::kGeomMultiMap : RenderProcess::kGeomStatic),
+                    (uint8_t)((isMultiMap ? uvSetCount : e.baseUV) | (vcol ? 0x80u : 0u)) };
+                const bool memoHit = memoOk && memoAlias(sk, key);
+                uint64_t capHash = 0;
+
+                if (memoHit) {
+                    // Aliased: the bytes it stood for, as a captured part books them.
+                    RenderProcess::noteUpload((uint8_t)uploadCat,
+                        vertexCount * (uint32_t)(isMultiMap ? sizeof(IPC::GeomVertexWireMM)
+                                                            : sizeof(IPC::GeomVertexWire))
+                        + triCount * 6u);
+                } else if (isMultiMap && triList) {
                     static std::vector<IPC::GeomVertexWireMM> mmScratch;  // single-threaded cache walk
                     mmScratch.resize(vertexCount);
                     for (uint32_t i = 0; i < vertexCount; ++i) {
@@ -2272,7 +2342,8 @@ namespace MGE::GeometryCache {
                         mmScratch.data(), vertexCount,
                         reinterpret_cast<const uint16_t*>(triList), triCount * 3u,
                         hasUVAnim ? uvAnimPayload.data() : nullptr,
-                        hasUVAnim ? (uint16_t)uvAnimPayload.size() : 0u);
+                        hasUVAnim ? (uint16_t)uvAnimPayload.size() : 0u, &capHash);
+                    if (memoOk) memoStore(sk, capHash, data, nullptr);
                     RenderProcess::noteUpload((uint8_t)uploadCat,
                         vertexCount * (uint32_t)sizeof(IPC::GeomVertexWireMM)
                         + triCount * 6u + (uint32_t)uvAnimPayload.size());
@@ -2312,7 +2383,8 @@ namespace MGE::GeometryCache {
                             reinterpret_cast<const uint16_t*>(triList), triCount * 3u,
                             false,
                             hasUVAnim ? uvAnimPayload.data() : nullptr,
-                            hasUVAnim ? (uint16_t)uvAnimPayload.size() : 0u);
+                            hasUVAnim ? (uint16_t)uvAnimPayload.size() : 0u, &capHash);
+                        if (memoOk) memoStore(sk, capHash, data, nullptr);
                         RenderProcess::noteUpload((uint8_t)uploadCat,
                             vertexCount * (uint32_t)sizeof(IPC::GeomVertexWire)
                             + triCount * 6u + (uint32_t)uvAnimPayload.size());
@@ -2388,8 +2460,17 @@ namespace MGE::GeometryCache {
             // capturing. (The skinned record loop is the dense-city CPU bottleneck; this is on
             // that path.)
             const bool wantCapture = RenderProcess::wantsGeometryCapture();
+            const auto* triList = wantCapture ? data->getTriList() : nullptr;
+            // Dedup 1b-1: a repeat instance of a memoised source (same data AND skin data — the
+            // weights come from NiSkinData) aliases its block, skipping the inversion and the wire
+            // loop below. Bone count and palette travel per draw, so they are not in the key.
+            const bool memoOk = triList && !g_walkingSky && geomMemoOn();
+            const SourceKey sk{ reinterpret_cast<uint32_t>(data), reinterpret_cast<uint32_t>(sd),
+                vertexCount, triCount, data->revisionID, (uint8_t)RenderProcess::kGeomSkinned, 0u };
+            const bool memoHit = memoOk && memoAlias(sk, key);
+            const bool build = wantCapture && !memoHit;
             static std::vector<IPC::SkinnedVertexWire> skScratch;   // single-threaded cache walk
-            if (wantCapture) skScratch.resize(vertexCount);
+            if (build) skScratch.resize(vertexCount);
 
             // Invert the per-bone weight lists into each vertex's 4 heaviest influences, kept in
             // place. This was a vector<vector<Inf>> (one heap allocation per vertex, a sort per
@@ -2400,7 +2481,7 @@ namespace MGE::GeometryCache {
             // these sizes) — and the 5th+ drop the same way.
             struct Top4 { float w[4]; uint8_t b[4]; uint8_t n; };
             static std::vector<Top4> s_top;   // same single-threaded walk as skScratch
-            if (wantCapture) {
+            if (build) {
                 MGE_ZoneScopedN("GeomCache:skin.invert");
                 s_top.assign(vertexCount, Top4{});
                 for (uint32_t b = 0; b < numBones; ++b) {
@@ -2423,7 +2504,7 @@ namespace MGE::GeometryCache {
                 }
             }
 
-            if (wantCapture) {
+            if (build) {
                 MGE_ZoneScopedN("GeomCache:skin.wire");
                 const auto* uvs = data->textureCoords;
                 const auto* nrm = data->normal;         // bind-pose model-space normals
@@ -2460,18 +2541,20 @@ namespace MGE::GeometryCache {
 
             // Ship the captured skinned VB to the Forge host (one part, SKINNED flag +
             // numBones). The per-frame bone palette ships separately from buildDrawList.
-            if (wantCapture) {
-                const auto* triList = data->getTriList();
-                if (triList) {
-                    MGE_ZoneScopedN("GeomCache:skin.ship");
+            if (triList) {
+                MGE_ZoneScopedN("GeomCache:skin.ship");
+                if (!memoHit) {
+                    uint64_t capHash = 0;
                     RenderProcess::captureSkinnedGeometry(key, data->revisionID,
                         reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                         skScratch.data(), vertexCount,
-                        reinterpret_cast<const uint16_t*>(triList), triCount * 3u, numBones);
-                    // Part A: skinned reships are the known NPC/creature cost.
-                    RenderProcess::noteUpload(RenderProcess::kUpSkin,
-                        vertexCount * (uint32_t)sizeof(IPC::SkinnedVertexWire) + triCount * 6u);
+                        reinterpret_cast<const uint16_t*>(triList), triCount * 3u, numBones,
+                        &capHash);
+                    if (memoOk) memoStore(sk, capHash, data, static_cast<NI::Object*>(sd));
                 }
+                // Part A: skinned reships are the known NPC/creature cost.
+                RenderProcess::noteUpload(RenderProcess::kUpSkin,
+                    vertexCount * (uint32_t)sizeof(IPC::SkinnedVertexWire) + triCount * 6u);
             }
 
             e.hostUploaded = true;   // consistent with uploadEntry (cleared by releaseEntry)
@@ -6133,6 +6216,7 @@ namespace MGE::GeometryCache {
         g_nearStaticCasters.clear(); // stale snapshot (find-guarded anyway); rebuilt next sweep
         g_nearAlphaCasters.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
+        g_sourceMemo.clear(); // likewise the source data/skin it pins
         // This purge is a cell transition → the new cell repopulates view-limited, so force a short
         // window of full-cell capture (see onFrameReady). Armed AFTER the clear so the window's
         // cache=/captures= baseline is the empty cache it actually starts from.

@@ -246,7 +246,8 @@ namespace RenderProcess {
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount,
                          bool forceReupload = false,
-                         const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0);
+                         const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0,
+                         std::uint64_t* hashOut = nullptr);
 
     // M-Skinning: capture a skinned part's bind-pose VB (model-space pos/normal +
     // per-vertex weights + packed bone indices). Like captureGeometry it assigns/reuses a
@@ -257,7 +258,7 @@ namespace RenderProcess {
     void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                 const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
                                 const std::uint16_t* indices, std::uint32_t indexCount,
-                                std::uint32_t numBones);
+                                std::uint32_t numBones, std::uint64_t* hashOut = nullptr);
 
     // Tier 4 multi-map: capture a STATIC opaque part carrying dark/detail/glow sibling maps,
     // with up to 4 per-vertex UV sets (GeomVertexWireMM). Like captureGeometry it assigns/reuses
@@ -267,7 +268,18 @@ namespace RenderProcess {
     void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                  const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
                                  const std::uint16_t* indices, std::uint32_t indexCount,
-                                 const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0);
+                                 const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0,
+                                 std::uint64_t* hashOut = nullptr);
+
+    // Geometry dedup 1b-1 (tasks/forge-geometry-dedup.md): the cache memoises each source mesh's
+    // content hash. `hashOut` on the captures above receives it whenever the dedup hashed the part
+    // (left untouched otherwise; 0 = never hashed). captureAliasKnown ships a repeat instance of a
+    // memoised source as an alias without its vertices: true = done (aliased, or this exact identity
+    // was already shipped), false = the caller builds the wire vertices and captures as usual.
+    enum GeomKind : std::uint8_t { kGeomStatic = 0, kGeomSkinned = 1, kGeomMultiMap = 2 };
+    bool captureAliasKnown(std::uint8_t kind, std::uint32_t key, std::uint16_t revision,
+                           std::uint32_t modelId, std::uint32_t vertexCount, std::uint32_t indexCount,
+                           std::uint64_t hash);
 
     // AT3 captured-alpha: called from the AT1 sorted-alpha reject gate
     // (distantland.cpp inspectIndexedPrimitive) for each alpha-BLENDED DIP MW is about to skip

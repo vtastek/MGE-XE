@@ -742,6 +742,8 @@ namespace {
         std::uint32_t kindBlocks[3] = {};    // `blocks` / `aliases` split by kContent*
         std::uint32_t kindAliases[3] = {};
         std::uint64_t kindAliasedBytes[3] = {};
+        std::uint32_t memoAliases = 0;   // of `aliases`: by a memoised hash, nothing built or hashed (1b-1)
+        std::uint32_t memoMisses = 0;    // memoised hash whose block had died: built and hashed again
     };
     AliasStats g_aliasStats;
 
@@ -750,7 +752,7 @@ namespace {
             return;
         }
         const AliasStats& s = g_aliasStats;
-        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu | kept: %u revived (%.1f MB), %u unpinned (%.1f MB), cold now %zu (%.1f / %llu MB) | blocks/aliases (MB): static %u/%u (%.1f) skin %u/%u (%.1f) mm %u/%u (%.1f)",
+        LOG::logline(">> [geom-alias] window ending at frame %u: %u new blocks, %u aliases (%.1f MB not shipped), hash %.2f ms, live blocks %zu / slots holding %zu | kept: %u revived (%.1f MB), %u unpinned (%.1f MB), cold now %zu (%.1f / %llu MB) | blocks/aliases (MB): static %u/%u (%.1f) skin %u/%u (%.1f) mm %u/%u (%.1f) | memo %u aliases, %u misses",
                      frame, s.blocks, s.aliases, s.aliasedBytes / 1048576.0,
                      s.hashMs, g_blockByContent.size(), g_slotBlock.size(),
                      s.revived, s.revivedBytes / 1048576.0,
@@ -759,7 +761,8 @@ namespace {
                      (unsigned long long)(geomKeepBytes() >> 20),
                      s.kindBlocks[0], s.kindAliases[0], s.kindAliasedBytes[0] / 1048576.0,
                      s.kindBlocks[1], s.kindAliases[1], s.kindAliasedBytes[1] / 1048576.0,
-                     s.kindBlocks[2], s.kindAliases[2], s.kindAliasedBytes[2] / 1048576.0);
+                     s.kindBlocks[2], s.kindAliases[2], s.kindAliasedBytes[2] / 1048576.0,
+                     s.memoAliases, s.memoMisses);
         g_aliasStats = AliasStats{};
     }
 
@@ -10071,17 +10074,89 @@ namespace RenderProcess {
         ++g_contentWindowId;
     }
 
+    static_assert(kContentStatic == kGeomStatic && kContentSkinned == kGeomSkinned &&
+                  kContentMultiMap == kGeomMultiMap, "cache-side GeomKind must match kContent*");
+
+    // The prologue every capture shares. False: the key already holds this exact identity, nothing
+    // to ship. Otherwise assigns the key's stable host slot (reused on re-upload so the host frees and
+    // rebuilds in place), latches whether this is the key's first upload, drains the staging blob if
+    // full and drops the slot's block ref, so the dedup lookup that follows sees the post-flush table.
+    bool beginCapture(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
+                      std::uint32_t vertexCount, bool forceReupload,
+                      std::uint32_t& slot, bool& firstUpload) {
+        // Skip only if the SAME object (modelId), same shape (vertexCount) and same revision
+        // was already shipped. Keying on revision alone aliased recycled NiTriShape* keys (a
+        // freed object's key+slot inherited by a new mesh with a colliding revisionID).
+        // forceReupload (SK1 sky dome) bypasses this — its vertex colours change every frame
+        // without a revisionID bump, so the dedup would otherwise freeze the gradient.
+        auto rev = g_uploadedRev.find(key);
+        if (!forceReupload && rev != g_uploadedRev.end() && rev->second.id == modelId &&
+            rev->second.vc == vertexCount && rev->second.rev == revision) {
+            return false;
+        }
+        auto ks = g_keySlot.find(key);
+        if (ks != g_keySlot.end()) {
+            slot = ks->second.slot;
+        } else {
+            slot = g_nextSlot++;
+            g_keySlot.emplace(key, SlotInfo{ slot });
+        }
+        // Latched BEFORE drainPendingIfFull: that can run a whole flushGeometry, whose eviction drain
+        // erases g_uploadedRev entries (and with them, possibly, `rev`).
+        firstUpload = (rev == g_uploadedRev.end());
+        drainPendingIfFull();
+        // GEOMETRY DEDUP. A re-upload of a slot that holds a block ref drops it first — the host's
+        // rebuild path releases the slot's range the same way — and ships plain (block 0), so a
+        // morphing mesh keeps the sameShape/streak path it always had. Only a key's FIRST upload
+        // (no prior g_uploadedRev entry) may share. A recycled key's slot may hold a block too.
+        dropBlockRef(slot);
+        return true;
+    }
+
+    // Ship `slot` as a header-only ALIAS onto block `bc` (live, or cold and revived here).
+    void emitAlias(std::uint8_t kind, std::uint32_t key, std::uint32_t slot, std::uint16_t revision,
+                   std::uint32_t modelId, std::uint32_t vertexCount,
+                   std::unordered_map<ContentKey, BlockRef, ContentKeyHash>::iterator bc) {
+        BlockRef& b = bc->second;   // b.bytes = this part's vertex + index bytes (same vc, ic, kind)
+        IPC::GeomPartWire ah = {};
+        ah.slot       = slot;
+        ah.revisionID = revision;
+        ah.flags      = IPC::kGeomFlagAlias;   // vertexCount = indexCount = 0 -> header-only
+        ah.block      = b.block;
+        const std::size_t at = g_pendingBlob.size();
+        g_pendingBlob.resize(at + sizeof(ah));
+        memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
+        ++g_pendingParts;
+        noteWindowPart(sizeof(ah));
+        if (b.cold) {
+            // Kept across a load (phase 2): the host still holds it under its pin.
+            g_coldBlocks.erase(b.coldIt);
+            g_coldBytes -= b.bytes;
+            b.cold = false;
+            ++g_aliasStats.revived;
+            g_aliasStats.revivedBytes += b.bytes;
+        }
+        ++b.refs;
+        g_slotBlock.emplace(slot, bc->first);
+        g_uploadedRev[key] = { modelId, vertexCount, revision };
+        ++g_aliasStats.aliases;
+        g_aliasStats.aliasedBytes += b.bytes;
+        ++g_aliasStats.kindAliases[kind];
+        g_aliasStats.kindAliasedBytes[kind] += b.bytes;
+        noteContentAliased(kind, b.bytes);
+    }
+
     // GEOMETRY DEDUP, every kind: hash the part's content and either ship a header-only ALIAS onto the
     // live (or cold) block holding it — returns true, the caller ships nothing more — or make this
     // upload the block's owner (hdr.block + kGeomFlagPinned set; the caller ships the payload). The
     // caller decides eligibility (a key's first upload, no uvAnim, not forced) and must already have
-    // run drainPendingIfFull and dropBlockRef(slot), so the lookup sees the post-flush block table.
+    // run beginCapture, so the lookup sees the post-flush block table. `hashOut` gets the hash.
     bool aliasOrRegister(std::uint8_t kind, std::uint32_t key, std::uint32_t slot,
                          std::uint16_t revision, std::uint32_t modelId,
                          const void* verts, std::size_t vbBytes,
                          const std::uint16_t* indices, std::size_t ibBytes,
                          std::uint32_t vertexCount, std::uint32_t indexCount,
-                         IPC::GeomPartWire& hdr) {
+                         IPC::GeomPartWire& hdr, std::uint64_t* hashOut) {
         if (!geomAliasKindOn(kind)) {
             return false;
         }
@@ -10096,35 +10171,13 @@ namespace RenderProcess {
         }
         const double hashMs = nowMs() - tHash0;
         g_aliasStats.hashMs += hashMs;
+        if (hashOut) {
+            *hashOut = ck.hash;
+        }
         auto bc = g_blockByContent.find(ck);
         noteSrcProbe(key, modelId, ck, hashMs, bc != g_blockByContent.end(), vbBytes + ibBytes);
         if (bc != g_blockByContent.end()) {
-            IPC::GeomPartWire ah = {};
-            ah.slot       = slot;
-            ah.revisionID = revision;
-            ah.flags      = IPC::kGeomFlagAlias;   // vertexCount = indexCount = 0 -> header-only
-            ah.block      = bc->second.block;
-            const std::size_t at = g_pendingBlob.size();
-            g_pendingBlob.resize(at + sizeof(ah));
-            memcpy(g_pendingBlob.data() + at, &ah, sizeof(ah));
-            ++g_pendingParts;
-            noteWindowPart(sizeof(ah));
-            if (bc->second.cold) {
-                // Kept across a load (phase 2): the host still holds it under its pin.
-                g_coldBlocks.erase(bc->second.coldIt);
-                g_coldBytes -= bc->second.bytes;
-                bc->second.cold = false;
-                ++g_aliasStats.revived;
-                g_aliasStats.revivedBytes += vbBytes + ibBytes;
-            }
-            ++bc->second.refs;
-            g_slotBlock.emplace(slot, ck);
-            g_uploadedRev[key] = { modelId, vertexCount, revision };
-            ++g_aliasStats.aliases;
-            g_aliasStats.aliasedBytes += vbBytes + ibBytes;
-            ++g_aliasStats.kindAliases[kind];
-            g_aliasStats.kindAliasedBytes[kind] += vbBytes + ibBytes;
-            noteContentAliased(kind, vbBytes + ibBytes);
+            emitAlias(kind, key, slot, revision, modelId, vertexCount, bc);
             return true;
         }
         hdr.block = ++g_nextBlock;
@@ -10144,29 +10197,15 @@ namespace RenderProcess {
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount,
                          bool forceReupload,
-                         const std::uint8_t* uvAnim, std::uint16_t uvAnimBytes) {
+                         const std::uint8_t* uvAnim, std::uint16_t uvAnimBytes,
+                         std::uint64_t* hashOut) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
             return;
         }
-        // Skip only if the SAME object (modelId), same shape (vertexCount) and same revision
-        // was already shipped. Keying on revision alone aliased recycled NiTriShape* keys (a
-        // freed object's key+slot inherited by a new mesh with a colliding revisionID).
-        // forceReupload (SK1 sky dome) bypasses this — its vertex colours change every frame
-        // without a revisionID bump, so the dedup would otherwise freeze the gradient.
-        auto rev = g_uploadedRev.find(key);
-        if (!forceReupload && rev != g_uploadedRev.end() && rev->second.id == modelId &&
-            rev->second.vc == vertexCount && rev->second.rev == revision) {
-            return;
-        }
-        // Stable host slot per cache key (reused on re-upload so the host frees
-        // and rebuilds in place).
         std::uint32_t slot;
-        auto ks = g_keySlot.find(key);
-        if (ks != g_keySlot.end()) {
-            slot = ks->second.slot;
-        } else {
-            slot = g_nextSlot++;
-            g_keySlot.emplace(key, SlotInfo{ slot });
+        bool firstUpload;
+        if (!beginCapture(key, revision, modelId, vertexCount, forceReupload, slot, firstUpload)) {
+            return;
         }
 
         IPC::GeomPartWire hdr = {};
@@ -10178,22 +10217,13 @@ namespace RenderProcess {
             hdr.flags      |= IPC::kGeomFlagUVAnim;
             hdr.uvAnimBytes = uvAnimBytes;
         }
-        // Latched BEFORE drainPendingIfFull: that can run a whole flushGeometry, whose eviction drain
-        // erases g_uploadedRev entries (and with them, possibly, `rev`).
-        const bool firstUpload = (rev == g_uploadedRev.end());
-
-        drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
 
-        // GEOMETRY DEDUP. A re-upload of a slot that holds a block ref drops it first — the host's
-        // rebuild path releases the slot's range the same way — and ships plain (block 0), so a
-        // morphing mesh keeps the sameShape/streak path it always had. Only a key's FIRST upload
-        // (no prior g_uploadedRev entry) may share: a block is plain, unanimated static content.
-        dropBlockRef(slot);
+        // GEOMETRY DEDUP: a block is plain, unanimated static content.
         if (firstUpload && !forceReupload && !hdr.uvAnimBytes &&
             aliasOrRegister(kContentStatic, key, slot, revision, modelId, verts, vbBytes,
-                            indices, ibBytes, vertexCount, indexCount, hdr)) {
+                            indices, ibBytes, vertexCount, indexCount, hdr, hashOut)) {
             return;
         }
 
@@ -10214,28 +10244,16 @@ namespace RenderProcess {
     void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                 const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
                                 const std::uint16_t* indices, std::uint32_t indexCount,
-                                std::uint32_t numBones) {
+                                std::uint32_t numBones, std::uint64_t* hashOut) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount || numBones == 0) {
             return;
         }
-        // Skip only if the same object+shape+revision was already shipped (shared map with
-        // captureGeometry); identity (modelId,vc) guards against recycled NiTriShape* keys.
-        auto rev = g_uploadedRev.find(key);
-        if (rev != g_uploadedRev.end() && rev->second.id == modelId &&
-            rev->second.vc == vertexCount && rev->second.rev == revision) {
+        std::uint32_t slot;
+        bool firstUpload;
+        if (!beginCapture(key, revision, modelId, vertexCount, false, slot, firstUpload)) {
             return;
         }
-        // Stable host slot per cache key (shared slot map / nextSlot with the static path).
-        std::uint32_t slot;
-        auto ks = g_keySlot.find(key);
-        if (ks != g_keySlot.end()) {
-            slot = ks->second.slot;
-        } else {
-            slot = g_nextSlot++;
-            g_keySlot.emplace(key, SlotInfo{ slot });
-        }
 
-        dropBlockRef(slot);   // a recycled key's slot may hold a block; the host releases it on rebuild
         IPC::GeomPartWire hdr = {};
         hdr.slot        = slot;
         hdr.revisionID  = revision;
@@ -10243,17 +10261,13 @@ namespace RenderProcess {
         hdr.vertexCount = vertexCount;
         hdr.indexCount  = indexCount;
         hdr.numBones    = static_cast<std::uint16_t>(numBones);
-        // Latched BEFORE drainPendingIfFull (its flush can erase g_uploadedRev entries) — see captureGeometry.
-        const bool firstUpload = (rev == g_uploadedRev.end());
-
-        drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::SkinnedVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         // GEOMETRY DEDUP phase 3: the bind-pose VB+IB is per-mesh content (bone count and palette
         // travel per DRAW), so every NPC wearing the same part shares one host buffer pair.
         if (firstUpload &&
             aliasOrRegister(kContentSkinned, key, slot, revision, modelId, verts, vbBytes,
-                            indices, ibBytes, vertexCount, indexCount, hdr)) {
+                            indices, ibBytes, vertexCount, indexCount, hdr, hashOut)) {
             return;
         }
         const std::size_t at = g_pendingBlob.size();
@@ -10272,28 +10286,17 @@ namespace RenderProcess {
     void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                  const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
                                  const std::uint16_t* indices, std::uint32_t indexCount,
-                                 const std::uint8_t* uvAnim, std::uint16_t uvAnimBytes) {
+                                 const std::uint8_t* uvAnim, std::uint16_t uvAnimBytes,
+                                 std::uint64_t* hashOut) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
             return;
         }
-        // Dedup on (modelId, vertexCount, revision) — shared map with captureGeometry; identity
-        // guards against recycled NiTriShape* keys (see captureGeometry).
-        auto rev = g_uploadedRev.find(key);
-        if (rev != g_uploadedRev.end() && rev->second.id == modelId &&
-            rev->second.vc == vertexCount && rev->second.rev == revision) {
+        std::uint32_t slot;
+        bool firstUpload;
+        if (!beginCapture(key, revision, modelId, vertexCount, false, slot, firstUpload)) {
             return;
         }
-        // Stable host slot per cache key (shared slot map / nextSlot with the static path).
-        std::uint32_t slot;
-        auto ks = g_keySlot.find(key);
-        if (ks != g_keySlot.end()) {
-            slot = ks->second.slot;
-        } else {
-            slot = g_nextSlot++;
-            g_keySlot.emplace(key, SlotInfo{ slot });
-        }
 
-        dropBlockRef(slot);   // a recycled key's slot may hold a block; the host releases it on rebuild
         IPC::GeomPartWire hdr = {};
         hdr.slot        = slot;
         hdr.revisionID  = revision;
@@ -10304,16 +10307,12 @@ namespace RenderProcess {
             hdr.flags      |= IPC::kGeomFlagUVAnim;
             hdr.uvAnimBytes = uvAnimBytes;
         }
-        // Latched BEFORE drainPendingIfFull (its flush can erase g_uploadedRev entries) — see captureGeometry.
-        const bool firstUpload = (rev == g_uploadedRev.end());
-
-        drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWireMM);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         // GEOMETRY DEDUP phase 3 — uvAnim parts stay private, as uvAnim statics do.
         if (firstUpload && !hdr.uvAnimBytes &&
             aliasOrRegister(kContentMultiMap, key, slot, revision, modelId, verts, vbBytes,
-                            indices, ibBytes, vertexCount, indexCount, hdr)) {
+                            indices, ibBytes, vertexCount, indexCount, hdr, hashOut)) {
             return;
         }
         const std::size_t at = g_pendingBlob.size();
@@ -10328,6 +10327,36 @@ namespace RenderProcess {
         noteWindowPart(sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         g_uploadedRev[key] = { modelId, vertexCount, revision };
         noteContent(2, key, verts, vbBytes, indices, ibBytes);
+    }
+
+    // Dedup 1b-1: a repeat instance of a source whose content hash the cache memoised. Alias it onto
+    // the block without building or hashing anything. Only a key's FIRST upload is eligible, as in
+    // the captures; anything else returns false before touching state so the capture runs as usual.
+    bool captureAliasKnown(std::uint8_t kind, std::uint32_t key, std::uint16_t revision,
+                           std::uint32_t modelId, std::uint32_t vertexCount, std::uint32_t indexCount,
+                           std::uint64_t hash) {
+        if (!wantsGeometryCapture() || !vertexCount || !indexCount || !geomAliasKindOn(kind)) {
+            return false;
+        }
+        auto rev = g_uploadedRev.find(key);
+        if (rev != g_uploadedRev.end()) {
+            // Already shipped: the capture's identity early-out, or a re-upload (ships plain).
+            return rev->second.id == modelId && rev->second.vc == vertexCount && rev->second.rev == revision;
+        }
+        std::uint32_t slot;
+        bool firstUpload;
+        beginCapture(key, revision, modelId, vertexCount, false, slot, firstUpload);
+        auto bc = g_blockByContent.find(ContentKey{ hash, vertexCount, indexCount, kind });
+        if (bc == g_blockByContent.end()) {
+            // The block died inside the window. The capture re-runs beginCapture, which is a no-op
+            // now (no g_uploadedRev entry, slot assigned, staging just drained, no block ref held),
+            // then hashes and owns a new block.
+            ++g_aliasStats.memoMisses;
+            return false;
+        }
+        emitAlias(kind, key, slot, revision, modelId, vertexCount, bc);
+        ++g_aliasStats.memoAliases;
+        return true;
     }
 
     void shutdown() {
