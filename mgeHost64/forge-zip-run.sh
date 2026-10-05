@@ -4,10 +4,13 @@
 # anything leaked, backed up, went white or fell over.
 # Usage: forge-zip-run.sh [delay=12] [save=ibodragonstareast360.ess] [target=500] [seed=1]
 #                         [timeout=1800] [clientEnv="NAME=v,NAME=v"] [trace] [farChance=0.4] [settle=20]
-#                         [mode=zip|hop] [hops=10] [dwell=4]
+#                         [mode=zip|hop|door] [hops=10] [dwell=4] [interior="Seyda Neen, Census and Excise Office"]
 #
 # mode=hop is the DOOR HOP: `hops` round trips exterior -> "Seyda Neen, Census and Excise Office" ->
 # the same exterior spot, `dwell` real seconds each side; MWSE.log logs each leg's positionCell ms.
+# mode=door goes through the REAL door references instead (MW's fade + loading menu, the player's
+# path): `hops` round trips to `interior`; MWSE.log logs each leg's activate -> cellChanged ms and
+# mgeXE.log's `[loadbar] up` says which legs raised MW's loading menu.
 #
 # THE MEASUREMENT — trends, not events: a stress run passes when the last heartbeats look like the
 # first ones.
@@ -30,6 +33,7 @@ SETTLE="${9:-20}"
 MODE="${10:-zip}"
 HOPS="${11:-10}"
 DWELL="${12:-4}"
+INTERIOR="${13:-Seyda Neen, Census and Excise Office}"
 CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP MGE_GEOM_CONTENT_PROBE MGE_GEOM_ALIAS MGE_GEOM_KEEP_MB MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_SCOPED_WALK MGE_GATE_LAZY"
 
 MW="/mnt/c/mgem/morrowind64"
@@ -58,9 +62,9 @@ restore() {
 }
 trap restore EXIT
 
-python3 - "$ILCFG" "$SAVE" "$AZCFG" "$DELAY" "$TARGET" "$SEED" "$FARCHANCE" "$SETTLE" "$MODE" "$HOPS" "$DWELL" <<'PY'
+python3 - "$ILCFG" "$SAVE" "$AZCFG" "$DELAY" "$TARGET" "$SEED" "$FARCHANCE" "$SETTLE" "$MODE" "$HOPS" "$DWELL" "$INTERIOR" <<'PY'
 import json, sys
-il, save, az, delay, target, seed, far, settle, mode, hops, dwell = sys.argv[1:12]
+il, save, az, delay, target, seed, far, settle, mode, hops, dwell, interior = sys.argv[1:13]
 with open(il) as f: cfg = json.load(f)
 cfg["continue"] = False          # else the mod loads the NEWEST save, not ours
 cfg["overrideFile"] = save
@@ -68,9 +72,9 @@ with open(il, "w") as f: json.dump(cfg, f, indent=2)
 with open(az, "w") as f:
     json.dump({"enabled": True, "delay": float(delay), "target": int(target), "seed": int(seed),
                "farChance": float(far), "settle": float(settle), "mode": mode, "hops": int(hops),
-               "dwell": float(dwell)}, f, indent=2)
+               "dwell": float(dwell), "interior": interior}, f, indent=2)
 PY
-echo "[zip] pinned save=$SAVE | mode=$MODE delay=${DELAY}s target=$TARGET seed=$SEED farChance=$FARCHANCE settle=${SETTLE}s hops=$HOPS dwell=${DWELL}s"
+echo "[zip] pinned save=$SAVE | mode=$MODE delay=${DELAY}s target=$TARGET seed=$SEED farChance=$FARCHANCE settle=${SETTLE}s hops=$HOPS dwell=${DWELL}s interior='$INTERIOR'"
 
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1
 for _ in $(seq 1 20); do
@@ -108,7 +112,7 @@ if [ -n "$CLIENTENV" ]; then
     ENVSET="${ENVSET}\$env:${p%%=*}='${p#*=}'; "
   done
 fi
-powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle ${ZIP_WINDOW:-Minimized}" >/dev/null 2>&1
 echo "[zip] launched Morrowind; waiting for the run..."
 
 t0=$(date +%s); last_report=0; alive_at_end=0
@@ -130,7 +134,7 @@ done
 
 echo
 echo "=== autozip (MWSE.log) ==="
-grep -E "\[autozip\] (armed|ZIP|HOP|hop |SETTLED|!!)" "$MWSELOG" 2>/dev/null || echo "  !! no [autozip] summary lines"
+grep -E "\[autozip\] (armed|ZIP|HOP|hop |DOOR|door |SETTLED|!!)" "$MWSELOG" 2>/dev/null || echo "  !! no [autozip] summary lines"
 grep -iE "error|traceback" "$MWSELOG" 2>/dev/null | grep -v "\[autozip\]" | head -10
 
 echo
