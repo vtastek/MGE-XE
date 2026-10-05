@@ -1142,6 +1142,12 @@ namespace {
     // RPCs on the local copy (holding it across texUploadBlocking would be a new 60s-freeze class).
     std::mutex                                g_texResidencyMx;
     std::unordered_map<std::string, std::uint32_t> g_texSlot;       // normalized name -> bindless slot
+    // A cached miss (slot 0) is PERMANENT for the session when the file is absent or too large: the
+    // data files do not change between cells. Most misses are _paramh/_paramh_np companion probes,
+    // ~700 per exterior, and re-probing them after every load cost ~28 ms of 40 us file-system misses
+    // on the return frame. Only a STAGING failure (out of memory, not a bad file) is worth retrying;
+    // those names are listed here and dropped at the next load's bookkeeping.
+    std::unordered_set<std::string>           g_texRetryMiss;
     std::uint32_t                             g_nextTexSlot = 1;    // 0 = host default white
     // Staged texture uploads awaiting flush: ONE ENTRY PER ELEMENT ([TexUploadWire][dds]), never a
     // single contiguous blob. This was a `std::vector<std::uint8_t>` that every staged entry was
@@ -2010,6 +2016,7 @@ namespace {
             g_texSwapSerial = 0;
             g_texShippedSerial = 0;
             g_texSlot.clear();
+            g_texRetryMiss.clear();
             g_slotName.clear();
             g_slotLastUsed.clear();
             g_slotBytes.clear();
@@ -2674,12 +2681,14 @@ namespace {
             && supplied->dataTexture == dataTexture && supplied->name == name) {
             r = takeBytes(*supplied);
         } else {
+            MGE_ZoneScopedN("tex:firstSight read");
             r = readFirstSight(name, dataTexture, deferAllowed);
         }
         void* data = r.data;
         unsigned size = r.size;
         const bool deferred = r.deferred;
 
+        MGE_ZoneScopedN("tex:firstSight stage");   // lock wait + slot assign + staging copy
         std::lock_guard<std::mutex> lk(g_texResidencyMx);
         {
             std::uint32_t known = 0;
@@ -2783,6 +2792,7 @@ namespace {
             g_slotBytes[slot] = 0;
             g_texFreeSlots.push_back(slot);
             g_texSlot[name] = 0;
+            g_texRetryMiss.insert(name);
             return 0;
         }
         return slot;
@@ -3747,7 +3757,7 @@ namespace {
                 const auto it = g_texSlot.find(n);
                 if (it == g_texSlot.end()) { continue; }
                 const std::uint32_t s = it->second;
-                if (s == 0) { g_texSlot.erase(it); continue; }   // a cached miss: forget it too
+                if (s == 0) { continue; }   // a cached miss stays (g_texRetryMiss): the file is still absent
                 if (IPC::isFlipSlot(s) || s >= IPC::kMaxTextures || g_slotName[s] != n) { continue; }
                 const std::uint32_t cold = coldBit(s);
                 g_texSlot.erase(it);
@@ -3839,11 +3849,13 @@ namespace {
                 stageTexUpload(rel, nullptr, 0u);
                 ++released;
             }
-            // Cached misses go too (cheap to re-probe; the new cell may have files the old one
-            // lacked). Released names were erased above; kept and flip-book names stay.
-            for (auto it = g_texSlot.begin(); it != g_texSlot.end();) {
-                if (it->second == 0) { it = g_texSlot.erase(it); } else { ++it; }
+            // Cached misses STAY (see g_texRetryMiss): only staging failures get another try.
+            // Released names were erased above; kept and flip-book names stay.
+            for (const std::string& n : g_texRetryMiss) {
+                const auto it = g_texSlot.find(n);
+                if (it != g_texSlot.end() && it->second == 0) { g_texSlot.erase(it); }
             }
+            g_texRetryMiss.clear();
             ++g_texEpoch;   // every cached slot re-resolves by name (kept ones find themselves again)
         }
         g_texKeptLastLoad.swap(keepNow);

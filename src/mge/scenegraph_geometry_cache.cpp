@@ -3102,14 +3102,16 @@ namespace MGE::GeometryCache {
                            && geom->parentNode->isInstanceOfType(NI::RTTIStaticPtr::NiBillboardNode);
                 // Material first: uploadEntry reads the captured map UV sets (baseUV/
                 // darkUV/detailUV/glowUV, set here) to size the VB's UV-set count.
-                extractMaterial(e, geom);
+                { MGE_ZoneScopedN("GeomCache:cap.material"); extractMaterial(e, geom); }
                 if (sk) {
+                    MGE_ZoneScopedN("GeomCache:cap.skinned");
                     buildSkinnedVB(e, geom, data, si, sd);          // static
                     if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
                 } else {
+                    MGE_ZoneScopedN("GeomCache:cap.upload");
                     uploadEntry(e, geom, data, key);
                 }
-                captureWorld(e, geom);                              // bounds center
+                { MGE_ZoneScopedN("GeomCache:cap.world"); captureWorld(e, geom); }  // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
                 e.homeInteriorCell = g_captureInteriorCell;         // cell-grid eviction home tag
@@ -3124,17 +3126,22 @@ namespace MGE::GeometryCache {
                 // attached to animated bones) and definite-mover records (NPC/Creature/Door) are
                 // movers by construction → animated. Only an Activator is ambiguous, so ONLY it pays
                 // the transform-controller walk (silt strider animates → dyn; still hammock → static).
+                {
+                MGE_ZoneScopedN("GeomCache:cap.classify");
                 const LiveKind kind = (g_walkingSky || g_walkingLandscape)
                                       ? LiveKind::None
                                       : (inCharacter ? LiveKind::Mover : referenceLiveKind(geom));
                 e.isLive   = (kind != LiveKind::None);
                 e.animated = (kind == LiveKind::Mover)
                           || (kind == LiveKind::Ambiguous && hasTransformAnim(geom));
+                }
                 e.isSky = g_walkingSky;
                 e.isFP = g_walkingFP;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
                 // NiSwitchNode variant binding (day/night window glow). Sky is exempt: the sky walk
                 // has its own visibility rules and carries no switch variants.
+                {
+                MGE_ZoneScopedN("GeomCache:cap.bind");
                 if (!g_walkingSky) bindSwitchOwner(e, geom);
                 // NiVisController binding (animated hide/show). Sky is exempt for the same reason
                 // as the switch binding: the sky walk has its own visibility rules.
@@ -3143,6 +3150,7 @@ namespace MGE::GeometryCache {
                 // same reason as the two bindings above, and carries no TES3 reference anyway.
                 if (!g_walkingSky) bindPortalOwner(e, geom);
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
+                }
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
@@ -5998,6 +6006,7 @@ namespace MGE::GeometryCache {
         bool reclassified = false;
         if (sk) {
             if (data->revisionID != e.revisionID || !e.isSkinned) {
+                MGE_ZoneScopedN("GeomCache:live.skinRebuild");
                 extractMaterial(e, geom);
                 buildSkinnedVB(e, geom, data, si, sd);
                 reclassified = true;
@@ -6008,6 +6017,7 @@ namespace MGE::GeometryCache {
             e.mirrored = computeMirrored(e);
         } else {
             if (data->revisionID != e.revisionID || e.isSkinned) {
+                MGE_ZoneScopedN("GeomCache:live.reupload");
                 g_walkingLandscape = e.isLandscape;   // landscape re-upload keeps single-UV
                 extractMaterial(e, geom);
                 uploadEntry(e, geom, data, key);
