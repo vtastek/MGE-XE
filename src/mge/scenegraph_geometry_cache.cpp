@@ -2339,19 +2339,6 @@ namespace MGE::GeometryCache {
             }
             e.skinnedUnsupported = false;
 
-            // Invert per-bone weight lists into per-vertex influences.
-            struct Inf { float w; uint8_t b; };
-            std::vector<std::vector<Inf>> perVert(vertexCount);
-            for (uint32_t b = 0; b < numBones; ++b) {
-                const auto& bd = sd->boneData[b];
-                if (!bd.weights) continue;
-                for (uint32_t k = 0; k < bd.weightCount; ++k) {
-                    const uint32_t vi = bd.weights[k].index;
-                    if (vi >= vertexCount) continue;
-                    perVert[vi].push_back({ bd.weights[k].weight, static_cast<uint8_t>(b) });
-                }
-            }
-
             // M-Skinning: compute the per-vertex skinned layout straight into the host wire
             // stream. Shipped once per (key,revision), re-uploaded on change; carries base-map
             // UV (per-vertex colour DiffAmb is a later fidelity tier).
@@ -2366,18 +2353,48 @@ namespace MGE::GeometryCache {
             static std::vector<IPC::SkinnedVertexWire> skScratch;   // single-threaded cache walk
             if (wantCapture) skScratch.resize(vertexCount);
 
+            // Invert the per-bone weight lists into each vertex's 4 heaviest influences, kept in
+            // place. This was a vector<vector<Inf>> (one heap allocation per vertex, a sort per
+            // vertex), ~8 ms of allocator churn per exterior return (~655 skinned parts). The
+            // insertion below reproduces the old output exactly: bones arrive in ascending order,
+            // and a new influence only passes STRICTLY lighter ones, so equal weights keep bone
+            // order — what the old sort gave (MSVC std::sort is an insertion sort, stable, at
+            // these sizes) — and the 5th+ drop the same way.
+            struct Top4 { float w[4]; uint8_t b[4]; uint8_t n; };
+            static std::vector<Top4> s_top;   // same single-threaded walk as skScratch
             if (wantCapture) {
+                MGE_ZoneScopedN("GeomCache:skin.invert");
+                s_top.assign(vertexCount, Top4{});
+                for (uint32_t b = 0; b < numBones; ++b) {
+                    const auto& bd = sd->boneData[b];
+                    if (!bd.weights) continue;
+                    for (uint32_t k = 0; k < bd.weightCount; ++k) {
+                        const uint32_t vi = bd.weights[k].index;
+                        if (vi >= vertexCount) continue;
+                        const float wt = bd.weights[k].weight;
+                        Top4& t = s_top[vi];
+                        int j = t.n < 4 ? t.n : 4;            // insertion point, from the end
+                        while (j > 0 && t.w[j - 1] < wt) --j;
+                        if (j >= 4) continue;                 // lighter than (or tied with) all 4 kept
+                        const int last = t.n < 4 ? t.n : 3;   // shift [j, last) right, dropping a 5th
+                        for (int m = last; m > j; --m) { t.w[m] = t.w[m - 1]; t.b[m] = t.b[m - 1]; }
+                        t.w[j] = wt;
+                        t.b[j] = static_cast<uint8_t>(b);
+                        if (t.n < 4) ++t.n;
+                    }
+                }
+            }
+
+            if (wantCapture) {
+                MGE_ZoneScopedN("GeomCache:skin.wire");
                 const auto* uvs = data->textureCoords;
                 const auto* nrm = data->normal;         // bind-pose model-space normals
                 for (uint32_t i = 0; i < vertexCount; ++i) {
-                    auto& infs = perVert[i];
-                    std::sort(infs.begin(), infs.end(),
-                              [](const Inf& a, const Inf& b) { return a.w > b.w; });
+                    const Top4& t = s_top[i];
                     float w[4] = {0,0,0,0};
                     uint8_t idx[4] = {0,0,0,0};
                     float sum = 0.0f;
-                    const size_t n = infs.size() < 4 ? infs.size() : 4;
-                    for (size_t j = 0; j < n; ++j) { w[j] = infs[j].w; idx[j] = infs[j].b; sum += infs[j].w; }
+                    for (int j = 0; j < t.n; ++j) { w[j] = t.w[j]; idx[j] = t.b[j]; sum += t.w[j]; }
                     if (sum > 1e-6f) { for (int j = 0; j < 4; ++j) w[j] /= sum; }
                     else             { w[0] = 1.0f; }
 
@@ -2408,6 +2425,7 @@ namespace MGE::GeometryCache {
             if (wantCapture) {
                 const auto* triList = data->getTriList();
                 if (triList) {
+                    MGE_ZoneScopedN("GeomCache:skin.ship");
                     RenderProcess::captureSkinnedGeometry(key, data->revisionID,
                         reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                         skScratch.data(), vertexCount,
