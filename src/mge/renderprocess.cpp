@@ -926,6 +926,9 @@ namespace {
     // the cache. Set by noteLoadingBar from the per-frame path, consumed by checkCellEpochAndPurge.
     // STICKY on purpose: the two run on different cadences (every frame vs produced frames only).
     bool                                        g_sawLoadingBar = false;
+    // This frame's cell-epoch check already ran at frame start (epochCheckAtFrameStart, before the
+    // cache walks); kickoffBody consumes it instead of checking a second time after them.
+    bool                                        g_epochCheckedAtStart = false;
 
     // --- Produce mode 3 "PARK-AND-FIRE" ---------------------------------------------------
     // The worker builds frame N's payload into the client-private scratch vectors and PARKS it
@@ -7479,7 +7482,12 @@ namespace RenderProcess {
 
         const unsigned frame = g_frame++;
 
-        checkCellEpochAndPurge(frame);
+        // Normally already run at frame start (epochCheckAtFrameStart), BEFORE this frame's cache
+        // walks. Here it is only the fallback for a frame whose frameSetupEarly never got that far.
+        if (!g_epochCheckedAtStart) {
+            checkCellEpochAndPurge(frame);
+        }
+        g_epochCheckedAtStart = false;
 
         // Re-walk the geometry cache to build the host's draw lists (the MGE→Forge feeding cost —
         // Phase 2 makes this GPU-resident so it goes to 0).
@@ -9048,6 +9056,27 @@ namespace RenderProcess {
         g_produceKickMs   = nowMs();
         g_produceInFlight = true;
         g_produceWorker.kick(device);
+    }
+
+    // THE PURGE MUST PRECEDE THE WALKS. checkCellEpochAndPurge empties the cache, and the sky and
+    // first-person entries are only ever (re)captured by onFrameReady's walks at BeginScene(0). The
+    // park fire runs its check at frame start, ahead of them. The serial path ran it inside
+    // kickoffBody, AFTER them, so a serial frame that purged built from a cache with no sky and no
+    // arms in it: `sky=0` in the composite, or `[seam] skip: no payload` (MW's suppressed frame
+    // shown instead), the "sky flickers / rarely the whole screen" on long exterior crossings
+    // (2026-10-05). It became reachable when 315a1fef sent the first frame after every loading bar
+    // down the serial path. Called from frameSetupEarly right before fireParked, on main, with the
+    // previous produce already drained by the BeginScene collect (the same point fireParked owns).
+    void epochCheckAtFrameStart(IDirect3DDevice9* device) {
+        g_epochCheckedAtStart = false;
+        if (!g_initOk || !g_enabled || !device) {
+            return;
+        }
+        if (g_produceMode == 3 && g_frameAheadLive && DistantLand::earlyForgeKickoff) {
+            return;   // a park-fire frame: fireParked runs the check at this same point
+        }
+        checkCellEpochAndPurge(g_frame);   // the frame number kickoffBody mints for this frame
+        g_epochCheckedAtStart = true;
     }
 
     // Mode 3 PARK-AND-FIRE: fire the payload the worker parked LAST frame, at the START of

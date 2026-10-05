@@ -54,6 +54,11 @@ namespace RenderProcess {
     // composite frame) on a cell-epoch change between build and fire.
     void fireParked(IDirect3DDevice9* device);
 
+    // The cell-epoch check (and purge) for every frame the park fire does NOT own, run at the same
+    // frame-start point, so a purge can never land after this frame's cache walks (which are the
+    // only thing that recaptures sky and first-person entries). Call right before fireParked.
+    void epochCheckAtFrameStart(IDirect3DDevice9* device);
+
     // Produce-worker OVERLAP mode (NUMPAD8 -> 2): drains the async produce kicked at BeginScene(0)
     // so it completes within the quiescent scene-0 window (before the finish reads g_kick and before
     // mwstart(N+1) mutates the live scene graph the worker read). No-op in the OFF/FENCED modes and

@@ -368,6 +368,9 @@ void DistantLand::frameSetupEarly() {
     // isDistantCell split so exteriors and eligible interiors share it. No-op outside
     // mode 3 / frame-ahead / early-kickoff frames.
     const double tFire0 = fseNowMs();
+    // Every other frame's cell-epoch purge runs here too, ahead of the walks below (see
+    // epochCheckAtFrameStart) — on the serial path it used to land after them.
+    RenderProcess::epochCheckAtFrameStart(device);
     RenderProcess::fireParked(device);
     dKick = fseNowMs() - tFire0;   // folded with the produce kick below into [fse] kick=
 
