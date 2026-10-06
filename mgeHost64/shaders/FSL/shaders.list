@@ -235,6 +235,20 @@
 #include "terrain.frag.fsl"
 #end
 
+// ...and two FEATURE variants, bound while their features are off (see terrain.frag.fsl):
+// nopbr = terrain PBR/parallax/height blend compiled out; lite = that + macro variation + sky AO.
+#frag terrain_nopbr.frag
+#define TERRAIN_NO_PBR
+#include "terrain.frag.fsl"
+#end
+
+#frag terrain_lite.frag
+#define TERRAIN_NO_PBR
+#define TERRAIN_NO_MACRO
+#define TERRAIN_NO_SKYAO
+#include "terrain.frag.fsl"
+#end
+
 // SUN shadow moments for host-owned TERRAIN — the landscape as a CASTER. Pairs with terrain.vert
 // (whose VSOutput it mirrors byte for byte); no alpha test, terrain is opaque. Without it a mountain
 // shadows nothing, which is also why sun shafts lit valleys a ridge should have blacked out.

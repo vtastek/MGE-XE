@@ -560,7 +560,16 @@ float4 PS_MAIN( VSOutput In )
     // before the albedo blend, because everything from here down reads a DISPLACED uv and the layer
     // the offset is computed from is one of these four. `pbrTerrainOn` is a cbuffer scalar, so with
     // terrain PBR off these four loads are not issued and nothing in this section costs anything.
+    // FEATURE VARIANTS (shaders.list): terrain_nopbr.frag / terrain_lite.frag compile terrain PBR —
+    // and with it parallax, the height blend and height AO — out, rather than branching around it.
+    // A uniform branch still reserves the registers of the path it skips (this shader sat at 128
+    // regs/thread on Turing with PBR off); a constant takes the path out of the program. The host
+    // binds them only while the matching knobs are off, so each is the shipped image of that state.
+#if defined(TERRAIN_NO_PBR)
+    const bool pbrTerrainOn = false;
+#else
     const bool pbrTerrainOn = (gShadowParams.pbrTerrain.x != 0.0f);
+#endif
     uint ps00 = 0u, ps10 = 0u, ps01 = 0u, ps11 = 0u;
     if (pbrTerrainOn) {
         ps00 = landParamSlot(i00); ps10 = landParamSlot(i10);
@@ -740,7 +749,11 @@ float4 PS_MAIN( VSOutput In )
     // value would slide vertically every time the player walks up a hill — the whole ground would
     // crawl. The screen-space gradient does NOT need the term back: it is uniform per frame and
     // cancels in ddx/ddy.
+#if defined(TERRAIN_NO_MACRO)
+    if (false)   // terrain_lite.frag: macro variation compiled out (all three amplitudes are 0)
+#else
     if ((tCut & 4u) == 0u)
+#endif
     {
         // ARM 1: elevation bands + slope. Free, blind on flat ground.
         float macro = terrainMacroTint(In.WorldPos.z + gFrameData.lodEye.z,
@@ -1004,7 +1017,11 @@ float4 PS_MAIN( VSOutput In )
     // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
     // a visible seam across the near/far handover on the same building.
     float3 amb = gFrameData.lodSunAmb.rgb
+#if defined(TERRAIN_NO_SKYAO)
+               * skyAmbFactorAO(normal, 1.0f);   // terrain_lite.frag: SH sky kept, its occlusion out
+#else
                * (((tCut & 1u) != 0u) ? 1.0f : skyAmbFactorPx(normal, In.WorldPos, In.Position.xy));
+#endif
     // "AO enable" tick (debugParams.w bit0), through the shared multi-bounce term.
     // ⚠ TERRAIN IS THE SURFACE THIS MATTERS MOST ON, and it is the one that prompted it. G1f made
     // grass a GTAO occluder, so the ground under a clump carries occlusion it never carried before —

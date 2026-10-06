@@ -50149,6 +50149,15 @@ void destroyHostWindow(Renderer* R);
     Shader*   g_pTerrainShaderDbg     = nullptr;
     Pipeline* g_pTerrainPipelineDbg   = nullptr;
     Pipeline* g_pTerrainPipelineEQDbg = nullptr;
+    // FEATURE variants (terrain.frag.fsl): NoPbr = terrain PBR/parallax/height blend compiled out,
+    // bound while pbrTerrain is off; Lite = that + macro variation + sky AO, bound while those are off
+    // too. A uniform branch keeps the skipped path's registers; a constant drops them.
+    Shader*   g_pTerrainShaderNoPbr     = nullptr;
+    Pipeline* g_pTerrainPipelineNoPbr   = nullptr;
+    Pipeline* g_pTerrainPipelineEQNoPbr = nullptr;
+    Shader*   g_pTerrainShaderLite      = nullptr;
+    Pipeline* g_pTerrainPipelineLite    = nullptr;
+    Pipeline* g_pTerrainPipelineEQLite  = nullptr;
     Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
     Pipeline* g_pTerrainPipelineWire = nullptr;
     Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
@@ -50416,6 +50425,23 @@ void destroyHostWindow(Renderer* R);
                 std::printf("[forge][terrain] debug variant (terrain_dbg.frag) FAILED — F12 terrain views off\n");
             }
         }
+        // ...and the two FEATURE variants (terrain_nopbr / terrain_lite), same pair shape. Non-fatal:
+        // without them the main shader draws those states exactly as before.
+        auto addTerrainVariant = [&](const char* frag, Shader** sh, Pipeline** geq, Pipeline** eq) {
+            ShaderLoadDesc vd = {};
+            vd.mVert.pFileName = "terrain.vert";
+            vd.mFrag.pFileName = frag;
+            addShader(R, &vd, sh);
+            if (!*sh) { std::printf("[forge][terrain] variant %s FAILED\n", frag); return; }
+            g.pShaderProgram = *sh;
+            addPipeline(R, &pd, geq);
+            g.pDepthState = &dsEq;
+            addPipeline(R, &pd, eq);
+            g.pDepthState = &ds;
+            g.pShaderProgram = g_pTerrainShader;
+        };
+        addTerrainVariant("terrain_nopbr.frag", &g_pTerrainShaderNoPbr, &g_pTerrainPipelineNoPbr, &g_pTerrainPipelineEQNoPbr);
+        addTerrainVariant("terrain_lite.frag",  &g_pTerrainShaderLite,  &g_pTerrainPipelineLite,  &g_pTerrainPipelineEQLite);
 
         // Mirror twin for the reflect-geo pass. CULL_MODE_NONE, deliberately, and NOT the CW winding
         // flip statics uses: statics are closed solids, so the mirror always shows their outward
@@ -51786,8 +51812,19 @@ void destroyHostWindow(Renderer* R);
         // ...and the debug variant of that pair whenever something only it can show is asked for.
         const bool dbgVar = g_pTerrainPipelineDbg
                          && (g_debugMode != 0u || g_terrainCut >= 1.0f || !g_terrainLean);
-        Pipeline* const geqPso = dbgVar ? g_pTerrainPipelineDbg : g_pTerrainPipeline;
-        Pipeline* const eqPso  = dbgVar ? g_pTerrainPipelineEQDbg : g_pTerrainPipelineEQ;
+        // ...otherwise the leanest FEATURE variant whose compiled-out features are all off now.
+        const bool noPbr  = !g_pbrTerrain;
+        const bool lite   = noPbr && g_skyAOStrength <= 0.0f && g_terrainMacroAmp <= 0.0f
+                         && g_terrainMacroNoiseAmp <= 0.0f && g_terrainMacroTexAmp <= 0.0f;
+        Pipeline* geqPso = g_pTerrainPipeline;
+        Pipeline* eqPso  = g_pTerrainPipelineEQ;
+        if (dbgVar) {
+            geqPso = g_pTerrainPipelineDbg;   eqPso = g_pTerrainPipelineEQDbg;
+        } else if (g_terrainLean && lite && g_pTerrainPipelineLite && g_pTerrainPipelineEQLite) {
+            geqPso = g_pTerrainPipelineLite;  eqPso = g_pTerrainPipelineEQLite;
+        } else if (g_terrainLean && noPbr && g_pTerrainPipelineNoPbr && g_pTerrainPipelineEQNoPbr) {
+            geqPso = g_pTerrainPipelineNoPbr; eqPso = g_pTerrainPipelineEQNoPbr;
+        }
         Pipeline* const mainPso = (eqPso && terrainPrepassRan()) ? eqPso : geqPso;
         Pipeline* pso = psoOverride                                 ? psoOverride
                       : (g_terrainWire && g_pTerrainPipelineWire)   ? g_pTerrainPipelineWire
@@ -62775,6 +62812,12 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainDepthPipeline) { removePipeline(R, g_pTerrainDepthPipeline); g_pTerrainDepthPipeline = nullptr; }
         if (g_pTerrainDepthShader)   { removeShader(R, g_pTerrainDepthShader);     g_pTerrainDepthShader = nullptr; }
         if (g_pTerrainPipelineEQDbg) { removePipeline(R, g_pTerrainPipelineEQDbg); g_pTerrainPipelineEQDbg = nullptr; }
+        for (Pipeline** pp : { &g_pTerrainPipelineNoPbr, &g_pTerrainPipelineEQNoPbr,
+                               &g_pTerrainPipelineLite,  &g_pTerrainPipelineEQLite }) {
+            if (*pp) { removePipeline(R, *pp); *pp = nullptr; }
+        }
+        if (g_pTerrainShaderNoPbr)   { removeShader(R, g_pTerrainShaderNoPbr);   g_pTerrainShaderNoPbr = nullptr; }
+        if (g_pTerrainShaderLite)    { removeShader(R, g_pTerrainShaderLite);    g_pTerrainShaderLite = nullptr; }
         if (g_pTerrainPipelineDbg)   { removePipeline(R, g_pTerrainPipelineDbg);   g_pTerrainPipelineDbg = nullptr; }
         if (g_pTerrainShaderDbg)     { removeShader(R, g_pTerrainShaderDbg);       g_pTerrainShaderDbg = nullptr; }
         if (g_pTerrainPipelineEQ)   { removePipeline(R, g_pTerrainPipelineEQ);   g_pTerrainPipelineEQ = nullptr; }
