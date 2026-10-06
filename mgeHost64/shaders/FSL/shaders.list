@@ -190,6 +190,11 @@
 #include "skyhw.frag.fsl"
 #end
 
+// Deferred sky composite (knob skyDeferred): gSkyColor -> the MSAA target where depth is still far.
+#frag skycomposite.frag
+#include "skycomposite.frag.fsl"
+#end
+
 // SK V2 viewer sky MESH (--forge-view only): baked MW sky meshes (dome + clouds) + a host-generated
 // sun billboard, all in the StaticElem 20B layout. Binding 1 = per-instance world rows + packed sky
 // params (P0..P3). Reuses opaque.srt.h / DefaultRootSignature + bindless gTextures. Three blend PSOs

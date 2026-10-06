@@ -1,0 +1,30 @@
+// mgeHost64 — DEFERRED SKY COMPOSITE (knob skyDeferred).
+//
+// The sky pass draws into gSkyColor (single-sample, the texture every fog site melts into) instead of
+// into the multisampled colour target, and this pass copies it back AFTER the opaque world, at z = 0
+// with GEQUAL and the scene depth bound: only samples nothing drew on (still the cleared far depth)
+// pass, and early-Z rejects every geometry-covered pixel before the shader launches.
+//
+// What it replaces: the sky drawn at full-screen 4x (every sample of every pixel, most of them about
+// to be overdrawn) followed by a full-screen MSAA RESOLVE to make gSkyColor. The values are the same
+// ones: every sample of a sky pixel held the same colour, and a geometry edge's uncovered samples get
+// exactly that colour here, per sample, through the depth test.
+//
+// Fullscreen triangle from shadowatlasview.vert (z = 0). gSkyColor is ALLOC-sized and the frame draws
+// from (0,0), so the pixel's own coordinate addresses it.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    float4 c = LoadTex2D(gSkyColor, NO_SAMPLER, int2(In.Position.xy), 0);
+    RETURN(c);
+}

@@ -3545,6 +3545,13 @@ namespace {
         // pass and again at the top of the mirror pass, and it covers the whole sphere.
         Shader*        pSkyHwShader = nullptr;             // shadowatlasview.vert + skyhw.frag
         Pipeline*      pSkyHwPipeline = nullptr;           // no blend, no depth, writes alpha 1
+        // Deferred sky (g_skyDeferred): the three sky PSOs at 1x into pSkyColorRT, and the composite
+        // that copies it into the MSAA target after the opaque world where depth is still far.
+        Pipeline*      pSkyPipeline1x = nullptr;
+        Pipeline*      pSkyPipelineAdd1x = nullptr;
+        Pipeline*      pSkyHwPipeline1x = nullptr;
+        Shader*        pSkyCompositeShader = nullptr;
+        Pipeline*      pSkyCompositePipeline = nullptr;
         // ⚠ TWO cbuffers, ONE per VIEW, and that is the whole reason this resource exists. It
         // carries invViewProj, and gShadowParams — which already has one — is bound by POINTER into
         // every PerFrame set including the mirror's, so a fullscreen pass reading it in the reflect
@@ -3715,6 +3722,7 @@ namespace {
         // same block; each is bound into the PerFrame set instances that its pass uses, and each
         // publishes its own inverse extent into that pass's gFrameData.fogParams.zw.
         Texture*       pSkyColor = nullptr;                // alloc-sized copy of the main view's sky
+        RenderTarget*  pSkyColorRT = nullptr;              // ...which IS this RT's texture (deferred sky draws into it)
         Texture*       pReflectSkyColor = nullptr;         // kReflectSize² copy of the mirror's sky
         // W3: the wave field, BOMBED from water_NRM.dds at launch into a Texture2DArray — 1024²x32
         // RG8 SLOPES (not the shipped 256³ Texture3D). The array is what buys hardware AF, which is
@@ -4518,6 +4526,7 @@ namespace {
            kGpuPhaseCullCount,     // inside CullCam: the count dispatch alone
            kGpuPhaseCullScatter,   // ...and the scatter dispatch alone (cam - count - scan - scatter = barriers + copies)
            kGpuPhaseSkySnap,       // inside Color, after ColorSky: the gSkyColor snapshot (MSAA resolve)
+           kGpuPhaseWaterRefr,     // inside Water: the pRefractColor copy (MSAA resolve)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -12010,6 +12019,14 @@ namespace {
                 std::printf("[forge] addPipeline(sky additive) FAILED\n");
                 return false;
             }
+            // Deferred-sky twins: 1x, no depth attachment (pSkyColorRT). Non-fatal.
+            sg.mSampleCount = SAMPLE_COUNT_1;
+            sg.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+            sg.pDepthState = nullptr;
+            sg.pBlendState = &skyBlend;
+            addPipeline(R, &skPd, &g_live.pSkyPipeline1x);
+            sg.pBlendState = &skyBlendAdd;
+            addPipeline(R, &skPd, &g_live.pSkyPipelineAdd1x);
 
             // One 64KB world window + a per-draw instance VB (kStaticInstU32 slots, like opaque).
             BufferLoadDesc swb = {};
@@ -12485,8 +12502,35 @@ namespace {
                 if (!g_live.pSkyHwPipeline) {
                     std::printf("[forge] addPipeline(skyhw) FAILED — physical sky disabled\n");
                 }
+                // Deferred sky: the same field at 1x into pSkyColorRT...
+                const SampleCount savSc = sag.mSampleCount;
+                const TinyImageFormat savDf = sag.mDepthStencilFormat;
+                sag.mSampleCount = SAMPLE_COUNT_1;
+                sag.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+                addPipeline(R, &savPd, &g_live.pSkyHwPipeline1x);
+                sag.mSampleCount = savSc;
+                sag.mDepthStencilFormat = savDf;
             } else {
                 std::printf("[forge] addShader(skyhw) FAILED — physical sky disabled\n");
+            }
+            // ...and its composite into the MSAA target: waterfill-Z's state (z = 0, GEQUAL, scene
+            // depth bound, no write), so only samples nothing drew on take the sky.
+            ShaderLoadDesc scDesc = {};
+            scDesc.mVert.pFileName = "shadowatlasview.vert";
+            scDesc.mFrag.pFileName = "skycomposite.frag";
+            addShader(R, &scDesc, &g_live.pSkyCompositeShader);
+            if (g_live.pSkyCompositeShader) {
+                DepthStateDesc scDepth = {};
+                scDepth.mDepthTest = true; scDepth.mDepthWrite = false; scDepth.mDepthFunc = CMP_GEQUAL;
+                DepthStateDesc* savDs = sag.pDepthState;
+                const TinyImageFormat savDf = sag.mDepthStencilFormat;
+                sag.pShaderProgram = g_live.pSkyCompositeShader;
+                sag.pBlendState = nullptr;
+                sag.pDepthState = &scDepth;
+                sag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                addPipeline(R, &savPd, &g_live.pSkyCompositePipeline);
+                sag.pDepthState = savDs;
+                sag.mDepthStencilFormat = savDf;
             }
         }
 
@@ -13246,10 +13290,19 @@ namespace {
                 sd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
                 sd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
                 sd.pName = "skyColor";
-                TextureLoadDesc sld = {};
-                sld.ppTexture = &g_live.pSkyColor;
-                sld.pDesc = &sd;
-                addResource(&sld, nullptr);
+                // A RENDER TARGET, so the deferred sky can draw straight into it (g_skyDeferred);
+                // every gSkyColor bind takes its texture exactly as it took the plain one.
+                RenderTargetDesc srt = {};
+                srt.mWidth = width; srt.mHeight = height; srt.mDepth = 1;
+                srt.mArraySize = 1; srt.mMipLevels = 1;
+                srt.mSampleCount = SAMPLE_COUNT_1;
+                srt.mFormat = g_live.sceneColorFormat;
+                srt.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                srt.mClearValue.r = srt.mClearValue.g = srt.mClearValue.b = srt.mClearValue.a = 0.0f;
+                srt.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                srt.pName = "skyColor";
+                addRenderTarget(R, &srt, &g_live.pSkyColorRT);
+                g_live.pSkyColor = g_live.pSkyColorRT ? g_live.pSkyColorRT->pTexture : nullptr;
 
                 TextureDesc rsd = sd;
                 rsd.mWidth = kReflectSize; rsd.mHeight = kReflectSize;
@@ -17953,6 +18006,15 @@ namespace {
     // Release 1: the scatter walks the COUNT pass's survivor list (cullscatter_list.comp) instead of
     // re-testing every instance (cullscatter.comp). Same rows. OFF = the old scatter, the A/B.
     bool g_cullSurvivorList = true;
+    // Release 1: draw the sky into gSkyColor (1x) and composite it into the MSAA target after the
+    // opaque world, at z = 0 GEQUAL (only samples nothing drew on). Replaces a full-screen 4x sky and
+    // the full-screen MSAA resolve that made gSkyColor. Same pixels. OFF = the old order, the A/B.
+    bool g_skyDeferred = true;
+    bool g_skyDeferredFrame = false;   // this frame's colour pass took the deferred path
+    // Release 1: the water's refraction copy resolves only the rows a ray can reach the water plane
+    // through (below its horizon), not the whole frame. OFF = the full-frame resolve, the A/B.
+    bool g_waterRefractRegion = true;
+    uint32_t g_lastRefractRows = 0;    // rows the last refraction copy resolved (heartbeat)
     enum { kSurvCam = 0, kSurvSun, kSurvRefl, kSurvSky, kSurvGrass, kSurvGrassSun, kSurvLanes };
     Pipeline* cullScatterPipe() {
         return (g_cullSurvivorList && g_live.pCullScatterListPipeline) ? g_live.pCullScatterListPipeline
@@ -23704,6 +23766,8 @@ namespace {
             { "cullDrawCount",       &g_cullDrawCount       },
             { "cullScanWave",        &g_cullScanWave        },
             { "cullSurvivorList",    &g_cullSurvivorList    },
+            { "skyDeferred",         &g_skyDeferred         },
+            { "waterRefractRegion",  &g_waterRefractRegion  },
             { "drawDistLights",      &g_drawDistLights      },   // baked lamps on distant land (G7 has none)
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
@@ -32499,7 +32563,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseCullCam, "cull cam" }, { kGpuPhaseCullScan, "cull scan" },
             { kGpuPhaseCullSun, "cull sun" }, { kGpuPhaseCullGrass, "cull grass" },
             { kGpuPhaseCullCount, "cull count" }, { kGpuPhaseCullScatter, "cull scatter" },
-            { kGpuPhaseSkySnap, "sky snapshot" },
+            { kGpuPhaseSkySnap, "sky snapshot" }, { kGpuPhaseWaterRefr, "water refract copy" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -33157,6 +33221,46 @@ void destroyHostWindow(Renderer* R);
     // and the scan reads only the first name on such a line. Both were build errors within one
     // compile. In another translation unit a missed dependency is a link error at best, and an
     // invented one silently shadows something real.
+    // Rows [y0, y1) of the render rect where the water plane can show, for an eye ABOVE it: a view
+    // ray reaches the plane only while it points down, and with a pinhole camera the ray's world z is
+    // LINEAR in NDC, so its four near-plane corners bound the region (no roll in MW makes it a band,
+    // but nothing here assumes that). Padded for wave crests and the refraction's own offset; false =
+    // resolve everything (underwater, close to the surface, or a degenerate matrix).
+    bool waterRefractRows(const float* rzVP, float eyeAboveWater, uint32_t H, uint32_t& y0, uint32_t& y1) {
+        if (!rzVP || !(eyeAboveWater > 256.0f) || H == 0) { return false; }
+        float inv[16];
+        if (!invert4x4(rzVP, inv)) { return false; }
+        auto dirZ = [&](float x, float y) {   // camera-relative world z of the near-plane point (reverse-Z near = 1)
+            const float c[4] = { x, y, 1.0f, 1.0f };
+            float v[4];
+            for (int j = 0; j < 4; ++j) { v[j] = c[0]*inv[j] + c[1]*inv[4+j] + c[2]*inv[8+j] + c[3]*inv[12+j]; }
+            return (std::fabs(v[3]) > 1e-12f) ? v[2] / v[3] : 0.0f;
+        };
+        float yTop = -1.0f, yBot = 1.0f;   // NDC (y up): the band's top, and its bottom
+        bool any = false;
+        for (float x : { -1.0f, 1.0f }) {
+            const float zb = dirZ(x, -1.0f), zt = dirZ(x, 1.0f);   // bottom, top edge of this column
+            // zc(y) = zb + (y+1)/2 (zt - zb); water where zc < 0.
+            float lo, hi;
+            if (zb < 0.0f && zt < 0.0f)       { lo = -1.0f; hi = 1.0f; }
+            else if (zb >= 0.0f && zt >= 0.0f) { continue; }
+            else {
+                const float yc = -1.0f + 2.0f * (-zb) / (zt - zb);
+                if (zb < 0.0f) { lo = -1.0f; hi = yc; } else { lo = yc; hi = 1.0f; }
+            }
+            yTop = any ? std::max(yTop, hi) : hi;
+            yBot = any ? std::min(yBot, lo) : lo;
+            any = true;
+        }
+        if (!any) { return false; }
+        const float pad = 64.0f;
+        const float r0 = (1.0f - yTop) * 0.5f * (float)H - pad;
+        const float r1 = (1.0f - yBot) * 0.5f * (float)H + pad;
+        y0 = (uint32_t)std::clamp(r0, 0.0f, (float)H);
+        y1 = (uint32_t)std::clamp(r1, 0.0f, (float)H);
+        return y1 > y0;
+    }
+
     template <class PhBegin, class PhEnd>
     void passForgeWaterSurface(RenderTarget* colorTarget, const float* rzViewProj,
                                const float* waterParams, unsigned waterEnabled,
@@ -33194,8 +33298,26 @@ void destroyHostWindow(Renderer* R);
                                                      : D3D12_RESOURCE_STATE_COPY_DEST;
                 cl->ResourceBarrier(2, pre);
             }
-            if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat)); }
+            gpuPhaseBegin(kGpuPhaseWaterRefr);
+            uint32_t ry0 = 0, ry1 = g_live.height;
+            bool region = false;
+            if (msaa && g_waterRefractRegion && waterParams && !(waterParams[7] > 0.5f)) {
+                const float* fc = (const float*)fbr(g_live.pFrameCbv);
+                const float eyeAbove = fc ? fc[58] - waterParams[0] : 0.0f;
+                region = waterRefractRows(rzViewProj, eyeAbove, g_live.height, ry0, ry1);
+            }
+            ID3D12GraphicsCommandList1* cl1 = nullptr;
+            if (region && SUCCEEDED(cl->QueryInterface(IID_PPV_ARGS(&cl1))) && cl1) {
+                D3D12_RECT r = { 0, (LONG)ry0, (LONG)g_live.width, (LONG)ry1 };
+                cl1->ResolveSubresourceRegion(refrRes, 0, 0, ry0, colRes, 0, &r,
+                                              (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat),
+                                              D3D12_RESOLVE_MODE_AVERAGE);
+                cl1->Release();
+            }
+            else if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat)); }
             else      { cl->CopyResource(refrRes, colRes); }
+            g_lastRefractRows = ry1 - ry0;
+            gpuPhaseEnd(kGpuPhaseWaterRefr);
             {
                 D3D12_RESOURCE_BARRIER post[2] = {};
                 post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -36391,6 +36513,7 @@ void destroyHostWindow(Renderer* R);
                 LOG::logline(">> [forge-hb] gpu residual: frame=%.2f bracketed=%.2f UNBRACKETED=%.2f (%.0f%%)"
                              " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f skyvis=%.2f(screen=%.2f) ripsim=%.2f"
                              " | cull: cam=%.2f(count=%.2f scan=%.2f scatter=%.2f inst=%u) sun=%.2f grass=%.2f"
+                             " | water refract copy=%.2f(rows=%u)"
                              " | measured but never printed: fp=%.2f(objvelFP=%.2f) objvel=%.2f",
                              frameMs, bracketed, resid,
                              (frameMs > 0.01) ? (100.0 * resid / frameMs) : 0.0,
@@ -36407,6 +36530,7 @@ void destroyHostWindow(Renderer* R);
                              (unsigned)g_live.cullInstCount,
                              g_lastGpuPhaseMs[kGpuPhaseCullSun],
                              g_lastGpuPhaseMs[kGpuPhaseCullGrass],
+                             g_lastGpuPhaseMs[kGpuPhaseWaterRefr], g_lastRefractRows,
                              g_lastGpuPhaseMs[kGpuPhaseColorFP],
                              g_lastGpuPhaseMs[kGpuPhaseObjVelFP],
                              g_lastGpuPhaseMs[kGpuPhaseObjVel]);
@@ -41975,9 +42099,32 @@ void destroyHostWindow(Renderer* R);
         // fullscreen opaque write is the one kind of pass where getting that wrong is total.
         const bool drawSkyHw = g_skyPhys.active && g_skyViewPub[0]
                             && g_live.pSkyHwPipeline && g_live.pPerBatchSetSky;
+        // DEFERRED SKY (g_skyDeferred): everything below draws into pSkyColorRT (1x) instead, and
+        // the composite after the DL block puts it into the MSAA target where depth is still far.
+        // Exterior-only (drawSkyHw), MSAA-only (at 1x the snapshot is a plain copy).
+        g_skyDeferredFrame = g_skyDeferred && drawSkyHw && g_live.sampleCount > 1 && g_live.pSkyColorRT
+                          && g_live.pSkyHwPipeline1x && g_live.pSkyPipeline1x && g_live.pSkyPipelineAdd1x
+                          && g_live.pSkyCompositePipeline;
+        Pipeline* const skyHwPipe   = g_skyDeferredFrame ? g_live.pSkyHwPipeline1x : g_live.pSkyHwPipeline;
+        Pipeline* const skyOverPipe = g_skyDeferredFrame ? g_live.pSkyPipeline1x : g_live.pSkyPipeline;
+        Pipeline* const skyAddPipe  = g_skyDeferredFrame ? g_live.pSkyPipelineAdd1x : g_live.pSkyPipelineAdd;
+        if (g_skyDeferredFrame) {
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            RenderTargetBarrier srb = {};
+            srb.pRenderTarget = g_live.pSkyColorRT;
+            srb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            srb.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
+            BindRenderTargetsDesc sbind = {};
+            sbind.mRenderTargetCount = 1;
+            sbind.mRenderTargets[0] = { g_live.pSkyColorRT, LOAD_ACTION_CLEAR };   // (0,0,0,0), as the MSAA target was
+            cmdBindRenderTargets(g_live.pCmd, &sbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        }
         if (drawSkyHw) {
             cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (Hosek-Wilkie)");
-            cmdBindPipeline(g_live.pCmd, g_live.pSkyHwPipeline);
+            cmdBindPipeline(g_live.pCmd, skyHwPipe);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
@@ -42013,12 +42160,12 @@ void destroyHostWindow(Renderer* R);
 
             // Bind a sky pipeline FIRST (establishes the shared default.rootsig the descriptor
             // binds need); the loop switches between the alpha-over / additive PSOs per draw.
-            cmdBindPipeline(g_live.pCmd, g_live.pSkyPipeline);
+            cmdBindPipeline(g_live.pCmd, skyOverPipe);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetSky);
-            Pipeline* curSkyPipe = g_live.pSkyPipeline;
+            Pipeline* curSkyPipe = skyOverPipe;
 
             // [sk-diag host] which sky items get skipped and why — the client packs N but the
             // host draws fewer from frame 1. Throttled dump. Remove after root-cause.
@@ -42098,7 +42245,7 @@ void destroyHostWindow(Renderer* R);
                 // the additive variant (deferred glare/clouds). Unhandled pairs fall back to
                 // alpha-over and log once (surfaces e.g. an unexpected moon-shadow blend). The
                 // skyOrder sort groups like blends, so rebinds are rare.
-                Pipeline* want = g_live.pSkyPipeline;
+                Pipeline* want = skyOverPipe;
                 if (cls == IPC::kSkyClassStars) {
                     // ⚠ THE STARS ARE FORCED ADDITIVE, AND IT IS THE OTHER HALF OF "EXPOSE UP".
                     // MW's daylight star fade is a texture-stage constant alpha (OpenMW reproduces
@@ -42110,9 +42257,9 @@ void destroyHostWindow(Renderer* R);
                     // and revealed by a black one, which is the behaviour that was asked for.
                     // The additive PSO's alpha is a coverage UNION, not a sum (skyBlendAdd), so the
                     // present-seam composite is unaffected.
-                    want = g_live.pSkyPipelineAdd;
+                    want = skyAddPipe;
                 } else if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
-                    want = g_live.pSkyPipelineAdd;
+                    want = skyAddPipe;
                 } else if (!(it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_INVSRCALPHA)) {
                     static bool warnedSkyBlend = false;
                     if (!warnedSkyBlend) {
@@ -42185,7 +42332,23 @@ void destroyHostWindow(Renderer* R);
         // Skipping this (feature off / resource missing) leaves the texture reading whatever it last
         // held; the shader gates on its ALPHA, and a never-written copy is zero-alpha, which is the
         // flat-fog fallback. So the failure mode here is the old image, not a wrong one.
-        if (g_live.pSkyColor && g_fogSkyStrength > 0.0f) {
+        if (g_skyDeferredFrame) {
+            // The sky is in pSkyColorRT already: hand it to the readers, re-bind the MSAA target
+            // (cleared at the top of the pass, untouched since) with the prepass depth.
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            RenderTargetBarrier srb = {};
+            srb.pRenderTarget = g_live.pSkyColorRT;
+            srb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            srb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
+            BindRenderTargetsDesc rebind = {};
+            rebind.mRenderTargetCount = 1;
+            rebind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            rebind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &rebind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        } else if (g_live.pSkyColor && g_fogSkyStrength > 0.0f) {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             gpuPhaseBegin(kGpuPhaseSkySnap);
             snapshotColorTarget(colorTarget, g_live.pSkyColor, g_live.sampleCount > 1);
@@ -42598,6 +42761,22 @@ void destroyHostWindow(Renderer* R);
         dlLiveRecord();
 
         gpuPhaseEnd(kGpuPhaseColorDL);
+
+        // DEFERRED SKY composite (g_skyDeferred): every opaque surface has written its depth, so
+        // z = 0 GEQUAL leaves exactly the samples nothing drew on. Before the water's refraction copy
+        // and every blended pass, which must see the sky behind them as before.
+        if (g_skyDeferredFrame) {
+            gpuPhaseBegin(kGpuPhaseSkySnap);
+            cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Sky composite (deferred)");
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyCompositePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetSky);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdEndDebugMarker(g_live.pCmd);
+            gpuPhaseEnd(kGpuPhaseSkySnap);
+        }
 
         // --- Debug light-origin boxes + shadow range spheres (colorTarget + pDepth still bound) ----
         // Both share the depth-OFF LINE_LIST pipeline + VB (boxes fill the head, spheres append).
