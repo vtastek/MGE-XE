@@ -16190,10 +16190,11 @@ namespace {
                 g_live.vrsReady = g_live.pVrsSet != nullptr;
                 g_live.vrsInRateState = false;
             }
-            std::printf("[forge] VRS %s (tier %d, tile %u, rate image %ux%u)\n",
-                        g_live.vrsReady ? "ready" : (tier2 ? "DISABLED (create failed)" : "unsupported"),
-                        (int)o6.VariableShadingRateTier, (unsigned)o6.ShadingRateImageTileSize,
-                        g_live.vrsW, g_live.vrsH);
+            // logline, not printf: host stdout is not captured under Wine (the Linux test box).
+            LOG::logline(">> [forge] VRS %s (tier %d, tile %u, rate image %ux%u)",
+                         g_live.vrsReady ? "ready" : (tier2 ? "DISABLED (create failed)" : "unsupported"),
+                         (int)o6.VariableShadingRateTier, (unsigned)o6.ShadingRateImageTileSize,
+                         g_live.vrsW, g_live.vrsH);
         }
 
         // --- FP1a: first-person pass resources ------------------------------------------
