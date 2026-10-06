@@ -17484,10 +17484,15 @@ namespace {
     // layer of every distant static is shaded (late-Z). OFF = the shader that shipped, the A/B.
     // Like grassPrepass this also puts statics into the depth every pre-colour reader sees (GTAO,
     // the shadow mask, the VRS rate image): the two arms are not the same image with those on.
-    bool  g_staticsPrepass = true;
+    // ⚠ OFF by default (2026-10-06, measured both boxes): Windows docks stdep 0.90 ms bought dl 2.08 -> 1.06,
+    // net ~-0.1 and frame p50 flat; Linux flat. The discard shader still gets the early depth TEST (only
+    // its write is late), and terrain + the near set already occlude; statics barely overdraw each other.
+    // The HDR scene also moved on distant foliage (8-bit output identical). Kept as a knob.
+    bool  g_staticsPrepass = false;
     bool  g_staticsPrepassRecorded = false;   // set by staticsRecordDepth when it issued the draw
     // Which VRS binds a frame actually issued (Linux 1660S: VRS passes flapped 2 -> 1 between identical
-    // runs, +0.5 ms GPU). Bits: 1 rate image built, 2 terrain, 4 statics, 8 water. Cur is filled
+    // runs, +0.5 ms GPU). Bits: 1 rate image built, 2 terrain, 4 statics, 8 water; why water was not:
+    // 16 the water pass ran, 32 it was flagged underwater, 64 a water debug view. Cur is filled
     // during record, Last is what the split prints (the previous recorded frame).
     uint32_t g_vrsMaskCur = 0, g_vrsMaskLast = 0;
     // DENSITY, and it is a PREFIX, not a per-instance test. g_grassInst is hash-shuffled once at
@@ -33507,6 +33512,7 @@ void destroyHostWindow(Renderer* R);
             // VRS (g_vrsWater): far water tiles composite once per 2x2. Not while submerged — the
             // rate image is built from the seabed side of the depth and means nothing from below.
             const bool vrsW = g_vrsWater && g_live.vrsBuilt && !underwater && !waterDebugBitsSet();
+            g_vrsMaskCur |= 16u | (underwater ? 32u : 0u) | (waterDebugBitsSet() ? 64u : 0u);
             if (vrsW) { vrsBind(true); g_vrsMaskCur |= 8u; }
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const WaterLodLevelHost& lvl = g_waterLevels[k];
@@ -36494,7 +36500,7 @@ void destroyHostWindow(Renderer* R);
             // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
             // prepass paid for itself is `grassdep + grass` now against `grass` alone at
             // grassPrepass=0.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s stdep=%.2f %s vrs=%c%c%c%c) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s stdep=%.2f %s vrs=%c%c%c%c[w:%c%c%c]) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
                          " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
                          g_lastGpuPhaseMs[kGpuPhaseSkySnap],
@@ -36517,6 +36523,9 @@ void destroyHostWindow(Renderer* R);
                          // vrs=BTSW: rate image Built, Terrain / Statics / Water bound ('-' = not this frame)
                          (g_vrsMaskLast & 1u) ? 'B' : '-', (g_vrsMaskLast & 2u) ? 'T' : '-',
                          (g_vrsMaskLast & 4u) ? 'S' : '-', (g_vrsMaskLast & 8u) ? 'W' : '-',
+                         // [w:RUD]: the water pass Ran, was flagged Underwater, had a Debug view
+                         (g_vrsMaskLast & 16u) ? 'R' : '-', (g_vrsMaskLast & 32u) ? 'U' : '-',
+                         (g_vrsMaskLast & 64u) ? 'D' : '-',
                          g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
                          // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
