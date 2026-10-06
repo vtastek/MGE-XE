@@ -3952,14 +3952,21 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 
 
     fog = saturate(fog);
-#line 389 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+
+
+
+
+
+
+    if (fog >= 1.0f && wf.x == 0.0f && wf.y == 0.0f && !waterCameraSubmerged()) { return lit; }
+#line 396 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float fogAir = mwFogAirShare(fog, wf.y, length(worldPosRel));
-#line 415 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 422 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     if (waterCameraSubmerged()) { fogAir = 1.0f; }
-#line 449 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 456 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
     float skyBehind = max(s.a, saturate(upness *  38.0f ));
-#line 506 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 513 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float3 behind = waterFogComposite(lit, worldPosRel, wf);
 
 

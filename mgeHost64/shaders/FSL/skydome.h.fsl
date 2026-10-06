@@ -316,6 +316,13 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
     // edge in the near scene grew black NaN dots. Found 2026-08-01; the interpolators feeding this
     // are CENTROID now, and this line means the next one that is not cannot reach a pow().
     fog = saturate(fog);
+    // UNFOGGED, NOTHING IN THE WAY: an above-water fragment inside the fog start with no water on
+    // its ray. Everything below then reduces to `lit` — fogAir = 1, so the extinction ramp is
+    // pow(0, shape) = 0 (the host keeps shape > 0) and the final lerp takes all of `behind`, which
+    // waterFogComposite returns unchanged at wf = (0,0). Returning here skips the haze LUT, the
+    // water composite and the pow for every near pixel (Release 1: fog was the largest term in the
+    // terrain shader). Same value up to the final lerp's rounding.
+    if (fog >= 1.0f && wf.x == 0.0f && wf.y == 0.0f && !waterCameraSubmerged()) { return lit; }
     // ⚠ AND THE PLANE TEST THAT USED TO SIT HERE IS GONE — 2026-08-15. mwFogAir compared this
     // fragment's z against the drawn water mesh and stripped the whole air ramp below it. Every
     // spelling of that test drew a line along the shoreline, because every spelling had to decide,
