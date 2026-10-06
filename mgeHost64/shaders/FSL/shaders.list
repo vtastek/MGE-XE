@@ -618,6 +618,11 @@
 #include "hizreduce.comp.fsl"
 #end
 
+// VRS Tier 2 rate image from the prepass depth (vrsrate.srt.h): far tiles 2x2, near tiles 1x1.
+#comp vrsrate.comp
+#include "vrsrate.comp.fsl"
+#end
+
 // H1 MIN-PYRAMID over the sky-height field (tasks/forge-heightfield-occlusion.md). Same two-variant
 // shape as the Hi-Z above, over a DIFFERENT quantity: pSkyHeight is a MAX raster of world height,
 // and an occluder field has to be the LOWEST surface in each footprint or it blocks rays that pass

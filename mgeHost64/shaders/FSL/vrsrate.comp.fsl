@@ -1,0 +1,41 @@
+// mgeHost64 — VRS rate image build (see vrsrate.srt.h). One thread per shading-rate tile.
+//
+// The test is on the tile's NEAREST depth: coarse only when every tap is beyond the threshold, so
+// a tile that holds any near surface (a rock edge in front of distant ground) shades per pixel.
+// Reverse-Z: near = 1, far/sky = 0, so "nearest" is the MAX. A tile that is all sky (max 0) also
+// comes out coarse, which is harmless — the rate image is bound only around the terrain draw, and
+// terrain is not drawn where the sky is.
+
+#include "vrsrate.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const int2  t     = int2(DispatchThreadID.xy);
+    const float thr   = gVrsParams.p.x;
+    const int   tile  = max((int)gVrsParams.p.z, 1);
+    const int   taps  = clamp((int)gVrsParams.p.w, 1, 16);
+    const int2  dims  = int2(GetDimensions(gVrsDepth, NO_SAMPLER));
+    const int2  mx    = dims - int2(1, 1);
+    const int2  o     = t * tile;
+    const int   step  = max(tile / taps, 1);
+
+    float nearest = 0.0f;
+    for (int y = 0; y < taps; ++y)
+    {
+        for (int x = 0; x < taps; ++x)
+        {
+            // Centred in each sub-cell, and the last row/column pulled onto the tile's far edge so
+            // a near surface along the border is not missed.
+            int2 p = o + int2(x, y) * step + int2(step / 2, step / 2);
+            if (x == taps - 1) { p.x = o.x + tile - 1; }
+            if (y == taps - 1) { p.y = o.y + tile - 1; }
+            nearest = max(nearest, LoadTex2D(gVrsDepth, NO_SAMPLER, min(p, mx), 0).r);
+        }
+    }
+    const uint rate = (thr > 0.0f && nearest < thr) ? (uint)gVrsParams.p.y : 0u;
+    Write2D(gVrsRate, t, rate);
+    RETURN();
+}

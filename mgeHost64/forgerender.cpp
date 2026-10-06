@@ -356,6 +356,8 @@ static int forgeEcoQoSState()
 // Phase 3 prologue: Hi-Z pyramid build SRT (HizSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature. See [[project_forge_gpu_occlusion]] M1.
 #include "shaders/FSL/hizreduce.srt.h"
+// VRS Tier 2 rate image (VrsSrtData, Persistent): far terrain shaded at 2x2. See vrsrate.srt.h.
+#include "shaders/FSL/vrsrate.srt.h"
 // WT4d/P2: planar-reflection mip-pyramid build SRT (ReflectMipSrtData, Persistent frequency —
 // the same shape as HizSrtData's, which is fine: aoblur/sunblur already prove two different
 // headers can share a compute frequency, and the bind cache is keyed on the descriptor HANDLE).
@@ -3157,6 +3159,19 @@ namespace {
         Pipeline*      pHizPipelineFirst = nullptr;
         Pipeline*      pHizPipeline = nullptr;
         DescriptorSet* pHizSet = nullptr;          // HizSrtData Persistent, maxSets = hizMips (set i = mip i)
+        // VRS Tier 2 (vrsrate.srt.h): the per-frame shading-rate image + its build pass. vrsReady =
+        // the device reports Tier 2 and everything below was created. The image rests in
+        // D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE once built (vrsInRateState), which Forge's D3D12
+        // backend has no mapping for, so its transitions go through the raw command list.
+        Texture*       pVrsRate = nullptr;
+        Shader*        pVrsShader = nullptr;
+        Pipeline*      pVrsPipeline = nullptr;
+        DescriptorSet* pVrsSet = nullptr;
+        Buffer*        pVrsCbv = nullptr;
+        uint32_t       vrsTile = 0, vrsW = 0, vrsH = 0;
+        bool           vrsReady = false;
+        bool           vrsInRateState = false;
+        bool           vrsBuilt = false;           // built THIS frame (the bind is gated on it)
         // Own pool/cmd/fence — never blocks the main submit. Per frame slot, like the frame's own.
         CmdPool*       pHizCmdPool[kFrameSlots] = {};
         Cmd*           pHizCmd[kFrameSlots] = {};
@@ -16065,6 +16080,75 @@ namespace {
                         width, height, mips);
         }
 
+        // --- VRS Tier 2 rate image (vrsrate.srt.h). NON-FATAL: without Tier 2 or on any create
+        // failure vrsReady stays false and the terrain shades per pixel as before. ---
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {};
+            const bool tier2 = SUCCEEDED(R->mDx.pDevice->CheckFeatureSupport(
+                                   D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))
+                            && o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2
+                            && o6.ShadingRateImageTileSize > 0;
+            if (tier2) {
+                g_live.vrsTile = o6.ShadingRateImageTileSize;
+                g_live.vrsW = (width  + g_live.vrsTile - 1) / g_live.vrsTile;
+                g_live.vrsH = (height + g_live.vrsTile - 1) / g_live.vrsTile;
+                TextureDesc vd = {};
+                vd.mWidth = g_live.vrsW; vd.mHeight = g_live.vrsH; vd.mDepth = 1;
+                vd.mArraySize = 1; vd.mMipLevels = 1;
+                vd.mSampleCount = SAMPLE_COUNT_1;
+                vd.mFormat = TinyImageFormat_R8_UINT;
+                vd.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                vd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                vd.pName = "vrsRateImage";
+                TextureLoadDesc vld = {};
+                vld.ppTexture = &g_live.pVrsRate;
+                vld.pDesc = &vd;
+                addResource(&vld, nullptr);
+
+                BufferLoadDesc vb = {};
+                vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                vb.mDesc.mSize = 256;
+                vb.mDesc.pName = "vrsParamsCbv";
+                vb.ppBuffer = &g_live.pVrsCbv;
+                addFrameBuf(&vb);
+                waitForAllResourceLoads();
+
+                ShaderLoadDesc vsd = {};
+                vsd.mComp.pFileName = "vrsrate.comp";
+                addShader(R, &vsd, &g_live.pVrsShader);
+                if (g_live.pVrsShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pVrsShader;
+                    addPipeline(R, &pd, &g_live.pVrsPipeline);
+                }
+                if (g_live.pVrsRate && g_live.pVrsCbv && g_live.pVrsPipeline && g_live.pLinearDepth) {
+                    DescriptorSetDesc vset = SRT_SET_DESC(VrsSrtData, Persistent, 1, 0);
+                    addDescriptorSet(R, &vset, &g_live.pVrsSet);
+                }
+                if (g_live.pVrsSet) {
+                    DescriptorData d[3] = {};
+                    d[0].mIndex = SRT_RES_IDX(VrsSrtData, Persistent, gVrsParams);
+                    d[0].ppBuffers = &g_live.pVrsCbv;
+                    d[1].mIndex = SRT_RES_IDX(VrsSrtData, Persistent, gVrsDepth);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pLinearDepth;
+                    d[2].mIndex = SRT_RES_IDX(VrsSrtData, Persistent, gVrsRate);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pVrsRate;
+                    updateDescriptorSet(R, 0, g_live.pVrsSet, 3, d);
+                }
+                g_live.vrsReady = g_live.pVrsSet != nullptr;
+                g_live.vrsInRateState = false;
+            }
+            std::printf("[forge] VRS %s (tier %d, tile %u, rate image %ux%u)\n",
+                        g_live.vrsReady ? "ready" : (tier2 ? "DISABLED (create failed)" : "unsupported"),
+                        (int)o6.VariableShadingRateTier, (unsigned)o6.ShadingRateImageTileSize,
+                        g_live.vrsW, g_live.vrsH);
+        }
+
         // --- FP1a: first-person pass resources ------------------------------------------
         // Second PerFrame cbuffer (the reflection/shadow-face second-view pattern) + a
         // PerFrame set clone with NEUTRAL swaps — FP pixels must not sample the main
@@ -17778,6 +17862,11 @@ namespace {
     // Terrain colour: ship terrain.frag (lean) unless a debug view needs terrain_dbg.frag. 0 = always
     // the debug variant, i.e. the shader as it was before the split — the A/B (g_pTerrainShaderDbg).
     bool g_terrainLean = true;
+    // VRS Tier 2 on the terrain colour pass (a DX12-only lever — user, 2026-10-06: match G7's
+    // decisions, deviate where DX12 gives an advantage). Tiles whose NEAREST prepass depth is beyond
+    // g_vrsDist world units shade once per 2x2 pixels; MSAA coverage stays per sample. Off = 1x1.
+    bool  g_terrainVrs = true;
+    float g_vrsDist    = 6144.0f;
     // M2 A/B: OFF forces hizParams.w = 0 -> the GPU occlusion test passes everything through and
     // the draw is byte-identical to frustum-only (the pyramid still builds; PD1 explicit A/B).
     bool g_hizOcclusion  = true;
@@ -23260,6 +23349,7 @@ namespace {
             { "terrainTexBias",      &g_terrainTexBias      },
             { "terrainCut",          &g_terrainCut          },
             { "terrainLodScale",     &g_terrainLodScale     },
+            { "vrsDist",             &g_vrsDist             },
             // PARALLAX (tasks/forge-parallax.md). Here as well as on the panel because the two
             // questions this milestone has to answer are both MEASUREMENTS a minimized run has to
             // be able to take with nobody at a slider: what does each arm cost on terrain (the
@@ -23455,6 +23545,7 @@ namespace {
             { "reflGpuCull",         &g_reflGpuCull         },
             { "cullDrawCount",       &g_cullDrawCount       },
             { "terrainLean",         &g_terrainLean         },
+            { "terrainVrs",          &g_terrainVrs          },
             { "reflCullVerify",      &g_reflCullVerify      },
             // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
             { "reflHeightOcc",       &g_reflHeightOcc       },
@@ -33034,6 +33125,69 @@ void destroyHostWindow(Renderer* R);
         gpuPhaseEnd(kGpuPhaseWater);
     }
 
+    // ─── VRS Tier 2: the rate image's raw transitions and its bind (vrsrate.srt.h) ─────────────
+    // Forge's D3D12 backend has no mapping for SHADING_RATE_SOURCE, so the image's two states are
+    // switched on the native list. Forge never tracks resource state, so nothing goes stale.
+    void vrsRawTransition(bool toRateSource) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = g_live.pVrsRate->mDx.pResource;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = toRateSource ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                : D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        b.Transition.StateAfter  = toRateSource ? D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE
+                                                : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        g_live.pCmd->mDx.pCmdList->ResourceBarrier(1, &b);
+        g_live.vrsInRateState = toRateSource;
+    }
+
+    // Build this frame's rate image from pLinearDepth (raw reverse-Z device depth, camera-relative
+    // rzViewProj). Called at the end of the post-depth phase, once pLinearDepth is SHADER_RESOURCE.
+    void vrsBuildRateImage(const float* rzViewProj) {
+        g_live.vrsBuilt = false;
+        if (!g_terrainVrs || !g_live.vrsReady || !rzViewProj) { return; }
+        // Device depth at view distance D: rzViewProj is a D3DX row-vector matrix (clip = v*M), so
+        // clip.w = v . (M[3],M[7],M[11]) + M[15] and clip.z = v . (M[2],M[6],M[10]) + M[14]. A point
+        // ON the w-axis at w = D gives the depth any surface at view depth D has.
+        const float* M = rzViewProj;
+        const float nx = M[3], ny = M[7], nz = M[11];
+        const float n2 = nx * nx + ny * ny + nz * nz;
+        float thr = 0.0f;
+        if (n2 > 1e-12f && g_vrsDist > 0.0f) {
+            const float D = g_vrsDist, k = D / n2;
+            const float w = D + M[15];
+            const float z = (nx * M[2] + ny * M[6] + nz * M[10]) * k + M[14];
+            if (w > 1e-6f) { thr = std::clamp(z / w, 0.0f, 1.0f); }
+        }
+        float* p = (float*)fbw(g_live.pVrsCbv);
+        if (!p) { return; }
+        p[0] = thr;
+        p[1] = (float)D3D12_SHADING_RATE_2X2;
+        p[2] = (float)g_live.vrsTile;
+        p[3] = 4.0f;
+        if (g_live.vrsInRateState) { vrsRawTransition(false); }
+        cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "VRS RATE IMAGE");
+        cmdBindPipeline(g_live.pCmd, g_live.pVrsPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pVrsSet);
+        cmdDispatch(g_live.pCmd, (g_live.vrsW + 7u) / 8u, (g_live.vrsH + 7u) / 8u, 1);
+        cmdEndDebugMarker(g_live.pCmd);
+        vrsRawTransition(true);
+        g_live.vrsBuilt = true;
+    }
+
+    // Arm/disarm the rate image for the draws in between. OVERRIDE on the image combiner: the
+    // image alone decides (the per-draw rate is 1x1 and there is no per-primitive rate).
+    void vrsBind(bool on) {
+        ID3D12GraphicsCommandList5* cl5 = nullptr;
+        if (FAILED(g_live.pCmd->mDx.pCmdList->QueryInterface(IID_PPV_ARGS(&cl5))) || !cl5) { return; }
+        const D3D12_SHADING_RATE_COMBINER c[2] = {
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            on ? D3D12_SHADING_RATE_COMBINER_OVERRIDE : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
+        cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, c);
+        cl5->RSSetShadingRateImage(on ? g_live.pVrsRate->mDx.pResource : nullptr);
+        cl5->Release();
+    }
+
     // TIER 2: linearize + GTAO compute. Whole kGpuPhasePostDepth bracket, and the seven nested
     // brackets inside it (Linearize, AODown, AOSearch, AOBlur, AOUp, ShadowMask).
     //
@@ -33409,6 +33563,9 @@ void destroyHostWindow(Renderer* R);
             }
             gpuPhaseEnd(kGpuPhaseShadowMask);
         }
+
+        // VRS: the rate image reads this frame's pLinearDepth, which only exists when the block ran.
+        if (aoBlockRan) { vrsBuildRateImage(rzViewProj); } else { g_live.vrsBuilt = false; }
 
         gpuPhaseEnd(kGpuPhasePostDepth);
 
@@ -58007,7 +58164,11 @@ void destroyHostWindow(Renderer* R);
         // Host-owned terrain FIRST: it is the real surface, at true height with no z-sink. The old
         // DL bake below (when its A/B toggle is on) still sinks itself, so wherever the two overlap
         // the sunk mesh simply loses the depth test.
+        // VRS: far terrain shades per 2x2 (the rate image built at the end of post-depth).
+        const bool vrsOn = g_terrainVrs && g_live.vrsBuilt && !g_terrainWire;
+        if (vrsOn) { vrsBind(true); }
         terrainRecord(g_live.pCmd, g_terrainMain, g_live.pPerFrameSet, /*mirror*/false);
+        if (vrsOn) { vrsBind(false); }
 
         // Phase C: bind the baked DISTANT light set for BOTH distant land + statics frags (falls back
         // to the near set if the baked set failed to build). They loop these camera-relative lights.
@@ -62792,6 +62953,12 @@ void destroyHostWindow(Renderer* R);
         g_liveLastInst = g_liveLastSubsets = 0;
         g_liveLastSubsetsRefl = g_liveLastInstRefl = 0;
         // Phase 3 Hi-Z prologue (fence already waited at the top of shutdown).
+        if (g_live.pVrsSet)          { removeDescriptorSet(R, g_live.pVrsSet);   g_live.pVrsSet = nullptr; }
+        if (g_live.pVrsPipeline)     { removePipeline(R, g_live.pVrsPipeline);   g_live.pVrsPipeline = nullptr; }
+        if (g_live.pVrsShader)       { removeShader(R, g_live.pVrsShader);       g_live.pVrsShader = nullptr; }
+        if (g_live.pVrsCbv)          { removeFrameBuf(g_live.pVrsCbv);           g_live.pVrsCbv = nullptr; }
+        if (g_live.pVrsRate)         { removeResource(g_live.pVrsRate);          g_live.pVrsRate = nullptr; }
+        g_live.vrsReady = false; g_live.vrsBuilt = false; g_live.vrsInRateState = false;
         if (g_live.pHizSet)          { removeDescriptorSet(R, g_live.pHizSet); }
         if (g_live.pHizPipeline)     { removePipeline(R, g_live.pHizPipeline); }
         if (g_live.pHizPipelineFirst){ removePipeline(R, g_live.pHizPipelineFirst); }
