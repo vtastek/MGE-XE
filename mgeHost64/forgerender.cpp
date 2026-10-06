@@ -8386,7 +8386,9 @@ namespace {
     // per pass for us vs 0.02M for G7's whole view. At 1080p a base quad 3 cells out is under 4 px —
     // quad-overdraw territory at 4x MSAA. 0.5 halves every band: ~7-8 px per quad where each rung
     // starts. The displacement patches are unaffected (they take the base rung by their own path).
-    float    g_terrainLodScale   = 0.5f;
+    // ⚠ BACK TO 1.0 (user, playing, 2026-10-06): at 0.5 the terrain visibly pops ~5 cells out. Quality
+    // over triangle count here ("we can use more triangles for higher quality"); 0.5 stays an A/B.
+    float    g_terrainLodScale   = 1.0f;
     // The mip the height is read at, and it is not decoration. One lattice step is 128 world units
     // = ~256 texels of a 1024 map tiling once per 512, so mip 0 would sample the field at 1/256 of
     // its rate: aliasing that crawls as the camera moves. 8 is the band-limit that matches the
@@ -18095,7 +18097,10 @@ namespace {
     // 2.38M tris to its 0.89M. g_staticsLodError is the simplifier's error budget as a fraction of
     // the mesh extent and g_staticsLodRatio its target index fraction — both LOAD-time (a restart
     // applies them). k ~ 0.07 = a sphere ~50 px in radius at 1080p, where a 2% error is ~1 px.
-    bool     g_staticsLod      = true;
+    // ⚠ OFF by default (2026-10-06): visible pops in play (the 2% budget is of the mesh EXTENT, ~2 px at
+    // the switch, more on large pieces), and it bought nothing measurable: +0.15 ms Linux wilderness,
+    // flat village, -0.12 Windows docks. Kept as a knob.
+    bool     g_staticsLod      = false;
     float    g_staticsLodK     = 0.07f;
     float    g_staticsLodError = 0.02f;
     float    g_staticsLodRatio = 0.25f;
