@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 332 "FSL/shaders.list"
+#line 338 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 60 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -3916,19 +3916,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     bool destProbe = (waterFlags & 524288u) != 0u;
 
     bool flatProbe = (waterFlags & 1048576u) != 0u;
-
-
-
-
-
-    waterDbg = 0u; heightView = false; normalView = false; hdrView = false;
-    destProbe = false; flatProbe = false;
-
-
-
-
-
-
+#line 506 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     uint smearTaps = (waterFlags >> 6) & 63u;
 
 
@@ -4580,4 +4568,4 @@ rg - 1.0f;
 
 	return (float4(result, 1.0f - kDstBl));
 }
-#line 333 "FSL/shaders.list"
+#line 339 "FSL/shaders.list"

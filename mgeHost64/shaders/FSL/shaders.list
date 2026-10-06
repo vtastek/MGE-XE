@@ -332,6 +332,12 @@
 #include "water.frag.fsl"
 #end
 
+// ...and its DEBUG variant (the waterFlagsWord view bits). Bound only while one is set.
+#frag water_dbg.frag
+#define WATER_DEBUG_VIEWS
+#include "water.frag.fsl"
+#end
+
 // CUSTOM MSAA RESOLVE (tasks/forge-postprocess.md step 4): filtered Catmull-Rom reconstruction with
 // inverse-luminance firefly weighting, replacing cl->ResolveSubresource. It has to exist before HDR
 // can, because a hardware resolve cannot format-convert — fp16 MSAA -> BGRA8 shared RT is not a

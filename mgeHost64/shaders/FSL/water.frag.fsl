@@ -490,6 +490,14 @@ float4 PS_MAIN( VSOutput In )
     bool   destProbe     = (waterFlags & 524288u) != 0u;
     // W22f bit 20 — show the refrFlat tap itself, opaque. Its pair; see the use beside destProbe.
     bool   flatProbe     = (waterFlags & 1048576u) != 0u;
+#ifndef WATER_DEBUG_VIEWS
+    // ⚠ THE SHIPPED VARIANT (shaders.list: water.frag) carries none of the debug VIEWS — the host binds
+    // water_dbg.frag (WATER_DEBUG_VIEWS) whenever one of their bits is set (waterDebugBitsSet). As
+    // constants every view's early RETURN and everything only it reads compiles out, the move that
+    // took 0.4-0.6 ms off terrain.frag (Release 1). Measurement bits (noReflect etc.) stay live.
+    waterDbg = 0u; heightView = false; normalView = false; hdrView = false;
+    destProbe = false; flatProbe = false;
+#endif
     // W4b bits 6-11: reflection smear tap BUDGET (max anisotropy), 0/1 = OFF (a single isotropic
     // fetch at the minor-axis LOD, i.e. the shipped W4 look). Six bits, not four: the requirement is
     // 1/cosI and grazing water — which is most water — needs tens, so a 15 cap WAS the binding

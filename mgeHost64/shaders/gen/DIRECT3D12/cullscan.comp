@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 720 "FSL/shaders.list"
+#line 726 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
@@ -1186,4 +1186,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         gArgs[subsetCount * 5u] = draws;
     return;
 }
-#line 721 "FSL/shaders.list"
+#line 727 "FSL/shaders.list"

@@ -3686,6 +3686,10 @@ namespace {
         Shader*        pWaterShader = nullptr;
         Pipeline*      pWaterPipeline = nullptr;           // depth GEQUAL, NO write, cull NONE, premultiplied over
         Pipeline*      pWaterPipelineZ = nullptr;          // ...and the opaque-era variant that writes it (g_waterZWrite)
+        // water_dbg.frag (WATER_DEBUG_VIEWS): the same pipeline over the debug-view variant, bound only
+        // while waterDebugBitsSet(). Optional — without it the views simply show the normal water.
+        Shader*        pWaterShaderDbg = nullptr;
+        Pipeline*      pWaterPipelineDbg = nullptr;
         Buffer*        pWaterWorldsBuf = nullptr;          // gBatch: worlds[0..5]=LOD levels, [6]=params, [7]=invVP
         DescriptorSet* pPerBatchSetWater = nullptr;        // gBatch bound to pWaterWorldsBuf, 1 instance
         Buffer*        pWaterInstanceBuf = nullptr;        // per-draw instance VB: DrawIndex=level (kMaxWaterLevels)
@@ -3786,6 +3790,7 @@ namespace {
         RenderTarget*  pSkyOracleC = nullptr;               // R32G32B32A32: (GTAO vis, AO armed, 0, frames)
         Shader*        pWaterFillShader = nullptr;          // shadowatlasview.vert + waterfill.frag
         Pipeline*      pWaterFillPipeline = nullptr;        // FILL-HOLES blend: INV_DEST_ALPHA / ONE
+        Pipeline*      pWaterFillPipelineZ = nullptr;       // ...depth-culled twin: only depth-0 pixels shade
         bool           sunShadowReady = false;
         Buffer*        pReflectSkyWorldsBuf = nullptr;     // reflect sky gBatch window (own; filled in the reflect pass)
         DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
@@ -5060,6 +5065,9 @@ namespace {
     // behind plausible fog: off, a pass that stopped drawing leaves a visible hole; on, it leaves
     // haze. Default on; this is the negative control.
     bool               g_waterFillAbove     = true;
+    // Depth-cull the backstop (pWaterFillPipelineZ): only depth-0 pixels launch its shader. Off = the
+    // full-screen pass as before. A/B only — the composite is the same where it can contribute.
+    bool               g_waterFillDepthCull = true;
     // Blend weight between MW's UnderwaterColor and the weather fog colour. Ini default 0.85 —
     // exposed because it is the one number that decides whether submerged distance reads as WATER
     // or as the sky leaking under the surface, and it is cheap to look at both.
@@ -9451,6 +9459,23 @@ namespace {
         if (!g_live.pWaterPipelineZ) {
             LOG::logline("!! [forge][water] addPipeline(water, Z-write A/B) FAILED — toggle disabled");
         }
+
+        // The debug-view variant (non-Z). Rebuilt with the rest on every reload; non-fatal.
+        wDepth.mDepthWrite = false;
+        if (g_live.pWaterPipelineDbg) { removePipeline(R, g_live.pWaterPipelineDbg); g_live.pWaterPipelineDbg = nullptr; }
+        if (g_live.pWaterShaderDbg)   { removeShader(R, g_live.pWaterShaderDbg);     g_live.pWaterShaderDbg = nullptr; }
+        ShaderLoadDesc wdDesc = {};
+        wdDesc.mVert.pFileName = "water.vert";
+        wdDesc.mFrag.pFileName = "water_dbg.frag";
+        addShader(R, &wdDesc, &g_live.pWaterShaderDbg);
+        if (g_live.pWaterShaderDbg) {
+            wg.pShaderProgram = g_live.pWaterShaderDbg;
+            addPipeline(R, &wPd, &g_live.pWaterPipelineDbg);
+            wg.pShaderProgram = g_live.pWaterShader;
+        }
+        if (!g_live.pWaterPipelineDbg) {
+            LOG::logline("!! [forge][water] debug variant (water_dbg.frag) FAILED — water debug views off");
+        }
         return true;
     }
 
@@ -12390,6 +12415,20 @@ namespace {
                 sag.pShaderProgram = g_live.pWaterFillShader;
                 sag.pBlendState = &wfBlend;
                 addPipeline(R, &savPd, &g_live.pWaterFillPipeline);
+                // ...and its DEPTH-CULLED twin (g_waterFillDepthCull). The fill can only change a
+                // pixel whose coverage is still zero, and such a pixel holds the cleared far depth
+                // (0, reverse-Z): nothing drew there. With the scene depth bound and the triangle
+                // at z = 0, GEQUAL passes exactly the depth-0 pixels (holes, sky, water — the
+                // surfaces that draw without depth) and early-Z rejects every geometry-covered pixel
+                // before the shader launches. Above water that was a full-screen 4x pass for
+                // nothing on most of the screen (~0.19 ms bare on the 1660S).
+                DepthStateDesc wfDepth = {};
+                wfDepth.mDepthTest = true; wfDepth.mDepthWrite = false; wfDepth.mDepthFunc = CMP_GEQUAL;
+                sag.pDepthState = &wfDepth;
+                sag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                addPipeline(R, &savPd, &g_live.pWaterFillPipelineZ);
+                sag.pDepthState = &savDepth;
+                sag.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
                 sag.pBlendState = nullptr;
                 if (!g_live.pWaterFillPipeline) {
                     std::printf("[forge] addPipeline(waterfill) FAILED\n");
@@ -22255,6 +22294,12 @@ namespace {
         // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 2097151.
         return (float)f;
     }
+    // Is any of the water debug VIEWS on? Those are the bits water.frag (the shipped variant) compiles
+    // out — bits 0-1, 5, 12, 17, 19, 20 — so the bind sites switch to water_dbg.frag for them.
+    inline bool waterDebugBitsSet() {
+        const uint32_t f = (uint32_t)waterFlagsWord();
+        return (f & (3u | 32u | 4096u | 131072u | 524288u | 1048576u)) != 0u;
+    }
     inline float waterAlphaBase(float windFactor) {
         return g_waterRoughBase * (windFactor / kWaterWindRef);
     }
@@ -23659,6 +23704,7 @@ namespace {
             // now: reflect re-renders the world into pReflectColor every frame and was the second
             // largest exterior phase with no way for a minimized harness to switch it off.
             { "waterNoReflect",     &g_waterNoReflect     },
+            { "waterFillDepthCull", &g_waterFillDepthCull },
             { "drawWater",          &g_drawWater          },   // F7 / "Draw: water" — 0 reads the seabed bare
             { "waterFog",           &g_waterFog           },   // the unified water fog (view path + light model)
             { "svmSnell",           &g_svmSnell           },   // underwater Snell window in the direction maps
@@ -32871,13 +32917,15 @@ void destroyHostWindow(Renderer* R);
         // at infinity with the haze in front of it, not the other way round.
         if (g_waterFillHoles && g_live.pWaterFillPipeline) {
             cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.5f, 0.8f, "UNDERWATER BACKSTOP");
+            const bool wfZ = g_waterFillDepthCull && g_live.pWaterFillPipelineZ && g_live.pDepth;
             BindRenderTargetsDesc wfBind = {};
             wfBind.mRenderTargetCount = 1;
             wfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            if (wfZ) { wfBind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD }; }
             cmdBindRenderTargets(g_live.pCmd, &wfBind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            cmdBindPipeline(g_live.pCmd, g_live.pWaterFillPipeline);
+            cmdBindPipeline(g_live.pCmd, wfZ ? g_live.pWaterFillPipelineZ : g_live.pWaterFillPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdDraw(g_live.pCmd, 3, 0);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
@@ -33124,7 +33172,9 @@ void destroyHostWindow(Renderer* R);
             // no per-draw sort can place it). Until that exists, side with the medium that is closer to
             // opaque. Inside the window — straight up from below — this still hides what should show.
             const bool waterZWrite = g_waterZWrite || underwater;
-            cmdBindPipeline(g_live.pCmd, (waterZWrite && g_live.pWaterPipelineZ)
+            cmdBindPipeline(g_live.pCmd, (waterDebugBitsSet() && g_live.pWaterPipelineDbg)
+                                             ? g_live.pWaterPipelineDbg
+                                             : (waterZWrite && g_live.pWaterPipelineZ)
                                              ? g_live.pWaterPipelineZ : g_live.pWaterPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);    // gFrameData + gAO + 4 water SRVs
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
@@ -53261,7 +53311,8 @@ void destroyHostWindow(Renderer* R);
         cmdBindRenderTargets(cmd, &wbind);
         cmdSetViewport(cmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
         cmdSetScissor(cmd, 0, 0, g_live.width, g_live.height);
-        cmdBindPipeline(cmd, g_live.pWaterPipeline);
+        cmdBindPipeline(cmd, (waterDebugBitsSet() && g_live.pWaterPipelineDbg) ? g_live.pWaterPipelineDbg
+                                                                              : g_live.pWaterPipeline);
         cmdBindDescriptorSet(cmd, 0, g_live.pPerFrameSet);
         cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSet);
         cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
@@ -62853,6 +62904,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSunShadowViewShader)    { removeShader(R, g_live.pSunShadowViewShader); g_live.pSunShadowViewShader = nullptr; }
         if (g_live.pVolFogPipeline)         { removePipeline(R, g_live.pVolFogPipeline); g_live.pVolFogPipeline = nullptr; }
         if (g_live.pWaterFillPipeline)      { removePipeline(R, g_live.pWaterFillPipeline); g_live.pWaterFillPipeline = nullptr; }
+        if (g_live.pWaterFillPipelineZ)     { removePipeline(R, g_live.pWaterFillPipelineZ); g_live.pWaterFillPipelineZ = nullptr; }
         if (g_live.pVolFogShader)           { removeShader(R, g_live.pVolFogShader); g_live.pVolFogShader = nullptr; }
         if (g_live.pWaterFillShader)        { removeShader(R, g_live.pWaterFillShader); g_live.pWaterFillShader = nullptr; }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
@@ -62883,6 +62935,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pWaterSlopeVar)          { removeResource(g_live.pWaterSlopeVar); }
         if (g_live.pWaterPipeline)          { removePipeline(R, g_live.pWaterPipeline); }
         if (g_live.pWaterPipelineZ)         { removePipeline(R, g_live.pWaterPipelineZ); }
+        if (g_live.pWaterPipelineDbg)       { removePipeline(R, g_live.pWaterPipelineDbg); g_live.pWaterPipelineDbg = nullptr; }
+        if (g_live.pWaterShaderDbg)         { removeShader(R, g_live.pWaterShaderDbg);     g_live.pWaterShaderDbg = nullptr; }
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
         // Phase F glow-billboard teardown.
         if (g_live.pGlowPipeline)           { removePipeline(R, g_live.pGlowPipeline); }
