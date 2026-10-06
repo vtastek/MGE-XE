@@ -3176,6 +3176,7 @@ namespace {
         bool           vrsReady = false;
         bool           vrsInRateState = false;
         bool           vrsBuilt = false;           // built THIS frame (the bind is gated on it)
+        bool           shadowMaskPrimed = false;   // pShadowMask has left its UAV creation state
         // Own pool/cmd/fence — never blocks the main submit. Per frame slot, like the frame's own.
         CmdPool*       pHizCmdPool[kFrameSlots] = {};
         Cmd*           pHizCmd[kFrameSlots] = {};
@@ -23714,6 +23715,9 @@ namespace {
             // largest exterior phase with no way for a minimized harness to switch it off.
             { "waterNoReflect",     &g_waterNoReflect     },
             { "waterFillDepthCull", &g_waterFillDepthCull },
+            // Point-light shadows master (slot patch + face re-render). With it off no slot is
+            // active and the mask pass is skipped too. G7's bare arm has no shadows at all.
+            { "shadowEnable",       &g_shadowEnable       },
             { "drawWater",          &g_drawWater          },   // F7 / "Draw: water" — 0 reads the seabed bare
             { "waterFog",           &g_waterFog           },   // the unified water fog (view path + light model)
             { "svmSnell",           &g_svmSnell           },   // underwater Snell window in the direction maps
@@ -33637,7 +33641,14 @@ void destroyHostWindow(Renderer* R);
         // ZERO active slots: the comp then writes an all-lit mask, keeping the UAV/SRV ping-pong
         // and the colour frag's mode-10 read state-valid. Own nested timer (kGpuPhaseShadowMask):
         // per-pixel cost scales with ACTIVE slots (PCF loads, x2 for dynBits slots).
-        if (g_live.shadowReady && aoBlockRan) {
+        // ...EXCEPT once it has run, with no active slot and no mask view open: then nothing reads a
+        // slot nibble (the frags read the mask only for a light with a slot), the mask is already in
+        // SHADER_RESOURCE from its last run, and the full-screen dispatch is pure cost (0.19 ms bare
+        // village on the 1660S). The first run is what takes it out of its UAV creation state.
+        const bool maskNeeded = !g_live.shadowMaskPrimed || g_lastShadowActive > 0u || g_debugMode == 10u
+                             || g_shadowFaceDebug || g_shadowAtlasDebug;
+        if (g_live.shadowReady && aoBlockRan && maskNeeded) {
+            g_live.shadowMaskPrimed = true;
             gpuPhaseBegin(kGpuPhaseShadowMask);
             if (!g_live.firstFrame) {
                 TextureBarrier tb = {};
