@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 880 "FSL/shaders.list"
+#line 885 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
@@ -1140,4 +1140,4 @@ void PS_MAIN( PSInput In )
 
     return;
 }
-#line 881 "FSL/shaders.list"
+#line 886 "FSL/shaders.list"

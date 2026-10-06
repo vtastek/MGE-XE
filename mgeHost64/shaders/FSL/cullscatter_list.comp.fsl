@@ -1,0 +1,79 @@
+// mgeHost64 — Stage B (B3) GPU statics cull, PASS 3 of 3: SCATTER, SURVIVOR-LIST variant (knob
+// cullSurvivorList).
+//
+// Same outputs as cullscatter.comp (read its header). cullscatter.comp re-runs every test of the
+// COUNT pass — vis mask, ranges, near slab, frustum, Hi-Z, height field — over every instance in the
+// world to find the survivors again: ~400k instance reads and Hi-Z taps on the camera lane to place
+// ~9k rows. cull.comp now appends each survivor's index to gSurvivors (counter gCullCount[2]), so
+// this pass walks that list and does only the row work. The dispatch keeps the instance-count size;
+// threads past the survivor count exit after one load.
+//
+// ⚠ Everything the ROW needs that cullscatter.comp derives on the way (camera-relative r3, the near
+// slab, the glow stagger, the LOD offset) is recomputed here from the same inputs with the same
+// header functions — the LOD offset MUST match cull.comp's, or a subset's rows and its count part.
+
+#include "cull.srt.h"
+#include "heightocclusion.h.fsl"
+#include "cellown.h.fsl"
+
+#define kMaxInst 65536u
+
+// Hours of per-instance stagger for glow-window night timing (matches cullscatter.comp).
+#define kGlowVarianceHours 0.5f
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint t = DispatchThreadID.x;
+    const uint n = min(gCullCount[2], (uint)gCullParams.misc.x);
+    if (t >= n)
+        RETURN();
+
+    const uint i = gSurvivors[t];
+    CullInstance inst = gCullInst[i];
+
+    float dx = inst.posX - gCullParams.eye.x;
+    float dy = inst.posY - gCullParams.eye.y;
+    float cz = inst.posZ - gCullParams.eye.z;
+    float dNear2 = dx * dx + dy * dy + cz * cz;
+    float nearSlab = nearPathSlab(inst.wr3.x, inst.wr3.y, inst.visIndex);
+
+    float4 r0 = inst.wr0;
+    float4 r1 = inst.wr1;
+    float4 r2 = inst.wr2;
+    float4 r3 = inst.wr3;
+    r3.x -= gCullParams.eye.x;
+    r3.y -= gCullParams.eye.y;
+    r3.z -= gCullParams.eye.z;
+
+    float glowStagger = sin(inst.wr3.x * 1.35f + inst.wr3.y) * kGlowVarianceHours;
+
+    const uint lodOff = cullLodOffset(inst.effR, dNear2);   // MUST match cull.comp
+    for (uint k = 0u; k < inst.numSubsets; ++k)
+    {
+        uint sid = inst.firstSubset + k + lodOff;
+        uint slot;
+        AtomicAdd(gSubsetCursor[sid], 1u, slot);
+        uint row = gSubsetOffset[sid] + slot;
+        if (row >= kMaxInst)   // ring overflow guard (matches cullscan clamp)
+            continue;
+
+        StaticsSubset s = gStaticsSubsets[sid];
+        uint b = row * 20u;
+        gInstOut[b + 0u]  = asuint(r0.x); gInstOut[b + 1u]  = asuint(r0.y);
+        gInstOut[b + 2u]  = asuint(r0.z); gInstOut[b + 3u]  = asuint(r0.w);
+        gInstOut[b + 4u]  = asuint(r1.x); gInstOut[b + 5u]  = asuint(r1.y);
+        gInstOut[b + 6u]  = asuint(r1.z); gInstOut[b + 7u]  = asuint(r1.w);
+        gInstOut[b + 8u]  = asuint(r2.x); gInstOut[b + 9u]  = asuint(r2.y);
+        gInstOut[b + 10u] = asuint(r2.z); gInstOut[b + 11u] = asuint(r2.w);
+        gInstOut[b + 12u] = asuint(r3.x); gInstOut[b + 13u] = asuint(r3.y);
+        gInstOut[b + 14u] = asuint(r3.z); gInstOut[b + 15u] = asuint(r3.w);
+        gInstOut[b + 16u] = asuint((float)s.texSlot);
+        gInstOut[b + 17u] = asuint((float)s.flags);
+        gInstOut[b + 18u] = asuint(glowStagger);
+        gInstOut[b + 19u] = asuint(nearSlab);   // 0 = no clip (DL owns it outright)
+    }
+    RETURN();
+}

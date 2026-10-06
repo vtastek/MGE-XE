@@ -3214,6 +3214,11 @@ namespace {
         Pipeline*      pCullScanPipeline = nullptr;
         Shader*        pCullScanWaveShader = nullptr;     // cullscan_wave.comp (g_cullScanWave); optional
         Pipeline*      pCullScanWavePipeline = nullptr;
+        Shader*        pCullScatterListShader = nullptr;  // cullscatter_list.comp (g_cullSurvivorList); optional
+        Pipeline*      pCullScatterListPipeline = nullptr;
+        // gSurvivors per cull lane (cull.srt.h), sized to the lane's instance count:
+        // kSurvCam / kSurvSun / kSurvRefl / kSurvSky (cullInstCount), kSurvGrass / kSurvGrassSun (grass).
+        Buffer*        pSurvivors[6] = {};
         Shader*        pCullScatterShader = nullptr;
         Pipeline*      pCullScatterPipeline = nullptr;
         uint32_t       cullSubsetCount = 0;         // g_staticsSubsets.size() at upload
@@ -4510,6 +4515,9 @@ namespace {
            kGpuPhaseCullScan,
            kGpuPhaseCullSun,
            kGpuPhaseCullGrass,
+           kGpuPhaseCullCount,     // inside CullCam: the count dispatch alone
+           kGpuPhaseCullScatter,   // ...and the scatter dispatch alone (cam - count - scan - scatter = barriers + copies)
+           kGpuPhaseSkySnap,       // inside Color, after ColorSky: the gSkyColor snapshot (MSAA resolve)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -17942,6 +17950,35 @@ namespace {
         return (g_cullScanWave && g_live.pCullScanWavePipeline) ? g_live.pCullScanWavePipeline
                                                                  : g_live.pCullScanPipeline;
     }
+    // Release 1: the scatter walks the COUNT pass's survivor list (cullscatter_list.comp) instead of
+    // re-testing every instance (cullscatter.comp). Same rows. OFF = the old scatter, the A/B.
+    bool g_cullSurvivorList = true;
+    enum { kSurvCam = 0, kSurvSun, kSurvRefl, kSurvSky, kSurvGrass, kSurvGrassSun, kSurvLanes };
+    Pipeline* cullScatterPipe() {
+        return (g_cullSurvivorList && g_live.pCullScatterListPipeline) ? g_live.pCullScatterListPipeline
+                                                                        : g_live.pCullScatterPipeline;
+    }
+    // Between a lane's COUNT and its scan/scatter: one UAV barrier over everything, which also covers
+    // the survivor list and its counter (gCullCount[2]) the scatter reads.
+    // A lane's gSurvivors: one uint per instance the lane can test, so the append never overflows.
+    void addSurvivorBuf(Buffer** out, uint32_t count, const char* name) {
+        BufferLoadDesc bd = {};
+        bd.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+        bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        bd.mDesc.mStructStride = sizeof(uint32_t);
+        bd.mDesc.mElementCount = std::max(count, 1u);
+        bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * bd.mDesc.mElementCount;
+        bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+        bd.mDesc.pName         = name;
+        bd.ppBuffer            = out;
+        addResource(&bd, nullptr);
+    }
+    void cullUavAll() {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = nullptr;
+        g_live.pCmd->mDx.pCmdList->ResourceBarrier(1, &b);
+    }
     // Terrain colour: ship terrain.frag (lean) unless a debug view needs terrain_dbg.frag. 0 = always
     // the debug variant, i.e. the shader as it was before the split — the A/B (g_pTerrainShaderDbg).
     bool g_terrainLean = true;
@@ -23666,6 +23703,7 @@ namespace {
             { "reflGpuCull",         &g_reflGpuCull         },
             { "cullDrawCount",       &g_cullDrawCount       },
             { "cullScanWave",        &g_cullScanWave        },
+            { "cullSurvivorList",    &g_cullSurvivorList    },
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
             { "vrsStatics",          &g_vrsStatics          },
@@ -32459,6 +32497,8 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseFbCopyA, "fb copy A" }, { kGpuPhaseFbCopyB, "fb copy B" },
             { kGpuPhaseCullCam, "cull cam" }, { kGpuPhaseCullScan, "cull scan" },
             { kGpuPhaseCullSun, "cull sun" }, { kGpuPhaseCullGrass, "cull grass" },
+            { kGpuPhaseCullCount, "cull count" }, { kGpuPhaseCullScatter, "cull scatter" },
+            { kGpuPhaseSkySnap, "sky snapshot" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -36283,9 +36323,10 @@ void destroyHostWindow(Renderer* R);
             // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
             // prepass paid for itself is `grassdep + grass` now against `grass` alone at
             // grassPrepass=0.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
                          " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
+                         g_lastGpuPhaseMs[kGpuPhaseSkySnap],
                          g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
                          g_live.froxelNearActive ? "on" : "off", g_live.froxelNearLightCount,
                          g_lastGpuPhaseMs[kGpuPhaseColorNear],
@@ -36348,7 +36389,7 @@ void destroyHostWindow(Renderer* R);
                 const double resid   = frameMs - bracketed;
                 LOG::logline(">> [forge-hb] gpu residual: frame=%.2f bracketed=%.2f UNBRACKETED=%.2f (%.0f%%)"
                              " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f skyvis=%.2f(screen=%.2f) ripsim=%.2f"
-                             " | cull: cam=%.2f(scan=%.2f) sun=%.2f grass=%.2f"
+                             " | cull: cam=%.2f(count=%.2f scan=%.2f scatter=%.2f inst=%u) sun=%.2f grass=%.2f"
                              " | measured but never printed: fp=%.2f(objvelFP=%.2f) objvel=%.2f",
                              frameMs, bracketed, resid,
                              (frameMs > 0.01) ? (100.0 * resid / frameMs) : 0.0,
@@ -36359,7 +36400,10 @@ void destroyHostWindow(Renderer* R);
                              g_lastGpuPhaseMs[kGpuPhaseSkyVisScreen],
                              g_lastGpuPhaseMs[kGpuPhaseRippleSim],
                              g_lastGpuPhaseMs[kGpuPhaseCullCam],
+                             g_lastGpuPhaseMs[kGpuPhaseCullCount],
                              g_lastGpuPhaseMs[kGpuPhaseCullScan],
+                             g_lastGpuPhaseMs[kGpuPhaseCullScatter],
+                             (unsigned)g_live.cullInstCount,
                              g_lastGpuPhaseMs[kGpuPhaseCullSun],
                              g_lastGpuPhaseMs[kGpuPhaseCullGrass],
                              g_lastGpuPhaseMs[kGpuPhaseColorFP],
@@ -40551,7 +40595,7 @@ void destroyHostWindow(Renderer* R);
             // reset gCullCount[0..1] (frustum parity + hiz-occluded): UAV -> COPY_DEST, zeros, -> UAV
             bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
             cl->CopyBufferRegion(g_live.pCullCountBuf->mDx.pResource, 0,
-                                 g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+                                 g_live.pCullCountZero->mDx.pResource, 0, 3 * sizeof(uint32_t));
             bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
 
             if (doGpuDraw) {
@@ -40573,11 +40617,14 @@ void destroyHostWindow(Renderer* R);
             cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.9f, 0.2f, "CULL count");
             cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
+            gpuPhaseBegin(kGpuPhaseCullCount);
             cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+            gpuPhaseEnd(kGpuPhaseCullCount);
             cmdEndDebugMarker(g_live.pCmd);
 
             if (doGpuDraw) {
                 uavBarrier(g_live.pSubsetCount);
+                cullUavAll();
                 // PREFIX pass (single thread): gSubsetCount -> gSubsetOffset + gpuArgs; reset gSubsetCursor.
                 cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.9f, 0.9f, "CULL prefix-sum");
                 gpuPhaseBegin(kGpuPhaseCullScan);
@@ -40591,9 +40638,11 @@ void destroyHostWindow(Renderer* R);
                 uavBarrier(g_live.pGpuArgs);
                 // SCATTER pass: survivors -> gInstOut rows.
                 cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.5f, 0.9f, "CULL scatter");
-                cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+                cmdBindPipeline(g_live.pCmd, cullScatterPipe());
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
+                gpuPhaseBegin(kGpuPhaseCullScatter);
                 cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+                gpuPhaseEnd(kGpuPhaseCullScatter);
                 cmdEndDebugMarker(g_live.pCmd);
                 uavBarrier(g_live.pGpuInstOut);
                 // Hand args/instOut to the draw (INDIRECT_ARGUMENT / VERTEX). Restored next cull frame.
@@ -42137,7 +42186,9 @@ void destroyHostWindow(Renderer* R);
         // flat-fog fallback. So the failure mode here is the old image, not a wrong one.
         if (g_live.pSkyColor && g_fogSkyStrength > 0.0f) {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
+            gpuPhaseBegin(kGpuPhaseSkySnap);
             snapshotColorTarget(colorTarget, g_live.pSkyColor, g_live.sampleCount > 1);
+            gpuPhaseEnd(kGpuPhaseSkySnap);
             BindRenderTargetsDesc rebind = {};
             rebind.mRenderTargetCount = 1;
             rebind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };   // keep the sky we just drew
@@ -56814,6 +56865,10 @@ void destroyHostWindow(Renderer* R);
             addResource(&bd, nullptr);
         };
         addSubsetUav(&g_live.pSubsetCount,  "subsetCount");
+        addSurvivorBuf(&g_live.pSurvivors[kSurvCam],  g_live.cullInstCount, "survivorsCam");
+        addSurvivorBuf(&g_live.pSurvivors[kSurvSun],  g_live.cullInstCount, "survivorsSun");
+        addSurvivorBuf(&g_live.pSurvivors[kSurvRefl], g_live.cullInstCount, "survivorsRefl");
+        addSurvivorBuf(&g_live.pSurvivors[kSurvSky],  g_live.cullInstCount, "survivorsSky");
         addSubsetUav(&g_live.pSubsetOffset, "subsetOffset");
         addSubsetUav(&g_live.pSubsetCursor, "subsetCursor");
 
@@ -56866,7 +56921,9 @@ void destroyHostWindow(Renderer* R);
         }
         g_live.gpuStaticsReady = g_live.pStaticsSubsetBuf && g_live.pSubsetCount && g_live.pSubsetOffset
                               && g_live.pSubsetCursor && g_live.pSubsetCountZero && g_live.pGpuArgs
-                              && g_live.pGpuInstOut;
+                              && g_live.pGpuInstOut && g_live.pSurvivors[kSurvCam]
+                              && g_live.pSurvivors[kSurvSun] && g_live.pSurvivors[kSurvRefl]
+                              && g_live.pSurvivors[kSurvSky];
         // cull.comp unconditionally writes gSubsetCount every frame — those UAVs MUST be bound, so the
         // whole cull is disabled if the B3 buffers failed (never run the count pass against an unbound UAV).
         if (!g_live.gpuStaticsReady) {
@@ -56895,12 +56952,13 @@ void destroyHostWindow(Renderer* R);
         }
         // Optional: without it every lane keeps the old scan.
         addCullPipeline("cullscan_wave.comp", &g_live.pCullScanWaveShader, &g_live.pCullScanWavePipeline);
+        addCullPipeline("cullscatter_list.comp", &g_live.pCullScatterListShader, &g_live.pCullScatterListPipeline);
 
         DescriptorSetDesc cset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
         addDescriptorSet(R, &cset, &g_live.pCullSet);
         if (!g_live.pCullSet) { std::printf("[forge][cull] addDescriptorSet FAILED\n"); return false; }
         {
-            DescriptorData d[12] = {};
+            DescriptorData d[14] = {};
             uint32_t n = 0;
             d[n].mIndex   = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
             d[n].ppBuffers = &g_live.pCullParamsCbv; ++n;
@@ -56937,6 +56995,8 @@ void destroyHostWindow(Renderer* R);
             d[n].mCount = 1;
             d[n].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
                                                            : &g_live.pSkyHeight->pTexture; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSurvivors);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pSurvivors[kSurvCam]; ++n;
             updateDescriptorSet(R, 0, g_live.pCullSet, n, d);
         }
 
@@ -56998,7 +57058,7 @@ void destroyHostWindow(Renderer* R);
                 DescriptorSetDesc sset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &sset, &g_live.pSunCullSet);
                 if (g_live.pSunCullSet) {
-                    DescriptorData sd[12] = {};
+                    DescriptorData sd[14] = {};
                     uint32_t sn = 0;
                     sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                     sd[sn].ppBuffers = &g_live.pSunCullParamsCbv; ++sn;
@@ -57031,6 +57091,8 @@ void destroyHostWindow(Renderer* R);
                     sd[sn].mCount = 1;
                     sd[sn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
                                                                    : &g_live.pSkyHeight->pTexture; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSurvivors);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSurvivors[kSurvSun]; ++sn;
                     updateDescriptorSet(R, 0, g_live.pSunCullSet, sn, sd);
                     g_live.sunCullReady = true;
                     std::printf("[forge][cull] SUN cull ready (A2): subsets=%u\n", subsetCount);
@@ -57114,7 +57176,7 @@ void destroyHostWindow(Renderer* R);
                 DescriptorSetDesc rset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &rset, &g_live.pReflCullSet);
                 if (g_live.pReflCullSet) {
-                    DescriptorData rd[12] = {};
+                    DescriptorData rd[14] = {};
                     uint32_t rn = 0;
                     rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                     rd[rn].ppBuffers = &g_live.pReflCullParamsCbv; ++rn;
@@ -57147,6 +57209,8 @@ void destroyHostWindow(Renderer* R);
                     rd[rn].mCount = 1;
                     rd[rn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
                                                                    : &g_live.pSkyHeight->pTexture; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSurvivors);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pSurvivors[kSurvRefl]; ++rn;
                     updateDescriptorSet(R, 0, g_live.pReflCullSet, rn, rd);
                     g_live.reflCullReady = true;
                     std::printf("[forge][cull] REFLECT cull ready (H2a): subsets=%u\n", subsetCount);
@@ -57229,7 +57293,7 @@ void destroyHostWindow(Renderer* R);
                 DescriptorSetDesc kset = SRT_SET_DESC(CullSrtData, PerBatch, 1 + 32, 0);   // 0 = height map, 1+k = map k
                 addDescriptorSet(R, &kset, &g_live.pSkyCullSet);
                 if (g_live.pSkyCullSet) {
-                    DescriptorData kd[12] = {};
+                    DescriptorData kd[14] = {};
                     uint32_t kn = 0;
                     kd[kn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                     kd[kn].ppBuffers = &g_live.pSkyCullParamsCbv; ++kn;
@@ -57262,6 +57326,8 @@ void destroyHostWindow(Renderer* R);
                     kd[kn].mCount = 1;
                     kd[kn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
                                                                    : &g_live.pSkyHeight->pTexture; ++kn;
+                    kd[kn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSurvivors);
+                    kd[kn].mCount = 1; kd[kn].ppBuffers = &g_live.pSurvivors[kSurvSky]; ++kn;
                     for (uint32_t si = 0; si <= 32; ++si) {   // only gCullParams (kd[0]) differs
                         Buffer* cb = (si > 0 && g_live.pSvmCullCbv[si - 1]) ? g_live.pSvmCullCbv[si - 1]
                                                                                  : g_live.pSkyCullParamsCbv;
@@ -57303,6 +57369,8 @@ void destroyHostWindow(Renderer* R);
             gib.pData               = nullptr;
             gib.ppBuffer            = &g_live.pGrassCullInst;
             addFrameBuf(&gib);   // rewritten on every window rebuild, under a frame in flight
+            addSurvivorBuf(&g_live.pSurvivors[kSurvGrass],    kGrassMaxInst, "survivorsGrass");
+            addSurvivorBuf(&g_live.pSurvivors[kSurvGrassSun], kGrassMaxInst, "survivorsGrassSun");
 
             BufferLoadDesc gsb = {};
             gsb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
@@ -57429,11 +57497,11 @@ void destroyHostWindow(Renderer* R);
             // buffers here, which is the only structural difference from the sun/sky clones.
             auto bindGrassSet = [&](DescriptorSet** set, Buffer** params, Buffer** count,
                                     Buffer** sCount, Buffer** sOff, Buffer** sCur,
-                                    Buffer** args, Buffer** instOut) -> bool {
+                                    Buffer** args, Buffer** instOut, Buffer** surv) -> bool {
                 DescriptorSetDesc dsd = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &dsd, set);
                 if (!*set) { return false; }
-                DescriptorData d[12] = {};
+                DescriptorData d[14] = {};
                 uint32_t n = 0;
                 d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                 d[n].ppBuffers = params; ++n;
@@ -57467,18 +57535,21 @@ void destroyHostWindow(Renderer* R);
                 d[n].mCount = 1;
                 d[n].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
                                                                : &g_live.pSkyHeight->pTexture; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSurvivors);
+                d[n].mCount = 1; d[n].ppBuffers = surv; ++n;
                 updateDescriptorSet(R, 0, *set, n, d);
                 return true;
             };
 
             if (g_live.pGrassCullInst && g_live.pGrassSubsetBuf && g_live.pGrassCullParamsCbv
+                && g_live.pSurvivors[kSurvGrass] && g_live.pSurvivors[kSurvGrassSun]
                 && g_live.pGrassCullCount && g_live.pGrassSubsetCount && g_live.pGrassSubsetOffset
                 && g_live.pGrassSubsetCursor && g_live.pGrassArgs && g_live.pGrassInstOut
                 && g_live.pGrassSubsetCountZero) {
                 g_live.grassCullReady = bindGrassSet(&g_live.pGrassCullSet,
                     &g_live.pGrassCullParamsCbv, &g_live.pGrassCullCount,
                     &g_live.pGrassSubsetCount, &g_live.pGrassSubsetOffset, &g_live.pGrassSubsetCursor,
-                    &g_live.pGrassArgs, &g_live.pGrassInstOut);
+                    &g_live.pGrassArgs, &g_live.pGrassInstOut, &g_live.pSurvivors[kSurvGrass]);
             }
             if (g_live.grassCullReady && g_live.pGrassSunCullParamsCbv && g_live.pGrassSunCullCount
                 && g_live.pGrassSunSubsetCount && g_live.pGrassSunSubsetOffset
@@ -57486,7 +57557,8 @@ void destroyHostWindow(Renderer* R);
                 g_live.grassSunCullReady = bindGrassSet(&g_live.pGrassSunCullSet,
                     &g_live.pGrassSunCullParamsCbv, &g_live.pGrassSunCullCount,
                     &g_live.pGrassSunSubsetCount, &g_live.pGrassSunSubsetOffset,
-                    &g_live.pGrassSunSubsetCursor, &g_live.pGrassSunArgs, &g_live.pGrassSunInstOut);
+                    &g_live.pGrassSunSubsetCursor, &g_live.pGrassSunArgs, &g_live.pGrassSunInstOut,
+                    &g_live.pSurvivors[kSurvGrassSun]);
             }
             std::printf("[forge][cull] GRASS cull %s: %u instances over %u subsets"
                         " (ring %u rows = %.1f MB, caster %s)\n",
@@ -58689,7 +58761,7 @@ void destroyHostWindow(Renderer* R);
 
         // Reset sun count[0..1] + subsetCount from the SHARED zero-staging buffers.
         bufBarrier(g_live.pSunCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
-        cl->CopyBufferRegion(g_live.pSunCullCount->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+        cl->CopyBufferRegion(g_live.pSunCullCount->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0, 3 * sizeof(uint32_t));
         bufBarrier(g_live.pSunCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
         bufBarrier(g_live.pSunSubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(g_live.pSunSubsetCount->mDx.pResource, 0, g_live.pSubsetCountZero->mDx.pResource, 0,
@@ -58705,6 +58777,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        cullUavAll();
         uavBarrier(g_live.pSunSubsetCount);
         cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
@@ -58712,7 +58785,7 @@ void destroyHostWindow(Renderer* R);
         uavBarrier(g_live.pSunSubsetOffset);
         uavBarrier(g_live.pSunSubsetCursor);
         uavBarrier(g_live.pSunArgs);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScatterPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pSunInstOut);
@@ -58804,7 +58877,7 @@ void destroyHostWindow(Renderer* R);
         // Reset count[0..1] + subsetCount from the SHARED zero-staging buffers (the sun lane's own
         // comment applies verbatim; these two buffers belong to nobody in particular).
         bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
-        cl->CopyBufferRegion(g_live.pReflCullCount->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+        cl->CopyBufferRegion(g_live.pReflCullCount->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0, 3 * sizeof(uint32_t));
         bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
         bufBarrier(g_live.pReflSubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(g_live.pReflSubsetCount->mDx.pResource, 0, g_live.pSubsetCountZero->mDx.pResource, 0,
@@ -58820,6 +58893,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        cullUavAll();
         uavBarrier(g_live.pReflSubsetCount);
         cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
@@ -58827,7 +58901,7 @@ void destroyHostWindow(Renderer* R);
         uavBarrier(g_live.pReflSubsetOffset);
         uavBarrier(g_live.pReflSubsetCursor);
         uavBarrier(g_live.pReflArgs);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScatterPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pReflInstOut);
@@ -59179,7 +59253,7 @@ void destroyHostWindow(Renderer* R);
         // grass-sized one (the shared buffer describes 10,910 subsets, this table has 27).
         bufBarrier(countBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(countBuf->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0,
-                             2 * sizeof(uint32_t));
+                             3 * sizeof(uint32_t));
         bufBarrier(countBuf, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
         bufBarrier(subCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(subCount->mDx.pResource, 0, g_live.pGrassSubsetCountZero->mDx.pResource, 0,
@@ -59195,6 +59269,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, set);
         cmdDispatch(g_live.pCmd, (instCount + 63u) / 64u, 1, 1);
+        cullUavAll();
         uavBarrier(subCount);
         cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, set);
@@ -59202,7 +59277,7 @@ void destroyHostWindow(Renderer* R);
         uavBarrier(subOff);
         uavBarrier(subCur);
         uavBarrier(argsBuf);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScatterPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, set);
         cmdDispatch(g_live.pCmd, (instCount + 63u) / 64u, 1, 1);
         uavBarrier(instOut);
@@ -59426,7 +59501,7 @@ void destroyHostWindow(Renderer* R);
         // Reset the counters from the SHARED zero-staging buffers (same as the sun cull).
         bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(g_live.pSkyCullCount->mDx.pResource, 0,
-                             g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+                             g_live.pCullCountZero->mDx.pResource, 0, 3 * sizeof(uint32_t));
         bufBarrier(g_live.pSkyCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
         bufBarrier(g_live.pSkySubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(g_live.pSkySubsetCount->mDx.pResource, 0,
@@ -59442,6 +59517,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
         cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        cullUavAll();
         uavBarrier(g_live.pSkySubsetCount);
         cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
@@ -59449,7 +59525,7 @@ void destroyHostWindow(Renderer* R);
         uavBarrier(g_live.pSkySubsetOffset);
         uavBarrier(g_live.pSkySubsetCursor);
         uavBarrier(g_live.pSkyArgs);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScatterPipe());
         cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pSkyInstOut);
@@ -63186,6 +63262,9 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pCullScanPipeline)    { removePipeline(R, g_live.pCullScanPipeline);    g_live.pCullScanPipeline = nullptr; }
         if (g_live.pCullScanShader)      { removeShader(R, g_live.pCullScanShader);        g_live.pCullScanShader = nullptr; }
         if (g_live.pCullScanWavePipeline) { removePipeline(R, g_live.pCullScanWavePipeline); g_live.pCullScanWavePipeline = nullptr; }
+        if (g_live.pCullScatterListPipeline) { removePipeline(R, g_live.pCullScatterListPipeline); g_live.pCullScatterListPipeline = nullptr; }
+        if (g_live.pCullScatterListShader) { removeShader(R, g_live.pCullScatterListShader); g_live.pCullScatterListShader = nullptr; }
+        for (Buffer*& sb : g_live.pSurvivors) { if (sb) { removeResource(sb); sb = nullptr; } }
         if (g_live.pCullScanWaveShader)  { removeShader(R, g_live.pCullScanWaveShader);    g_live.pCullScanWaveShader = nullptr; }
         if (g_live.pCullScatterPipeline) { removePipeline(R, g_live.pCullScatterPipeline); g_live.pCullScatterPipeline = nullptr; }
         if (g_live.pCullScatterShader)   { removeShader(R, g_live.pCullScatterShader);     g_live.pCullScatterShader = nullptr; }

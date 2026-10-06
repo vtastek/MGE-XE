@@ -119,6 +119,19 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         RETURN();
     }
 
+    // Survivor list (cull.srt.h gSurvivors): one atomic per wave, not per thread.
+    {
+        const uint waveN = WaveActiveCountBits(true);
+        uint waveBase = 0u;
+        if (WaveIsFirstLane())
+        {
+            AtomicAdd(gCullCount[2], waveN, waveBase);
+        }
+        const uint idx = WaveReadLaneFirst(waveBase) + WavePrefixCountBits(true);
+        if (idx < (uint)gCullParams.misc.x)
+            gSurvivors[idx] = i;
+    }
+
     const uint lodOff = cullLodOffset(inst.effR, dNear2);   // MUST match cullscatter.comp
     for (uint k = 0u; k < inst.numSubsets; ++k)
     {

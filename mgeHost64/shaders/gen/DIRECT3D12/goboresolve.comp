@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 949 "FSL/shaders.list"
+#line 954 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/goboresolve.comp.fsl"
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/goboresolve.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/goboresolve.srt.h"
@@ -1097,4 +1097,4 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     Write3D(gGoboOut, int3((int)did.x, (int)did.y, (int)(dims.x + did.z)), 1.0f - sum * (1.0f / 16.0f));
     return;
 }
-#line 950 "FSL/shaders.list"
+#line 955 "FSL/shaders.list"

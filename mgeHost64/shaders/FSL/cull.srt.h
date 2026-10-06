@@ -51,5 +51,11 @@ BEGIN_SRT(CullSrtData)
         // whatever was last in those heap slots the moment someone armed it by accident.
         DECL_CBUFFER (PerBatch, CBUFFER(HeightOccParams), gHeightOccParams)
         DECL_TEXTURE (PerBatch, Tex2D(float),          gSkyHeightMin)  // H1's MIN-pyramid over pSkyHeight
+        // Release 1: the COUNT pass appends every survivor's instance index here (counter =
+        // gCullCount[2], reset with the other two), so cullscatter_list.comp writes rows for the
+        // survivors alone instead of re-testing every instance in the world (~400k on the camera
+        // lane for ~9k survivors). Sized to the lane's instance count: it cannot overflow. APPENDED
+        // LAST for gCullHiz's reason.
+        DECL_RWBUFFER(PerBatch, RWBuffer(uint),        gSurvivors)
     END_SRT_SET(PerBatch)
 END_SRT(CullSrtData)

@@ -756,6 +756,11 @@
 #include "cullscatter.comp.fsl"
 #end
 
+// SCATTER, survivor-list variant (knob cullSurvivorList): rows for the COUNT pass's survivors only.
+#comp cullscatter_list.comp
+#include "cullscatter_list.comp.fsl"
+#end
+
 // H0: the HEIGHT-FIELD OCCLUSION PROBE — a MEASUREMENT over the two views that have no occlusion
 // culling (the sun caster and the water mirror). One thread per resident static instance: re-run
 // that view's own cull rule, then ask gSunOcc (one compare) or march gSkyHeight (from the ray's

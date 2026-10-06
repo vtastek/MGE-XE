@@ -1087,6 +1087,12 @@ STRUCT(CullParams)
 #line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
         CBUFFER(HeightOccParams) gHeightOccParams :  register(b10,space2);
         Tex2D(float) gSkyHeightMin :  register(t11,space2);
+
+
+
+
+
+        RWBuffer(uint) gSurvivors :  register(u12,space2);
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizocclusion.h.fsl"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizocclusion.h.fsl"
