@@ -208,7 +208,16 @@ if [ -n "$CLIENTENV" ]; then
     ENVSET="${ENVSET}\$env:${p%%=*}='${p#*=}'; "
   done
 fi
+# MGE_NSYS_OUT=<windows path without extension>: launch under Nsight Systems instead (both processes,
+# dx12 + vulkan GPU workloads in submit batches). MGE_NSYS_DELAY / MGE_NSYS_DURATION in seconds; keep
+# delay + duration inside the run (samples x ~1.3 s after load) so the report finalises before the kill.
+if [ -n "${MGE_NSYS_OUT:-}" ]; then
+  NSYS='C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.5.1\target-windows-x64\nsys.exe'
+  echo "[harness] Nsight Systems -> ${MGE_NSYS_OUT}.nsys-rep (delay ${MGE_NSYS_DELAY:-60}s, ${MGE_NSYS_DURATION:-5}s)"
+  powershell.exe -Command "${ENVSET}Start-Process -FilePath '$NSYS' -WorkingDirectory '$WINDIR' -WindowStyle Minimized -ArgumentList 'profile','-t','dx12,vulkan,nvtx','--dx12-gpu-workload=batch','--vulkan-gpu-workload=batch','--delay=${MGE_NSYS_DELAY:-60}','--duration=${MGE_NSYS_DURATION:-5}','-f','true','-o','${MGE_NSYS_OUT}','${WINDIR}\\Morrowind.exe'" >/dev/null 2>&1
+else
 powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle Minimized" >/dev/null 2>&1
+fi
 
 # A watcher for Morrowind's NATIVE warning boxes (Win32 #32770), kept as cheap insurance.
 #

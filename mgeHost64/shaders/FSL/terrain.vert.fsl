@@ -157,6 +157,49 @@ float loadHeightWide(uint slot, int lx, int ly, uint spanX, uint spanY, int x, i
 // the mesh's: at rung 6 a rung-6 difference averages the gradient over 2048 world units and the
 // terrain shades flat at exactly the distance you are looking at most of it. Step 1 gives each
 // lattice point the normal MW's own per-vertex normal carries, for the same 4 loads.
+// ─── GEOMORPH (knob terrainMorph; gShadowParams.sunNoise.z = the ladder scale, 0 = off) ─────────────
+// A cell draws at ONE rung and flips to the next when its centre crosses kTerrainLodDist[r] *
+// terrainLodScale; without a morph that flip is a visible pop (user, in play: "can see pop 5 cells
+// away"). Here every vertex of rung k blends toward the rung k+1 SURFACE as it nears that distance, so
+// at the flip the two meshes are the same shape. The blend weight is a function of the VERTEX's own
+// distance and nothing else, so any two units that share a vertex (same rung, or one stitched onto the
+// other's lattice) compute the same height and no crack opens. It reaches 1 a cell before the switch
+// distance: a vertex is at most ~0.7 cells (plus relief) nearer than its cell's centre.
+// Normals come from the full-resolution field at every rung (terrainCornerNormal), so they never move.
+#define TERRAIN_LOD_D0 3.0f   // kTerrainLodDist[TERRAIN_BASE_RUNG] in forgerender.cpp; each rung doubles
+float terrainMorphW(float rung, float dCells)
+{
+    const float sc = gShadowParams.sunNoise.z;
+    if (!(sc > 0.0f) || rung < TERRAIN_BASE_RUNG || rung >= 9.0f) { return 0.0f; }
+    const float D = TERRAIN_LOD_D0 * exp2(rung - TERRAIN_BASE_RUNG) * sc;
+    const float E = D - 1.0f;
+    const float S = max(E - 0.25f * D, 0.0f);
+    if (E <= S) { return (dCells >= E) ? 1.0f : 0.0f; }
+    return saturate((dCells - S) / (E - S));
+}
+// The height rung `rung` DISPLAYS at integer lattice point (x, y) of a cell: exact on the coarser
+// rung's lattice, else morphed toward the coarser triangle surface there (b–c diagonal, u + v = 1, the
+// split every template uses). `origin` = the cell's camera-relative origin, for the distance.
+float terrainHeightOnRung(uint slot, float rung, float2 origin, int x, int y)
+{
+    const float h = loadHeight(slot, x, y);
+    if (!(gShadowParams.sunNoise.z > 0.0f) || rung < TERRAIN_BASE_RUNG || rung >= 9.0f) { return h; }
+    const int  st = (int)exp2(rung - TERRAIN_BASE_RUNG);
+    const bool ox = (x % (2 * st)) != 0;
+    const bool oy = (y % (2 * st)) != 0;
+    if (!ox && !oy) { return h; }
+    const float3 p = float3(origin.x + float(x) * TERRAIN_SPACING, origin.y + float(y) * TERRAIN_SPACING,
+                            h - gFrameData.lodEye.z);
+    const float  m = terrainMorphW(rung, length(p - gFrameData.eyePos.xyz)
+                                         * (1.0f / (TERRAIN_SPACING * float(TERRAIN_QUADS))));
+    if (m <= 0.0f) { return h; }
+    float t;
+    if (ox && oy)  { t = 0.5f * (loadHeight(slot, x + st, y - st) + loadHeight(slot, x - st, y + st)); }
+    else if (ox)   { t = 0.5f * (loadHeight(slot, x - st, y) + loadHeight(slot, x + st, y)); }
+    else           { t = 0.5f * (loadHeight(slot, x, y - st) + loadHeight(slot, x, y + st)); }
+    return lerp(h, t, m);
+}
+
 float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, int x, int y)
 {
     const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, x - 1, y);
@@ -259,8 +302,18 @@ VSOutput VS_MAIN( VSInput In )
         const float a0   = floor(g / snap) * snap;
         const float a1   = min(a0 + snap, float(TERRAIN_QUADS));
         const float t    = (g - a0) / snap;
-        h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
-                         : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
+        if (float(snapR) >= TERRAIN_BASE_RUNG) {
+            // A coarse lattice: the neighbour DISPLAYS its morphed heights there, so follow those.
+            h = (axis == 1u) ? lerp(terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)a0, (int)gyf),
+                                    terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)a1, (int)gyf), t)
+                             : lerp(terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)gxf, (int)a0),
+                                    terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)gxf, (int)a1), t);
+        } else {
+            h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
+                             : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
+        }
+    } else if (!fine) {
+        h = terrainHeightOnRung(slot, float(rung), In.Origin.xy, (int)gxf, (int)gyf);
     } else {
         h = loadHeightAt(slot, gxf, gyf, fine);
     }

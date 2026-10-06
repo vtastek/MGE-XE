@@ -2663,11 +2663,39 @@ float loadHeightWide(uint slot, int lx, int ly, uint spanX, uint spanY, int x, i
     }
     return loadHeight(slot, x, y);
 }
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+float terrainMorphW(float rung, float dCells)
+{
+    const float sc = gShadowParams.sunNoise.z;
+    if (!(sc > 0.0f) || rung <  4.0f  || rung >= 9.0f) { return 0.0f; }
+    const float D =  3.0f  * exp2(rung -  4.0f ) * sc;
+    const float E = D - 1.0f;
+    const float S = max(E - 0.25f * D, 0.0f);
+    if (E <= S) { return (dCells >= E) ? 1.0f : 0.0f; }
+    return saturate((dCells - S) / (E - S));
+}
 
 
 
-
-
+float terrainHeightOnRung(uint slot, float rung, float2 origin, int x, int y)
+{
+    const float h = loadHeight(slot, x, y);
+    if (!(gShadowParams.sunNoise.z > 0.0f) || rung <  4.0f  || rung >= 9.0f) { return h; }
+    const int st = (int)exp2(rung -  4.0f );
+    const bool ox = (x % (2 * st)) != 0;
+    const bool oy = (y % (2 * st)) != 0;
+    if (!ox && !oy) { return h; }
+    const float3 p = float3(origin.x + float(x) *  128.0f , origin.y + float(y) *  128.0f ,
+                            h - gFrameData.lodEye.z);
+    const float m = terrainMorphW(rung, length(p - gFrameData.eyePos.xyz)
+                                         * (1.0f / ( 128.0f  * float( 64 ))));
+    if (m <= 0.0f) { return h; }
+    float t;
+    if (ox && oy) { t = 0.5f * (loadHeight(slot, x + st, y - st) + loadHeight(slot, x - st, y + st)); }
+    else if (ox) { t = 0.5f * (loadHeight(slot, x - st, y) + loadHeight(slot, x + st, y)); }
+    else { t = 0.5f * (loadHeight(slot, x, y - st) + loadHeight(slot, x, y + st)); }
+    return lerp(h, t, m);
+}
 
 float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, int x, int y)
 {
@@ -2678,7 +2706,7 @@ float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, in
     const float d = 2.0f *  128.0f ;
     return normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
 }
-#line 193 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 VSOutput VS_MAIN( VSInput In )
 {
@@ -2710,7 +2738,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     const bool fine = (float(rung) <  4.0f );
-#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
     uint snapR = rung;
     uint axis = 0u;
     if (In.Grid.y == 0.0f) { uint nr = (nbrR >> 16u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 1u; } }
@@ -2720,14 +2748,24 @@ VSOutput VS_MAIN( VSInput In )
 
     float h;
     if (axis != 0u) {
-#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 300 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
         const float snap = exp2(float(snapR) -  4.0f );
         const float g = (axis == 1u) ? gxf : gyf;
         const float a0 = floor(g / snap) * snap;
         const float a1 = min(a0 + snap, float( 64 ));
         const float t = (g - a0) / snap;
-        h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
-                         : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
+        if (float(snapR) >=  4.0f ) {
+
+            h = (axis == 1u) ? lerp(terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)a0, (int)gyf),
+                                    terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)a1, (int)gyf), t)
+                             : lerp(terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)gxf, (int)a0),
+                                    terrainHeightOnRung(slot, float(snapR), In.Origin.xy, (int)gxf, (int)a1), t);
+        } else {
+            h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
+                             : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
+        }
+    } else if (!fine) {
+        h = terrainHeightOnRung(slot, float(rung), In.Origin.xy, (int)gxf, (int)gyf);
     } else {
         h = loadHeightAt(slot, gxf, gyf, fine);
     }
@@ -2750,7 +2788,7 @@ VSOutput VS_MAIN( VSInput In )
 
     if (gShadowParams.terrainDisp.x != 0.0f)
     {
-#line 299 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 352 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
         if (axis == 0u)
         {
 
@@ -2773,7 +2811,7 @@ VSOutput VS_MAIN( VSInput In )
             }
         }
     }
-#line 337 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 390 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
     if (!fine) {
         Out.Normal = terrainCornerNormal(slot, lx, ly, spanX, spanY, (int)gxf, (int)gyf);
     } else {

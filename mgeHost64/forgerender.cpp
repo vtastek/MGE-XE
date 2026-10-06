@@ -8389,6 +8389,10 @@ namespace {
     // ⚠ BACK TO 1.0 (user, playing, 2026-10-06): at 0.5 the terrain visibly pops ~5 cells out. Quality
     // over triangle count here ("we can use more triangles for higher quality"); 0.5 stays an A/B.
     float    g_terrainLodScale   = 1.0f;
+    // GEOMORPH (terrain.vert terrainHeightOnRung): vertices blend toward the next rung's surface before
+    // their cell flips, so the ladder can step without a visible pop. Reaches the shader as
+    // gShadowParams.sunNoise.z = the ladder scale (0 = off). OFF draws exactly the old heights.
+    bool     g_terrainMorph      = true;
     // The mip the height is read at, and it is not decoration. One lattice step is 128 world units
     // = ~256 texels of a 1024 map tiling once per 512, so mip 0 would sample the field at 1/256 of
     // its rate: aliasing that crawls as the camera moves. 8 is the band-limit that matches the
@@ -23806,6 +23810,7 @@ namespace {
             { "reflGpuCull",         &g_reflGpuCull         },
             { "cullDrawCount",       &g_cullDrawCount       },
             { "cullScanWave",        &g_cullScanWave        },
+            { "terrainMorph",        &g_terrainMorph        },
             { "hizLinFused",         &g_hizLinFused         },
             { "cullSurvivorList",    &g_cullSurvivorList    },
             { "skyDeferred",         &g_skyDeferred         },
@@ -59917,7 +59922,7 @@ void destroyHostWindow(Renderer* R);
         if (mode >= 3u) { mode = upscaleTemporalActive() ? 2u : 1u; }
         mp[kSunNoiseFloat + 0] = (float)mode;
         mp[kSunNoiseFloat + 1] = (float)(s_sunNoiseFrame & 63u);
-        mp[kSunNoiseFloat + 2] = 0.0f;
+        mp[kSunNoiseFloat + 2] = g_terrainMorph ? std::clamp(g_terrainLodScale, 0.25f, 4.0f) : 0.0f;  // terrain geomorph
         mp[kSunNoiseFloat + 3] = 0.0f;
     }
 
