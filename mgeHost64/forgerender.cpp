@@ -3212,6 +3212,8 @@ namespace {
         Buffer*        pGpuInstOut    = nullptr;    // RW_BUFFER|VERTEX: survivor rows (20 uint/inst)
         Shader*        pCullScanShader = nullptr;
         Pipeline*      pCullScanPipeline = nullptr;
+        Shader*        pCullScanWaveShader = nullptr;     // cullscan_wave.comp (g_cullScanWave); optional
+        Pipeline*      pCullScanWavePipeline = nullptr;
         Shader*        pCullScatterShader = nullptr;
         Pipeline*      pCullScatterPipeline = nullptr;
         uint32_t       cullSubsetCount = 0;         // g_staticsSubsets.size() at upload
@@ -4502,6 +4504,12 @@ namespace {
            // inside it, between the chunks.
            kGpuPhaseFbCopyA,
            kGpuPhaseFbCopyB,
+           // Nested inside kGpuPhaseCull (Release 1: cull read 0.9-1.1 ms on the RTX box, G7 has
+           // none): the camera statics lane whole, its prefix scan alone, the sun lane, the grass lanes.
+           kGpuPhaseCullCam,
+           kGpuPhaseCullScan,
+           kGpuPhaseCullSun,
+           kGpuPhaseCullGrass,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -17926,6 +17934,14 @@ namespace {
     // What OFF pays is the walk: every subset in the world is a command, per statics pass, per cascade,
     // per lane — ~20k empty commands a frame on the 1660S for ~10 real draws on an empty view.
     bool g_cullDrawCount = true;
+    // Release 1: the prefix scan every cull lane runs as cullscan_wave.comp (WavePrefixSum, 1,024
+    // subsets a tile, one barrier a tile) instead of cullscan.comp (Hillis-Steele, 256 a tile, 18
+    // barriers a tile). Same outputs. OFF = the old scan, the A/B.
+    bool g_cullScanWave = true;
+    Pipeline* cullScanPipe() {
+        return (g_cullScanWave && g_live.pCullScanWavePipeline) ? g_live.pCullScanWavePipeline
+                                                                 : g_live.pCullScanPipeline;
+    }
     // Terrain colour: ship terrain.frag (lean) unless a debug view needs terrain_dbg.frag. 0 = always
     // the debug variant, i.e. the shader as it was before the split — the A/B (g_pTerrainShaderDbg).
     bool g_terrainLean = true;
@@ -23649,6 +23665,7 @@ namespace {
             //     cullSubsetCount ~= 10,910 regardless of survivors.
             { "reflGpuCull",         &g_reflGpuCull         },
             { "cullDrawCount",       &g_cullDrawCount       },
+            { "cullScanWave",        &g_cullScanWave        },
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
             { "vrsStatics",          &g_vrsStatics          },
@@ -32440,6 +32457,8 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseGrassDepth, "grass depth" }, { kGpuPhaseGrassColor, "grass" }, { kGpuPhaseSkyVis, "skyvis" },
             { kGpuPhaseSkyVisScreen, "skyvis screen" }, { kGpuPhaseRippleSim, "ripple sim" },
             { kGpuPhaseFbCopyA, "fb copy A" }, { kGpuPhaseFbCopyB, "fb copy B" },
+            { kGpuPhaseCullCam, "cull cam" }, { kGpuPhaseCullScan, "cull scan" },
+            { kGpuPhaseCullSun, "cull sun" }, { kGpuPhaseCullGrass, "cull grass" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -36317,6 +36336,9 @@ void destroyHostWindow(Renderer* R);
                     kGpuPhaseColorFP,    kGpuPhaseApl,        kGpuPhaseUpscale,
                     kGpuPhaseResolveFilter, kGpuPhaseMotionBlur, kGpuPhaseBloom,
                     kGpuPhaseResolve,
+                    // Bracketed since they landed and printed nowhere: the bare Release-1 arm read
+                    // 1.3-1.75 ms UNBRACKETED on the RTX box, gone with svm=0,ripSimOn=0.
+                    kGpuPhaseSkyVis,     kGpuPhaseSkyVisScreen, kGpuPhaseRippleSim,
                 };
                 double bracketed = 0.0;
                 for (uint32_t i = 0; i < (uint32_t)(sizeof(kTopLevel) / sizeof(kTopLevel[0])); ++i) {
@@ -36325,13 +36347,21 @@ void destroyHostWindow(Renderer* R);
                 const double frameMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
                 const double resid   = frameMs - bracketed;
                 LOG::logline(">> [forge-hb] gpu residual: frame=%.2f bracketed=%.2f UNBRACKETED=%.2f (%.0f%%)"
-                             " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f"
+                             " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f skyvis=%.2f(screen=%.2f) ripsim=%.2f"
+                             " | cull: cam=%.2f(scan=%.2f) sun=%.2f grass=%.2f"
                              " | measured but never printed: fp=%.2f(objvelFP=%.2f) objvel=%.2f",
                              frameMs, bracketed, resid,
                              (frameMs > 0.01) ? (100.0 * resid / frameMs) : 0.0,
                              g_lastGpuPhaseMs[kGpuPhaseHizMip0],
                              g_lastGpuPhaseMs[kGpuPhaseReLinear],
                              g_lastGpuPhaseMs[kGpuPhaseApl],
+                             g_lastGpuPhaseMs[kGpuPhaseSkyVis],
+                             g_lastGpuPhaseMs[kGpuPhaseSkyVisScreen],
+                             g_lastGpuPhaseMs[kGpuPhaseRippleSim],
+                             g_lastGpuPhaseMs[kGpuPhaseCullCam],
+                             g_lastGpuPhaseMs[kGpuPhaseCullScan],
+                             g_lastGpuPhaseMs[kGpuPhaseCullSun],
+                             g_lastGpuPhaseMs[kGpuPhaseCullGrass],
                              g_lastGpuPhaseMs[kGpuPhaseColorFP],
                              g_lastGpuPhaseMs[kGpuPhaseObjVelFP],
                              g_lastGpuPhaseMs[kGpuPhaseObjVel]);
@@ -40504,6 +40534,7 @@ void destroyHostWindow(Renderer* R);
         // row into gInstOut. dlLiveRecord draws from gInstOut/gpuArgs via cmdExecuteIndirect.
         // Raw D3D12 CopyBufferRegion resets the counters (Forge has no buffer->buffer copy); Forge
         // BufferBarriers keep the DEFAULT-heap UAV states tracked.
+        gpuPhaseBegin(kGpuPhaseCullCam);
         if (g_live.pCullPipeline && g_live.cullInstCount) {
             // Statics LOD lanes (arm2.zw = floats 10/11) of the cbuffer the camera, sun and sky lanes
             // share; the mirror's copy takes the same two values where it is refilled.
@@ -40549,9 +40580,11 @@ void destroyHostWindow(Renderer* R);
                 uavBarrier(g_live.pSubsetCount);
                 // PREFIX pass (single thread): gSubsetCount -> gSubsetOffset + gpuArgs; reset gSubsetCursor.
                 cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.9f, 0.9f, "CULL prefix-sum");
-                cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+                gpuPhaseBegin(kGpuPhaseCullScan);
+                cmdBindPipeline(g_live.pCmd, cullScanPipe());
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
                 cmdDispatch(g_live.pCmd, 1, 1, 1);
+                gpuPhaseEnd(kGpuPhaseCullScan);
                 cmdEndDebugMarker(g_live.pCmd);
                 uavBarrier(g_live.pSubsetOffset);
                 uavBarrier(g_live.pSubsetCursor);
@@ -40575,6 +40608,7 @@ void destroyHostWindow(Renderer* R);
                                  g_live.pCullCountBuf->mDx.pResource, 0, 2 * sizeof(uint32_t));
             bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
+        gpuPhaseEnd(kGpuPhaseCullCam);
 
         // ===================== Follow-on 3: shadow-light occlusion cull =============================
         // One group of 32 threads (one per shadow slot) tests each slot's influence sphere vs the
@@ -40621,7 +40655,9 @@ void destroyHostWindow(Renderer* R);
 
         // SUN shadow A2: the second statics cull (sun ortho box, nearCut=0, Hi-Z off) → pSunArgs/
         // pSunInstOut for renderSunShadow. Pure compute here (no RT bound), same phase as the camera cull.
+        gpuPhaseBegin(kGpuPhaseCullSun);
         dispatchSunCull();
+        gpuPhaseEnd(kGpuPhaseCullSun);
 
         // H2a: and the MIRROR's lane (mirror frustum, near cut + ownership + Hi-Z all off) ->
         // pReflArgs/pReflInstOut for dlReflectRecordGeo. Same phase and same three pipelines. It
@@ -40635,7 +40671,9 @@ void destroyHostWindow(Renderer* R);
         // array. Runs unconditionally with the other culls rather than lazily from the draw, so the
         // SUN caster's survivors are ready before renderSunShadow — which runs before the DL colour
         // block that consumes the camera lane's.
+        gpuPhaseBegin(kGpuPhaseCullGrass);
         dispatchGrassCull();
+        gpuPhaseEnd(kGpuPhaseCullGrass);
 
         gpuPhaseEnd(kGpuPhaseCull);
 
@@ -56855,6 +56893,8 @@ void destroyHostWindow(Renderer* R);
          || !addCullPipeline("cullscatter.comp", &g_live.pCullScatterShader, &g_live.pCullScatterPipeline)) {
             return false;
         }
+        // Optional: without it every lane keeps the old scan.
+        addCullPipeline("cullscan_wave.comp", &g_live.pCullScanWaveShader, &g_live.pCullScanWavePipeline);
 
         DescriptorSetDesc cset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
         addDescriptorSet(R, &cset, &g_live.pCullSet);
@@ -58597,6 +58637,10 @@ void destroyHostWindow(Renderer* R);
     // statics cast into the near scene AND from off-screen, which the camera-culled A1 set can't.
     // Pure compute; runs in the cull phase after the camera cull.
     void dispatchSunCull() {
+        // No sun map this frame = no consumer (renderSunShadow exits on the same flag). The lane cost
+        // 0.4-1.0 ms on the RTX box with the sun shadow off. Its args keep their state flag, so the
+        // first frame the shadow comes back culls before it draws, as on any other frame.
+        if (!g_drawSunShadow) { return; }
         if (!g_live.sunCullReady || !g_live.pCullPipeline || !g_live.cullInstCount) { return; }
         if (!g_dlExterior || !g_dlLiveInit || !g_staticsLiveOk) { return; }
         if (!g_live.pCullParamsCbv || !fbr(g_live.pCullParamsCbv)
@@ -58662,7 +58706,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pSunSubsetCount);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
         uavBarrier(g_live.pSunSubsetOffset);
@@ -58777,7 +58821,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pReflSubsetCount);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
         uavBarrier(g_live.pReflSubsetOffset);
@@ -59152,7 +59196,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindDescriptorSet(g_live.pCmd, 0, set);
         cmdDispatch(g_live.pCmd, (instCount + 63u) / 64u, 1, 1);
         uavBarrier(subCount);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, 0, set);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
         uavBarrier(subOff);
@@ -59399,7 +59443,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
         uavBarrier(g_live.pSkySubsetCount);
-        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindPipeline(g_live.pCmd, cullScanPipe());
         cmdBindDescriptorSet(g_live.pCmd, kset, g_live.pSkyCullSet);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
         uavBarrier(g_live.pSkySubsetOffset);
@@ -63141,6 +63185,8 @@ void destroyHostWindow(Renderer* R);
         // Stage B (B3) GPU-draw resources + extra pipelines.
         if (g_live.pCullScanPipeline)    { removePipeline(R, g_live.pCullScanPipeline);    g_live.pCullScanPipeline = nullptr; }
         if (g_live.pCullScanShader)      { removeShader(R, g_live.pCullScanShader);        g_live.pCullScanShader = nullptr; }
+        if (g_live.pCullScanWavePipeline) { removePipeline(R, g_live.pCullScanWavePipeline); g_live.pCullScanWavePipeline = nullptr; }
+        if (g_live.pCullScanWaveShader)  { removeShader(R, g_live.pCullScanWaveShader);    g_live.pCullScanWaveShader = nullptr; }
         if (g_live.pCullScatterPipeline) { removePipeline(R, g_live.pCullScatterPipeline); g_live.pCullScatterPipeline = nullptr; }
         if (g_live.pCullScatterShader)   { removeShader(R, g_live.pCullScatterShader);     g_live.pCullScatterShader = nullptr; }
         if (g_live.pStaticsSubsetBuf)  { removeResource(g_live.pStaticsSubsetBuf);  g_live.pStaticsSubsetBuf = nullptr; }

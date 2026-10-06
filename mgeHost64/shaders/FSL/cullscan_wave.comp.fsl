@@ -1,0 +1,112 @@
+// mgeHost64 — Stage B (B3) GPU statics cull, PASS 2 of 3: PREFIX-SUM, WAVE variant (knob cullScanWave).
+//
+// Same contract as cullscan.comp (read its header): gSubsetCount -> gSubsetOffset (exclusive prefix),
+// gSubsetCursor reset, compacted IndirectDrawIndexArguments in sid order, tail zeroed, draw count at
+// gArgs[subsetCount*5]. One workgroup of 256, dispatch (1,1,1).
+//
+// WHY. cullscan.comp walks the subsets 256 at a time with an 8-step Hillis-Steele scan: 18 group
+// barriers per 256 subsets, in ONE workgroup on ONE SM. With the statics LOD block appended the subset
+// table doubled (Windows install: 18,984 + 10,244 = 29,228 -> 115 tiles, ~2,000 barriers), and every
+// cull lane (camera, sun, sky, grass, mirror) runs one. Here each thread owns 4 CONSECUTIVE subsets,
+// a tile is 1,024, and the scan across the group is WavePrefixSum + one row of per-wave totals in
+// groupshared: ONE barrier per tile (the totals row is double-buffered by tile parity, so the next
+// tile's writes cannot race this tile's reads). The running bases live in registers — every thread
+// sums the same totals row, so they stay uniform without a groupshared broadcast.
+
+#include "cull.srt.h"
+
+#define SCAN_GROUP 256u
+#define PER_THREAD 4u
+#define TILE (SCAN_GROUP * PER_THREAD)
+#define MAX_WAVES 32u   // 256 / 8: any wave size >= 8
+
+GroupShared(uint, g_waveC[2 * MAX_WAVES]);
+GroupShared(uint, g_waveD[2 * MAX_WAVES]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(256, 1, 1)
+void CS_MAIN( SV_GroupThreadID(uint3) GroupThreadID )
+{
+    INIT_MAIN;
+    const uint tid = GroupThreadID.x;
+    const uint subsetCount = (uint)gCullParams.misc.y;
+    const uint lanes  = WaveGetLaneCount();
+    const uint waveId = tid / lanes;
+    const uint nWaves = SCAN_GROUP / lanes;
+
+    uint base = 0u;       // instances before this tile
+    uint drawBase = 0u;   // compacted commands before this tile
+    const uint numTiles = (subsetCount + TILE - 1u) / TILE;
+    for (uint tile = 0u; tile < numTiles; ++tile)
+    {
+        const uint sid0 = tile * TILE + tid * PER_THREAD;
+        uint c[PER_THREAD];
+        uint sumC = 0u, sumD = 0u;
+        UNROLL
+        for (uint j = 0u; j < PER_THREAD; ++j)
+        {
+            const uint sid = sid0 + j;
+            c[j] = (sid < subsetCount) ? gSubsetCount[sid] : 0u;
+            sumC += c[j];
+            sumD += (c[j] != 0u) ? 1u : 0u;
+        }
+        const uint inWaveC = WavePrefixSum(sumC);
+        const uint inWaveD = WavePrefixSum(sumD);
+        const uint row = (tile & 1u) * MAX_WAVES;
+        if (WaveGetLaneIndex() == lanes - 1u)
+        {
+            g_waveC[row + waveId] = inWaveC + sumC;
+            g_waveD[row + waveId] = inWaveD + sumD;
+        }
+        GroupMemoryBarrier();
+
+        uint preC = 0u, preD = 0u, totC = 0u, totD = 0u;
+        for (uint w = 0u; w < nWaves; ++w)
+        {
+            const uint wc = g_waveC[row + w];
+            const uint wd = g_waveD[row + w];
+            if (w < waveId) { preC += wc; preD += wd; }
+            totC += wc; totD += wd;
+        }
+
+        uint off  = base + preC + inWaveC;
+        uint draw = drawBase + preD + inWaveD;
+        UNROLL
+        for (uint j = 0u; j < PER_THREAD; ++j)
+        {
+            const uint sid = sid0 + j;
+            if (sid < subsetCount)
+            {
+                gSubsetOffset[sid] = off;
+                gSubsetCursor[sid] = 0u;
+                if (c[j] != 0u)
+                {
+                    StaticsSubset s = gStaticsSubsets[sid];
+                    const uint a = draw * 5u;
+                    gArgs[a + 0u] = s.indexCount;     // IndexCountPerInstance
+                    gArgs[a + 1u] = c[j];             // InstanceCount
+                    gArgs[a + 2u] = s.ibBase;         // StartIndexLocation
+                    gArgs[a + 3u] = s.vbBase;         // BaseVertexLocation
+                    gArgs[a + 4u] = off;              // StartInstanceLocation
+                    draw += 1u;
+                }
+            }
+            off += c[j];
+        }
+        base += totC;
+        drawBase += totD;
+    }
+
+    // Zero the tail, so a full-length (count-buffer-less) execute draws nothing past the packed list.
+    for (uint t = drawBase + tid; t < subsetCount; t += SCAN_GROUP)
+    {
+        gArgs[t * 5u + 0u] = 0u;
+        gArgs[t * 5u + 1u] = 0u;
+        gArgs[t * 5u + 2u] = 0u;
+        gArgs[t * 5u + 3u] = 0u;
+        gArgs[t * 5u + 4u] = 0u;
+    }
+    if (tid == 0u)
+        gArgs[subsetCount * 5u] = drawBase;   // the count buffer (host: kCullDrawCountWord)
+    RETURN();
+}

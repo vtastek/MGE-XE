@@ -972,395 +972,220 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 803 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
-#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.srt.h"
-#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.srt.h"
-STRUCT(RippleSimParams)
+#line 751 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan_wave.comp.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan_wave.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullparams.h.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullparams.h.fsl"
+STRUCT(CullInstance)
 {
+    float4 wr0;
+    float4 wr1;
+    float4 wr2;
+    float4 wr3;
 
+    float posX;
+    float posY;
+    float posZ;
+    float effR;
+    uint rangeEndIdx;
+    uint firstSubset;
+    uint numSubsets;
+    uint visIndex;
 
-    float4 sim;
-
-
-
-
-
-
-
-    float4 scroll;
-
-
-
-
-
-
-
-
-    float4 wave;
-
-
-
-
-    float4 srcBounds;
-
-
-
-
-
-
-    float4 tiles;
-
-
-
-    float4 impulses[ 64 ];
-#line 116
+#line 42
 };
 
-        CBUFFER(RippleSimParams) gRippleSimParams :  register(b0,space0);
-        RTex2D(float4) gRippleSimPrev :  register(u1,space0);
-        RWTex2D(float4) gRippleSimNext :  register(u2,space0);
 
-
-        RWBuffer(uint) gWakeMaskPrev :  register(u3,space0);
-        RWBuffer(uint) gWakeMaskNext :  register(u4,space0);
-        RWBuffer(uint) gWakeTileList :  register(u5,space0);
-        RWBuffer(uint) gWakeNormList :  register(u6,space0);
-
-
-        RWBuffer(uint) gWakeArgs :  register(u7,space0);
-
-
-
-        RWBuffer(uint) gWakeStats :  register(u8,space0);
-#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
-
-
-
-
-
-
-
-
-
-#define srt_g_wave g_wave
-#line 48
-groupshared float g_wave[1296];
-
-#define srt_g_tileMax g_tileMax
-#line 50
-groupshared uint g_tileMax;
-
-
-
-
-
-
-
-
-
-float4 waveFetchPrev(int2 c, int size)
+STRUCT(StaticsSubset)
 {
-    if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
-    return LoadRWTex2D(gRippleSimPrev, c);
-}
+    uint vbBase;
+    uint ibBase;
+    uint indexCount;
+    uint texSlot;
+    uint flags;
+#line 52
+};
 
-NUM_THREADS( 16 ,  16 , 1)
-void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
+
+
+
+
+
+
+
+
+
+STRUCT(HeightOccParams)
+{
+
+
+
+
+    float4 arm;
+
+
+    float4 map;
+
+
+
+
+    float4 arm2;
+#line 78
+};
+
+STRUCT(CullParams)
+{
+    float4 planes[6];
+    float4 eye;
+    float4 ranges;
+    float4 misc;
+
+
+
+
+
+
+
+
+
+
+    float4x4 hizVP;
+    float4 hizParams;
+    float4 hizEyeDelta;
+
+
+
+
+
+
+
+    float4 visMask[16];
+
+
+
+
+
+
+    float4 cellOwn;
+#line 114
+};
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+
+        CBUFFER(CullParams) gCullParams :  register(b0,space2);
+        Buffer(CullInstance) gCullInst :  register(t1,space2);
+        Buffer(StaticsSubset) gStaticsSubsets :  register(t2,space2);
+        RWBuffer(uint) gCullCount :  register(u3,space2);
+        RWBuffer(uint) gSubsetCount :  register(u4,space2);
+        RWBuffer(uint) gSubsetOffset :  register(u5,space2);
+        RWBuffer(uint) gSubsetCursor :  register(u6,space2);
+        RWBuffer(uint) gArgs :  register(u7,space2);
+        RWBuffer(uint) gInstOut :  register(u8,space2);
+        Tex2D(float) gCullHiz :  register(t9,space2);
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+        CBUFFER(HeightOccParams) gHeightOccParams :  register(b10,space2);
+        Tex2D(float) gSkyHeightMin :  register(t11,space2);
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan_wave.comp.fsl"
+
+
+
+
+
+
+#define srt_g_waveC g_waveC
+#line 23
+groupshared uint g_waveC[2 *  32u ];
+#define srt_g_waveD g_waveD
+#line 24
+groupshared uint g_waveD[2 *  32u ];
+
+[RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
+NUM_THREADS(256, 1, 1)
+void CS_MAIN( uint3 GroupThreadID : SV_GROUPTHREADID )
 {
     INIT_MAIN;
+    const uint tid = GroupThreadID.x;
+    const uint subsetCount = (uint)gCullParams.misc.y;
+    const uint lanes = WaveGetLaneCount();
+    const uint waveId = tid / lanes;
+    const uint nWaves =  256u  / lanes;
 
-    int size = int(gRippleSimParams.sim.x);
-    int nImp = int(gRippleSimParams.sim.w);
-    int2 shift = int2(gRippleSimParams.scroll.xy);
-
-
-
-
-
-
-
-
-
-    uint nT = uint(gRippleSimParams.tiles.z);
-    uint2 lt = uint2(did.x & 15u, did.y & 15u);
-    uint2 tileId;
-    if (gRippleSimParams.tiles.x > 0.5f)
+    uint base = 0u;
+    uint drawBase = 0u;
+    const uint numTiles = (subsetCount +  ( 256u * 4u )  - 1u) /  ( 256u * 4u ) ;
+    for (uint tile = 0u; tile < numTiles; ++tile)
     {
-        uint packed = gWakeTileList[did.x >> 4u];
-        tileId = uint2(packed & 0xFFFFu, packed >> 16u);
-    }
-    else
-    {
-        tileId = did.xy >> 4u;
-    }
-    int2 org = int2(tileId) *  16 ;
-    int2 me = org + int2(lt);
-    uint tid = lt.y * 16u + lt.x;
-    if (tid == 0u) { g_tileMax = 0u; }
-
-
-
-
-
-
-    LOOP for (uint t = tid; t < 1296u; t += 256u)
-    {
-        int2 lp = int2(int(t % 36u), int(t / 36u));
-        int2 gp = org + lp -  10 ;
-        g_wave[t] = waveFetchPrev(gp + shift, size).x;
-    }
-    GroupMemoryBarrier();
-
-
-
-
-
-    int base = (int(lt.y) +  10 ) *  36  + int(lt.x) +  10 ;
-    float acc = 0.0f;
-    acc += +2.17780013f * (g_wave[base + 0]);
-    acc += -0.34549933f * (g_wave[base - 1] + g_wave[base - 36] + g_wave[base + 36] + g_wave[base + 1]);
-    acc += -0.08995026f * (g_wave[base - 37] + g_wave[base + 35] + g_wave[base - 35] + g_wave[base + 37]);
-    acc += +0.02103996f * (g_wave[base - 2] + g_wave[base - 72] + g_wave[base + 72] + g_wave[base + 2]);
-    acc += -0.00822204f * (g_wave[base - 38] + g_wave[base + 34] + g_wave[base - 73] + g_wave[base + 71] +
-                     g_wave[base - 71] + g_wave[base + 73] + g_wave[base - 34] + g_wave[base + 38]);
-    acc += -0.00806185f * (g_wave[base - 74] + g_wave[base + 70] + g_wave[base - 70] + g_wave[base + 74]);
-    acc += -0.02357332f * (g_wave[base - 3] + g_wave[base - 108] + g_wave[base + 108] + g_wave[base + 3]);
-    acc += -0.00795436f * (g_wave[base - 39] + g_wave[base + 33] + g_wave[base - 109] + g_wave[base + 107] +
-                     g_wave[base - 107] + g_wave[base + 109] + g_wave[base - 33] + g_wave[base + 39]);
-    acc += -0.00314146f * (g_wave[base - 75] + g_wave[base + 69] + g_wave[base - 110] + g_wave[base + 106] +
-                     g_wave[base - 106] + g_wave[base + 110] + g_wave[base - 69] + g_wave[base + 75]);
-    acc += -0.00241880f * (g_wave[base - 111] + g_wave[base + 105] + g_wave[base - 105] + g_wave[base + 111]);
-    acc += +0.00676221f * (g_wave[base - 4] + g_wave[base - 144] + g_wave[base + 144] + g_wave[base + 4]);
-    acc += -0.00091150f * (g_wave[base - 40] + g_wave[base + 32] + g_wave[base - 145] + g_wave[base + 143] +
-                     g_wave[base - 143] + g_wave[base + 145] + g_wave[base - 32] + g_wave[base + 40]);
-    acc += -0.00215142f * (g_wave[base - 76] + g_wave[base + 68] + g_wave[base - 146] + g_wave[base + 142] +
-                     g_wave[base - 142] + g_wave[base + 146] + g_wave[base - 68] + g_wave[base + 76]);
-    acc += -0.00136043f * (g_wave[base - 112] + g_wave[base + 104] + g_wave[base - 147] + g_wave[base + 141] +
-                     g_wave[base - 141] + g_wave[base + 147] + g_wave[base - 104] +
-                     g_wave[base + 112]);
-    acc += -0.00112814f * (g_wave[base - 148] + g_wave[base + 140] + g_wave[base - 140] + g_wave[base + 148]);
-    acc += -0.00710518f * (g_wave[base - 5] + g_wave[base - 180] + g_wave[base + 180] + g_wave[base + 5]);
-    acc += -0.00229906f * (g_wave[base - 41] + g_wave[base + 31] + g_wave[base - 181] + g_wave[base + 179] +
-                     g_wave[base - 179] + g_wave[base + 181] + g_wave[base - 31] + g_wave[base + 41]);
-    acc += -0.00108781f * (g_wave[base - 77] + g_wave[base + 67] + g_wave[base - 182] + g_wave[base + 178] +
-                     g_wave[base - 178] + g_wave[base + 182] + g_wave[base - 67] + g_wave[base + 77]);
-    acc += -0.00106219f * (g_wave[base - 113] + g_wave[base + 103] + g_wave[base - 183] + g_wave[base + 177] +
-                     g_wave[base - 177] + g_wave[base + 183] + g_wave[base - 103] +
-                     g_wave[base + 113]);
-    acc += -0.00079110f * (g_wave[base - 149] + g_wave[base + 139] + g_wave[base - 184] + g_wave[base + 176] +
-                     g_wave[base - 176] + g_wave[base + 184] + g_wave[base - 139] +
-                     g_wave[base + 149]);
-    acc += -0.00069344f * (g_wave[base - 185] + g_wave[base + 175] + g_wave[base - 175] + g_wave[base + 185]);
-    acc += +0.00267026f * (g_wave[base - 6] + g_wave[base - 216] + g_wave[base + 216] + g_wave[base + 6]);
-    acc += -0.00032953f * (g_wave[base - 42] + g_wave[base + 30] + g_wave[base - 217] + g_wave[base + 215] +
-                     g_wave[base - 215] + g_wave[base + 217] + g_wave[base - 30] + g_wave[base + 42]);
-    acc += -0.00092070f * (g_wave[base - 78] + g_wave[base + 66] + g_wave[base - 218] + g_wave[base + 214] +
-                     g_wave[base - 214] + g_wave[base + 218] + g_wave[base - 66] + g_wave[base + 78]);
-    acc += -0.00071142f * (g_wave[base - 114] + g_wave[base + 102] + g_wave[base - 219] + g_wave[base + 213] +
-                     g_wave[base - 213] + g_wave[base + 219] + g_wave[base - 102] +
-                     g_wave[base + 114]);
-    acc += -0.00067088f * (g_wave[base - 150] + g_wave[base + 138] + g_wave[base - 220] + g_wave[base + 212] +
-                     g_wave[base - 212] + g_wave[base + 220] + g_wave[base - 138] +
-                     g_wave[base + 150]);
-    acc += -0.00055837f * (g_wave[base - 186] + g_wave[base + 174] + g_wave[base - 221] + g_wave[base + 211] +
-                     g_wave[base - 211] + g_wave[base + 221] + g_wave[base - 174] +
-                     g_wave[base + 186]);
-    acc += -0.00050855f * (g_wave[base - 222] + g_wave[base + 210] + g_wave[base - 210] + g_wave[base + 222]);
-    acc += -0.00306437f * (g_wave[base - 7] + g_wave[base - 252] + g_wave[base + 252] + g_wave[base + 7]);
-    acc += -0.00106128f * (g_wave[base - 43] + g_wave[base + 29] + g_wave[base - 253] + g_wave[base + 251] +
-                     g_wave[base - 251] + g_wave[base + 253] + g_wave[base - 29] + g_wave[base + 43]);
-    acc += -0.00059001f * (g_wave[base - 79] + g_wave[base + 65] + g_wave[base - 254] + g_wave[base + 250] +
-                     g_wave[base - 250] + g_wave[base + 254] + g_wave[base - 65] + g_wave[base + 79]);
-    acc += -0.00061649f * (g_wave[base - 115] + g_wave[base + 101] + g_wave[base - 255] + g_wave[base + 249] +
-                     g_wave[base - 249] + g_wave[base + 255] + g_wave[base - 101] +
-                     g_wave[base + 115]);
-    acc += -0.00052957f * (g_wave[base - 151] + g_wave[base + 137] + g_wave[base - 256] + g_wave[base + 248] +
-                     g_wave[base - 248] + g_wave[base + 256] + g_wave[base - 137] +
-                     g_wave[base + 151]);
-    acc += -0.00049909f * (g_wave[base - 187] + g_wave[base + 173] + g_wave[base - 257] + g_wave[base + 247] +
-                     g_wave[base - 247] + g_wave[base + 257] + g_wave[base - 173] +
-                     g_wave[base + 187]);
-    acc += -0.00044468f * (g_wave[base - 223] + g_wave[base + 209] + g_wave[base - 258] + g_wave[base + 246] +
-                     g_wave[base - 246] + g_wave[base + 258] + g_wave[base - 209] +
-                     g_wave[base + 223]);
-    acc += -0.00041096f * (g_wave[base - 259] + g_wave[base + 245] + g_wave[base - 245] + g_wave[base + 259]);
-    acc += +0.00100610f * (g_wave[base - 8] + g_wave[base - 288] + g_wave[base + 288] + g_wave[base + 8]);
-    acc += -0.00028975f * (g_wave[base - 44] + g_wave[base + 28] + g_wave[base - 289] + g_wave[base + 287] +
-                     g_wave[base - 287] + g_wave[base + 289] + g_wave[base - 28] + g_wave[base + 44]);
-    acc += -0.00055638f * (g_wave[base - 80] + g_wave[base + 64] + g_wave[base - 290] + g_wave[base + 286] +
-                     g_wave[base - 286] + g_wave[base + 290] + g_wave[base - 64] + g_wave[base + 80]);
-    acc += -0.00048232f * (g_wave[base - 116] + g_wave[base + 100] + g_wave[base - 291] + g_wave[base + 285] +
-                     g_wave[base - 285] + g_wave[base + 291] + g_wave[base - 100] +
-                     g_wave[base + 116]);
-    acc += -0.00047413f * (g_wave[base - 152] + g_wave[base + 136] + g_wave[base - 292] + g_wave[base + 284] +
-                     g_wave[base - 284] + g_wave[base + 292] + g_wave[base - 136] +
-                     g_wave[base + 152]);
-    acc += -0.00043155f * (g_wave[base - 188] + g_wave[base + 172] + g_wave[base - 293] + g_wave[base + 283] +
-                     g_wave[base - 283] + g_wave[base + 293] + g_wave[base - 172] +
-                     g_wave[base + 188]);
-    acc += -0.00040522f * (g_wave[base - 224] + g_wave[base + 208] + g_wave[base - 294] + g_wave[base + 282] +
-                     g_wave[base - 282] + g_wave[base + 294] + g_wave[base - 208] +
-                     g_wave[base + 224]);
-    acc += -0.00035981f * (g_wave[base - 260] + g_wave[base + 244] + g_wave[base - 295] + g_wave[base + 281] +
-                     g_wave[base - 281] + g_wave[base + 295] + g_wave[base - 244] +
-                     g_wave[base + 260]);
-    acc += -0.00035981f * (g_wave[base - 296] + g_wave[base + 280] + g_wave[base - 280] + g_wave[base + 296]);
-    acc += -0.00142109f * (g_wave[base - 9] + g_wave[base - 324] + g_wave[base + 324] + g_wave[base + 9]);
-    acc += -0.00061354f * (g_wave[base - 45] + g_wave[base + 27] + g_wave[base - 325] + g_wave[base + 323] +
-                     g_wave[base - 323] + g_wave[base + 325] + g_wave[base - 27] + g_wave[base + 45]);
-    acc += -0.00042876f * (g_wave[base - 81] + g_wave[base + 63] + g_wave[base - 326] + g_wave[base + 322] +
-                     g_wave[base - 322] + g_wave[base + 326] + g_wave[base - 63] + g_wave[base + 81]);
-    acc += -0.00044077f * (g_wave[base - 117] + g_wave[base + 99] + g_wave[base - 327] + g_wave[base + 321] +
-                     g_wave[base - 321] + g_wave[base + 327] + g_wave[base - 99] +
-                     g_wave[base + 117]);
-    acc += -0.00040806f * (g_wave[base - 153] + g_wave[base + 135] + g_wave[base - 328] + g_wave[base + 320] +
-                     g_wave[base - 320] + g_wave[base + 328] + g_wave[base - 135] +
-                     g_wave[base + 153]);
-    acc += -0.00038669f * (g_wave[base - 189] + g_wave[base + 171] + g_wave[base - 329] + g_wave[base + 319] +
-                     g_wave[base - 319] + g_wave[base + 329] + g_wave[base - 171] +
-                     g_wave[base + 189]);
-    acc += -0.00035981f * (g_wave[base - 225] + g_wave[base + 207] + g_wave[base - 330] + g_wave[base + 318] +
-                     g_wave[base - 318] + g_wave[base + 330] + g_wave[base - 207] +
-                     g_wave[base + 225]);
-    acc += -0.00035981f * (g_wave[base - 261] + g_wave[base + 243] + g_wave[base - 331] + g_wave[base + 317] +
-                     g_wave[base - 317] + g_wave[base + 331] + g_wave[base - 243] +
-                     g_wave[base + 261]);
-    acc += -0.00035981f * (g_wave[base - 297] + g_wave[base + 279] + g_wave[base - 332] + g_wave[base + 316] +
-                     g_wave[base - 316] + g_wave[base + 332] + g_wave[base - 279] +
-                     g_wave[base + 297]);
-    acc += -0.00035981f * (g_wave[base - 333] + g_wave[base + 315] + g_wave[base - 315] + g_wave[base + 333]);
-    acc += +0.00004636f * (g_wave[base - 10] + g_wave[base - 360] + g_wave[base + 360] + g_wave[base + 10]);
-    acc += -0.00033047f * (g_wave[base - 46] + g_wave[base + 26] + g_wave[base - 361] + g_wave[base + 359] +
-                     g_wave[base - 359] + g_wave[base + 361] + g_wave[base - 26] + g_wave[base + 46]);
-    acc += -0.00039954f * (g_wave[base - 82] + g_wave[base + 62] + g_wave[base - 362] + g_wave[base + 358] +
-                     g_wave[base - 358] + g_wave[base + 362] + g_wave[base - 62] + g_wave[base + 82]);
-    acc += -0.00037138f * (g_wave[base - 118] + g_wave[base + 98] + g_wave[base - 363] + g_wave[base + 357] +
-                     g_wave[base - 357] + g_wave[base + 363] + g_wave[base - 98] +
-                     g_wave[base + 118]);
-    acc += -0.00035981f * (g_wave[base - 154] + g_wave[base + 134] + g_wave[base - 364] + g_wave[base + 356] +
-                     g_wave[base - 356] + g_wave[base + 364] + g_wave[base - 134] +
-                     g_wave[base + 154]);
-    acc += -0.00035981f * (g_wave[base - 190] + g_wave[base + 170] + g_wave[base - 365] + g_wave[base + 355] +
-                     g_wave[base - 355] + g_wave[base + 365] + g_wave[base - 170] +
-                     g_wave[base + 190]);
-    acc += -0.00035981f * (g_wave[base - 226] + g_wave[base + 206] + g_wave[base - 366] + g_wave[base + 354] +
-                     g_wave[base - 354] + g_wave[base + 366] + g_wave[base - 206] +
-                     g_wave[base + 226]);
-    acc += -0.00035981f * (g_wave[base - 262] + g_wave[base + 242] + g_wave[base - 367] + g_wave[base + 353] +
-                     g_wave[base - 353] + g_wave[base + 367] + g_wave[base - 242] +
-                     g_wave[base + 262]);
-    acc += -0.00035981f * (g_wave[base - 298] + g_wave[base + 278] + g_wave[base - 368] + g_wave[base + 352] +
-                     g_wave[base - 352] + g_wave[base + 368] + g_wave[base - 278] +
-                     g_wave[base + 298]);
-    acc += -0.00035981f * (g_wave[base - 334] + g_wave[base + 314] + g_wave[base - 369] + g_wave[base + 351] +
-                     g_wave[base - 351] + g_wave[base + 369] + g_wave[base - 314] +
-                     g_wave[base + 334]);
-    acc += -0.00035981f * (g_wave[base - 370] + g_wave[base + 350] + g_wave[base - 350] + g_wave[base + 370]);
-
-
-
-
-
-
-
-    float grav = gRippleSimParams.wave.x;
-    float dt = gRippleSimParams.wave.y;
-    float damp = gRippleSimParams.wave.z;
-
-
-
-
-
-    dt = min(dt, 1.8f / sqrt(max(grav *  3.4226f , 1.0e-6f)));
-
-    float4 pc = waveFetchPrev(me + shift, size);
-    float v = (pc.y - grav * acc * dt) * damp;
-#line 309 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
-    float visc4 = clamp(gRippleSimParams.wave.w * dt * (1.0f / 64.0f), 0.0f, 1.0f / 64.0f);
-    if (visc4 > 0.0f) {
-        float c = pc.y;
-        float xm = waveFetchPrev(me + shift + int2(-1, 0), size).y;
-        float xp = waveFetchPrev(me + shift + int2( 1, 0), size).y;
-        float ym = waveFetchPrev(me + shift + int2( 0, -1), size).y;
-        float yp = waveFetchPrev(me + shift + int2( 0, 1), size).y;
-        float xmm = waveFetchPrev(me + shift + int2(-2, 0), size).y;
-        float xpp = waveFetchPrev(me + shift + int2( 2, 0), size).y;
-        float ymm = waveFetchPrev(me + shift + int2( 0, -2), size).y;
-        float ypp = waveFetchPrev(me + shift + int2( 0, 2), size).y;
-        float mm = waveFetchPrev(me + shift + int2(-1, -1), size).y;
-        float mp = waveFetchPrev(me + shift + int2(-1, 1), size).y;
-        float pm = waveFetchPrev(me + shift + int2( 1, -1), size).y;
-        float pp = waveFetchPrev(me + shift + int2( 1, 1), size).y;
-
-
-        float l0 = xm + xp + ym + yp - 4.0f * c;
-        float lxm = xmm + c + mm + mp - 4.0f * xm;
-        float lxp = xpp + c + pm + pp - 4.0f * xp;
-        float lym = ymm + c + mm + pm - 4.0f * ym;
-        float lyp = ypp + c + mp + pp - 4.0f * yp;
-        v -= visc4 * (lxm + lxp + lym + lyp - 4.0f * l0);
-    }
-
-    float h = g_wave[base] + v * dt;
-#line 349 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
-    float4 sb = gRippleSimParams.srcBounds;
-    if (nImp > 0 && float(me.x) >= sb.x && float(me.y) >= sb.y
-                 && float(me.x) <= sb.z && float(me.y) <= sb.w)
-    {
-        LOOP for (int i = 0; i < nImp; ++i)
+        const uint sid0 = tile *  ( 256u * 4u )  + tid *  4u ;
+        uint c[ 4u ];
+        uint sumC = 0u, sumD = 0u;
+        UNROLL
+        for (uint j = 0u; j <  4u ; ++j)
         {
-            float4 s = gRippleSimParams.impulses[i];
-            float d = length(float2(me) - s.xy);
-#line 374 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
-            float tw = max(0.5f * s.z, 2.0f);
-            float tt = saturate(abs(d - s.z) / tw);
-            float disp = tt * tt * (3.0f - 2.0f * tt);
-            h = lerp(-s.w, h, disp);
-            v = lerp(0.0f, v, disp);
+            const uint sid = sid0 + j;
+            c[j] = (sid < subsetCount) ? gSubsetCount[sid] : 0u;
+            sumC += c[j];
+            sumD += (c[j] != 0u) ? 1u : 0u;
         }
-    }
-
-
-
-
-    float fade = 1.0f - gRippleSimParams.tiles.w;
-    h *= fade;
-    v *= fade;
-
-
-    if (abs(h) < 1.0e-6f && abs(v) < 1.0e-6f) { h = 0.0f; v = 0.0f; }
-
-
-
-
-
-
-
-    float mag = (me.x < size && me.y < size) ? max(abs(h), abs(v)) : 0.0f;
-    uint prevMax;
-    InterlockedMax(g_tileMax, asuint(mag), prevMax) ;
-    GroupMemoryBarrier();
-    bool quiet = asfloat(g_tileMax) <= gRippleSimParams.tiles.y;
-    if (quiet) { h = 0.0f; v = 0.0f; pc.z = 0.0f; pc.w = 0.0f; }
-
-
-
-    if (me.x < size && me.y < size)
-    {
-        Write2D(gRippleSimNext, me, float4(h, v, pc.z, pc.w));
-    }
-    if (tid == 0u && nT > 0u)
-    {
-        gWakeMaskNext[tileId.y * nT + tileId.x] = quiet ? 0u : 1u;
-        if (!quiet)
+        const uint inWaveC = WavePrefixSum(sumC);
+        const uint inWaveD = WavePrefixSum(sumD);
+        const uint row = (tile & 1u) *  32u ;
+        if (WaveGetLaneIndex() == lanes - 1u)
         {
-            uint nzPrev;
-            AtomicAdd(gWakeStats[0], 1u, nzPrev);
+            g_waveC[row + waveId] = inWaveC + sumC;
+            g_waveD[row + waveId] = inWaveD + sumD;
         }
+        GroupMemoryBarrier();
+
+        uint preC = 0u, preD = 0u, totC = 0u, totD = 0u;
+        for (uint w = 0u; w < nWaves; ++w)
+        {
+            const uint wc = g_waveC[row + w];
+            const uint wd = g_waveD[row + w];
+            if (w < waveId) { preC += wc; preD += wd; }
+            totC += wc; totD += wd;
+        }
+
+        uint off = base + preC + inWaveC;
+        uint draw = drawBase + preD + inWaveD;
+        UNROLL
+        for (uint j = 0u; j <  4u ; ++j)
+        {
+            const uint sid = sid0 + j;
+            if (sid < subsetCount)
+            {
+                gSubsetOffset[sid] = off;
+                gSubsetCursor[sid] = 0u;
+                if (c[j] != 0u)
+                {
+                    StaticsSubset s = gStaticsSubsets[sid];
+                    const uint a = draw * 5u;
+                    gArgs[a + 0u] = s.indexCount;
+                    gArgs[a + 1u] = c[j];
+                    gArgs[a + 2u] = s.ibBase;
+                    gArgs[a + 3u] = s.vbBase;
+                    gArgs[a + 4u] = off;
+                    draw += 1u;
+                }
+            }
+            off += c[j];
+        }
+        base += totC;
+        drawBase += totD;
     }
 
+
+    for (uint t = drawBase + tid; t < subsetCount; t +=  256u )
+    {
+        gArgs[t * 5u + 0u] = 0u;
+        gArgs[t * 5u + 1u] = 0u;
+        gArgs[t * 5u + 2u] = 0u;
+        gArgs[t * 5u + 3u] = 0u;
+        gArgs[t * 5u + 4u] = 0u;
+    }
+    if (tid == 0u)
+        gArgs[subsetCount * 5u] = drawBase;
     return;
 }
-#line 804 "FSL/shaders.list"
+#line 752 "FSL/shaders.list"

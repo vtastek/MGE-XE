@@ -746,6 +746,11 @@
 #include "cullscan.comp.fsl"
 #end
 
+// PREFIX-SUM, wave variant (knob cullScanWave): WavePrefixSum, 1,024 subsets per tile, one barrier per tile.
+#comp cullscan_wave.comp
+#include "cullscan_wave.comp.fsl"
+#end
+
 // SCATTER: re-test survivors, write each (instance,subset) camera-relative row into the GPU instance ring.
 #comp cullscatter.comp
 #include "cullscatter.comp.fsl"
