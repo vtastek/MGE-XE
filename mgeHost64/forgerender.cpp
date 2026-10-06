@@ -8130,6 +8130,10 @@ namespace {
     // still there — the same trap pbrmaterial.h.fsl records for the gradient radius and terracing
     // ([[feedback_a_look_dial_inside_a_measurement]]).
     float    g_terrainTexBias = 0.0f;
+    // g_terrainCut — a COST PROBE for the terrain colour shader (Release 1 P1), not a look knob: a
+    // bitmask, each bit removes one stage (bit list at the top of terrain.frag.fsl PS_MAIN). 0 = as
+    // shipped. Integer-valued; carried in the free pbrTerrain.w lane.
+    float    g_terrainCut = 0.0f;
 
     // ─── PARALLAX (tasks/forge-parallax.md) ──────────────────────────────────────────────────────
     // Parallax mapping, Drobot soft parallax shadows, height blending and near-camera terrain
@@ -23238,6 +23242,7 @@ namespace {
             { "pbrSpecMulti",        &g_pbrSpecMulti        },
             { "pbrSpecBase",         &g_pbrSpecBase         },
             { "terrainTexBias",      &g_terrainTexBias      },
+            { "terrainCut",          &g_terrainCut          },
             // PARALLAX (tasks/forge-parallax.md). Here as well as on the panel because the two
             // questions this milestone has to answer are both MEASUREMENTS a minimized run has to
             // be able to take with nobody at a slider: what does each arm cost on terrain (the
@@ -23536,11 +23541,15 @@ namespace {
             { "nearGobo",           &g_nearGobo           },
             { "goboForceNear",      &g_goboForceNear      },
             { "causticOn",          &g_causticOn          },
+            { "drawSunShadow",      &g_drawSunShadow      },
+            { "bloomEnable",        &g_bloomEnable        },
             // AO's two big levers. halfRes is here because it is a 4x PIXEL COUNT change hiding
             // behind a dev-panel checkbox, and the harness runs minimized — so the one A/B that
             // separates "AO is slow" from "AO is running full-res" could not be driven at all.
             { "aoHalfRes",          &g_aoHalfRes          },
             { "aoEnable",           &g_aoEnable           },
+            // aoEnable=0 alone still runs the AO dispatch: the bent normal consumes it (~1 ms).
+            { "bentNormalEnable",   &g_bentNormalEnable   },
             // 0 = hardware ResolveSubresource (a box average, and format-locked). The floor this
             // pass is measured against.
             { "customResolve",      &g_customResolve      },
@@ -39677,7 +39686,7 @@ void destroyHostWindow(Renderer* R);
             // above it, this one is not a PBR arm: it is the base bilinear blend every terrain
             // pixel pays with pbrTerrain, the height blend and parallax all off.
             mp[kPbrTerrainFloat + 2] = std::clamp(g_heightBlendWidth, 0.25f, 1.0f);
-            mp[kPbrTerrainFloat + 3] = 0.0f;
+            mp[kPbrTerrainFloat + 3] = std::clamp(std::floor(g_terrainCut), 0.0f, 511.0f);
             mp[kPbrTerrainAOFloat + 0] = g_pbrTerrainHeightAO ? 1.0f : 0.0f;
             mp[kPbrTerrainAOFloat + 1] = std::clamp(g_pbrTerrainHeightAOStr, 0.0f, 1.0f);
             mp[kPbrTerrainAOFloat + 2] = std::clamp(g_pbrTerrainHeightAOLod, 0.0f, 12.0f);

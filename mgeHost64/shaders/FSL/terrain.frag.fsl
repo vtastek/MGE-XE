@@ -390,6 +390,14 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
 
+    // `terrainCut` (host knob, pbrTerrain.w): a COST PROBE, not a look knob. Each bit removes one
+    // stage so an A/B prices it (Release 1 P1: 4.1 ms of terrain colour for 0.26M tris, PBR off).
+    // 0 = the shader as shipped. Cbuffer-driven, so every branch is uniform across the draw.
+    //   1 sky ambient factor   2 point lights   4 macro variation   8 albedo without AF
+    //   16 fog   32 one albedo tap   64 vertex colour   128 water transmit + caustic projector
+    //   256 sun shadow visibility
+    const uint tCut = (uint)(gShadowParams.pbrTerrain.w + 0.5f);
+
     const int  lx    = (int)In.Cell.y;
     const int  ly    = (int)In.Cell.z;
     const uint spanX = In.Cell.w & 0xFFFFu;
@@ -661,7 +669,24 @@ float4 PS_MAIN( VSOutput In )
     const bool gradArmEff = gradArm || paraLive;
 
     float3 albedo;
-    if (oneSquare) {
+    if ((tCut & 8u) != 0u) {
+        // cost probe: no anisotropic filtering — one bilinear tap per corner at the isotropic LOD
+        const float2 dims = max(lodDims, float2(1.0f, 1.0f));
+        const float  lvl  = max(0.0f, log2(max(max(length(gdx * dims), length(gdy * dims)), 1e-8f)));
+        if (oneSquare || (tCut & 32u) != 0u) {
+            albedo = SampleLvlLandArray(gTerrainArrays[id00 >> 16u], gSamplerBilinearWrap,
+                                        float3(uvS, float(id00 & 0xFFFFu)), lvl).rgb;
+        } else {
+            albedo  = SampleLvlLandArray(gTerrainArrays[id00 >> 16u], gSamplerBilinearWrap,
+                                         float3(uvS, float(id00 & 0xFFFFu)), lvl).rgb * w00;
+            albedo += SampleLvlLandArray(gTerrainArrays[id10 >> 16u], gSamplerBilinearWrap,
+                                         float3(uvS, float(id10 & 0xFFFFu)), lvl).rgb * w10;
+            albedo += SampleLvlLandArray(gTerrainArrays[id01 >> 16u], gSamplerBilinearWrap,
+                                         float3(uvS, float(id01 & 0xFFFFu)), lvl).rgb * w01;
+            albedo += SampleLvlLandArray(gTerrainArrays[id11 >> 16u], gSamplerBilinearWrap,
+                                         float3(uvS, float(id11 & 0xFFFFu)), lvl).rgb * w11;
+        }
+    } else if (oneSquare || (tCut & 32u) != 0u) {
         albedo = sampleLand(id00, uvS, gdx, gdy, gradArmEff);   // interior of a square: one tap
     } else {
         albedo  = sampleLand(id00, uvS, gdx, gdy, gradArmEff) * w00;
@@ -685,6 +710,7 @@ float4 PS_MAIN( VSOutput In )
     // is one value per lattice vertex, so its domain is the quad. The whole fix costs
     // four buffer loads and three lerps. Edge behaviour is a clamp, which is faithful: each MW cell
     // interpolates its OWN vertex colours and neighbours agree at the shared boundary column.
+    if ((tCut & 64u) == 0u)
     {
         const uint cslot = In.Cell.x;
         float3 c00 = loadVertexColor(cslot, x0, y0);
@@ -702,6 +728,7 @@ float4 PS_MAIN( VSOutput In )
     // value would slide vertically every time the player walks up a hill — the whole ground would
     // crawl. The screen-space gradient does NOT need the term back: it is uniform per frame and
     // cancels in ddx/ddy.
+    if ((tCut & 4u) == 0u)
     {
         // ARM 1: elevation bands + slope. Free, blind on flat ground.
         float macro = terrainMacroTint(In.WorldPos.z + gFrameData.lodEye.z,
@@ -739,7 +766,7 @@ float4 PS_MAIN( VSOutput In )
 
     // (`normal` is declared up with the uv gradients now — the tangent frame the parallax block
     //  builds needs it before the albedo blend.)
-    float  sunVis = sunShadowVisibility(In.WorldPos, normal);
+    float  sunVis = ((tCut & 256u) != 0u) ? 1.0f : sunShadowVisibility(In.WorldPos, normal);
     // D5 — the height field's own shadow, folded into the SAME visibility the cascades write, so it
     // reaches the sun's diffuse and its specular lobe from one place. ⚠ The multiply is INSIDE the
     // branch rather than a `* 1.0` outside it: the house rule this file states for the W32 caustic
@@ -964,7 +991,8 @@ float4 PS_MAIN( VSOutput In )
     // SH1: distant ambient gets the same sky direction the near paths do. Landed together with them
     // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
     // a visible seam across the near/far handover on the same building.
-    float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(normal, In.WorldPos, In.Position.xy);
+    float3 amb = gFrameData.lodSunAmb.rgb
+               * (((tCut & 1u) != 0u) ? 1.0f : skyAmbFactorPx(normal, In.WorldPos, In.Position.xy));
     // "AO enable" tick (debugParams.w bit0), through the shared multi-bounce term.
     // ⚠ TERRAIN IS THE SURFACE THIS MATTERS MOST ON, and it is the one that prompted it. G1f made
     // grass a GTAO occluder, so the ground under a clump carries occlusion it never carried before —
@@ -983,12 +1011,12 @@ float4 PS_MAIN( VSOutput In )
     // W7b — absorption on the way IN (waterfog.h.fsl). Terrain matters most of all the callers here:
     // the SEABED is terrain, so this is the surface whose lighting the whole model is about. Applied
     // to the sun and ambient terms only, before the point lights below add into `result`.
-    float3 tSunW, tAmbW;
-    waterLightTransmit(In.WorldPos, tSunW, tAmbW);
+    float3 tSunW = float3(1.0f, 1.0f, 1.0f), tAmbW = float3(1.0f, 1.0f, 1.0f);
+    if ((tCut & 128u) == 0u) { waterLightTransmit(In.WorldPos, tSunW, tAmbW); }
     // W32 — a submerged lamp is a caustic PROJECTOR (waterfog.h.fsl). Hoisted out of BOTH light
     // loops below: above water this is one cbuffer compare for the whole fragment instead of one
     // call per light. The seabed is terrain, so this is the surface the whole feature is aimed at.
-    bool causProj = causticProjectorActive(In.WorldPos);
+    bool causProj = ((tCut & 128u) == 0u) && causticProjectorActive(In.WorldPos);
     // Sun N.L on the SHADING normal, hoisted out of the `result` expression because the PBR sun
     // specular below needs exactly this number (the lobe and the diffuse must agree on N.L, or a
     // highlight can sit where the surface is already dark). Identical arithmetic when pbrLive is
@@ -1072,7 +1100,11 @@ float4 PS_MAIN( VSOutput In )
     // and the mask is read from inside both divergent light loops. Guards are cbuffer-driven, so the
     // branch is uniform across the draw.
     int2 maskPx = srcPx;   // resolved with the AO read above — same snapshot, same size
-    if (length(In.WorldPos) < gFrameData.lodParams.x)
+    if ((tCut & 2u) != 0u)
+    {
+        // cost probe: no point lights
+    }
+    else if (length(In.WorldPos) < gFrameData.lodParams.x)
     {
         // NEAR live lights — opaque.frag's inlined body, clustered through the NEAR grid
         // (froxelDimsNear + gFroxelMaskNear), which is where froxelassign.comp bins these lights.
@@ -1309,7 +1341,7 @@ float4 PS_MAIN( VSOutput In )
     }
 
     result = tonemapInPass(result);
-    result = applyFog(result, In.WorldPos, In.Position.xy);
+    if ((tCut & 16u) == 0u) { result = applyFog(result, In.WorldPos, In.Position.xy); }
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
