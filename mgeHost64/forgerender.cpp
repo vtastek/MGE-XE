@@ -3167,6 +3167,10 @@ namespace {
         // the device reports Tier 2 and everything below was created. The image rests in
         // D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE once built (vrsInRateState), which Forge's D3D12
         // backend has no mapping for, so its transitions go through the raw command list.
+        // pVrsRateRes is created here, TYPED R8_UINT, and wrapped by pVrsRate (pNativeHandle, so Forge
+        // does not own it): Forge creates every texture TYPELESS, and native D3D12 rejects a typeless
+        // rate image at Close() (E_INVALIDARG -> device removed). vkd3d-proton accepted it.
+        ID3D12Resource* pVrsRateRes = nullptr;
         Texture*       pVrsRate = nullptr;
         Shader*        pVrsShader = nullptr;
         Pipeline*      pVrsPipeline = nullptr;
@@ -16139,7 +16143,22 @@ namespace {
                 g_live.vrsTile = o6.ShadingRateImageTileSize;
                 g_live.vrsW = (width  + g_live.vrsTile - 1) / g_live.vrsTile;
                 g_live.vrsH = (height + g_live.vrsTile - 1) / g_live.vrsTile;
+                D3D12_HEAP_PROPERTIES hp = {};
+                hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC rd = {};
+                rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                rd.Width = g_live.vrsW; rd.Height = g_live.vrsH;
+                rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+                rd.Format = DXGI_FORMAT_R8_UINT;
+                rd.SampleDesc.Count = 1;
+                rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                if (FAILED(R->mDx.pDevice->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_live.pVrsRateRes)))) {
+                    g_live.pVrsRateRes = nullptr;
+                }
                 TextureDesc vd = {};
+                vd.pNativeHandle = g_live.pVrsRateRes;
                 vd.mWidth = g_live.vrsW; vd.mHeight = g_live.vrsH; vd.mDepth = 1;
                 vd.mArraySize = 1; vd.mMipLevels = 1;
                 vd.mSampleCount = SAMPLE_COUNT_1;
@@ -16150,7 +16169,7 @@ namespace {
                 TextureLoadDesc vld = {};
                 vld.ppTexture = &g_live.pVrsRate;
                 vld.pDesc = &vd;
-                addResource(&vld, nullptr);
+                if (g_live.pVrsRateRes) { addResource(&vld, nullptr); }
 
                 BufferLoadDesc vb = {};
                 vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -63232,6 +63251,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pVrsShader)       { removeShader(R, g_live.pVrsShader);       g_live.pVrsShader = nullptr; }
         if (g_live.pVrsCbv)          { removeFrameBuf(g_live.pVrsCbv);           g_live.pVrsCbv = nullptr; }
         if (g_live.pVrsRate)         { removeResource(g_live.pVrsRate);          g_live.pVrsRate = nullptr; }
+        if (g_live.pVrsRateRes)      { g_live.pVrsRateRes->Release();            g_live.pVrsRateRes = nullptr; }
         g_live.vrsReady = false; g_live.vrsBuilt = false; g_live.vrsInRateState = false;
         if (g_live.pHizSet)          { removeDescriptorSet(R, g_live.pHizSet); }
         if (g_live.pHizPipeline)     { removePipeline(R, g_live.pHizPipeline); }
