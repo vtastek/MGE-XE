@@ -17762,6 +17762,12 @@ namespace {
     // for the parity check + the reflect path); this only switches which instance/arg buffers the MAIN
     // statics draw consumes. A/B toggle until visually verified, then the CPU main cull can be removed.
     bool g_gpuStaticsCull = true;
+    // Release 1 P1: hand every GPU-cull execute-indirect the COUNT cullscan writes after its compacted
+    // args (gArgs[subsetCount*5]). OFF = maxCount = cullSubsetCount with no count buffer, as before:
+    // the packed list then runs into a zeroed tail, so both arms draw the same thing in the same order.
+    // What OFF pays is the walk: every subset in the world is a command, per statics pass, per cascade,
+    // per lane — ~20k empty commands a frame on the 1660S for ~10 real draws on an empty view.
+    bool g_cullDrawCount = true;
     // M2 A/B: OFF forces hizParams.w = 0 -> the GPU occlusion test passes everything through and
     // the draw is byte-identical to frustum-only (the pyramid still builds; PD1 explicit A/B).
     bool g_hizOcclusion  = true;
@@ -23436,6 +23442,7 @@ namespace {
             //     the compacted CPU ring issues a few hundred indirect commands, the GPU one issues
             //     cullSubsetCount ~= 10,910 regardless of survivors.
             { "reflGpuCull",         &g_reflGpuCull         },
+            { "cullDrawCount",       &g_cullDrawCount       },
             { "reflCullVerify",      &g_reflCullVerify      },
             // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
             { "reflHeightOcc",       &g_reflHeightOcc       },
@@ -56313,8 +56320,8 @@ void destroyHostWindow(Renderer* R);
         ab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
         ab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
         ab.mDesc.mStructStride = sizeof(uint32_t);
-        ab.mDesc.mElementCount = subsetCount * 5u;
-        ab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+        ab.mDesc.mElementCount = subsetCount * 5u + 1u;   // +1: the draw COUNT (cullscan compacts)
+        ab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * (subsetCount * 5u + 1u);
         ab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
         ab.mDesc.pName         = "gpuStaticsArgs";
         ab.ppBuffer            = &g_live.pGpuArgs;
@@ -56452,8 +56459,8 @@ void destroyHostWindow(Renderer* R);
             sab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
             sab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
             sab.mDesc.mStructStride = sizeof(uint32_t);
-            sab.mDesc.mElementCount = subsetCount * 5u;
-            sab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+            sab.mDesc.mElementCount = subsetCount * 5u + 1u;
+            sab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * (subsetCount * 5u + 1u);
             sab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
             sab.mDesc.pName         = "sunCullArgs";
             sab.ppBuffer            = &g_live.pSunArgs;
@@ -56567,8 +56574,8 @@ void destroyHostWindow(Renderer* R);
             rab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
             rab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
             rab.mDesc.mStructStride = sizeof(uint32_t);
-            rab.mDesc.mElementCount = subsetCount * 5u;
-            rab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+            rab.mDesc.mElementCount = subsetCount * 5u + 1u;
+            rab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * (subsetCount * 5u + 1u);
             rab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
             rab.mDesc.pName         = "reflCullArgs";
             rab.ppBuffer            = &g_live.pReflArgs;
@@ -56682,8 +56689,8 @@ void destroyHostWindow(Renderer* R);
             kab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
             kab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
             kab.mDesc.mStructStride = sizeof(uint32_t);
-            kab.mDesc.mElementCount = subsetCount * 5u;
-            kab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+            kab.mDesc.mElementCount = subsetCount * 5u + 1u;
+            kab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * (subsetCount * 5u + 1u);
             kab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
             kab.mDesc.pName         = "skyCullArgs";
             kab.ppBuffer            = &g_live.pSkyArgs;
@@ -56813,8 +56820,8 @@ void destroyHostWindow(Renderer* R);
                 bd.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
                 bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
                 bd.mDesc.mStructStride = sizeof(uint32_t);
-                bd.mDesc.mElementCount = gSub * 5u;
-                bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * gSub * 5u;
+                bd.mDesc.mElementCount = gSub * 5u + 1u;   // +1: the draw COUNT (cullscan compacts)
+                bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * (gSub * 5u + 1u);
                 bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
                 bd.mDesc.pName         = name;
                 bd.ppBuffer            = out;
@@ -57928,10 +57935,22 @@ void destroyHostWindow(Renderer* R);
         return wantCW ? g_pStaticsPipelineCW : g_pStaticsPipeline;
     }
 
+    // Execute-indirect over a GPU-cull lane's args (pGpuArgs / pSunArgs / pReflArgs / pSkyArgs and
+    // grass's two): cullscan packs the commands with survivors to the front and writes their number
+    // after the last per-subset slot, so the draw walks only those (g_cullDrawCount).
+    // `n` is the subset table the lane's scan ran over (misc.y): the statics table, or grass's own.
+    void cullLaneExecute(Cmd* cmd, Buffer* args, uint32_t n) {
+        cmdExecuteIndirect(cmd, INDIRECT_DRAW_INDEX, n, args, 0,
+                           g_cullDrawCount ? args : nullptr,
+                           (uint64_t)sizeof(uint32_t) * n * 5u);
+    }
+    void cullLaneExecute(Buffer* args) { cullLaneExecute(g_live.pCmd, args, g_live.cullSubsetCount); }
+
     // Record the live DL draws into g_live.pCmd. Runs AFTER the near colour pass with colorTarget +
     // pDepth still bound: land + statics depth-write with reverse-Z GEQUAL, so the near scene (larger
     // reverse-Z) correctly occludes DL behind it, and DL fills the empty sky/horizon. (No GTAO on DL:
     // GTAO already ran on the near-only depth before this.)
+
     void dlLiveRecord() {
         if (!g_dlExterior || !g_dlLiveInit) { return; }
         cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.5f, "DISTANT LAND (live)");
@@ -57961,9 +57980,8 @@ void destroyHostWindow(Renderer* R);
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
             if (gpuDraw) {
-                // One indirect command per subset (zero-instance subsets = no-op draws).
-                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
-                                   g_live.pGpuArgs, 0, nullptr, 0);
+                // One indirect command per subset WITH survivors (cullscan compacts; see cullLaneExecute).
+                cullLaneExecute(g_live.pGpuArgs);
             } else {
                 cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
                                    g_pStaticsArgsRing, 0, nullptr, 0);
@@ -57978,8 +57996,7 @@ void destroyHostWindow(Renderer* R);
             if (g_pStaticsLayerPipeline) {
                 cmdBindPipeline(g_live.pCmd, g_pStaticsLayerPipeline);
                 if (gpuDraw) {
-                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
-                                       g_live.pGpuArgs, 0, nullptr, 0);
+                    cullLaneExecute(g_live.pGpuArgs);
                 } else {
                     cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
                                        g_pStaticsArgsRing, 0, nullptr, 0);
@@ -57989,8 +58006,7 @@ void destroyHostWindow(Renderer* R);
             if (g_pStaticsAddPipeline) {
                 cmdBindPipeline(g_live.pCmd, g_pStaticsAddPipeline);
                 if (gpuDraw) {
-                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
-                                       g_live.pGpuArgs, 0, nullptr, 0);
+                    cullLaneExecute(g_live.pGpuArgs);
                 } else {
                     cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
                                        g_pStaticsArgsRing, 0, nullptr, 0);
@@ -58051,8 +58067,7 @@ void destroyHostWindow(Renderer* R);
         uint32_t gstrides[2] = { 20, kStaticsInstStride };
         cmdBindVertexBuffer(cmd, 2, gvbs, gstrides, nullptr);
         cmdBindIndexBuffer(cmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-        cmdExecuteIndirect(cmd, INDIRECT_DRAW_INDEX, g_grassSubsetCount,
-                           g_live.pGrassArgs, 0, nullptr, 0);
+        cullLaneExecute(cmd, g_live.pGrassArgs, g_grassSubsetCount);
     }
 
     // G1f: the grass Z-PREPASS entry, recorded inside the prepass block AFTER terrainRecordDepth.
@@ -59134,7 +59149,7 @@ void destroyHostWindow(Renderer* R);
             uint32_t strides[2] = { 20, kStaticsInstStride };
             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount, g_live.pSkyArgs, 0, nullptr, 0);
+            cullLaneExecute(g_live.pSkyArgs);
             if (g_pSvmTerrainPipeline) {
                 terrainRecord(g_live.pCmd, TV, g_live.pPerFrameSetSkyHeight, /*mirror*/false,
                               /*frameSetIndex*/1u + k, g_pSvmTerrainPipeline);
@@ -59293,7 +59308,7 @@ void destroyHostWindow(Renderer* R);
             cmdBindVertexBuffer(g_live.pCmd, 2, kvbs, kstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
             drawnSubsets = g_live.cullSubsetCount;
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, drawnSubsets, g_live.pSkyArgs, 0, nullptr, 0);
+            cullLaneExecute(g_live.pSkyArgs);
         }
         cmdBindRenderTargets(g_live.pCmd, nullptr);
         {
@@ -60868,7 +60883,8 @@ void destroyHostWindow(Renderer* R);
             cmdBindDescriptorSet(g_live.pCmd, c, g_live.pPerFrameSetSun);   // gFrameData := cascade c's ortho VP
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, argCount, argsBuf, 0, nullptr, 0);
+            if (sunDraw || gpuDraw) { cullLaneExecute(argsBuf); }
+            else { cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, argCount, argsBuf, 0, nullptr, 0); }
 
             // G1e: grass casters into the same tile, from the grass SUN lane. The pipeline pairs
             // grass.vert with the very sunshadow_statics.frag bound just above — which is the point:
@@ -60885,8 +60901,7 @@ void destroyHostWindow(Renderer* R);
                 Buffer*  gvbs[2]     = { g_pStaticsVB, g_live.pGrassSunInstOut };
                 uint32_t gstrides[2] = { 20, kStaticsInstStride };
                 cmdBindVertexBuffer(g_live.pCmd, 2, gvbs, gstrides, nullptr);
-                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_grassSubsetCount,
-                                   g_live.pGrassSunArgs, 0, nullptr, 0);
+                cullLaneExecute(g_live.pCmd, g_live.pGrassSunArgs, g_grassSubsetCount);
                 // No state restore needed: the next cascade re-binds the statics PSO, VB and IB at
                 // the top of this loop (they moved in here when terrainRecord started binding its
                 // own lattice), and terrainRecord below binds everything it needs itself.
@@ -60954,8 +60969,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
         cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
         if (gpuDraw) {
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
-                               g_live.pGpuArgs, 0, nullptr, 0);
+            cullLaneExecute(g_live.pGpuArgs);
         } else {
             cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
                                g_pStaticsArgsRing, 0, nullptr, 0);
@@ -61135,9 +61149,12 @@ void destroyHostWindow(Renderer* R);
             uint32_t sstrides[2] = { 20, kStaticsInstStride };
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX,
-                               reflDraw ? g_live.cullSubsetCount : g_liveLastSubsetsRefl,
-                               reflDraw ? g_live.pReflArgs : g_pStaticsArgsRingRefl, 0, nullptr, 0);
+            if (reflDraw) {
+                cullLaneExecute(g_live.pReflArgs);
+            } else {
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
+                                   g_pStaticsArgsRingRefl, 0, nullptr, 0);
+            }
         }
         cmdEndDebugMarker(g_live.pCmd);
     }

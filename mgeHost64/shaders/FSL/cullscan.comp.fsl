@@ -16,8 +16,17 @@
 #define kMaxInst 65536u
 #define SCAN_GROUP 256u
 
+// ⚠ THE ARGS ARE COMPACTED: only subsets with survivors get a command, packed in sid order (so the
+// draw order is unchanged), and the number of them is written at gArgs[subsetCount*5] — the COUNT
+// BUFFER the host hands cmdExecuteIndirect. Without it every subset in the world was a command,
+// zero-instance ones included: 4,981 subsets x every statics pass x every lane walked ~20k empty
+// commands a frame to draw ~10 objects on an empty view (Release 1 P1, 1660S). The tail past the
+// count is zeroed, so a caller that still passes maxCount = subsetCount and no count buffer draws
+// exactly what it drew before.
 GroupShared(uint, g_scan[256]);
+GroupShared(uint, g_scanD[256]);  // the same scan over "this subset has survivors" (0/1)
 GroupShared(uint, g_base);        // running instance base carried across tiles
+GroupShared(uint, g_drawBase);    // running compacted command index carried across tiles
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(256, 1, 1)
@@ -28,7 +37,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     uint subsetCount = (uint)gCullParams.misc.y;
 
     if (tid == 0u)
+    {
         g_base = 0u;
+        g_drawBase = 0u;
+    }
     GroupMemoryBarrier();
 
     uint numTiles = (subsetCount + SCAN_GROUP - 1u) / SCAN_GROUP;
@@ -36,41 +48,67 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     {
         uint sid = tile * SCAN_GROUP + tid;
         uint c = (sid < subsetCount) ? gSubsetCount[sid] : 0u;
+        uint d = (c != 0u) ? 1u : 0u;
 
         // In-place Hillis-Steele inclusive scan over the 256 tile counts (read phase, barrier, write
         // phase, barrier — each thread reads its neighbour into a register before any thread writes).
-        g_scan[tid] = c;
+        // Both scans ride the same barriers.
+        g_scan[tid]  = c;
+        g_scanD[tid] = d;
         GroupMemoryBarrier();
         UNROLL
         for (uint off = 1u; off < SCAN_GROUP; off <<= 1u)
         {
-            uint v = (tid >= off) ? g_scan[tid - off] : 0u;
+            uint v  = (tid >= off) ? g_scan[tid - off]  : 0u;
+            uint vd = (tid >= off) ? g_scanD[tid - off] : 0u;
             GroupMemoryBarrier();
-            g_scan[tid] = g_scan[tid] + v;
+            g_scan[tid]  = g_scan[tid] + v;
+            g_scanD[tid] = g_scanD[tid] + vd;
             GroupMemoryBarrier();
         }
 
-        uint excl      = g_scan[tid] - c;        // exclusive prefix within the tile
-        uint tileTotal = g_scan[SCAN_GROUP - 1u]; // inclusive sum of the whole tile
+        uint excl       = g_scan[tid] - c;         // exclusive prefix within the tile
+        uint tileTotal  = g_scan[SCAN_GROUP - 1u];  // inclusive sum of the whole tile
+        uint exclD      = g_scanD[tid] - d;
+        uint tileDraws  = g_scanD[SCAN_GROUP - 1u];
 
         if (sid < subsetCount)
         {
             uint off2 = g_base + excl;            // global instance offset for this subset
             gSubsetOffset[sid] = off2;
             gSubsetCursor[sid] = 0u;
-            StaticsSubset s = gStaticsSubsets[sid];
-            uint a = sid * 5u;
-            gArgs[a + 0u] = s.indexCount;         // IndexCountPerInstance
-            gArgs[a + 1u] = c;                    // InstanceCount
-            gArgs[a + 2u] = s.ibBase;             // StartIndexLocation
-            gArgs[a + 3u] = s.vbBase;             // BaseVertexLocation
-            gArgs[a + 4u] = off2;                 // StartInstanceLocation
+            if (d != 0u)
+            {
+                StaticsSubset s = gStaticsSubsets[sid];
+                uint a = (g_drawBase + exclD) * 5u;
+                gArgs[a + 0u] = s.indexCount;     // IndexCountPerInstance
+                gArgs[a + 1u] = c;                // InstanceCount
+                gArgs[a + 2u] = s.ibBase;         // StartIndexLocation
+                gArgs[a + 3u] = s.vbBase;         // BaseVertexLocation
+                gArgs[a + 4u] = off2;             // StartInstanceLocation
+            }
         }
 
         GroupMemoryBarrier();
         if (tid == 0u)
-            g_base = g_base + tileTotal;
+        {
+            g_base     = g_base + tileTotal;
+            g_drawBase = g_drawBase + tileDraws;
+        }
         GroupMemoryBarrier();
     }
+
+    // Zero the tail, so a full-length (count-buffer-less) execute draws nothing past the packed list.
+    uint draws = g_drawBase;
+    for (uint t = draws + tid; t < subsetCount; t += SCAN_GROUP)
+    {
+        gArgs[t * 5u + 0u] = 0u;
+        gArgs[t * 5u + 1u] = 0u;
+        gArgs[t * 5u + 2u] = 0u;
+        gArgs[t * 5u + 3u] = 0u;
+        gArgs[t * 5u + 4u] = 0u;
+    }
+    if (tid == 0u)
+        gArgs[subsetCount * 5u] = draws;          // the count buffer (host: kCullDrawCountWord)
     RETURN();
 }
