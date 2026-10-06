@@ -17484,6 +17484,10 @@ namespace {
     // the shadow mask, the VRS rate image): the two arms are not the same image with those on.
     bool  g_staticsPrepass = true;
     bool  g_staticsPrepassRecorded = false;   // set by staticsRecordDepth when it issued the draw
+    // Which VRS binds a frame actually issued (Linux 1660S: VRS passes flapped 2 -> 1 between identical
+    // runs, +0.5 ms GPU). Bits: 1 rate image built, 2 terrain, 4 statics, 8 water. Cur is filled
+    // during record, Last is what the split prints (the previous recorded frame).
+    uint32_t g_vrsMaskCur = 0, g_vrsMaskLast = 0;
     // DENSITY, and it is a PREFIX, not a per-instance test. g_grassInst is hash-shuffled once at
     // load, so any prefix of it is a spatially uniform random subset of the whole field — which
     // means density can be a dispatch COUNT instead of a branch in a shared shader. Three
@@ -33224,6 +33228,7 @@ void destroyHostWindow(Renderer* R);
         cmdEndDebugMarker(g_live.pCmd);
         vrsRawTransition(true);
         g_live.vrsBuilt = true;
+        g_vrsMaskCur |= 1u;
     }
 
     // Arm/disarm the rate image for the draws in between. OVERRIDE on the image combiner: the
@@ -33497,7 +33502,7 @@ void destroyHostWindow(Renderer* R);
             // VRS (g_vrsWater): far water tiles composite once per 2x2. Not while submerged — the
             // rate image is built from the seabed side of the depth and means nothing from below.
             const bool vrsW = g_vrsWater && g_live.vrsBuilt && !underwater && !waterDebugBitsSet();
-            if (vrsW) { vrsBind(true); }
+            if (vrsW) { vrsBind(true); g_vrsMaskCur |= 8u; }
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const WaterLodLevelHost& lvl = g_waterLevels[k];
                 uint32_t variant = 0;
@@ -36484,7 +36489,7 @@ void destroyHostWindow(Renderer* R);
             // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
             // prepass paid for itself is `grassdep + grass` now against `grass` alone at
             // grassPrepass=0.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s stdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s stdep=%.2f %s vrs=%c%c%c%c) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
                          " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
                          g_lastGpuPhaseMs[kGpuPhaseSkySnap],
@@ -36504,6 +36509,9 @@ void destroyHostWindow(Renderer* R);
                          g_lastGpuPhaseMs[kGpuPhaseStaticsDepth],
                          g_staticsPrepassRecorded ? "stEQ" : (g_staticsPrepass ? "stGEQUAL(prepass unavailable)"
                                                                               : "stGEQUAL(off)"),
+                         // vrs=BTSW: rate image Built, Terrain / Statics / Water bound ('-' = not this frame)
+                         (g_vrsMaskLast & 1u) ? 'B' : '-', (g_vrsMaskLast & 2u) ? 'T' : '-',
+                         (g_vrsMaskLast & 4u) ? 'S' : '-', (g_vrsMaskLast & 8u) ? 'W' : '-',
                          g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
                          // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
@@ -40690,6 +40698,7 @@ void destroyHostWindow(Renderer* R);
         // rather than misdraw, which is the failure mode hardest to catch in a minimized harness.
         g_grassPrepassRecorded = false;
         g_staticsPrepassRecorded = false;   // same latch rule as grass
+        g_vrsMaskLast = g_vrsMaskCur; g_vrsMaskCur = 0;
         auto gpuPhaseBegin = [&](uint32_t i) {
             cpuPhaseT0[i] = hostNowMs();
             g_gpuPhaseIssued[i] = true;
@@ -58843,6 +58852,8 @@ void destroyHostWindow(Renderer* R);
         // bind stays armed across both so the pair costs one set and one clear of the rate state.
         const bool vrsStat = g_vrsStatics && g_live.vrsBuilt;
         if (vrsOn || vrsStat) { vrsBind(vrsOn); }
+        if (vrsOn)   { g_vrsMaskCur |= 2u; }
+        if (vrsStat) { g_vrsMaskCur |= 4u; }
         terrainRecord(g_live.pCmd, g_terrainMain, g_live.pPerFrameSet, /*mirror*/false);
         if (vrsOn != vrsStat) { vrsBind(vrsStat); }
 
