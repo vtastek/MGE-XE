@@ -390,13 +390,25 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
 
+    // ⚠ TWO VARIANTS OF THIS FILE (shaders.list): `terrain.frag`, the one the ground ships with, and
+    // `terrain_dbg.frag` (TERRAIN_DEBUG_VIEWS), which the host binds only while an F12 view or the
+    // `terrainCut` probe is active (or terrainLean=0). Measured 2026-10-06 on the 1660S: this shader
+    // at 128 registers/thread = 50% occupancy, and every stage removed sped up the rest — the
+    // signature of register pressure. Everything only a debug view reads (the LOD probes, the
+    // distinct-texture count, litTerm, the sky-vis texel) is dead code in the shipped variant, so the
+    // compiler drops it; nothing in the shipped image depends on it.
+    //
     // `terrainCut` (host knob, pbrTerrain.w): a COST PROBE, not a look knob. Each bit removes one
     // stage so an A/B prices it (Release 1 P1: 4.1 ms of terrain colour for 0.26M tris, PBR off).
     // 0 = the shader as shipped. Cbuffer-driven, so every branch is uniform across the draw.
     //   1 sky ambient factor   2 point lights   4 macro variation   8 albedo without AF
     //   16 fog   32 one albedo tap   64 vertex colour   128 water transmit + caustic projector
     //   256 sun shadow visibility
+#ifdef TERRAIN_DEBUG_VIEWS
     const uint tCut = (uint)(gShadowParams.pbrTerrain.w + 0.5f);
+#else
+    const uint tCut = 0u;   // the shipped variant: every probe branch folds away
+#endif
 
     const int  lx    = (int)In.Cell.y;
     const int  ly    = (int)In.Cell.z;
@@ -1343,6 +1355,7 @@ float4 PS_MAIN( VSOutput In )
     result = tonemapInPass(result);
     if ((tCut & 16u) == 0u) { result = applyFog(result, In.WorldPos, In.Position.xy); }
 
+#ifdef TERRAIN_DEBUG_VIEWS
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     // AO buffer views (3/4), same branches as opaque.frag / multimap.frag. Added with the AO
@@ -1578,5 +1591,6 @@ float4 PS_MAIN( VSOutput In )
         else if (distinctIds >= 4u) { cc = float3(1.00f, 0.12f, 0.10f); }
         RETURN(float4(cc, 1.0f));
     }
+#endif // TERRAIN_DEBUG_VIEWS
     RETURN(float4(result, 1.0f));
 }

@@ -17768,6 +17768,9 @@ namespace {
     // What OFF pays is the walk: every subset in the world is a command, per statics pass, per cascade,
     // per lane — ~20k empty commands a frame on the 1660S for ~10 real draws on an empty view.
     bool g_cullDrawCount = true;
+    // Terrain colour: ship terrain.frag (lean) unless a debug view needs terrain_dbg.frag. 0 = always
+    // the debug variant, i.e. the shader as it was before the split — the A/B (g_pTerrainShaderDbg).
+    bool g_terrainLean = true;
     // M2 A/B: OFF forces hizParams.w = 0 -> the GPU occlusion test passes everything through and
     // the draw is byte-identical to frustum-only (the pyramid still builds; PD1 explicit A/B).
     bool g_hizOcclusion  = true;
@@ -23443,6 +23446,7 @@ namespace {
             //     cullSubsetCount ~= 10,910 regardless of survivors.
             { "reflGpuCull",         &g_reflGpuCull         },
             { "cullDrawCount",       &g_cullDrawCount       },
+            { "terrainLean",         &g_terrainLean         },
             { "reflCullVerify",      &g_reflCullVerify      },
             // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
             { "reflHeightOcc",       &g_reflHeightOcc       },
@@ -49858,6 +49862,13 @@ void destroyHostWindow(Renderer* R);
     // did not. EQUAL makes the erase stick, and matches the contract the opaque colour pass has had
     // all along (forgerender.cpp: "CMP_EQUAL + depthWrite OFF = true early-Z").
     Pipeline* g_pTerrainPipelineEQ = nullptr;
+    // The DEBUG variant of the main colour pair (terrain_dbg.frag: F12 views + the terrainCut probe).
+    // terrain.frag ships without them because the shader was register-bound — 128 regs/thread, 50%
+    // occupancy on Turing (1660S, 2026-10-06) — and everything only a debug view reads was live in
+    // it. Bound only while g_debugMode or terrainCut is non-zero, or terrainLean=0 (the A/B).
+    Shader*   g_pTerrainShaderDbg     = nullptr;
+    Pipeline* g_pTerrainPipelineDbg   = nullptr;
+    Pipeline* g_pTerrainPipelineEQDbg = nullptr;
     Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
     Pipeline* g_pTerrainPipelineWire = nullptr;
     Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
@@ -50104,6 +50115,26 @@ void destroyHostWindow(Renderer* R);
             // Non-fatal: terrainRecord falls back to the GEQUAL pipeline, i.e. exactly the
             // pre-portal behaviour (hole in depth, no hole in colour).
             std::printf("[forge][terrain] addPipeline(EQ) FAILED — portals will not cut terrain\n");
+        }
+
+        // The debug variant's GEQUAL + EQUAL pair (see g_pTerrainShaderDbg). Non-fatal: without it
+        // the F12 terrain views and terrainCut simply do nothing on the ground.
+        {
+            ShaderLoadDesc dd = {};
+            dd.mVert.pFileName = "terrain.vert";
+            dd.mFrag.pFileName = "terrain_dbg.frag";
+            addShader(R, &dd, &g_pTerrainShaderDbg);
+            if (g_pTerrainShaderDbg) {
+                g.pShaderProgram = g_pTerrainShaderDbg;
+                addPipeline(R, &pd, &g_pTerrainPipelineDbg);
+                g.pDepthState = &dsEq;
+                addPipeline(R, &pd, &g_pTerrainPipelineEQDbg);
+                g.pDepthState = &ds;
+                g.pShaderProgram = g_pTerrainShader;
+            }
+            if (!g_pTerrainPipelineDbg) {
+                std::printf("[forge][terrain] debug variant (terrain_dbg.frag) FAILED — F12 terrain views off\n");
+            }
         }
 
         // Mirror twin for the reflect-geo pass. CULL_MODE_NONE, deliberately, and NOT the CW winding
@@ -51470,8 +51501,12 @@ void destroyHostWindow(Renderer* R);
         // MAIN colour draw only: prefer the EQUAL twin so a stencil portal's depth erase survives
         // into colour (see g_pTerrainPipelineEQ). The mirror (reflect-geo) and override (Z-prepass,
         // sun cascade) paths are untouched — neither has a prepass of its own to match against.
-        Pipeline* const mainPso = (g_pTerrainPipelineEQ && terrainPrepassRan())
-                                ? g_pTerrainPipelineEQ : g_pTerrainPipeline;
+        // ...and the debug variant of that pair whenever something only it can show is asked for.
+        const bool dbgVar = g_pTerrainPipelineDbg
+                         && (g_debugMode != 0u || g_terrainCut >= 1.0f || !g_terrainLean);
+        Pipeline* const geqPso = dbgVar ? g_pTerrainPipelineDbg : g_pTerrainPipeline;
+        Pipeline* const eqPso  = dbgVar ? g_pTerrainPipelineEQDbg : g_pTerrainPipelineEQ;
+        Pipeline* const mainPso = (eqPso && terrainPrepassRan()) ? eqPso : geqPso;
         Pipeline* pso = psoOverride                                 ? psoOverride
                       : (g_terrainWire && g_pTerrainPipelineWire)   ? g_pTerrainPipelineWire
                       : mirror                                      ? g_pTerrainPipelineMirror
@@ -62369,6 +62404,9 @@ void destroyHostWindow(Renderer* R);
         if (g_pSunShadowTerrainShader)   { removeShader(R, g_pSunShadowTerrainShader);     g_pSunShadowTerrainShader = nullptr; }
         if (g_pTerrainDepthPipeline) { removePipeline(R, g_pTerrainDepthPipeline); g_pTerrainDepthPipeline = nullptr; }
         if (g_pTerrainDepthShader)   { removeShader(R, g_pTerrainDepthShader);     g_pTerrainDepthShader = nullptr; }
+        if (g_pTerrainPipelineEQDbg) { removePipeline(R, g_pTerrainPipelineEQDbg); g_pTerrainPipelineEQDbg = nullptr; }
+        if (g_pTerrainPipelineDbg)   { removePipeline(R, g_pTerrainPipelineDbg);   g_pTerrainPipelineDbg = nullptr; }
+        if (g_pTerrainShaderDbg)     { removeShader(R, g_pTerrainShaderDbg);       g_pTerrainShaderDbg = nullptr; }
         if (g_pTerrainPipelineEQ)   { removePipeline(R, g_pTerrainPipelineEQ);   g_pTerrainPipelineEQ = nullptr; }
         if (g_pTerrainPipeline)     { removePipeline(R, g_pTerrainPipeline);     g_pTerrainPipeline = nullptr; }
         if (g_pTerrainShader)       { removeShader(R, g_pTerrainShader);         g_pTerrainShader = nullptr; }

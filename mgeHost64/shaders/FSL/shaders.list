@@ -228,6 +228,13 @@
 #include "terrain.frag.fsl"
 #end
 
+// ...and its DEBUG variant: the F12 views + the terrainCut cost probe. Bound only while one of them
+// is active (or terrainLean=0), so the ground ships without their registers (see terrain.frag.fsl).
+#frag terrain_dbg.frag
+#define TERRAIN_DEBUG_VIEWS
+#include "terrain.frag.fsl"
+#end
+
 // SUN shadow moments for host-owned TERRAIN — the landscape as a CASTER. Pairs with terrain.vert
 // (whose VSOutput it mirrors byte for byte); no alpha test, terrain is opaque. Without it a mountain
 // shadows nothing, which is also why sun shafts lit valleys a ridge should have blacked out.
