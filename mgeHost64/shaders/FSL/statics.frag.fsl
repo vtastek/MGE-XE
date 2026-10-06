@@ -251,7 +251,13 @@ PSOut PS_MAIN( VSOutput In )
     float3 pbrV     = float3(0.0f, 0.0f, 1.0f);
     // pbrStatics.x is a cbuffer scalar and TexIndex is FLAT, so both tests are uniform per draw.
     bool   pbrLive  = false;
+#if defined(STATICS_NO_PBR)
+    // statics_nopbr.frag (shaders.list): PBR compiled out, bound while pbrStatics is off — a constant
+    // drops the path's registers where the uniform branch below only skips its instructions.
+    if (false)
+#else
     if (gShadowParams.pbrStatics.x != 0.0f)
+#endif
     {
         const uint pslot = staticsParamSlot(bucket, layer);
         pbrLive = (pslot != 0u);

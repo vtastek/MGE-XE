@@ -267,6 +267,12 @@
 #include "statics.frag.fsl"
 #end
 
+// ...its PBR-off FEATURE variant (bound while pbrStatics is off; see statics.frag.fsl).
+#frag statics_nopbr.frag
+#define STATICS_NO_PBR
+#include "statics.frag.fsl"
+#end
+
 // Phase 4 hero distant statics blend pass: the SAME statics.vert body built HERO_PASS=1 (keeps only
 // the hero-blend subsets, clips the rest) + a blend frag (statics.frag minus discard, real alpha).
 // Drawn after water on a SRCALPHA/INVSRCALPHA depth-GEQUAL/no-write PSO. No GPU-cull change — reuses

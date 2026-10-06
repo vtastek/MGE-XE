@@ -49142,6 +49142,11 @@ void destroyHostWindow(Renderer* R);
     Pipeline* g_pStaticsPipeline = nullptr;   // FRONT_FACE_CCW: MW's live in-game viewProj
     Pipeline* g_pStaticsPipelineCW = nullptr; // FRONT_FACE_CW: synthetic dlLookAtLH camera (--forge-view)
     Pipeline* g_pStaticsPipelineNone = nullptr; // CULL_MODE_NONE: facing A/B (see g_staticsFacing)
+    // statics_nopbr.frag (PBR compiled out): the same three facings, bound while pbrStatics is off.
+    Shader*   g_pStaticsShaderNoPbr        = nullptr;
+    Pipeline* g_pStaticsPipelineNoPbr      = nullptr;
+    Pipeline* g_pStaticsPipelineCWNoPbr    = nullptr;
+    Pipeline* g_pStaticsPipelineNoneNoPbr  = nullptr;
     Shader*   g_pStaticsBlendShader   = nullptr; // Phase 4 hero blend: statics_heroblend.vert + statics_blend.frag
     Pipeline* g_pStaticsBlendPipeline = nullptr; // SRCALPHA/INVSRCALPHA, depth GEQUAL test / no write, cull NONE
     // GitD lit-window multi-map layers: DESTCOLOR/ZERO (multiply), depth EQUAL test / no write.
@@ -52257,6 +52262,24 @@ void destroyHostWindow(Renderer* R);
         g.pRasterizerState = &rsNone;
         addPipeline(R, &pd, &g_pStaticsPipelineNone);
         if (!g_pStaticsPipelineNone) { std::printf("[forge][dl] addPipeline(statics NONE) FAILED\n"); return false; }
+
+        // The PBR-off FEATURE variant of all three (statics_nopbr.frag). Non-fatal: without it the
+        // main shader draws pbrStatics-off exactly as before (dlPickStaticsPipeline falls back).
+        {
+            ShaderLoadDesc nd = {};
+            nd.mVert.pFileName = "statics.vert";
+            nd.mFrag.pFileName = "statics_nopbr.frag";
+            addShader(R, &nd, &g_pStaticsShaderNoPbr);
+            if (g_pStaticsShaderNoPbr) {
+                g.pShaderProgram = g_pStaticsShaderNoPbr;
+                g.pRasterizerState = &rs;     addPipeline(R, &pd, &g_pStaticsPipelineNoPbr);
+                g.pRasterizerState = &rsCW;   addPipeline(R, &pd, &g_pStaticsPipelineCWNoPbr);
+                g.pRasterizerState = &rsNone; addPipeline(R, &pd, &g_pStaticsPipelineNoneNoPbr);
+                g.pShaderProgram = g_pStaticsShader;
+            } else {
+                std::printf("[forge][dl] statics_nopbr.frag FAILED — PBR-off statics use the main shader\n");
+            }
+        }
 
         // Phase 4 hero distant statics BLEND pass. statics_heroblend.vert (HERO_PASS=1 -> keeps only
         // hero-blend subsets, clips the rest) + statics_blend.frag (real alpha). SRCALPHA/INVSRCALPHA,
@@ -58362,8 +58385,12 @@ void destroyHostWindow(Renderer* R);
         const bool cw = (g_staticsFacing == 1u) ? false            // force CCW
                       : (g_staticsFacing == 2u) ? true             // force CW
                       : g_dlStaticsFrontCW;                        // 0 = auto (per-camera default)
-        if (g_staticsFacing == 3u) { return g_pStaticsPipelineNone; }
+        // PBR off and no debug view: the PBR-compiled-out variant of the same facing, when it exists.
+        const bool np = !g_pbrStatics && g_debugMode == 0u && g_pStaticsPipelineNoPbr
+                     && g_pStaticsPipelineCWNoPbr && g_pStaticsPipelineNoneNoPbr;
+        if (g_staticsFacing == 3u) { return np ? g_pStaticsPipelineNoneNoPbr : g_pStaticsPipelineNone; }
         const bool wantCW = mirror ? !cw : cw;
+        if (np) { return wantCW ? g_pStaticsPipelineCWNoPbr : g_pStaticsPipelineNoPbr; }
         return wantCW ? g_pStaticsPipelineCW : g_pStaticsPipeline;
     }
 
@@ -63041,6 +63068,10 @@ void destroyHostWindow(Renderer* R);
         if (g_pStaticsLayerShader) { removeShader(R, g_pStaticsLayerShader); g_pStaticsLayerShader = nullptr; }
         if (g_pStaticsBlendPipeline) { removePipeline(R, g_pStaticsBlendPipeline); g_pStaticsBlendPipeline = nullptr; }
         if (g_pStaticsPipelineNone) { removePipeline(R, g_pStaticsPipelineNone); g_pStaticsPipelineNone = nullptr; }
+        for (Pipeline** pp : { &g_pStaticsPipelineNoPbr, &g_pStaticsPipelineCWNoPbr, &g_pStaticsPipelineNoneNoPbr }) {
+            if (*pp) { removePipeline(R, *pp); *pp = nullptr; }
+        }
+        if (g_pStaticsShaderNoPbr) { removeShader(R, g_pStaticsShaderNoPbr); g_pStaticsShaderNoPbr = nullptr; }
         if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsPipeline) { removePipeline(R, g_pSunShadowStaticsPipeline); g_pSunShadowStaticsPipeline = nullptr; }
