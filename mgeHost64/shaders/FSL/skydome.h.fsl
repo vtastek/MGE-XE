@@ -300,7 +300,6 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
     // PER PIXEL (fog.h.fsl mwFogFactorAt): the interpolated vertex fog a long wall carried was the
     // average of its far corners', not the fog at the point you are looking at.
     float fog = mwFogFactorAt(worldPosRel);
-    float4 s = fogSkySample(pixelXy);
 
     // WATER FOG — the segment of this ray that runs through water (waterfog.h.fsl). Exactly (0, 0)
     // when the feature is off or the fragment is above the surface, so everything below is unchanged.
@@ -323,6 +322,8 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
     // water composite and the pow for every near pixel (Release 1: fog was the largest term in the
     // terrain shader). Same value up to the final lerp's rounding.
     if (fog >= 1.0f && wf.x == 0.0f && wf.y == 0.0f && !waterCameraSubmerged()) { return lit; }
+    // The sky snapshot is fetched only past the early-out (it fed only the terms below it).
+    float4 s = fogSkySample(pixelXy);
     // ⚠ AND THE PLANE TEST THAT USED TO SIT HERE IS GONE — 2026-08-15. mwFogAir compared this
     // fragment's z against the drawn water mesh and stripped the whole air ramp below it. Every
     // spelling of that test drew a line along the shoreline, because every spelling had to decide,
