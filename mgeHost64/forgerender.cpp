@@ -17913,6 +17913,13 @@ namespace {
     // g_vrsDist world units shade once per 2x2 pixels; MSAA coverage stays per sample. Off = 1x1.
     bool  g_terrainVrs = true;
     float g_vrsDist    = 6144.0f;
+    // The same rate image around the DISTANT STATICS draws (all three layer PSOs) and the WATER
+    // surface. Statics: far buildings are a few dozen pixels, their texels sub-pixel; the alpha-tested
+    // subsets go coarse too, which is the thing to look at in a dump pair. Water: blended, so VRS
+    // only changes how often the composite is evaluated; the depth the image was built from is the
+    // seabed's, so near shallows stay per pixel.
+    bool  g_vrsStatics = true;
+    bool  g_vrsWater   = true;
     // DISTANT-STATICS LOD (heightocclusion.h.fsl cullLodOffset). At load every statics subset gets a
     // meshoptimizer-simplified copy appended after the originals (borders locked, so the seams
     // between a model's subsets stay closed); the GPU cull hands an instance its simplified subsets
@@ -23623,6 +23630,8 @@ namespace {
             { "cullDrawCount",       &g_cullDrawCount       },
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
+            { "vrsStatics",          &g_vrsStatics          },
+            { "vrsWater",            &g_vrsWater            },
             { "staticsLod",          &g_staticsLod          },
             { "reflCullVerify",      &g_reflCullVerify      },
             // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
@@ -32987,6 +32996,69 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
+    // ─── VRS Tier 2: the rate image's raw transitions and its bind (vrsrate.srt.h) ─────────────
+    // Forge's D3D12 backend has no mapping for SHADING_RATE_SOURCE, so the image's two states are
+    // switched on the native list. Forge never tracks resource state, so nothing goes stale.
+    void vrsRawTransition(bool toRateSource) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = g_live.pVrsRate->mDx.pResource;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = toRateSource ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                : D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        b.Transition.StateAfter  = toRateSource ? D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE
+                                                : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        g_live.pCmd->mDx.pCmdList->ResourceBarrier(1, &b);
+        g_live.vrsInRateState = toRateSource;
+    }
+
+    // Build this frame's rate image from pLinearDepth (raw reverse-Z device depth, camera-relative
+    // rzViewProj). Called at the end of the post-depth phase, once pLinearDepth is SHADER_RESOURCE.
+    void vrsBuildRateImage(const float* rzViewProj) {
+        g_live.vrsBuilt = false;
+        if (!g_terrainVrs || !g_live.vrsReady || !rzViewProj) { return; }
+        // Device depth at view distance D: rzViewProj is a D3DX row-vector matrix (clip = v*M), so
+        // clip.w = v . (M[3],M[7],M[11]) + M[15] and clip.z = v . (M[2],M[6],M[10]) + M[14]. A point
+        // ON the w-axis at w = D gives the depth any surface at view depth D has.
+        const float* M = rzViewProj;
+        const float nx = M[3], ny = M[7], nz = M[11];
+        const float n2 = nx * nx + ny * ny + nz * nz;
+        float thr = 0.0f;
+        if (n2 > 1e-12f && g_vrsDist > 0.0f) {
+            const float D = g_vrsDist, k = D / n2;
+            const float w = D + M[15];
+            const float z = (nx * M[2] + ny * M[6] + nz * M[10]) * k + M[14];
+            if (w > 1e-6f) { thr = std::clamp(z / w, 0.0f, 1.0f); }
+        }
+        float* p = (float*)fbw(g_live.pVrsCbv);
+        if (!p) { return; }
+        p[0] = thr;
+        p[1] = (float)D3D12_SHADING_RATE_2X2;
+        p[2] = (float)g_live.vrsTile;
+        p[3] = 4.0f;
+        if (g_live.vrsInRateState) { vrsRawTransition(false); }
+        cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "VRS RATE IMAGE");
+        cmdBindPipeline(g_live.pCmd, g_live.pVrsPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pVrsSet);
+        cmdDispatch(g_live.pCmd, (g_live.vrsW + 7u) / 8u, (g_live.vrsH + 7u) / 8u, 1);
+        cmdEndDebugMarker(g_live.pCmd);
+        vrsRawTransition(true);
+        g_live.vrsBuilt = true;
+    }
+
+    // Arm/disarm the rate image for the draws in between. OVERRIDE on the image combiner: the
+    // image alone decides (the per-draw rate is 1x1 and there is no per-primitive rate).
+    void vrsBind(bool on) {
+        ID3D12GraphicsCommandList5* cl5 = nullptr;
+        if (FAILED(g_live.pCmd->mDx.pCmdList->QueryInterface(IID_PPV_ARGS(&cl5))) || !cl5) { return; }
+        const D3D12_SHADING_RATE_COMBINER c[2] = {
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            on ? D3D12_SHADING_RATE_COMBINER_OVERRIDE : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
+        cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, c);
+        cl5->RSSetShadingRateImage(on ? g_live.pVrsRate->mDx.pResource : nullptr);
+        cl5->Release();
+    }
+
     // WT1: the Forge water surface. Whole kGpuPhaseWater bracket, no outputs.
     //
     // The Begin sits one line above the banner in renderScene, so the region starts there rather
@@ -33184,6 +33256,10 @@ void destroyHostWindow(Renderer* R);
             uint32_t wstrides[2] = { 12, (uint32_t)sizeof(uint32_t) };
             cmdBindVertexBuffer(g_live.pCmd, 2, wvbs, wstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_live.pWaterIB, INDEX_TYPE_UINT16, 0);
+            // VRS (g_vrsWater): far water tiles composite once per 2x2. Not while submerged — the
+            // rate image is built from the seabed side of the depth and means nothing from below.
+            const bool vrsW = g_vrsWater && g_live.vrsBuilt && !underwater && !waterDebugBitsSet();
+            if (vrsW) { vrsBind(true); }
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const WaterLodLevelHost& lvl = g_waterLevels[k];
                 uint32_t variant = 0;
@@ -33201,74 +33277,12 @@ void destroyHostWindow(Renderer* R);
                                         lvl.ibStart[variant], 1, 0, k);
                 ++g_lastWaterLevels;   // Phase 0 panel
             }
+            if (vrsW) { vrsBind(false); }
         }
 
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         gpuPhaseEnd(kGpuPhaseWater);
-    }
-
-    // ─── VRS Tier 2: the rate image's raw transitions and its bind (vrsrate.srt.h) ─────────────
-    // Forge's D3D12 backend has no mapping for SHADING_RATE_SOURCE, so the image's two states are
-    // switched on the native list. Forge never tracks resource state, so nothing goes stale.
-    void vrsRawTransition(bool toRateSource) {
-        D3D12_RESOURCE_BARRIER b = {};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource   = g_live.pVrsRate->mDx.pResource;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = toRateSource ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                                : D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
-        b.Transition.StateAfter  = toRateSource ? D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE
-                                                : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        g_live.pCmd->mDx.pCmdList->ResourceBarrier(1, &b);
-        g_live.vrsInRateState = toRateSource;
-    }
-
-    // Build this frame's rate image from pLinearDepth (raw reverse-Z device depth, camera-relative
-    // rzViewProj). Called at the end of the post-depth phase, once pLinearDepth is SHADER_RESOURCE.
-    void vrsBuildRateImage(const float* rzViewProj) {
-        g_live.vrsBuilt = false;
-        if (!g_terrainVrs || !g_live.vrsReady || !rzViewProj) { return; }
-        // Device depth at view distance D: rzViewProj is a D3DX row-vector matrix (clip = v*M), so
-        // clip.w = v . (M[3],M[7],M[11]) + M[15] and clip.z = v . (M[2],M[6],M[10]) + M[14]. A point
-        // ON the w-axis at w = D gives the depth any surface at view depth D has.
-        const float* M = rzViewProj;
-        const float nx = M[3], ny = M[7], nz = M[11];
-        const float n2 = nx * nx + ny * ny + nz * nz;
-        float thr = 0.0f;
-        if (n2 > 1e-12f && g_vrsDist > 0.0f) {
-            const float D = g_vrsDist, k = D / n2;
-            const float w = D + M[15];
-            const float z = (nx * M[2] + ny * M[6] + nz * M[10]) * k + M[14];
-            if (w > 1e-6f) { thr = std::clamp(z / w, 0.0f, 1.0f); }
-        }
-        float* p = (float*)fbw(g_live.pVrsCbv);
-        if (!p) { return; }
-        p[0] = thr;
-        p[1] = (float)D3D12_SHADING_RATE_2X2;
-        p[2] = (float)g_live.vrsTile;
-        p[3] = 4.0f;
-        if (g_live.vrsInRateState) { vrsRawTransition(false); }
-        cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "VRS RATE IMAGE");
-        cmdBindPipeline(g_live.pCmd, g_live.pVrsPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pVrsSet);
-        cmdDispatch(g_live.pCmd, (g_live.vrsW + 7u) / 8u, (g_live.vrsH + 7u) / 8u, 1);
-        cmdEndDebugMarker(g_live.pCmd);
-        vrsRawTransition(true);
-        g_live.vrsBuilt = true;
-    }
-
-    // Arm/disarm the rate image for the draws in between. OVERRIDE on the image combiner: the
-    // image alone decides (the per-draw rate is 1x1 and there is no per-primitive rate).
-    void vrsBind(bool on) {
-        ID3D12GraphicsCommandList5* cl5 = nullptr;
-        if (FAILED(g_live.pCmd->mDx.pCmdList->QueryInterface(IID_PPV_ARGS(&cl5))) || !cl5) { return; }
-        const D3D12_SHADING_RATE_COMBINER c[2] = {
-            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
-            on ? D3D12_SHADING_RATE_COMBINER_OVERRIDE : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
-        cl5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, c);
-        cl5->RSSetShadingRateImage(on ? g_live.pVrsRate->mDx.pResource : nullptr);
-        cl5->Release();
     }
 
     // TIER 2: linearize + GTAO compute. Whole kGpuPhasePostDepth bracket, and the seven nested
@@ -58330,9 +58344,12 @@ void destroyHostWindow(Renderer* R);
         // the sunk mesh simply loses the depth test.
         // VRS: far terrain shades per 2x2 (the rate image built at the end of post-depth).
         const bool vrsOn = g_terrainVrs && g_live.vrsBuilt && !g_terrainWire;
-        if (vrsOn) { vrsBind(true); }
+        // ...and the distant statics after it (g_vrsStatics): same image, same far-tile rule. The
+        // bind stays armed across both so the pair costs one set and one clear of the rate state.
+        const bool vrsStat = g_vrsStatics && g_live.vrsBuilt;
+        if (vrsOn || vrsStat) { vrsBind(vrsOn); }
         terrainRecord(g_live.pCmd, g_terrainMain, g_live.pPerFrameSet, /*mirror*/false);
-        if (vrsOn) { vrsBind(false); }
+        if (vrsOn != vrsStat) { vrsBind(vrsStat); }
 
         // Phase C: bind the baked DISTANT light set for BOTH distant land + statics frags (falls back
         // to the near set if the baked set failed to build). They loop these camera-relative lights.
@@ -58387,6 +58404,8 @@ void destroyHostWindow(Renderer* R);
                 }
             }
         }
+
+        if (vrsStat) { vrsBind(false); }   // grass shades per pixel: its alpha test would go blocky
 
         // G1: grass, from its own cull lane, inside the same DL block and with the same RT + depth
         // bound. AFTER the statics draw rather than before, on the ordinary early-Z argument: grass
