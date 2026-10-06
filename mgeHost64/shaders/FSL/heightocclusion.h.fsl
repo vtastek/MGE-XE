@@ -202,3 +202,18 @@ bool heightOccluded(float3 c_rel, float effR)
     }
     return false;
 }
+
+// ─── DISTANT-STATICS LOD (Release 1: G7-matched geometry) ────────────────────────────────────────
+// Rides the same cbuffer's spare lanes: arm2.z = k, arm2.w = the LOD block's subset OFFSET (the
+// host appends one simplified copy of every statics subset after the originals, in the same order).
+// An instance takes its simplified subsets when effR < k * distance, i.e. when its bound sphere
+// subtends less than k radians — the simplifier's error budget is a fraction of the mesh size, so a
+// fixed angular size holds the on-screen error under a pixel. k = 0 (the grass lane's buffer, and
+// lodStatics off) = always the originals. cull.comp and cullscatter.comp MUST call this with the
+// same arguments, or the count and the scatter disagree about which subset an instance fills.
+uint cullLodOffset(float effR, float dist2)
+{
+    const float k = gHeightOccParams.arm2.z;
+    if (!(k > 0.0f)) { return 0u; }
+    return (effR * effR < k * k * dist2) ? (uint)gHeightOccParams.arm2.w : 0u;
+}

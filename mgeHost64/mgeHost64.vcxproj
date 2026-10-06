@@ -249,6 +249,9 @@
     <ClCompile Include="..\3rdparty\msoc\MaskedOcclusionCullingAVX512.cpp">
       <AdditionalOptions>/arch:AVX512 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
+    <!-- Vendored meshoptimizer: the distant statics' simplified LOD index ranges, built at load. -->
+    <ClCompile Include="..\3rdparty\meshoptimizer\src\allocator.cpp" />
+    <ClCompile Include="..\3rdparty\meshoptimizer\src\simplifier.cpp" />
   </ItemGroup>
   <!-- The Forge (D3D12 RHI + ResourceLoader + OS layer), x64-only. These vendored TUs
        compile with The Forge's required ABI: no exceptions / no RTTI / _HAS_EXCEPTIONS=0.

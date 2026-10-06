@@ -112,9 +112,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Constant for a given instance for the whole session, so it can never flicker.
     float glowStagger = sin(inst.wr3.x * 1.35f + inst.wr3.y) * kGlowVarianceHours;
 
+    const uint lodOff = cullLodOffset(inst.effR, dNear2);   // MUST match cull.comp
     for (uint k = 0u; k < inst.numSubsets; ++k)
     {
-        uint sid = inst.firstSubset + k;
+        uint sid = inst.firstSubset + k + lodOff;
         uint slot;
         AtomicAdd(gSubsetCursor[sid], 1u, slot);
         uint row = gSubsetOffset[sid] + slot;

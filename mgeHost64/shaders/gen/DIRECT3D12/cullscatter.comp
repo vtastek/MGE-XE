@@ -1258,6 +1258,21 @@ bool heightOccluded(float3 c_rel, float effR)
     }
     return false;
 }
+
+
+
+
+
+
+
+
+
+uint cullLodOffset(float effR, float dist2)
+{
+    const float k = gHeightOccParams.arm2.z;
+    if (!(k > 0.0f)) { return 0u; }
+    return (effR * effR < k * k * dist2) ? (uint)gHeightOccParams.arm2.w : 0u;
+}
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
 #line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
@@ -1381,9 +1396,10 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     float glowStagger = sin(inst.wr3.x * 1.35f + inst.wr3.y) *  0.5f ;
 
+    const uint lodOff = cullLodOffset(inst.effR, dNear2);
     for (uint k = 0u; k < inst.numSubsets; ++k)
     {
-        uint sid = inst.firstSubset + k;
+        uint sid = inst.firstSubset + k + lodOff;
         uint slot;
         AtomicAdd(gSubsetCursor[sid], 1u, slot);
         uint row = gSubsetOffset[sid] + slot;

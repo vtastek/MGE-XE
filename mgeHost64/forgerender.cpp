@@ -16,6 +16,10 @@
 // forgerender.h). Keep host (STL) headers OUT of this TU — talk to the rest of
 // the host only through the plain decls in forgerender.h.
 
+// meshoptimizer (vendored): the distant statics' simplified LOD index ranges (g_staticsLod).
+// FIRST, before any Forge header: its allocator section names ::operator new, which Forge's
+// memory-tracking macros rewrite.
+#include "../3rdparty/meshoptimizer/src/meshoptimizer.h"
 #include "forgerender.h"
 #include "ipc/geomwire.h"
 #include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (fillFrameTimings)
@@ -3261,6 +3265,9 @@ namespace {
         // is never written.
         Buffer*        pHeightOccCbvOff  = nullptr;   // arm.x = 0, written ONCE
         Buffer*        pHeightOccCbvRefl = nullptr;   // the mirror's, refreshed per frame
+        // The GRASS lanes' copy: all zero, forever. Grass shares cull.comp but has its own subset
+        // table, so it must never see the statics LOD lanes (arm2.zw) the other two now carry.
+        Buffer*        pHeightOccCbvGrass = nullptr;
         // --- H0: THE HEIGHT-FIELD OCCLUSION PROBE (occprobe.comp; tasks/forge-heightfield-occlusion.md)
         // A MEASUREMENT over the two views that have no occlusion culling of any kind — the SUN
         // caster and the WATER MIRROR — and nothing else. It draws nothing, gates nothing, and is
@@ -17867,6 +17874,28 @@ namespace {
     // g_vrsDist world units shade once per 2x2 pixels; MSAA coverage stays per sample. Off = 1x1.
     bool  g_terrainVrs = true;
     float g_vrsDist    = 6144.0f;
+    // DISTANT-STATICS LOD (heightocclusion.h.fsl cullLodOffset). At load every statics subset gets a
+    // meshoptimizer-simplified copy appended after the originals (borders locked, so the seams
+    // between a model's subsets stay closed); the GPU cull hands an instance its simplified subsets
+    // when its bound sphere subtends less than g_staticsLodK radians. G7 (a shipped release, user
+    // 2026-10-06: trust its LOD decisions) simplifies its distant statics; bare village we drew
+    // 2.38M tris to its 0.89M. g_staticsLodError is the simplifier's error budget as a fraction of
+    // the mesh extent and g_staticsLodRatio its target index fraction — both LOAD-time (a restart
+    // applies them). k ~ 0.07 = a sphere ~50 px in radius at 1080p, where a 2% error is ~1 px.
+    bool     g_staticsLod      = true;
+    float    g_staticsLodK     = 0.07f;
+    float    g_staticsLodError = 0.02f;
+    float    g_staticsLodRatio = 0.25f;
+    uint32_t g_staticsLodOffset = 0;      // the LOD block's first subset (0 = no LOD block built)
+    // Writes HeightOccParams.arm2.zw (floats 10/11) = (k, offset) into a statics cull lane's cbuffer.
+    // k = 0 when the block was not built or the knob is off, which makes cullLodOffset return 0.
+    inline void publishStaticsLod(Buffer* cbv) {
+        if (!cbv || !fbr(cbv)) { return; }
+        float* hp = (float*)fbwRange(cbv, 10 * sizeof(float), 2 * sizeof(float));
+        const bool on = g_staticsLod && g_staticsLodOffset > 0;
+        hp[10] = on ? std::max(0.0f, g_staticsLodK) : 0.0f;
+        hp[11] = on ? (float)g_staticsLodOffset : 0.0f;
+    }
     // M2 A/B: OFF forces hizParams.w = 0 -> the GPU occlusion test passes everything through and
     // the draw is byte-identical to frustum-only (the pyramid still builds; PD1 explicit A/B).
     bool g_hizOcclusion  = true;
@@ -23350,6 +23379,9 @@ namespace {
             { "terrainCut",          &g_terrainCut          },
             { "terrainLodScale",     &g_terrainLodScale     },
             { "vrsDist",             &g_vrsDist             },
+            { "staticsLodK",         &g_staticsLodK         },
+            { "staticsLodError",     &g_staticsLodError     },
+            { "staticsLodRatio",     &g_staticsLodRatio     },
             // PARALLAX (tasks/forge-parallax.md). Here as well as on the panel because the two
             // questions this milestone has to answer are both MEASUREMENTS a minimized run has to
             // be able to take with nobody at a slider: what does each arm cost on terrain (the
@@ -23546,6 +23578,7 @@ namespace {
             { "cullDrawCount",       &g_cullDrawCount       },
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
+            { "staticsLod",          &g_staticsLod          },
             { "reflCullVerify",      &g_reflCullVerify      },
             // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
             { "reflHeightOcc",       &g_reflHeightOcc       },
@@ -40377,6 +40410,9 @@ void destroyHostWindow(Renderer* R);
         // Raw D3D12 CopyBufferRegion resets the counters (Forge has no buffer->buffer copy); Forge
         // BufferBarriers keep the DEFAULT-heap UAV states tracked.
         if (g_live.pCullPipeline && g_live.cullInstCount) {
+            // Statics LOD lanes (arm2.zw = floats 10/11) of the cbuffer the camera, sun and sky lanes
+            // share; the mirror's copy takes the same two values where it is refilled.
+            publishStaticsLod(g_live.pHeightOccCbvOff);
             ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
             const bool doGpuDraw = g_live.gpuStaticsReady && g_gpuStaticsCull;
             auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
@@ -52259,6 +52295,7 @@ void destroyHostWindow(Renderer* R);
         megaVB.reserve(160u << 20); megaIB.reserve(64u << 20);
         g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
         g_staticsDefs.reserve(distantStaticCount);
+        std::vector<uint32_t> subsetVerts;   // per subset: its vertex count (the LOD build needs it)
 
         for (uint32_t s = 0; s < distantStaticCount; ++s) {
             if (p + 21 > end) { break; }
@@ -52325,6 +52362,7 @@ void destroyHostWindow(Renderer* R);
                 }
                 g_staticsSubsets.push_back(sub);
                 g_staticsSubsetTex.push_back(name);
+                subsetVerts.push_back((verts > 0 && faces > 0) ? (uint32_t)verts : 0u);
             }
             g_staticsDefs.push_back(def);
         }
@@ -52435,6 +52473,76 @@ void destroyHostWindow(Renderer* R);
             } else {
                 LOG::logline(">> [forge][dl] hero_anim.data absent - hero statics inert");
             }
+        }
+
+        // ---- The LOD block (g_staticsLod): one simplified copy of every subset, appended in order, so
+        // subset sid's LOD is sid + g_staticsLodOffset. AFTER the hero bake above, so the copies carry
+        // the hero/layer flags their originals ended with. A subset the simplifier cannot reduce by at
+        // least 10% (or one too small to bother with) gets an exact copy of itself, which keeps the
+        // offset a single constant for the cull. Simplified by POSITION only with the borders LOCKED:
+        // a model is several subsets (one per texture), and an unlocked border would open the seam
+        // between two of them; attribute seams inside a subset are split vertices already, which the
+        // simplifier treats as borders too.
+        g_staticsLodOffset = 0;
+        if (g_staticsLod && !g_staticsSubsets.empty()) {
+            const uint32_t N = (uint32_t)g_staticsSubsets.size();
+            g_staticsSubsets.reserve((size_t)N * 2);
+            g_staticsSubsetTex.reserve((size_t)N * 2);
+            auto halfToFloat = [](uint16_t h) -> float {
+                const uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+                uint32_t f;
+                if (e == 0)       { f = s; if (m) { float v = std::ldexp((float)m, -24); return s ? -v : v; } }
+                else if (e == 31) { f = s | 0x7F800000u | (m << 13); }
+                else              { f = s | ((e + 112u) << 23) | (m << 13); }
+                float out; std::memcpy(&out, &f, 4); return out;
+            };
+            std::vector<float>    pos;
+            std::vector<uint32_t> src, dst;
+            uint64_t trisIn = 0, trisOut = 0;
+            uint32_t reduced = 0;
+            for (uint32_t sid = 0; sid < N; ++sid) {
+                StaticsSubsetGPU lod = g_staticsSubsets[sid];
+                const uint32_t vc = subsetVerts[sid];
+                const uint32_t ic = lod.indexCount;
+                trisIn += ic / 3;
+                if (vc >= 8 && ic >= 3 * 32) {
+                    pos.resize((size_t)vc * 3);
+                    const uint8_t* vb = megaVB.data() + (size_t)lod.vbBase * 20;
+                    for (uint32_t v = 0; v < vc; ++v) {
+                        uint16_t h[3]; std::memcpy(h, vb + (size_t)v * 20, 6);
+                        pos[v * 3 + 0] = halfToFloat(h[0]);
+                        pos[v * 3 + 1] = halfToFloat(h[1]);
+                        pos[v * 3 + 2] = halfToFloat(h[2]);
+                    }
+                    src.resize(ic);
+                    const uint8_t* ib = megaIB.data() + (size_t)lod.ibBase * 2;
+                    for (uint32_t i = 0; i < ic; ++i) { uint16_t x; std::memcpy(&x, ib + (size_t)i * 2, 2); src[i] = x; }
+                    dst.resize(ic);
+                    const size_t target = std::max<size_t>(3, ((size_t)(ic * std::clamp(g_staticsLodRatio, 0.01f, 1.0f)) / 3) * 3);
+                    float err = 0.0f;
+                    const size_t n = meshopt_simplify(dst.data(), src.data(), ic, pos.data(), vc, sizeof(float) * 3,
+                                                      target, std::clamp(g_staticsLodError, 0.0f, 1.0f),
+                                                      meshopt_SimplifyLockBorder, &err);
+                    if (n >= 3 && n * 10 <= (size_t)ic * 9) {
+                        lod.ibBase     = (uint32_t)(megaIB.size() / 2);
+                        lod.indexCount = (uint32_t)n;
+                        for (size_t i = 0; i < n; ++i) {
+                            const uint16_t x = (uint16_t)dst[i];
+                            megaIB.insert(megaIB.end(), (const uint8_t*)&x, (const uint8_t*)&x + 2);
+                        }
+                        ++reduced;
+                    }
+                }
+                trisOut += lod.indexCount / 3;
+                g_staticsSubsets.push_back(lod);
+                g_staticsSubsetTex.push_back(g_staticsSubsetTex[sid]);
+            }
+            g_staticsLodOffset = N;
+            LOG::logline(">> [forge][dl] statics LOD: %u of %u subsets simplified (error %.3f, ratio %.2f): "
+                         "%llu -> %llu tris (%.0f%%), lod at effR < %.3f * distance",
+                         reduced, N, g_staticsLodError, g_staticsLodRatio,
+                         (unsigned long long)trisIn, (unsigned long long)trisOut,
+                         trisIn ? 100.0 * (double)trisOut / (double)trisIn : 0.0, g_staticsLodK);
         }
 
         // uvAnim = subsets whose source NIF carried an NiUVController (flags bit2 -> statics.vert
@@ -56479,7 +56587,11 @@ void destroyHostWindow(Renderer* R);
             };
             addHeightOccCbv(&g_live.pHeightOccCbvOff,  "heightOccParamsOff");
             addHeightOccCbv(&g_live.pHeightOccCbvRefl, "heightOccParamsRefl");
+            addHeightOccCbv(&g_live.pHeightOccCbvGrass, "heightOccParamsGrass");
             waitForAllResourceLoads();
+            if (g_live.pHeightOccCbvGrass && fbr(g_live.pHeightOccCbvGrass)) {
+                std::memset(fbw(g_live.pHeightOccCbvGrass), 0, 256);
+            }
             // The DISARMED buffer, written once and never again. Zeroing arm.x is the whole contract
             // for the five lanes that bind it, and writing it here — rather than trusting the
             // allocation to be zero — is the [[feedback_clear_reserved_lanes_before_writing_them]]
@@ -57153,7 +57265,8 @@ void destroyHostWindow(Renderer* R);
                 // nothing would leave these slots reading whatever the heap last held there, which is
                 // the failure mode the moment someone arms the test by accident.
                 d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gHeightOccParams);
-                d[n].ppBuffers = &g_live.pHeightOccCbvOff; ++n;
+                d[n].ppBuffers = g_live.pHeightOccCbvGrass ? &g_live.pHeightOccCbvGrass
+                                                           : &g_live.pHeightOccCbvOff; ++n;
                 d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSkyHeightMin);
                 d[n].mCount = 1;
                 d[n].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
@@ -58469,6 +58582,7 @@ void destroyHostWindow(Renderer* R);
             hp[9] = std::max(0.0f, g_reflHeightOccMargin);
             hp[10] = hp[11] = 0.0f;
             g_reflHeightOccArmed = arm;
+            publishStaticsLod(g_live.pHeightOccCbvRefl);
         }
 
         ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
@@ -62882,6 +62996,7 @@ void destroyHostWindow(Renderer* R);
         // H2b: the two shared HeightOccParams cbuffers (every cull lane binds one of them).
         if (g_live.pHeightOccCbvOff)   { removeFrameBuf(g_live.pHeightOccCbvOff);   g_live.pHeightOccCbvOff = nullptr; }
         if (g_live.pHeightOccCbvRefl)  { removeFrameBuf(g_live.pHeightOccCbvRefl);  g_live.pHeightOccCbvRefl = nullptr; }
+        if (g_live.pHeightOccCbvGrass) { removeFrameBuf(g_live.pHeightOccCbvGrass); g_live.pHeightOccCbvGrass = nullptr; }
         // H0 probe (only ever non-null if `occProbe` armed the lazy create).
         for (uint32_t v = 0; v < 2u; ++v) {
             if (g_live.pOccProbeCullCbv[v])   { removeFrameBuf(g_live.pOccProbeCullCbv[v]);   g_live.pOccProbeCullCbv[v] = nullptr; }
