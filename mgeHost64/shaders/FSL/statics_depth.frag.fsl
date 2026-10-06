@@ -1,0 +1,59 @@
+// mgeHost64 — DISTANT STATICS Z-PREPASS fragment stage (depth + coverage only; knob staticsPrepass).
+//
+// MGE renders all of its depth first, distant statics included, and shades against it. Ours did not:
+// statics.frag exports its own SV_Coverage and discards, with depth-write on, so the hardware could
+// not resolve a fragment's depth before its shader ran and every overdrawn layer of every distant
+// static paid the full shade. Same defect, and same fix, as grass (G1f, grassdepth.frag).
+//
+// This pass runs the SAME vertex stage (statics.vert, unchanged: SV_Position is bit-identical) and the
+// SAME coverage computation as statics.frag (one texture, one sampler, one alpha reference, the shared
+// a2cCoverageMask), writes depth + the sample mask, and no colour. The colour pass then binds the
+// STATICS_EARLY_Z build of statics.frag against CMP_EQUAL with depth-write OFF.
+//
+// ⚠ THE PAIRING IS THE WHOLE RISK: CMP_EQUAL rejects every sample this pass did not write, so the two
+// must agree bit for bit. Nothing here may be "equivalent but cheaper".
+//
+// Opaque subsets (Flags bit 1 clear) take the full mask without the fetch, exactly as statics.frag's
+// a2cCoverageMask(…, 0) returns ~0 for them. Flags is FLAT and one indirect command is one subset, so
+// the branch is per-draw uniform and the derivative inside it sees a whole quad.
+
+#include "opaque.srt.h"
+#include "a2c.h.fsl"        // a2cCoverageMask() — the SHARED cutout coverage
+
+// MUST stay byte-identical to statics.frag's VSOutput (== statics.vert's).
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
+};
+
+// SV_Coverage and NO SV_Target (mRenderTargetCount = 0), as grassdepth.frag / depthonly.frag.
+STRUCT(PSOut)
+{
+    DATA(uint, Coverage, SV_Coverage);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PSOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint cov = ~0u;
+    if ((In.Flags & 0x2u) != 0u)
+    {
+        uint bucket = In.TexIndex >> 16;
+        uint layer  = In.TexIndex & 0xFFFFu;
+        float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+        cov = a2cCoverageMask(tex.a, 133.0f / 255.0f);
+    }
+    if (cov == 0u) { discard; }
+    PSOut Out;
+    Out.Coverage = cov;
+    RETURN(Out);
+}

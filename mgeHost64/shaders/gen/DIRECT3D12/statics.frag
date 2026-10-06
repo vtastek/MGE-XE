@@ -4365,16 +4365,14 @@ STRUCT(VSOutput)
     DATA(CENTROID(float3), SunLight, TEXCOORD6);
 #line 63
 };
-
-
-
-
-
+#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 STRUCT(PSOut)
 {
     DATA(float4, Color, SV_Target0);
+
     DATA(uint, Coverage, SV_Coverage);
-#line 73
+
+#line 84
 };
 
 
@@ -4401,7 +4399,7 @@ float4 sampleStaticsParam(uint slot, float2 uv)
     return SampleTex2DArray(gStaticsParamArrays[bucket], gSamplerAnisotropic,
                             float3(uv, (float)layer));
 }
-#line 112 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 float2 staticsParamDims(uint bucket)
 {
     uint w, h, e;
@@ -4416,10 +4414,10 @@ float staticsHeightLvl(uint slot, float2 uv, float lvl)
     uint bucket = slot >> 16u;
     uint layer = slot & 0xFFFFu;
     return  gStaticsParamArrays[bucket].SampleLevel(gSamplerBilinearWrap, float3(uv, (float)layer), lvl) .
-#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 a;
 }
-#line 139 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 float2 staticsGradCdblur(uint slot, float2 uv, float2 duvdx, float2 duvdy, float radius)
 {
     const float2 size0 = staticsParamDims(slot >> 16u);
@@ -4454,8 +4452,10 @@ PSOut PS_MAIN( VSOutput In )
 
 
 
+
     uint cov = a2cCoverageMask(tex.a, ((In.Flags & 0x2u) != 0u) ? (133.0f / 255.0f) : 0.0f);
     if (cov == 0u) { discard; }
+
 
 
 
@@ -4473,14 +4473,14 @@ PSOut PS_MAIN( VSOutput In )
 
     float3 tSun, tAmb;
     waterLightTransmit(In.WorldPos, tSun, tAmb);
-#line 203 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 216 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     const float3 pbrDPdx = ddx(In.WorldPos);
     const float3 pbrDPdy = ddy(In.WorldPos);
     const float2 pbrDUVdx = ddx(In.Uv);
     const float2 pbrDUVdy = ddy(In.Uv);
 
     float3 nShade = nGeom;
-#line 237 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 250 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     const bool sunPerPixel = (gShadowParams.pbrStatics.z != 0.0f);
     const float sunNdl = sunPerPixel ? saturate(dot(nGeom, -gFrameData.sunDir.xyz)) : 1.0f;
     float3 sunTerm = In.SunLight * sunNdl;
@@ -4731,7 +4731,9 @@ PSOut PS_MAIN( VSOutput In )
 
 
     PSOut Out;
+
     Out.Coverage = cov;
+
 
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
@@ -4753,7 +4755,7 @@ PSOut PS_MAIN( VSOutput In )
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f); RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     if (dbg == 19u) {
-#line 522 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 537 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
         const float3 srcCol = pbrLive ? float3(0.06f, 1.00f, 0.18f) : float3(0.10f, 0.10f, 0.11f);
 
 

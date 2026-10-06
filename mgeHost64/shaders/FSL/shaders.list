@@ -278,6 +278,23 @@
 #include "statics.frag.fsl"
 #end
 
+// staticsPrepass: the Z-prepass PAIR (G1f's shape). statics_depth = depth + coverage only; the two
+// _eq builds are the colour halves (CMP_EQUAL, depth-write off, no coverage, no discard).
+#frag statics_depth.frag
+#include "statics_depth.frag.fsl"
+#end
+
+#frag statics_eq.frag
+#define STATICS_EARLY_Z 1
+#include "statics.frag.fsl"
+#end
+
+#frag statics_nopbr_eq.frag
+#define STATICS_NO_PBR
+#define STATICS_EARLY_Z 1
+#include "statics.frag.fsl"
+#end
+
 // Phase 4 hero distant statics blend pass: the SAME statics.vert body built HERO_PASS=1 (keeps only
 // the hero-blend subsets, clips the rest) + a blend frag (statics.frag minus discard, real alpha).
 // Drawn after water on a SRCALPHA/INVSRCALPHA depth-GEQUAL/no-write PSO. No GPU-cull change — reuses

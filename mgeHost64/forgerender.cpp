@@ -4529,6 +4529,7 @@ namespace {
            kGpuPhaseCullScatter,   // ...and the scatter dispatch alone (cam - count - scan - scatter = barriers + copies)
            kGpuPhaseSkySnap,       // inside Color, after ColorSky: the gSkyColor snapshot (MSAA resolve)
            kGpuPhaseWaterRefr,     // inside Water: the pRefractColor copy (MSAA resolve)
+           kGpuPhaseStaticsDepth,  // inside Prepass: the distant statics Z-prepass (staticsPrepass)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -17475,6 +17476,14 @@ namespace {
     // the EQ pipeline. A latch rather than a second evaluation of the same predicate — see the note
     // at grassRecordDepth. Cleared once per frame beside g_gpuPhaseIssued.
     bool  g_grassPrepassRecorded = false;
+    // Release 1: the distant statics get the same pair (statics_depth.frag in the prepass, then the
+    // STATICS_EARLY_Z colour build at CMP_EQUAL, depth-write off). MGE draws all of its depth first;
+    // statics.frag exports SV_Coverage + discard with depth-write on, so without this every overdrawn
+    // layer of every distant static is shaded (late-Z). OFF = the shader that shipped, the A/B.
+    // Like grassPrepass this also puts statics into the depth every pre-colour reader sees (GTAO,
+    // the shadow mask, the VRS rate image): the two arms are not the same image with those on.
+    bool  g_staticsPrepass = true;
+    bool  g_staticsPrepassRecorded = false;   // set by staticsRecordDepth when it issued the draw
     // DENSITY, and it is a PREFIX, not a per-instance test. g_grassInst is hash-shuffled once at
     // load, so any prefix of it is a spatially uniform random subset of the whole field — which
     // means density can be a dispatch COUNT instead of a branch in a shared shader. Three
@@ -23954,6 +23963,7 @@ namespace {
             // SV_Coverage — i.e. the exact shader that shipped — so this knob, unlike grassOn,
             // prices the OVERDRAW alone: same blades, same cull, same vertex work on both arms.
             { "grassPrepass",        &g_grassPrepass        },
+            { "staticsPrepass",      &g_staticsPrepass      },
             { "grassShadows",        &g_grassShadows        },
             { "grassNearCut",        &g_grassNearCut        },
             // 0 = ignore the authored red channel and treat every subset as foliage (stock's
@@ -32346,6 +32356,8 @@ void destroyHostWindow(Renderer* R);
     void dispatchGrassCull(); // G1a: the grass cull lane (own instance array + subset table)
     void drawGrass();         // G1: the grass colour draw, inside the DL block
     void grassRecordDepth(Cmd* cmd);  // G1f: its Z-prepass half, inside the prepass block
+    void staticsRecordDepth(Cmd* cmd);   // staticsPrepass: the distant statics' Z-prepass half
+    Pipeline* staticsEqPipeline();       // ...and the CMP_EQUAL colour PSO it pairs with
     void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
     void publishGrassCrushParams(float* mp);                     // G7: the crush field's own lanes
     void publishSkyVis();        // the maps' receiver lane (armed or not, and the distance match)
@@ -32583,6 +32595,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseCullSun, "cull sun" }, { kGpuPhaseCullGrass, "cull grass" },
             { kGpuPhaseCullCount, "cull count" }, { kGpuPhaseCullScatter, "cull scatter" },
             { kGpuPhaseSkySnap, "sky snapshot" }, { kGpuPhaseWaterRefr, "water refract copy" },
+            { kGpuPhaseStaticsDepth, "statics depth" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -34811,6 +34824,12 @@ void destroyHostWindow(Renderer* R);
             // g_terrainMain the colour pass draws, one pipeline swap apart.
             terrainRecordDepth(g_live.pCmd);
 
+            // --- DISTANT STATICS, depth + coverage (staticsPrepass). After terrain for the same
+            // early-Z reason, before grass so the buildings occlude the blades behind them too.
+            gpuPhaseBeginG(kGpuPhaseStaticsDepth);
+            staticsRecordDepth(g_live.pCmd);
+            gpuPhaseEndG(kGpuPhaseStaticsDepth);
+
             // --- G1f HOST-OWNED GRASS, depth-only. AFTER terrain, and that ordering is the whole
             // reason this is cheap: grass is a cutout whose every fragment costs a texture fetch,
             // and by this point the near opaque set AND the ground it grows out of have written
@@ -36465,7 +36484,7 @@ void destroyHostWindow(Renderer* R);
             // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
             // prepass paid for itself is `grassdep + grass` now against `grass` alone at
             // grassPrepass=0.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f(snap=%.2f) nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s stdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
                          " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
                          g_lastGpuPhaseMs[kGpuPhaseSkySnap],
@@ -36482,6 +36501,9 @@ void destroyHostWindow(Renderer* R);
                          // with none of the win, and the ms alone cannot tell those apart.
                          g_grassPrepassRecorded ? "EQ" : (g_grassPrepass ? "GEQUAL(prepass unavailable)"
                                                                         : "GEQUAL(off)"),
+                         g_lastGpuPhaseMs[kGpuPhaseStaticsDepth],
+                         g_staticsPrepassRecorded ? "stEQ" : (g_staticsPrepass ? "stGEQUAL(prepass unavailable)"
+                                                                              : "stGEQUAL(off)"),
                          g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
                          // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
@@ -40667,6 +40689,7 @@ void destroyHostWindow(Renderer* R);
         // and EQUAL against depth nothing wrote draws NOTHING — grass would vanish for a frame
         // rather than misdraw, which is the failure mode hardest to catch in a minimized harness.
         g_grassPrepassRecorded = false;
+        g_staticsPrepassRecorded = false;   // same latch rule as grass
         auto gpuPhaseBegin = [&](uint32_t i) {
             cpuPhaseT0[i] = hostNowMs();
             g_gpuPhaseIssued[i] = true;
@@ -49474,6 +49497,14 @@ void destroyHostWindow(Renderer* R);
     Pipeline* g_pStaticsPipelineNoPbr      = nullptr;
     Pipeline* g_pStaticsPipelineCWNoPbr    = nullptr;
     Pipeline* g_pStaticsPipelineNoneNoPbr  = nullptr;
+    // staticsPrepass pair (CCW only: the live camera's facing). Depth = statics.vert +
+    // statics_depth.frag, no RT, GEQUAL + write. EQ = statics_eq / statics_nopbr_eq, CMP_EQUAL, no write.
+    Shader*   g_pStaticsDepthShader      = nullptr;
+    Pipeline* g_pStaticsDepthPipeline    = nullptr;
+    Shader*   g_pStaticsShaderEQ         = nullptr;
+    Pipeline* g_pStaticsPipelineEQ       = nullptr;
+    Shader*   g_pStaticsShaderNoPbrEQ    = nullptr;
+    Pipeline* g_pStaticsPipelineNoPbrEQ  = nullptr;
     Shader*   g_pStaticsBlendShader   = nullptr; // Phase 4 hero blend: statics_heroblend.vert + statics_blend.frag
     Pipeline* g_pStaticsBlendPipeline = nullptr; // SRCALPHA/INVSRCALPHA, depth GEQUAL test / no write, cull NONE
     // GitD lit-window multi-map layers: DESTCOLOR/ZERO (multiply), depth EQUAL test / no write.
@@ -52608,6 +52639,43 @@ void destroyHostWindow(Renderer* R);
             }
         }
 
+        // staticsPrepass pair. Non-fatal: any piece missing and the frame draws the original GEQUAL
+        // statics (staticsRecordDepth checks all three it may need before it records anything).
+        {
+            ShaderLoadDesc dd = {};
+            dd.mVert.pFileName = "statics.vert";
+            dd.mFrag.pFileName = "statics_depth.frag";
+            addShader(R, &dd, &g_pStaticsDepthShader);
+            ShaderLoadDesc ed = {};
+            ed.mVert.pFileName = "statics.vert";
+            ed.mFrag.pFileName = "statics_eq.frag";
+            addShader(R, &ed, &g_pStaticsShaderEQ);
+            ShaderLoadDesc end = {};
+            end.mVert.pFileName = "statics.vert";
+            end.mFrag.pFileName = "statics_nopbr_eq.frag";
+            addShader(R, &end, &g_pStaticsShaderNoPbrEQ);
+            if (g_pStaticsDepthShader) {
+                PipelineDesc dpd = pd;
+                GraphicsPipelineDesc& dg = dpd.mGraphicsDesc;
+                dg.mRenderTargetCount = 0;
+                dg.pColorFormats = nullptr;
+                dg.pRasterizerState = &rs;
+                dg.pShaderProgram = g_pStaticsDepthShader;
+                addPipeline(R, &dpd, &g_pStaticsDepthPipeline);
+            }
+            DepthStateDesc dsEq = {};
+            dsEq.mDepthTest = true; dsEq.mDepthWrite = false; dsEq.mDepthFunc = CMP_EQUAL;
+            PipelineDesc epd = pd;
+            GraphicsPipelineDesc& eg = epd.mGraphicsDesc;
+            eg.pDepthState = &dsEq;
+            eg.pRasterizerState = &rs;
+            if (g_pStaticsShaderEQ)    { eg.pShaderProgram = g_pStaticsShaderEQ;    addPipeline(R, &epd, &g_pStaticsPipelineEQ); }
+            if (g_pStaticsShaderNoPbrEQ) { eg.pShaderProgram = g_pStaticsShaderNoPbrEQ; addPipeline(R, &epd, &g_pStaticsPipelineNoPbrEQ); }
+            std::printf("[forge][dl] statics Z-prepass pair: depth=%s eq=%s nopbr_eq=%s\n",
+                        g_pStaticsDepthPipeline ? "ok" : "FAILED", g_pStaticsPipelineEQ ? "ok" : "FAILED",
+                        g_pStaticsPipelineNoPbrEQ ? "ok" : "FAILED");
+        }
+
         // Phase 4 hero distant statics BLEND pass. statics_heroblend.vert (HERO_PASS=1 -> keeps only
         // hero-blend subsets, clips the rest) + statics_blend.frag (real alpha). SRCALPHA/INVSRCALPHA,
         // depth GEQUAL TEST / NO write, cull NONE (two-sided translucent fence/lava). Same vertex
@@ -55525,6 +55593,8 @@ void destroyHostWindow(Renderer* R);
 
             // Replay the live cull result — the EXACT in-game DL record (land visible-set + statics
             // execute-indirect over the rings). It binds its own pipelines + descriptor sets.
+            // No Z-prepass here: the statics must not take the CMP_EQUAL pipeline.
+            g_staticsPrepassRecorded = false;
             dlLiveRecord();
 
             // WV1 water LAST (after sky+land+statics) so the whole opaque frame is its refraction +
@@ -58786,7 +58856,9 @@ void destroyHostWindow(Renderer* R);
         // runs either way (fills g_liveLastInst for the parity check + the reflect path).
         const bool gpuDraw = g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState;
         if (g_drawDLStatics && g_staticsLiveOk && (gpuDraw || g_liveLastSubsets > 0)) {
-            cmdBindPipeline(g_live.pCmd, dlPickStaticsPipeline(/*mirror*/false));
+            // staticsPrepass: CMP_EQUAL against the depth staticsRecordDepth wrote, when it did.
+            cmdBindPipeline(g_live.pCmd, (gpuDraw && g_staticsPrepassRecorded) ? staticsEqPipeline()
+                                                                                 : dlPickStaticsPipeline(/*mirror*/false));
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);   // Phase C: baked distant lights
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
@@ -58857,6 +58929,37 @@ void destroyHostWindow(Renderer* R);
     // Z-prepass entry asks the identical question a thousand lines earlier in the frame, and the two
     // MUST agree — a prepass that ran on a set the colour pass does not draw is wasted work, and a
     // colour pass that runs EQUAL on a set the prepass skipped draws nothing at all.
+    // staticsPrepass: the colour PSO the pair uses (PBR-off build when that variant is in use).
+    Pipeline* staticsEqPipeline() {
+        const bool np = !g_pbrStatics && g_debugMode == 0u && g_pStaticsPipelineNoPbr;
+        return np ? g_pStaticsPipelineNoPbrEQ : g_pStaticsPipelineEQ;
+    }
+
+    // The distant statics' Z-prepass half. Issues the SAME indirect draw dlLiveRecord's GPU path does
+    // (same VB/IB, instance stream, args, vertex shader), so SV_Position is bit-identical and the
+    // colour pass can test CMP_EQUAL. Only the live camera's facing (CCW, facing selector on auto);
+    // the facing A/B, the CW probe camera and the CPU-cull fallback keep the original pipeline.
+    void staticsRecordDepth(Cmd* cmd) {
+        if (!g_staticsPrepass || !g_pStaticsDepthPipeline || !staticsEqPipeline()) { return; }
+        if (!g_dlExterior || !g_dlLiveInit || !g_drawDLStatics || !g_staticsLiveOk) { return; }
+        if (g_staticsFacing != 0u || g_dlStaticsFrontCW) { return; }
+        if (!(g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState)) { return; }
+        cmdBeginDebugMarker(cmd, 0.3f, 0.6f, 0.5f, "DISTANT STATICS (Z-prepass)");
+        cmdBindPipeline(cmd, g_pStaticsDepthPipeline);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                              : g_live.pPerLightsSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerBatchSet);
+        Buffer*  svbs[2]     = { g_pStaticsVB, g_live.pGpuInstOut };
+        uint32_t sstrides[2] = { 20, kStaticsInstStride };
+        cmdBindVertexBuffer(cmd, 2, svbs, sstrides, nullptr);
+        cmdBindIndexBuffer(cmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        cullLaneExecute(cmd, g_live.pGpuArgs, g_live.cullSubsetCount);
+        cmdEndDebugMarker(cmd);
+        g_staticsPrepassRecorded = true;   // latched by the code that issued it (grassRecordDepth's rule)
+    }
+
     bool grassDrawArmed() {
         if (!g_drawGrass || !g_pGrassPipeline || !g_live.grassCullReady) { return false; }
         if (!g_live.grassArgsInDrawState || !g_grassSubsetCount) { return false; }
@@ -63430,6 +63533,12 @@ void destroyHostWindow(Renderer* R);
             if (*pp) { removePipeline(R, *pp); *pp = nullptr; }
         }
         if (g_pStaticsShaderNoPbr) { removeShader(R, g_pStaticsShaderNoPbr); g_pStaticsShaderNoPbr = nullptr; }
+        for (Pipeline** pp : { &g_pStaticsDepthPipeline, &g_pStaticsPipelineEQ, &g_pStaticsPipelineNoPbrEQ }) {
+            if (*pp) { removePipeline(R, *pp); *pp = nullptr; }
+        }
+        for (Shader** sp : { &g_pStaticsDepthShader, &g_pStaticsShaderEQ, &g_pStaticsShaderNoPbrEQ }) {
+            if (*sp) { removeShader(R, *sp); *sp = nullptr; }
+        }
         if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsPipeline) { removePipeline(R, g_pSunShadowStaticsPipeline); g_pSunShadowStaticsPipeline = nullptr; }

@@ -66,10 +66,21 @@ STRUCT(VSOutput)
 // which is exactly why A2C here is SV_Coverage and not the D3D12 blend-state AlphaToCoverageEnable:
 // hardware A2C derives its mask from SV_Target0.a, and that channel is already spoken for. Writing
 // the cutout alpha there instead would hand the seam a coverage value squared.
+// STATICS_EARLY_Z (statics_eq / statics_nopbr_eq, knob staticsPrepass): the colour half of the
+// statics Z-prepass pair. statics_depth.frag already wrote depth + this coverage, the colour pipeline
+// is CMP_EQUAL with depth-write OFF, so the depth test alone selects the samples: no coverage output
+// and no discard, which is what lets early-Z reject every overdrawn layer before it is shaded.
+// Without it (the original) this pass exports SV_Coverage + discard with depth-write on = late-Z,
+// every layer of every distant static fully shaded.
+#ifndef STATICS_EARLY_Z
+#define STATICS_EARLY_Z 0
+#endif
 STRUCT(PSOut)
 {
     DATA(float4, Color,    SV_Target0);
+#if !STATICS_EARLY_Z
     DATA(uint,   Coverage, SV_Coverage);
+#endif
 };
 
 // ─── The `_paramh` companion of one LOD texture ──────────────────────────────────────────────────
@@ -170,8 +181,10 @@ PSOut PS_MAIN( VSOutput In )
     // Computed OUTSIDE the branch: a2cCoverageMask takes a derivative, which needs the whole 2x2
     // quad present. Flags is FLAT and one draw is one subset, so the branch is quad-uniform in
     // practice — but the rule is cheap to honour and expensive to get wrong.
+#if !STATICS_EARLY_Z
     uint cov = a2cCoverageMask(tex.a, ((In.Flags & 0x2u) != 0u) ? (133.0f / 255.0f) : 0.0f);
     if (cov == 0u) { discard; }
+#endif
 
     // Sun shadows (Phase B): statics.vert split its per-vertex lighting into Color (ambient +
     // emissive, never shadowed) and SunLight (the sun N.L term). Attenuating only the latter by the
@@ -484,7 +497,9 @@ PSOut PS_MAIN( VSOutput In )
 
     // Every exit carries the same coverage — the debug views are still the same silhouette.
     PSOut Out;
+#if !STATICS_EARLY_Z
     Out.Coverage = cov;
+#endif
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
