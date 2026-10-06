@@ -8317,6 +8317,13 @@ namespace {
     // Not a distance — the ladder does distance; this is the one rung that answers "how finely may
     // the carve be resolved".
     float    g_terrainPatchRung  = 0.0f;
+    // Scale on the LOD ladder's distances (kTerrainLodDist). 1.0 = the original ladder: base 128-u
+    // lattice out to 3 cells, then a rung per doubling. MEASURED against G7 v0.20.3 (a shipped release,
+    // so its LOD sizes are a fair reference — user, 2026-10-06): bare wilderness 0.25M terrain tris
+    // per pass for us vs 0.02M for G7's whole view. At 1080p a base quad 3 cells out is under 4 px —
+    // quad-overdraw territory at 4x MSAA. 0.5 halves every band: ~7-8 px per quad where each rung
+    // starts. The displacement patches are unaffected (they take the base rung by their own path).
+    float    g_terrainLodScale   = 0.5f;
     // The mip the height is read at, and it is not decoration. One lattice step is 128 world units
     // = ~256 texels of a 1024 map tiling once per 512, so mip 0 would sample the field at 1/256 of
     // its rate: aliasing that crawls as the camera moves. 8 is the band-limit that matches the
@@ -23252,6 +23259,7 @@ namespace {
             { "pbrSpecBase",         &g_pbrSpecBase         },
             { "terrainTexBias",      &g_terrainTexBias      },
             { "terrainCut",          &g_terrainCut          },
+            { "terrainLodScale",     &g_terrainLodScale     },
             // PARALLAX (tasks/forge-parallax.md). Here as well as on the panel because the two
             // questions this milestone has to answer are both MEASUREMENTS a minimized run has to
             // be able to take with nobody at a slider: what does each arm cost on terrain (the
@@ -45614,8 +45622,12 @@ void destroyHostWindow(Renderer* R);
         // the kernel, which is a different filter and not a slower one. Fall back to the frag loop.
         const float rfDiam    = (g_resolveDiameter > 0.001f) ? g_resolveDiameter : 0.001f;
         const float rfRadius  = std::floor(rfDiam * 0.5f + 0.499f);
+        // ...and RADIUS 0 SKIPS IT, unless the motion blur needs its single-sample image: at radius 0
+        // the kernel is the pixel's own samples (a box-like resolve, what a hardware resolve does), so
+        // the frag loop is SAMPLE_COUNT loads and a full-screen compute pass in front of it is pure
+        // cost — ~1.1-1.3 ms on the 1660S at 1080p 4x (Release 1, bare A/B against G7).
         const bool  rfRunning = shaderResolve && g_live.rfReady && g_resolveCompute
-                             && rfRadius <= 2.0f;
+                             && rfRadius <= 2.0f && (rfRadius >= 1.0f || g_mbEnable);
         g_lastRfRan = rfRunning;   // heartbeat only — the mb= bracket names this as a reason
 
         // ⚠ THE BARRIER HOIST, NOW A LAMBDA WITH THREE CALLERS (M1 4b). pSceneColor sits in
@@ -51286,7 +51298,9 @@ void destroyHostWindow(Renderer* R);
             if (V.visible.size() >= kTerrainMaxInst) { break; }
 
             uint32_t lod = kTerrainLods - 1;
-            const float dCells = std::sqrt(d2) * (1.0f / Terrain::kCellSize);
+            // terrainLodScale shrinks the whole ladder (dividing the cell distance is the same thing).
+            const float dCells = std::sqrt(d2) * (1.0f / Terrain::kCellSize)
+                               / std::clamp(g_terrainLodScale, 0.25f, 4.0f);
             for (uint32_t l = 0; l < kTerrainLods; ++l) {
                 if (dCells < kTerrainLodDist[l]) { lod = l; break; }
             }
