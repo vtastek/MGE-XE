@@ -25,6 +25,12 @@
 #ifndef HIZ_FIRST
 #define HIZ_FIRST 0
 #endif
+// hizfirstlin_sc1/sc4 (knob hizLinFused): the first pass ALSO writes the value to pLinearDepth. The
+// colour->water seam's re-linearize was the same read (sample 0 of the same post-colour pDepth) into
+// the same R32F device depth, so one dispatch now feeds both.
+#ifndef HIZ_LIN
+#define HIZ_LIN 0
+#endif
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
@@ -61,5 +67,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     }
 #endif
     Write2D(gHizDstMip, p, d);
+#if HIZ_LIN
+    Write2D(gHizLinOut, p, d);
+#endif
     RETURN();
 }

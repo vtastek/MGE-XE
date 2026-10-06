@@ -3161,6 +3161,8 @@ namespace {
         Shader*        pHizShaderFirst = nullptr;  // hizfirst_sc1/sc4.comp (pDepth sample 0 -> mip 0)
         Shader*        pHizShader = nullptr;       // hizreduce.comp (2x2 MIN reduce, mip i-1 -> i)
         Pipeline*      pHizPipelineFirst = nullptr;
+        Shader*        pHizShaderFirstLin = nullptr;    // hizfirstlin_sc1/sc4.comp (+ pLinearDepth); optional
+        Pipeline*      pHizPipelineFirstLin = nullptr;  // g_hizLinFused; null = the two dispatches
         Pipeline*      pHizPipeline = nullptr;
         DescriptorSet* pHizSet = nullptr;          // HizSrtData Persistent, maxSets = hizMips (set i = mip i)
         // VRS Tier 2 (vrsrate.srt.h): the per-frame shading-rate image + its build pass. vrsReady =
@@ -16141,6 +16143,15 @@ namespace {
             ShaderLoadDesc hrd = {};
             hrd.mComp.pFileName = "hizreduce.comp";
             addShader(R, &hrd, &g_live.pHizShader);
+            ShaderLoadDesc hld2 = {};
+            hld2.mComp.pFileName = (g_live.sampleCount > 1) ? "hizfirstlin_sc4.comp" : "hizfirstlin_sc1.comp";
+            addShader(R, &hld2, &g_live.pHizShaderFirstLin);
+            if (g_live.pHizShaderFirstLin) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pHizShaderFirstLin;
+                addPipeline(R, &pd, &g_live.pHizPipelineFirstLin);
+            }
             if (g_live.pHizShaderFirst) {
                 PipelineDesc pd = {};
                 pd.mType = PIPELINE_TYPE_COMPUTE;
@@ -16163,7 +16174,7 @@ namespace {
             }
             if (g_live.pHizSet) {
                 for (uint32_t m = 0; m < mips; ++m) {
-                    DescriptorData d[3] = {};
+                    DescriptorData d[4] = {};
                     d[0].mIndex = SRT_RES_IDX(HizSrtData, Persistent, gHizSceneDepth);
                     d[0].mCount = 1;
                     d[0].ppTextures = &g_live.pDepth->pTexture;
@@ -16175,7 +16186,10 @@ namespace {
                     d[2].mCount = 1;
                     d[2].ppTextures = &g_live.pHiz;
                     d[2].mUAVMipSlice = (uint16_t)m;
-                    updateDescriptorSet(R, m, g_live.pHizSet, 3, d);
+                    d[3].mIndex = SRT_RES_IDX(HizSrtData, Persistent, gHizLinOut);   // read by hizfirstlin only
+                    d[3].mCount = 1;
+                    d[3].ppTextures = &g_live.pLinearDepth;
+                    updateDescriptorSet(R, m, g_live.pHizSet, g_live.pLinearDepth ? 4u : 3u, d);
                 }
                 for (uint32_t s = 0; s < kFrameSlots; ++s) {
                     CmdPoolDesc hp = {};
@@ -18006,6 +18020,10 @@ namespace {
     // Release 1: the scatter walks the COUNT pass's survivor list (cullscatter_list.comp) instead of
     // re-testing every instance (cullscatter.comp). Same rows. OFF = the old scatter, the A/B.
     bool g_cullSurvivorList = true;
+    // Release 1: at the colour->water seam, ONE dispatch (hizfirstlin) writes both Hi-Z mip 0 and
+    // pLinearDepth — the two were the same read of sample 0 of pDepth into the same value. OFF = the
+    // hiz mip 0 and re-linearize dispatches, the A/B.
+    bool g_hizLinFused = true;
     // Release 1: draw the sky into gSkyColor (1x) and composite it into the MSAA target after the
     // opaque world, at z = 0 GEQUAL (only samples nothing drew on). Replaces a full-screen 4x sky and
     // the full-screen MSAA resolve that made gSkyColor. Same pixels. OFF = the old order, the A/B.
@@ -23765,6 +23783,7 @@ namespace {
             { "reflGpuCull",         &g_reflGpuCull         },
             { "cullDrawCount",       &g_cullDrawCount       },
             { "cullScanWave",        &g_cullScanWave        },
+            { "hizLinFused",         &g_hizLinFused         },
             { "cullSurvivorList",    &g_cullSurvivorList    },
             { "skyDeferred",         &g_skyDeferred         },
             { "waterRefractRegion",  &g_waterRefractRegion  },
@@ -42978,10 +42997,18 @@ void destroyHostWindow(Renderer* R);
                 }
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
             }
+            // hizLinFused: the Hi-Z dispatch also writes pLinearDepth (same sample-0 read, same value),
+            // and the re-linearize below is skipped. Its full-allocation extent covers the render
+            // rect the re-linearize wrote; the border it adds is pDepth's cleared far.
+            const bool fuseHizLin = doHizMip0 && doSeamLinearize && g_hizLinFused
+                                 && g_live.pHizPipelineFirstLin;
             if (doHizMip0) {
                 gpuPhaseBegin(kGpuPhaseHizMip0);
-                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.8f, "HI-Z MIP0 (scene depth -> pHiz mip 0)");
-                cmdBindPipeline(g_live.pCmd, g_live.pHizPipelineFirst);
+                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.8f, fuseHizLin
+                    ? "HI-Z MIP0 + RE-LINEARIZE (scene depth -> pHiz mip 0 + pLinearDepth)"
+                    : "HI-Z MIP0 (scene depth -> pHiz mip 0)");
+                cmdBindPipeline(g_live.pCmd, fuseHizLin ? g_live.pHizPipelineFirstLin
+                                                        : g_live.pHizPipelineFirst);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHizSet);
                 // Build the pyramid over the FULL allocation, not the current render sub-rect: pDepth's
                 // out-of-viewport border is cleared to far (0.0) each frame, so the border pyramid
@@ -42992,7 +43019,7 @@ void destroyHostWindow(Renderer* R);
                 cmdEndDebugMarker(g_live.pCmd);
                 gpuPhaseEnd(kGpuPhaseHizMip0);
             }
-            if (doSeamLinearize) {
+            if (doSeamLinearize && !fuseHizLin) {
                 // Same pipeline and same set as the pre-colour dispatch — only pDepth's CONTENTS have
                 // moved on. Sized by the RENDER rect (the linearize writes what the frame drew), unlike
                 // the Hi-Z above which covers the whole allocation.
@@ -47452,6 +47479,17 @@ void destroyHostWindow(Renderer* R);
             if (g_live.pHizShader)        { removeShader(R, g_live.pHizShader);          g_live.pHizShader = nullptr; }
             if (g_live.pHizPipelineFirst) { removePipeline(R, g_live.pHizPipelineFirst); g_live.pHizPipelineFirst = nullptr; }
             if (g_live.pHizShaderFirst)   { removeShader(R, g_live.pHizShaderFirst);     g_live.pHizShaderFirst = nullptr; }
+            if (g_live.pHizPipelineFirstLin) { removePipeline(R, g_live.pHizPipelineFirstLin); g_live.pHizPipelineFirstLin = nullptr; }
+            if (g_live.pHizShaderFirstLin)   { removeShader(R, g_live.pHizShaderFirstLin);     g_live.pHizShaderFirstLin = nullptr; }
+            ShaderLoadDesc hld2 = {};
+            hld2.mComp.pFileName = (g_live.sampleCount > 1) ? "hizfirstlin_sc4.comp" : "hizfirstlin_sc1.comp";
+            addShader(R, &hld2, &g_live.pHizShaderFirstLin);
+            if (g_live.pHizShaderFirstLin) {
+                PipelineDesc pld = {};
+                pld.mType = PIPELINE_TYPE_COMPUTE;
+                pld.mComputeDesc.pShaderProgram = g_live.pHizShaderFirstLin;
+                addPipeline(R, &pld, &g_live.pHizPipelineFirstLin);
+            }
             ShaderLoadDesc hfd = {};
             hfd.mComp.pFileName = (g_live.sampleCount > 1) ? "hizfirst_sc4.comp" : "hizfirst_sc1.comp";
             addShader(R, &hfd, &g_live.pHizShaderFirst);
@@ -63563,6 +63601,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pHizPipelineFirst){ removePipeline(R, g_live.pHizPipelineFirst); }
         if (g_live.pHizShader)       { removeShader(R, g_live.pHizShader); }
         if (g_live.pHizShaderFirst)  { removeShader(R, g_live.pHizShaderFirst); }
+        if (g_live.pHizPipelineFirstLin) { removePipeline(R, g_live.pHizPipelineFirstLin); }
+        if (g_live.pHizShaderFirstLin)   { removeShader(R, g_live.pHizShaderFirstLin); }
         for (uint32_t s = 0; s < kFrameSlots; ++s) {
             if (g_live.pHizQueryPool[s]) { exitQueryPool(R, g_live.pHizQueryPool[s]); }
             if (g_live.pHizFence[s])     { exitFence(R, g_live.pHizFence[s]); }

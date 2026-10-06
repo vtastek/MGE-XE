@@ -645,6 +645,20 @@
 #include "hizreduce.comp.fsl"
 #end
 
+#comp hizfirstlin_sc1.comp
+#define HIZ_FIRST 1
+#define HIZ_LIN 1
+#define SAMPLE_COUNT 1
+#include "hizreduce.comp.fsl"
+#end
+
+#comp hizfirstlin_sc4.comp
+#define HIZ_FIRST 1
+#define HIZ_LIN 1
+#define SAMPLE_COUNT 4
+#include "hizreduce.comp.fsl"
+#end
+
 #comp hizreduce.comp
 #include "hizreduce.comp.fsl"
 #end

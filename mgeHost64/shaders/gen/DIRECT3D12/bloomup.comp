@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 738 "FSL/shaders.list"
+#line 752 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomup.comp.fsl"
 #line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomup.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
@@ -1063,4 +1063,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gBloomDst, p, lerp(cur, c, blend));
     return;
 }
-#line 739 "FSL/shaders.list"
+#line 753 "FSL/shaders.list"

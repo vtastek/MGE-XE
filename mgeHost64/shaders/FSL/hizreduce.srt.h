@@ -38,5 +38,6 @@ BEGIN_SRT(HizSrtData)
 #endif
         DECL_RWTEXTURE(Persistent, RTex2D(float),  gHizSrcMip)     // pyramid mip i-1 (reduce only)
         DECL_RWTEXTURE(Persistent, WTex2D(float),  gHizDstMip)     // pyramid mip i (both passes)
+        DECL_RWTEXTURE(Persistent, WTex2D(float),  gHizLinOut)     // pLinearDepth (hizfirstlin only)
     END_SRT_SET(Persistent)
 END_SRT(HizSrtData)
