@@ -23704,6 +23704,7 @@ namespace {
             { "cullDrawCount",       &g_cullDrawCount       },
             { "cullScanWave",        &g_cullScanWave        },
             { "cullSurvivorList",    &g_cullSurvivorList    },
+            { "drawDistLights",      &g_drawDistLights      },   // baked lamps on distant land (G7 has none)
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
             { "vrsStatics",          &g_vrsStatics          },
