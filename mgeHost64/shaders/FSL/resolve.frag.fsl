@@ -241,6 +241,13 @@ float4 PS_MAIN(PsIn In)
     int    sampRad  = int(gResolveParams.dims.w);                  // integer neighbourhood bound
     float  invLuma  = gResolveParams.opts.x;
     float  cubicC   = gResolveParams.opts.z;                       // Mitchell C: 0.5 = Catmull-Rom
+    // ⚠ A KERNEL NO WIDER THAN ONE PIXEL IS A BOX. At diameter 1 (filtRad 0.5, the host's radius-0
+    // "hardware-like" resolve) only the pixel's own samples pass the support test, and every 4x sample
+    // sits 0.375 px out on one axis, i.e. at rescaled x = 1.5 in Catmull-Rom's NEGATIVE lobe: all four
+    // weights were negative, totalWeight < 0, the normaliser clamped to 1e-5 and max(rgb, 0) wrote
+    // EXACT BLACK over the whole frame. A cubic cannot be sampled that narrow; equal weights over the
+    // pixel's samples is what a hardware resolve does and what the host means by radius 0.
+    const bool boxKernel = (filtRad <= 0.5f);
 
     // ONE accumulator over all four channels — see the premultiplication note in resolve.srt.h.
     float4 sum         = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -280,7 +287,8 @@ float4 PS_MAIN(PsIn In)
 #endif
 
                     // rescaleCubic: [-2,2] -> [-1,1]. Separable, so one 1-D evaluation per axis.
-                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
+                    float w = boxKernel ? 1.0f
+                            : rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
                               rFilterCubic(sampleDist.y * 2.0f, 0.0f, cubicC);
 
                     // ⚠ THE FIREFLY GUARD RESCALES THE SAMPLE, NEVER THE KERNEL WEIGHT.

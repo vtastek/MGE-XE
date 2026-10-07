@@ -122,8 +122,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         {
             float dx = abs(float(k) + subOffsets[s].x) / filtRad;
             float dy = abs(float(k) + subOffsets[s].y) / filtRad;
-            wx[k + RF_RADIUS] = (dx <= 1.0f) ? rfFilterCubic(dx * 2.0f, 0.0f, cubicC) : 0.0f;
-            wy[k + RF_RADIUS] = (dy <= 1.0f) ? rfFilterCubic(dy * 2.0f, 0.0f, cubicC) : 0.0f;
+            // filtRad <= 0.5 is a BOX over the pixel's own samples — resolve.frag's boxKernel note.
+            wx[k + RF_RADIUS] = (dx <= 1.0f) ? (filtRad <= 0.5f ? 1.0f : rfFilterCubic(dx * 2.0f, 0.0f, cubicC)) : 0.0f;
+            wy[k + RF_RADIUS] = (dy <= 1.0f) ? (filtRad <= 0.5f ? 1.0f : rfFilterCubic(dy * 2.0f, 0.0f, cubicC)) : 0.0f;
             swx += wx[k + RF_RADIUS];
             swy += wy[k + RF_RADIUS];
         }
