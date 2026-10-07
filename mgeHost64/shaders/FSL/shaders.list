@@ -787,6 +787,12 @@
 #include "cullscan_wave.comp.fsl"
 #end
 
+// Statics LAYER draw list (camera lane, after the scan): one fixed slot per multi-map layer subset,
+// so the MOD/ADD layer passes draw their few hundred subsets instead of re-running the whole list.
+#comp cull_layers.comp
+#include "cull_layers.comp.fsl"
+#end
+
 // SCATTER: re-test survivors, write each (instance,subset) camera-relative row into the GPU instance ring.
 #comp cullscatter.comp
 #include "cullscatter.comp.fsl"

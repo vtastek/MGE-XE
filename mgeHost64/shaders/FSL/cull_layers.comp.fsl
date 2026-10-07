@@ -1,0 +1,34 @@
+// mgeHost64 — statics LAYER draw list (camera lane, after the PREFIX scan).
+//
+// The multi-map layer passes (statics.vert LAYER_PASS 1 = MOD/MOD2X, 2 = ADD) used to re-run the base
+// pass's whole compacted list and clip everything but their layers in the vertex stage: every visible
+// distant static's vertices fetched, assembled and shaded three times a frame (docks: the two layer
+// passes were 0.38 ms of a 1.33 ms distant-land colour pass). The layer subsets are a FIXED list from
+// the bake — a few hundred of ~19k — so each gets a FIXED slot here: entry i draws subset gLayerList[i+1]
+// with this frame's survivor count and prefix offset, or nothing (InstanceCount 0) when it has none.
+// No atomics and no count buffer; the host executes the multiply entries first and the add entries
+// after them, each pass over its own slots only. The vertex stage's per-pass clip stays as it was, so a
+// slot can never draw in the wrong pass.
+
+#include "cull_layers.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint i = DispatchThreadID.x;
+    const uint n = gLayerList[0];
+    if (i < n)
+    {
+        const uint sid = gLayerList[i + 1u];
+        const StaticsSubset s = gStaticsSubsets[sid];
+        const uint a = i * 5u;
+        gLayerArgs[a + 0u] = s.indexCount;          // IndexCountPerInstance
+        gLayerArgs[a + 1u] = gSubsetCount[sid];     // InstanceCount (0 = not visible this frame)
+        gLayerArgs[a + 2u] = s.ibBase;              // StartIndexLocation
+        gLayerArgs[a + 3u] = s.vbBase;              // BaseVertexLocation
+        gLayerArgs[a + 4u] = gSubsetOffset[sid];    // StartInstanceLocation (its rows in gInstOut)
+    }
+    RETURN();
+}

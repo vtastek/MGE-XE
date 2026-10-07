@@ -356,6 +356,7 @@ static int forgeEcoQoSState()
 // the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
 // redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
 #include "shaders/FSL/cull.srt.h"
+#include "shaders/FSL/cull_layers.srt.h"
 #include "shaders/FSL/occprobe.srt.h"
 // Phase 3 prologue: Hi-Z pyramid build SRT (HizSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature. See [[project_forge_gpu_occlusion]] M1.
@@ -1183,6 +1184,22 @@ namespace ForgeRender {
     // hdrDumpIfArmed). Unlike the RenderDoc arm this needs nothing installed — it is a copy the host
     // does itself — so the only way it declines is a build with no linear target to read, which it
     // says at capture time rather than here.
+    // PIX programmatic capture around arbitrary host work (--forge-replay MGE_REPLAY_PIX). Needs
+    // enablePixCapture() before init(); false when the capturer is not loaded.
+    bool pixCaptureBegin(const wchar_t* fileName) {
+        if (!g_pixBegin) { return false; }
+        struct GpuCapParams { const wchar_t* fileName; } params = { fileName };
+        const long hr = g_pixBegin(&params);
+        LOG::logline(">> [pix] BeginProgrammaticGpuCapture(%ls) -> hr=0x%08lX", fileName, hr);
+        return hr >= 0;
+    }
+    void pixCaptureEnd() {
+        if (!g_pixEnd) { return; }
+        const long hr = g_pixEnd();
+        LOG::logline(">> [pix] EndProgrammaticGpuCapture -> hr=0x%08lX", hr);
+        LOG::flush();
+    }
+
     void armHdrDump() {
         g_hdrDumpArmed = true;
         LOG::logline(">> [forge] HDR dump ARMED — next frame -> hdrdump/mge_NNNN.exr + .tga"); LOG::flush();
@@ -3216,6 +3233,17 @@ namespace {
         Pipeline*      pCullScanPipeline = nullptr;
         Shader*        pCullScanWaveShader = nullptr;     // cullscan_wave.comp (g_cullScanWave); optional
         Pipeline*      pCullScanWavePipeline = nullptr;
+        // Statics LAYER draw list (cull_layers.comp): one fixed IndirectDrawIndexArguments slot per
+        // multi-map layer subset — the MOD/MOD2X ones first (layerMulCount), then the ADD ones
+        // (layerAddCount). Filled on the camera lane after the scan; drawn by the two layer passes.
+        Shader*        pCullLayersShader = nullptr;
+        Pipeline*      pCullLayersPipeline = nullptr;
+        DescriptorSet* pCullLayersSet = nullptr;
+        Buffer*        pLayerList = nullptr;
+        Buffer*        pLayerArgs = nullptr;
+        uint32_t       layerMulCount = 0;
+        uint32_t       layerAddCount = 0;
+        bool           layerArgsReady = false;
         Shader*        pCullScatterListShader = nullptr;  // cullscatter_list.comp (g_cullSurvivorList); optional
         Pipeline*      pCullScatterListPipeline = nullptr;
         // gSurvivors per cull lane (cull.srt.h), sized to the lane's instance count:
@@ -17435,6 +17463,8 @@ namespace {
     // they gate the host render blocks; MGE's counterparts are gated separately on the client (F-keys).
     bool g_drawSky       = true;
     bool g_drawDLStatics = true;
+    // MEASUREMENT: 0 skips the statics multiply/ADD layer passes (lit windows lose their layers).
+    bool g_staticsLayerPasses = true;
     // ─── G1 GRASS (tasks/forge-grass.md) ─────────────────────────────────────────────────────────
     // Grass has been missing since S4a deleted MGE's DX9 colour layer; the placements were resident
     // on the host the whole time and thrown away by a single `rangeEndIdx = 0xFFFFFFFF` skip. These
@@ -23766,6 +23796,7 @@ namespace {
             { "alphaHighlight", &g_alphaHighlight },   // flat per-class colour on every alpha draw
             { "pbrEnable", &g_pbrEnable },
             { "drawDLStatics", &g_drawDLStatics },
+            { "staticsLayerPasses", &g_staticsLayerPasses },
             // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
             // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
             // cost has to be measured on a minimized harness run with nobody at the panel.
@@ -40804,6 +40835,9 @@ void destroyHostWindow(Renderer* R);
                 if (g_live.gpuArgsInDrawState) {
                     bufBarrier(g_live.pGpuArgs,    RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
                     bufBarrier(g_live.pGpuInstOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
+                    if (g_live.layerArgsReady) {
+                        bufBarrier(g_live.pLayerArgs, RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
                     g_live.gpuArgsInDrawState = false;
                 }
             }
@@ -40840,6 +40874,14 @@ void destroyHostWindow(Renderer* R);
                 gpuPhaseEnd(kGpuPhaseCullScatter);
                 cmdEndDebugMarker(g_live.pCmd);
                 uavBarrier(g_live.pGpuInstOut);
+                // The statics LAYER draw list: the scan's counts + offsets into fixed slots.
+                if (g_live.layerArgsReady) {
+                    const uint32_t nl = g_live.layerMulCount + g_live.layerAddCount;
+                    cmdBindPipeline(g_live.pCmd, g_live.pCullLayersPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullLayersSet);
+                    cmdDispatch(g_live.pCmd, (nl + 63u) / 64u, 1, 1);
+                    bufBarrier(g_live.pLayerArgs, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
+                }
                 // Hand args/instOut to the draw (INDIRECT_ARGUMENT / VERTEX). Restored next cull frame.
                 bufBarrier(g_live.pGpuArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
                 bufBarrier(g_live.pGpuInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -57316,6 +57358,73 @@ void destroyHostWindow(Renderer* R);
             updateDescriptorSet(R, 0, g_live.pCullSet, n, d);
         }
 
+        // Statics LAYER draw list (cull_layers.comp). Non-fatal: without it the layer passes keep
+        // re-running the whole compacted list (the vertex stage clips what is not theirs).
+        g_live.layerArgsReady = false;
+        {
+            std::vector<uint32_t> mul, add;
+            for (uint32_t sid = 0; sid < subsetCount; ++sid) {
+                const uint32_t op = (g_staticsSubsets[sid].flags >> 6) & 0x3u;
+                if (op == 1u || op == 2u) { mul.push_back(sid); }
+                else if (op == 3u)        { add.push_back(sid); }
+            }
+            const uint32_t total = (uint32_t)(mul.size() + add.size());
+            if (total > 0) {
+                std::vector<uint32_t> list;
+                list.reserve(total + 1u);
+                list.push_back(total);
+                list.insert(list.end(), mul.begin(), mul.end());
+                list.insert(list.end(), add.begin(), add.end());
+                BufferLoadDesc lb = {};
+                lb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+                lb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                lb.mDesc.mStructStride = sizeof(uint32_t);
+                lb.mDesc.mElementCount = total + 1u;
+                lb.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * (total + 1u);
+                lb.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+                lb.mDesc.pName         = "staticsLayerList";
+                lb.pData               = list.data();
+                lb.ppBuffer            = &g_live.pLayerList;
+                addResource(&lb, nullptr);
+                BufferLoadDesc la = {};
+                la.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
+                la.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                la.mDesc.mStructStride = sizeof(uint32_t);
+                la.mDesc.mElementCount = total * 5u;
+                la.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * total * 5u;
+                la.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                la.mDesc.pName         = "staticsLayerArgs";
+                la.ppBuffer            = &g_live.pLayerArgs;
+                addResource(&la, nullptr);
+                waitForAllResourceLoads();
+                addCullPipeline("cull_layers.comp", &g_live.pCullLayersShader, &g_live.pCullLayersPipeline);
+                DescriptorSetDesc lset = SRT_SET_DESC(CullLayersSrtData, PerBatch, 1, 0);
+                if (g_live.pLayerList && g_live.pLayerArgs && g_live.pCullLayersPipeline) {
+                    addDescriptorSet(R, &lset, &g_live.pCullLayersSet);
+                }
+                if (g_live.pCullLayersSet) {
+                    DescriptorData d[5] = {};
+                    d[0].mIndex = SRT_RES_IDX(CullLayersSrtData, PerBatch, gStaticsSubsets);
+                    d[0].mCount = 1; d[0].ppBuffers = &g_live.pStaticsSubsetBuf;
+                    d[1].mIndex = SRT_RES_IDX(CullLayersSrtData, PerBatch, gLayerList);
+                    d[1].mCount = 1; d[1].ppBuffers = &g_live.pLayerList;
+                    d[2].mIndex = SRT_RES_IDX(CullLayersSrtData, PerBatch, gSubsetCount);
+                    d[2].mCount = 1; d[2].ppBuffers = &g_live.pSubsetCount;
+                    d[3].mIndex = SRT_RES_IDX(CullLayersSrtData, PerBatch, gSubsetOffset);
+                    d[3].mCount = 1; d[3].ppBuffers = &g_live.pSubsetOffset;
+                    d[4].mIndex = SRT_RES_IDX(CullLayersSrtData, PerBatch, gLayerArgs);
+                    d[4].mCount = 1; d[4].ppBuffers = &g_live.pLayerArgs;
+                    updateDescriptorSet(R, 0, g_live.pCullLayersSet, 5, d);
+                    g_live.layerMulCount  = (uint32_t)mul.size();
+                    g_live.layerAddCount  = (uint32_t)add.size();
+                    g_live.layerArgsReady = true;
+                }
+            }
+            LOG::logline(">> [cull] statics layer draw list: %u MOD/MOD2X + %u ADD of %u subsets (%s)",
+                         (unsigned)mul.size(), (unsigned)add.size(), subsetCount,
+                         g_live.layerArgsReady ? "own slots" : (total ? "FAILED - full list" : "none"));
+        }
+
         // SUN shadow A2: duplicate the cull OUTPUT buffers + a sun params CBV + a sun descriptor set
         // (shares the gCullInst/gStaticsSubsets/gCullHiz inputs + the zero-staging + the 3 pipelines).
         // Non-fatal: on any failure sunCullReady stays false and renderSunShadow falls back to the
@@ -58911,9 +59020,16 @@ void destroyHostWindow(Renderer* R);
             // clipped). Must run HERE, immediately after the base draw and before anything else
             // touches the RT, so each layer multiplies onto its own base pixels. Nothing to do when
             // the bake has no layers — the clipped subsets simply produce no raster work.
-            if (g_pStaticsLayerPipeline) {
+            // gpuDraw implies this frame's camera cull ran the layer list (same block, same frame).
+            const bool layerSlots = gpuDraw && g_live.layerArgsReady;
+            if (g_pStaticsLayerPipeline && g_staticsLayerPasses) {
                 cmdBindPipeline(g_live.pCmd, g_pStaticsLayerPipeline);
-                if (gpuDraw) {
+                if (layerSlots) {
+                    if (g_live.layerMulCount) {
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.layerMulCount,
+                                           g_live.pLayerArgs, 0, nullptr, 0);
+                    }
+                } else if (gpuDraw) {
                     cullLaneExecute(g_live.pGpuArgs);
                 } else {
                     cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
@@ -58921,9 +59037,14 @@ void destroyHostWindow(Renderer* R);
                 }
             }
             // ADD (glow-map) layers last, so they land on the finished multiplicative stack.
-            if (g_pStaticsAddPipeline) {
+            if (g_pStaticsAddPipeline && g_staticsLayerPasses) {
                 cmdBindPipeline(g_live.pCmd, g_pStaticsAddPipeline);
-                if (gpuDraw) {
+                if (layerSlots) {
+                    if (g_live.layerAddCount) {
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.layerAddCount, g_live.pLayerArgs,
+                                           (uint64_t)sizeof(uint32_t) * 5u * g_live.layerMulCount, nullptr, 0);
+                    }
+                } else if (gpuDraw) {
                     cullLaneExecute(g_live.pGpuArgs);
                 } else {
                     cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
@@ -63619,6 +63740,12 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pCullScanPipeline)    { removePipeline(R, g_live.pCullScanPipeline);    g_live.pCullScanPipeline = nullptr; }
         if (g_live.pCullScanShader)      { removeShader(R, g_live.pCullScanShader);        g_live.pCullScanShader = nullptr; }
         if (g_live.pCullScanWavePipeline) { removePipeline(R, g_live.pCullScanWavePipeline); g_live.pCullScanWavePipeline = nullptr; }
+        if (g_live.pCullLayersPipeline) { removePipeline(R, g_live.pCullLayersPipeline); g_live.pCullLayersPipeline = nullptr; }
+        if (g_live.pCullLayersShader)   { removeShader(R, g_live.pCullLayersShader);     g_live.pCullLayersShader = nullptr; }
+        if (g_live.pCullLayersSet)      { removeDescriptorSet(R, g_live.pCullLayersSet); g_live.pCullLayersSet = nullptr; }
+        if (g_live.pLayerList)          { removeResource(g_live.pLayerList);              g_live.pLayerList = nullptr; }
+        if (g_live.pLayerArgs)          { removeResource(g_live.pLayerArgs);              g_live.pLayerArgs = nullptr; }
+        g_live.layerArgsReady = false;
         if (g_live.pCullScatterListPipeline) { removePipeline(R, g_live.pCullScatterListPipeline); g_live.pCullScatterListPipeline = nullptr; }
         if (g_live.pCullScatterListShader) { removeShader(R, g_live.pCullScatterListShader); g_live.pCullScatterListShader = nullptr; }
         for (Buffer*& sb : g_live.pSurvivors) { if (sb) { removeResource(sb); sb = nullptr; } }

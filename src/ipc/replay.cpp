@@ -14,7 +14,8 @@
 // CPU/GPU overlap question can be asked without the client.
 //
 // MGE_REPLAY_DUMP=<n> arms the HDR dump on replay frame n (counted across passes), for image A/Bs
-// against a live dump of the same recorded frame.
+// against a live dump of the same recorded frame. MGE_REPLAY_SIZE=WxH overrides the render size.
+// MGE_REPLAY_PIX=<n> takes a PIX GPU capture of frame n (forge_replay.wpix in the cwd).
 
 #include "ipc/server.h"
 #include "ipc/ipcrecord.h"
@@ -24,6 +25,7 @@
 #include "forgerender.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -106,6 +108,24 @@ namespace IPC {
 		char dumpEnv[16] = {};
 		const long dumpAt = (GetEnvironmentVariableA("MGE_REPLAY_DUMP", dumpEnv, sizeof(dumpEnv)) > 0)
 			? std::strtol(dumpEnv, nullptr, 10) : -1;
+		// MGE_REPLAY_SIZE=WxH overrides the recorded render size (diagnostic: does a pass's cost follow
+		// the pixel count or not). The allocation stays the recorded one; the host clamps to it.
+		unsigned forceW = 0, forceH = 0;
+		{
+			char sz[32] = {};
+			if (GetEnvironmentVariableA("MGE_REPLAY_SIZE", sz, sizeof(sz)) > 0) {
+				if (sscanf_s(sz, "%ux%u", &forceW, &forceH) != 2) { forceW = forceH = 0; }
+			}
+		}
+
+		// MGE_REPLAY_PIX=<n>: PIX programmatic GPU capture of replay frame n -> forge_replay.wpix (cwd).
+		// The capturer has to hook d3d12 before the device exists, so it loads here, before RenderInit.
+		char pixEnv[16] = {};
+		const long pixAt = (GetEnvironmentVariableA("MGE_REPLAY_PIX", pixEnv, sizeof(pixEnv)) > 0)
+			? std::strtol(pixEnv, nullptr, 10) : -1;
+		if (pixAt >= 0 && !ForgeRender::enablePixCapture()) {
+			LOG::logline("!! [replay] MGE_REPLAY_PIX set but WinPixGpuCapturer.dll did not load");
+		}
 
 		Rec::Reader rd;
 		if (!rd.open(path)) {
@@ -213,6 +233,10 @@ namespace IPC {
 					params.devDistLightsToggle = 0;
 					params.devGpuCapture = 0;
 					params.devDumpHdr = (frameNo == dumpAt) ? 1u : 0u;
+					if (forceW != 0) {
+						params.renderWidth = forceW;
+						params.renderHeight = forceH;
+					}
 					FrameLists L = {};
 					for (unsigned k = 0; k < kFrameListCount && k < r.blobCount; ++k) {
 						L.ptr[k] = r.blobs[k].ptr;
@@ -220,7 +244,11 @@ namespace IPC {
 					}
 					L.capVertBytes = (std::min)(params.capturedVertBytes, L.bytes[kListCaptured]);
 					spinMs(cpuMs);
+					const bool pix = (frameNo == pixAt) && ForgeRender::pixCaptureBegin(L"forge_replay.wpix");
 					renderFrameCore(params, L);
+					if (pix) {
+						ForgeRender::pixCaptureEnd();
+					}
 					++frames;
 					++frameNo;
 					break;

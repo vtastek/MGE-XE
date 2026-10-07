@@ -341,6 +341,8 @@ namespace ForgeRender {
     // Arm PIX programmatic GPU capture — MUST be called before sceneProbe()/init() so
     // WinPixGpuCapturer.dll hooks d3d12 device creation. sceneProbe wraps one renderScene.
     bool enablePixCapture();
+    bool pixCaptureBegin(const wchar_t* fileName);   // programmatic capture (replay); false if not loaded
+    void pixCaptureEnd();
 
     // Arm RenderDoc in-application capture — MUST be called before sceneProbe()/init() so
     // renderdoc.dll hooks d3d12 device creation. sceneProbe wraps one renderScene in

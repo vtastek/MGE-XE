@@ -100,6 +100,37 @@ VSOutput VS_MAIN( VSInput In )
     INIT_MAIN;
     VSOutput Out;
 
+#if LAYER_PASS != 0
+    // ⚠ THE LAYER PASSES DECIDE OWNERSHIP FIRST. Both re-run the base pass's whole indirect list (the
+    // layer subsets are scattered through every mesh's subset range, so they cannot get their own
+    // compacted list cheaply) and keep only their layers — a few hundred of ~19k subsets. The test used
+    // to sit at the END of this function, so every vertex of every visible distant static paid the full
+    // transform, sky-AO ambient, water transmit, fog, UV animation and slab work twice more per frame
+    // just to be clipped: 0.38 ms of the docks' 1.33 ms distant-land colour pass. A vertex that is not
+    // this pass's now leaves at once, with the same off-screen position the old clip wrote.
+    {
+        uint layerOp0 = ((uint)(In.InstParams.y + 0.5f) >> 6) & 0x3u;
+#if LAYER_PASS == 1
+        bool own = (layerOp0 == 1u || layerOp0 == 2u);
+#else
+        bool own = (layerOp0 == 3u);
+#endif
+        if (!own) {
+            Out.Position    = float4(1e9f, 1e9f, 1e9f, 1.0f);
+            Out.Uv          = float2(0.0f, 0.0f);
+            Out.Color       = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            Out.Fog         = 0.0f;
+            Out.TexIndex    = 0u;
+            Out.Flags       = 0u;
+            Out.WorldPos    = float3(0.0f, 0.0f, 0.0f);
+            Out.WorldNormal = float3(0.0f, 0.0f, 0.0f);
+            Out.SunLight    = float3(0.0f, 0.0f, 0.0f);
+            Out.Clip        = 1.0f;
+            RETURN(Out);
+        }
+    }
+#endif
+
     // worldPos = pos * M with M stored as 4 ROWS (W0..W3) in the instance stream — the explicit
     // row combination is identical to D3DX's row-vector pos*M regardless of HLSL matrix packing.
     float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
