@@ -16,6 +16,7 @@
 // MGE_REPLAY_DUMP=<n> arms the HDR dump on replay frame n (counted across passes), for image A/Bs
 // against a live dump of the same recorded frame. MGE_REPLAY_SIZE=WxH overrides the render size.
 // MGE_REPLAY_PIX=<n> takes a PIX GPU capture of frame n (forge_replay.wpix in the cwd).
+// MGE_REPLAY_MSAA=<n> overrides the recorded MSAA sample count.
 
 #include "ipc/server.h"
 #include "ipc/ipcrecord.h"
@@ -177,7 +178,13 @@ namespace IPC {
 				switch (r.command) {
 				case Command::RenderInit:
 					if (first && !inited) {
-						inited = ForgeRender::init(fixedU32(r, 0), fixedU32(r, 1), fixedU32(r, 2), fixedU32(r, 3));
+						// MGE_REPLAY_MSAA=<n> overrides the recorded sample count (A/B of the AA level).
+						unsigned samples = fixedU32(r, 2);
+						char msaaEnv[8] = {};
+						if (GetEnvironmentVariableA("MGE_REPLAY_MSAA", msaaEnv, sizeof(msaaEnv)) > 0) {
+							samples = static_cast<unsigned>(std::strtoul(msaaEnv, nullptr, 10));
+						}
+						inited = ForgeRender::init(fixedU32(r, 0), fixedU32(r, 1), samples, fixedU32(r, 3));
 						LOG::logline(">> [replay] RenderInit %ux%u %ux AF%u -> %d",
 							fixedU32(r, 0), fixedU32(r, 1), fixedU32(r, 2), fixedU32(r, 3), (int)inited);
 					}

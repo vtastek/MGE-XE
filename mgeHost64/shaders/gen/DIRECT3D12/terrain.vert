@@ -2786,9 +2786,12 @@ VSOutput VS_MAIN( VSInput In )
 
 
 
+
+
+
     if (gShadowParams.terrainDisp.x != 0.0f)
     {
-#line 352 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 355 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
         if (axis == 0u)
         {
 
@@ -2811,7 +2814,7 @@ VSOutput VS_MAIN( VSInput In )
             }
         }
     }
-#line 390 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 394 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
     if (!fine) {
         Out.Normal = terrainCornerNormal(slot, lx, ly, spanX, spanY, (int)gxf, (int)gyf);
     } else {

@@ -21767,6 +21767,11 @@ namespace {
     float g_reflFidelity = -1.0f;   // <0 = derive from the roughness; [0,1] pins it
     float g_reflDistScale = -1.0f;  // <0 = derive from the fidelity; >0 pins the tier multiplier
     float g_reflLodBias   = -1.0f;  // <0 = derive from the fidelity; >=0 pins the terrain LOD steps
+    // The water mirror's terrain is LODded by distance in SHADING too (user, 2026-10-07): near the shore
+    // the reflection is seen right beside the real ground, so rungs [0, this) draw with the FULL main
+    // shader (PBR, parallax, displacement); the coarser rungs — mid and far — with terrain_mirror
+    // (no PBR / parallax / macro / displacement; sun shadows and sky AO kept).
+    float g_reflTerrainFullRungs = 1.0f;
 
     // The scalar. 1.0 = today's picture, exactly.
     inline float reflFidelity() {
@@ -23753,6 +23758,7 @@ namespace {
             // frame at all, and that is the regression test for the whole of part 2's plumbing.
             { "reflFidelity",        &g_reflFidelity        },
             { "reflDistScale",       &g_reflDistScale       },
+            { "reflTerrainFullRungs", &g_reflTerrainFullRungs },
             { "reflLodBias",         &g_reflLodBias         },
             { "mbShutter",           &g_mbShutter           },
             { "mbShutterFps",        &g_mbShutterFps        },
@@ -50592,6 +50598,8 @@ void destroyHostWindow(Renderer* R);
     Pipeline* g_pTerrainPipelineLite    = nullptr;
     Pipeline* g_pTerrainPipelineEQLite  = nullptr;
     Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
+    Shader*   g_pTerrainShaderMirror = nullptr;     // terrain_mirror.vert/.frag: no PBR/macro/displacement
+    Pipeline* g_pTerrainPipelineMirrorFull = nullptr;   // the mirror's NEAR rungs: the main shader, CULL_NONE
     Pipeline* g_pTerrainPipelineWire = nullptr;
     Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
     Pipeline* g_pTerrainDepthPipeline = nullptr;
@@ -50886,7 +50894,23 @@ void destroyHostWindow(Renderer* R);
         // g_dlStaticsFrontCW's note warns about. Cost is bounded — one 1024² target.
         RasterizerStateDesc rm = rs; rm.mCullMode = CULL_MODE_NONE;
         g.pRasterizerState = &rm;
+        // ...and its OWN shader pair (terrain_mirror.vert/.frag): no PBR / parallax / height blend /
+        // macro variation and no near-camera displacement. The full main shader used to run on every
+        // reflected pixel of a 4x 1024² target: reflections can be simpler, but sun shadows and sky AO
+        // stay (user, 2026-10-07). Falls back to the main shader if the pair fails to load.
+        {
+            ShaderLoadDesc md = {};
+            md.mVert.pFileName = "terrain_mirror.vert";
+            md.mFrag.pFileName = "terrain_mirror.frag";
+            addShader(R, &md, &g_pTerrainShaderMirror);
+            if (g_pTerrainShaderMirror) { g.pShaderProgram = g_pTerrainShaderMirror; }
+            else { std::printf("[forge][terrain] terrain_mirror FAILED — the mirror keeps the full shader\n"); }
+        }
         addPipeline(R, &pd, &g_pTerrainPipelineMirror);
+        g.pShaderProgram = g_pTerrainShader;
+        if (g_pTerrainShaderMirror) {   // the near-rung twin; null => every rung takes the lite one
+            addPipeline(R, &pd, &g_pTerrainPipelineMirrorFull);
+        }
         if (!g_pTerrainPipelineMirror) { std::printf("[forge][terrain] addPipeline(mirror) FAILED\n"); return false; }
         g.pRasterizerState = &rs;
 
@@ -52280,6 +52304,7 @@ void destroyHostWindow(Renderer* R);
         // ring the way `base`/`cursor` filled it, so neither side names a layout and adding a family
         // or a rung cannot desynchronise them.
         uint32_t firstInstance = 0;
+        Pipeline* boundMirror = pso;
         for (uint32_t f = 0; f < kTerrainFamilies; ++f) {
             for (uint32_t l = 0; l < kTerrainLods; ++l) {
                 const uint32_t n = V.drawCounts[f][l];
@@ -52288,6 +52313,13 @@ void destroyHostWindow(Renderer* R);
                 // A (family, rung) the family does not carry has no template. It should also have no
                 // instances, so this is a guard against a future emit, not a live case.
                 if (!rg.indexCount) { continue; }
+                // The mirror's distance LOD of SHADING (g_reflTerrainFullRungs): the near rungs take the
+                // full shader, the rest the lite one. Only the PSO changes; bindings are shared.
+                if (pso == g_pTerrainPipelineMirror && g_pTerrainPipelineMirrorFull) {
+                    Pipeline* want = ((float)l < g_reflTerrainFullRungs) ? g_pTerrainPipelineMirrorFull
+                                                                         : g_pTerrainPipelineMirror;
+                    if (want != boundMirror) { cmdBindPipeline(cmd, want); boundMirror = want; }
+                }
                 cmdDrawIndexedInstanced(cmd, rg.indexCount, rg.firstIndex, n, rg.firstVertex, firstInstance);
                 firstInstance += n;
             }
@@ -58943,7 +58975,9 @@ void destroyHostWindow(Renderer* R);
                       : (g_staticsFacing == 2u) ? true             // force CW
                       : g_dlStaticsFrontCW;                        // 0 = auto (per-camera default)
         // PBR off and no debug view: the PBR-compiled-out variant of the same facing, when it exists.
-        const bool np = !g_pbrStatics && g_debugMode == 0u && g_pStaticsPipelineNoPbr
+        // The WATER MIRROR always takes it: reflections can be simpler (user, 2026-10-07) — no
+        // parallax, no PBR relief through a wavy mirror; the sun shadow and sky ambient stay.
+        const bool np = (!g_pbrStatics || mirror) && g_debugMode == 0u && g_pStaticsPipelineNoPbr
                      && g_pStaticsPipelineCWNoPbr && g_pStaticsPipelineNoneNoPbr;
         if (g_staticsFacing == 3u) { return np ? g_pStaticsPipelineNoneNoPbr : g_pStaticsPipelineNone; }
         const bool wantCW = mirror ? !cw : cw;
@@ -63445,6 +63479,8 @@ void destroyHostWindow(Renderer* R);
         // Host-owned terrain teardown (before the descriptor sets that reference the data buffers).
         if (g_pTerrainPipelineWire) { removePipeline(R, g_pTerrainPipelineWire); g_pTerrainPipelineWire = nullptr; }
         if (g_pTerrainPipelineMirror) { removePipeline(R, g_pTerrainPipelineMirror); g_pTerrainPipelineMirror = nullptr; }
+        if (g_pTerrainShaderMirror)   { removeShader(R, g_pTerrainShaderMirror);     g_pTerrainShaderMirror = nullptr; }
+        if (g_pTerrainPipelineMirrorFull) { removePipeline(R, g_pTerrainPipelineMirrorFull); g_pTerrainPipelineMirrorFull = nullptr; }
         if (g_pSunShadowTerrainPipeline) { removePipeline(R, g_pSunShadowTerrainPipeline); g_pSunShadowTerrainPipeline = nullptr; }
         if (g_pSvmTerrainPipeline) { removePipeline(R, g_pSvmTerrainPipeline); g_pSvmTerrainPipeline = nullptr; }
         if (g_pSunShadowTerrainShader)   { removeShader(R, g_pSunShadowTerrainShader);     g_pSunShadowTerrainShader = nullptr; }

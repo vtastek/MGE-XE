@@ -334,6 +334,9 @@ VSOutput VS_MAIN( VSInput In )
 
     // ─── PHASE 4a: near-camera displacement (terraindisp.h.fsl) ────────────────────────
     // Armed by a cbuffer scalar, so with it off this is one uniform branch and not a texture fetch.
+    // TERRAIN_NO_DISP (terrain_mirror.vert): the water reflection never displaces — a few units of
+    // carving under the player's feet are invisible through a wavy mirror, and the fetch is not.
+#ifndef TERRAIN_NO_DISP
     if (gShadowParams.terrainDisp.x != 0.0f)
     {
         // ⚠ NEVER ON A STITCHED VERTEX, and this is the crack guard, not a shortcut. A boundary
@@ -371,6 +374,7 @@ VSOutput VS_MAIN( VSInput In )
             }
         }
     }
+#endif
 
     // ─── THE NORMAL, AND D4: IT DOES NOT FOLLOW THE CARVING ──────────────────────────────────────
     // On the base lattice this is terrainCornerNormal at this vertex — unchanged, one call, four
