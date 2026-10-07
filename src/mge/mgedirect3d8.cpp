@@ -31,13 +31,20 @@ void translatePresentParams8to9(D3DPRESENT_PARAMETERS8* e, bool isEx,
                                 D3DDISPLAYMODEEX& dm, D3DDISPLAYMODEEX** pdm) {
     // MSAA parameters
     D3DMULTISAMPLE_TYPE msaaSamples = (D3DMULTISAMPLE_TYPE)Configuration.AALevel;
-    // MEASUREMENT PROBE (Release 1 G7 campaign): MGE_CLIENT_MSAA=0 creates MW's own backbuffer single-
-    // sample while the Forge host keeps Configuration.AALevel (renderprocess.cpp reads that, not this).
-    // Under the seam MW's 4x backbuffer only carries the composite quad + UI, then resolves at Present;
-    // this prices that. F11 / the DX9 path lose MSAA with it set — not a shipping mode.
-    if (char v[8] = {}; GetEnvironmentVariableA("MGE_CLIENT_MSAA", v, sizeof(v)) > 0 && v[0] == '0') {
+    // Under the Forge takeover MW's own backbuffer is SINGLE-SAMPLE; the host keeps
+    // Configuration.AALevel (renderprocess.cpp reads that, not this) and resolves its own MSAA. MW's
+    // backbuffer then carries only the composite quad + UI, and at 4x it cost the client ~0.3 ms of GPU
+    // a frame (docks, 2560x1600) for edges nothing on it has: the clear, the full-screen composite, the
+    // UI and the present-time resolve all ran at 4 samples. What loses AA: MW's own 3D in menus (the
+    // inventory paper doll) and the F11 / dead-host vanilla fallback. MGE_CLIENT_MSAA=1 restores it,
+    // MGE_CLIENT_MSAA=0 forces single-sample without the render process.
+    bool clientMsaa = !Configuration.UseRenderProcess;
+    if (char v[8] = {}; GetEnvironmentVariableA("MGE_CLIENT_MSAA", v, sizeof(v)) > 0) {
+        clientMsaa = (v[0] != '0');
+    }
+    if (!clientMsaa && msaaSamples != D3DMULTISAMPLE_NONE) {
+        LOG::logline(">> [msaa] client backbuffer single-sample (host keeps %d)", (int)Configuration.AALevel);
         msaaSamples = D3DMULTISAMPLE_NONE;
-        LOG::logline(">> [msaa] MGE_CLIENT_MSAA=0: client backbuffer single-sample (host keeps %d)", (int)Configuration.AALevel);
     }
     DWORD msaaQuality = 0;
 

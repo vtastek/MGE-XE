@@ -127,6 +127,9 @@ namespace {
     // when, is unchanged: frame N still reaches g_mainTex before this MW frame's blit.
     // numpad-* cycles off -> 1-ahead -> 1.5-ahead; MGE_COPY_AT_BLIT=0|1 sets it at seam init.
     bool   g_copyAtBlit = true;
+    // MGE_SEAM_PROBE (measurement only, the picture is WRONG while set): bit 0 skips the host-RT copy,
+    // bit 1 the composite blit. Prices the client's own GPU share of a frame against the host's.
+    unsigned g_seamProbe = 0;
 
     // The pipelining mode as ONE value (numpad-* and the panel's radio set it; both flags derive).
     enum PipeMode { kPipeOff = 0, kPipeAhead1 = 1, kPipeAhead15 = 2 };
@@ -1588,6 +1591,36 @@ namespace {
     VkCommandPool   g_cmdPool = VK_NULL_HANDLE;  // owned
     VkCommandBuffer g_cmd     = VK_NULL_HANDLE;
     VkFence         g_fence   = VK_NULL_HANDLE;  // owned
+    // The RT copy's COMPLETION, as a client-owned timeline semaphore: the copy signals g_copySeq and
+    // returns without a CPU wait. The copy used to vkWaitForFences inline, which parked MW's main
+    // thread for the host's whole GPU frame (the [hb] copy= column, ~1.4 ms on the docks) and cost
+    // ~0.4 ms of frame. Nothing after the copy on THIS queue needs it: the composite is ordered behind
+    // it by the copy's closing barrier (barrier scopes span submissions on one queue). What does need
+    // it waits here instead, at the point of reuse: the next copy (g_cmd), the next kickoff (the host
+    // may then draw into the slot this copy reads), a device reset, teardown. vkWaitSemaphores is
+    // thread-safe, which the kickoff (produce worker) needs. MGE_COPY_SYNC=0 = the old inline wait.
+    VkSemaphore     g_copySem = VK_NULL_HANDLE;  // owned; timeline
+    bool            g_copySemOk = false;
+    bool            g_copyAsync = true;          // MGE_COPY_SYNC=0 clears it
+    // DXVK flush before the copy: OFF by default. It split MW's frame into an extra submission (one more
+    // cross-process GPU switch per frame) to order work the copy never touches — what is pending in
+    // DXVK at the copy is MW's frame-so-far; the last read of g_mainTex (the previous composite) went
+    // out with the previous Present. A copy that lands after this frame's composite (a backstop drain)
+    // just hands that composite a newer, complete frame: the copy's own barriers cover the layout and
+    // the order. MGE_COPY_FLUSH=1 restores it.
+    bool            g_copyFlush = false;
+    std::uint64_t   g_copySeq = 0;               // main thread only
+    std::atomic<std::uint64_t> g_copySubmitted{0};   // last value a submitted copy signals
+    // Slot-reuse guard for the kickoff. The host alternates its two RTs (frame F draws into F-2's), and
+    // the contract is that F-2 was copied before F is kicked; with an async copy "copied" must mean
+    // EXECUTED. One RPC is in flight at a time, so F-1 has always finished before kick F: the copy of
+    // F-2 is the latest copy, unless the latest copy already read F-1 (the latest finished frame) — then
+    // it is the one before. Waiting the right one, not simply the latest, is what keeps the 1-ahead
+    // pipeline from waiting out F-1's whole GPU frame before kicking F.
+    struct CopyRec { std::uint64_t hostFence; std::uint64_t value; };
+    std::mutex     g_copyRecMx;
+    CopyRec        g_copyRec[2] = {};             // [0] = latest copy, [1] = the one before
+    std::atomic<std::uint64_t> g_lastFinishedFence{0};
 
     // Tier 1 (tasks/forge-host-gpu-lane.md): the host's SHARED monotonic D3D12 frame fence,
     // imported here as a Vulkan TIMELINE semaphore. When the host stops CPU-blocking on its own
@@ -1642,6 +1675,7 @@ namespace {
         PFN_vkImportSemaphoreWin32HandleKHR ImportSemaphoreWin32HandleKHR;
         PFN_vkCreateSemaphore            CreateSemaphore;
         PFN_vkDestroySemaphore           DestroySemaphore;
+        PFN_vkWaitSemaphores             WaitSemaphores;   // optional: the async copy needs it
     } vk = {};
 
     bool loadVulkan() {
@@ -1694,6 +1728,7 @@ namespace {
             (PFN_vkImportSemaphoreWin32HandleKHR)vk.GetDeviceProcAddr(g_dev, "vkImportSemaphoreWin32HandleKHR");
         vk.CreateSemaphore  = (PFN_vkCreateSemaphore)vk.GetDeviceProcAddr(g_dev, "vkCreateSemaphore");
         vk.DestroySemaphore = (PFN_vkDestroySemaphore)vk.GetDeviceProcAddr(g_dev, "vkDestroySemaphore");
+        vk.WaitSemaphores   = (PFN_vkWaitSemaphores)vk.GetDeviceProcAddr(g_dev, "vkWaitSemaphores");
         if (!ok) {
             LOG::logline("!! [seam] failed to resolve required Vulkan entry points — seam disabled");
         }
@@ -1979,7 +2014,66 @@ namespace {
             return false;
         }
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        return vk.CreateFence(g_dev, &fci, nullptr, &g_fence) == VK_SUCCESS;
+        if (vk.CreateFence(g_dev, &fci, nullptr, &g_fence) != VK_SUCCESS) {
+            return false;
+        }
+        // Optional: without it the copy keeps its inline fence wait.
+        {
+            char v[4] = {};
+            if (GetEnvironmentVariableA("MGE_COPY_SYNC", v, sizeof(v)) > 0 && v[0] == '0') {
+                g_copyAsync = false;
+            }
+            if (GetEnvironmentVariableA("MGE_COPY_FLUSH", v, sizeof(v)) > 0) {
+                g_copyFlush = (v[0] != '0');
+            }
+        }
+        g_copySemOk = false;
+        if (g_copyAsync && vk.CreateSemaphore && vk.WaitSemaphores) {
+            VkSemaphoreTypeCreateInfo stci = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+            stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            stci.initialValue  = 0;
+            VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            sci.pNext = &stci;
+            g_copySemOk = vk.CreateSemaphore(g_dev, &sci, nullptr, &g_copySem) == VK_SUCCESS;
+            g_copySeq = 0;
+            g_copySubmitted.store(0);
+        }
+        LOG::logline(">> [seam] RT copy: DXVK flush before it %s", g_copyFlush ? "ON (MGE_COPY_FLUSH=1)" : "off");
+        LOG::logline(">> [seam] RT copy completion: %s", g_copySemOk
+                     ? "timeline semaphore, waited at reuse (no inline CPU wait)"
+                     : g_copyAsync ? "fence, inline CPU wait (no timeline semaphore)" : "fence, inline CPU wait (MGE_COPY_SYNC=0)");
+        return true;
+    }
+
+    void waitCopyValue(std::uint64_t v) {
+        if (!g_copySemOk || v == 0) {
+            return;
+        }
+        VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        wi.semaphoreCount = 1;
+        wi.pSemaphores    = &g_copySem;
+        wi.pValues        = &v;
+        vk.WaitSemaphores(g_dev, &wi, UINT64_MAX);
+    }
+
+    // Block until the last submitted RT copy has executed (see g_copySem). Any thread. ~0 in the steady
+    // state: the copy only waits on the host frame it reads, which retired long before anyone asks.
+    void waitCopyRetired() {
+        waitCopyValue(g_copySubmitted.load());
+    }
+
+    // Before a kickoff: the copy that reads the RT slot the kicked frame will draw into (g_copyRec).
+    void waitCopyForSlotReuse() {
+        if (!g_copySemOk) {
+            return;
+        }
+        std::uint64_t v;
+        {
+            std::lock_guard<std::mutex> lk(g_copyRecMx);
+            const std::uint64_t f1 = g_lastFinishedFence.load();
+            v = (f1 != 0 && g_copyRec[0].hostFence == f1) ? g_copyRec[1].value : g_copyRec[0].value;
+        }
+        waitCopyValue(v);
     }
 
     void releaseAll() {
@@ -1987,6 +2081,11 @@ namespace {
             if (g_frameSem && vk.DestroySemaphore) { vk.DestroySemaphore(g_dev, g_frameSem, nullptr); }
             g_frameSem = VK_NULL_HANDLE;
             g_frameSemOk = false;
+            waitCopyRetired();
+            if (g_copySem && vk.DestroySemaphore) { vk.DestroySemaphore(g_dev, g_copySem, nullptr); }
+            g_copySem = VK_NULL_HANDLE;
+            g_copySemOk = false;
+            g_copySubmitted.store(0);
             if (g_fence)     { vk.DestroyFence(g_dev, g_fence, nullptr); g_fence = VK_NULL_HANDLE; }
             if (g_cmdPool)   { vk.DestroyCommandPool(g_dev, g_cmdPool, nullptr); g_cmdPool = VK_NULL_HANDLE; g_cmd = VK_NULL_HANDLE; }
             for (unsigned i = 0; i < 2; ++i) {
@@ -2233,6 +2332,11 @@ namespace {
                 LOG::logline(">> [seam] MGE_COPY_AT_BLIT=%c — RT copy %s", v[0],
                              g_copyAtBlit ? "at the blit (1.5-ahead)" : "at the collect (1-ahead)");
             }
+            if (GetEnvironmentVariableA("MGE_SEAM_PROBE", v, sizeof(v)) > 0) {
+                g_seamProbe = static_cast<unsigned>(v[0] - '0') & 3u;
+                LOG::logline("!! [seam] MGE_SEAM_PROBE=%u — measurement only: %s%s", g_seamProbe,
+                             (g_seamProbe & 1u) ? "RT copy SKIPPED " : "", (g_seamProbe & 2u) ? "composite SKIPPED" : "");
+            }
             // MGE_FRAME_AHEAD=0: boot with frame-ahead OFF — the third numpad-* state, which the
             // harness cannot reach by key. Exists so the OFF path gets tested at all (it once froze).
             if (GetEnvironmentVariableA("MGE_FRAME_AHEAD", v, sizeof(v)) > 0) {
@@ -2275,6 +2379,9 @@ namespace {
     // rtSlot (P3): which of the host's two shared RTs this frame rendered into (the finish reply's
     // rtSlot) — the image copied, and in event mode the event waited.
     bool copyHostRtToDst(std::uint64_t hostFenceValue, std::uint32_t rtSlot) {
+        if (g_seamProbe & 1u) {
+            return true;
+        }
         const unsigned slot = rtSlot & 1u;
         // Spike attribution (rare 12ms "Forge RT copy" with host already finished): the outer
         // zone can't say WHICH of the three main-thread blockers stalled — the DXVK flush (drains
@@ -2285,10 +2392,13 @@ namespace {
         {
             // Flush any DXVK rendering that touches the dst image before we use its queue.
             MGE_ZoneScopedN("RTcopy: DXVK flush");
-            g_vki->FlushRenderingCommands();
+            if (g_copyFlush) {
+                g_vki->FlushRenderingCommands();
+            }
         }
         const double tcFlush = nowMs();
 
+        waitCopyRetired();   // g_cmd is reused: the previous copy must have executed
         vk.ResetCommandBuffer(g_cmd, 0);
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2349,6 +2459,15 @@ namespace {
             si.pWaitSemaphores      = &g_frameSem;
             si.pWaitDstStageMask    = &waitStage;
         }
+        // Async completion: signal the copy's own timeline instead of the fence (see g_copySem).
+        const uint64_t copyValue = g_copySeq + 1;
+        if (g_copySemOk) {
+            tsi.signalSemaphoreValueCount = 1;
+            tsi.pSignalSemaphoreValues    = &copyValue;
+            si.pNext                = &tsi;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores    = &g_copySem;
+        }
 
         // Tier 1 EVENT handoff: no semaphore to put on the submit, so hold the submit itself until
         // the host's frame event says its fence reached this frame's value. Placed after recording
@@ -2379,10 +2498,18 @@ namespace {
         // out of the commit pending a real-play A/B.
         g_vki->LockSubmissionQueue();
         tcLocked = nowMs();                       // time spent waiting on DXVK's submit lock
-        VkResult r = vk.QueueSubmit(g_queue, 1, &si, g_fence);
+        VkResult r = vk.QueueSubmit(g_queue, 1, &si, g_copySemOk ? VK_NULL_HANDLE : g_fence);
         g_vki->ReleaseSubmissionQueue();
         tcSubmit = nowMs();
-        if (r == VK_SUCCESS) {
+        if (r == VK_SUCCESS && g_copySemOk) {
+            g_copySeq = copyValue;
+            {
+                std::lock_guard<std::mutex> lk(g_copyRecMx);
+                g_copyRec[1] = g_copyRec[0];
+                g_copyRec[0] = { hostFenceValue, copyValue };
+            }
+            g_copySubmitted.store(copyValue);
+        } else if (r == VK_SUCCESS) {
             MGE_ZoneScopedN("RTcopy: fence wait");   // unlocked — our copy's GPU completion only
             vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
             vk.ResetFences(g_dev, 1, &g_fence);
@@ -6481,6 +6608,7 @@ namespace RenderProcess {
         // extra waitProduce is belt-and-braces (idempotent no-op once collect has drained).
         collectDeferredFinish(device);
         waitProduce();
+        waitCopyRetired();
         LOG::logline(">> [seam] preDeviceReset: host frame drained, produce worker idle");
     }
 
@@ -6744,6 +6872,9 @@ namespace RenderProcess {
             markMainPhase(MP_FINISH_COPY);   // main is now blocked on the host IPC finish
             r.ok = g_client->renderSceneFinish(&r.hostMs, &hostT, &frameFence, &rtSlot);
         }
+        if (r.ok) {
+            g_lastFinishedFence.store(frameFence);   // F-1 for the next kickoff's slot guard
+        }
         r.tRender = nowMs();
         // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
         // = IPC/sync/host-present overhead. With the finish deferred to the next frame's
@@ -6846,6 +6977,9 @@ namespace RenderProcess {
     double compositeBlitMainTex(IDirect3DDevice9* device) {
         MGE_ZoneScopedN("Forge composite blit");
         const double t0 = nowMs();
+        if (g_seamProbe & 2u) {
+            return 0.0;
+        }
         static bool s_firstBlit = true;
         if (s_firstBlit) {
             s_firstBlit = false;
@@ -8752,6 +8886,7 @@ namespace RenderProcess {
         {
             markWorkerPhase(WK_KICKOFF);
             MGE_ZoneScopedN("Forge renderSceneKickoff");
+            waitCopyForSlotReuse();   // F-2's RT copy must have EXECUTED before F may redraw it
             ok = g_client->renderSceneKickoff(frame, (const float*)&viewProj, lighting,
                      haveDraw ? g_drawVec->id() : IPC::InvalidVector,
                      haveDraw ? drawCount : 0,
