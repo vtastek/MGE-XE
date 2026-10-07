@@ -19867,6 +19867,11 @@ namespace {
     // `mgeHost64_ldr.exe`, built from THIS source with only these two bools flipped — an older LDR
     // binary is not a valid A/B partner, it is a different renderer. Check the horizon fog band first.
     bool     g_hdrSceneColor   = true;
+    // The HDR scene in 32 bits: B10G11R11_UFLOAT instead of R16G16B16A16_SFLOAT (user, 2026-10-07:
+    // "R11G11B10F"). Half the colour bandwidth of every scene pass + both MSAA resolves. It has NO alpha
+    // channel (reads 1.0), so the scene's coverage alpha is gone with it. Init-time (formats are baked
+    // into the PSOs), so env / replay only for now.
+    bool     g_sceneR11G11B10 = false;
 
     // STEP 5 — THE LINEAR MIGRATION. tasks/forge-postprocess.md.
     //
@@ -23806,6 +23811,7 @@ namespace {
             // Scene colour FORMAT + domain (read at init, so env/replay only): 0 = the BGRA8 display-
             // referred path the fp16 build replaced. Here to PRICE the format on a replay, not to ship.
             { "hdrSceneColor", &g_hdrSceneColor },
+            { "sceneR11G11B10", &g_sceneR11G11B10 },
             { "linearScene", &g_linearScene },
             // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
             // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
@@ -30331,8 +30337,9 @@ void destroyHostWindow(Renderer* R);
         // runs first and is what tells buildOpaquePath to make the target at all.
         if (g_live.pRT) {
             const bool wantHdr = g_hdrSceneColor;
-            g_live.sceneColorFormat = wantHdr ? TinyImageFormat_R16G16B16A16_SFLOAT
-                                              : g_live.pRT->mFormat;
+            g_live.sceneColorFormat = !wantHdr        ? g_live.pRT->mFormat
+                                    : g_sceneR11G11B10 ? TinyImageFormat_B10G11R11_UFLOAT
+                                                       : TinyImageFormat_R16G16B16A16_SFLOAT;
             // Step 6a: the SAME expression also decides the target's units. One evaluation, stored
             // once — see the sceneReferred declaration for why these cannot be two switches.
             g_live.sceneReferred = wantHdr;
@@ -30342,7 +30349,9 @@ void destroyHostWindow(Renderer* R);
             g_live.linearScene = g_linearScene && wantHdr;
             LOG::logline(">> [scenefmt] %s (requested=%d sampleCount=%u) — deliver=B8G8R8A8_UNORM, "
                          "scene colour is %s, %s (tonemap in %s)",
-                         wantHdr ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
+                         (g_live.sceneColorFormat == TinyImageFormat_B10G11R11_UFLOAT ? "B10G11R11_UFLOAT"
+                          : g_live.sceneColorFormat == TinyImageFormat_R16G16B16A16_SFLOAT ? "R16G16B16A16_SFLOAT"
+                          : "B8G8R8A8_UNORM"),
                          (int)g_hdrSceneColor, g_live.sampleCount,
                          wantHdr ? "SCENE-REFERRED" : "display-referred",
                          g_live.linearScene ? "LINEAR" : "gamma (MW authored)",
@@ -30352,7 +30361,9 @@ void destroyHostWindow(Renderer* R);
             // AFTER the probe's early return, so LOG::logline is dropped there. A probe that cannot
             // say which colour domain it just validated is not validating it.
             std::printf("[forge] scene colour: %s, %s, %s\n",
-                        wantHdr ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
+                        (g_live.sceneColorFormat == TinyImageFormat_B10G11R11_UFLOAT ? "B10G11R11_UFLOAT"
+                          : g_live.sceneColorFormat == TinyImageFormat_R16G16B16A16_SFLOAT ? "R16G16B16A16_SFLOAT"
+                          : "B8G8R8A8_UNORM"),
                         wantHdr ? "scene-referred" : "display-referred",
                         g_live.linearScene ? "LINEAR" : "gamma (MW authored)");
             if (g_linearScene && !wantHdr) {
