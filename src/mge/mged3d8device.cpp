@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
 #include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
@@ -25,6 +28,63 @@
 
 bool g_tracyActive = false;
 
+// [ui-census] (tasks/forge-host-ui.md P0, measurement only; MGE_UI_CENSUS=1): every draw MW issues in
+// the UI stage (past the Forge composite), aggregated by the signature a host-side replay would have
+// to reproduce, logged every 300 frames. Answers "what does the host have to draw to own the UI".
+namespace {
+    int g_uiCensusOn = -1;   // -1 = env not read yet
+    std::map<std::string, unsigned> g_uiCensus;
+    unsigned g_uiCensusFrames = 0, g_uiCensusDraws = 0, g_uiCensusPrims = 0;
+
+    bool uiCensusOn() {
+        if (g_uiCensusOn < 0) {
+            char v[4] = {};
+            g_uiCensusOn = (GetEnvironmentVariableA("MGE_UI_CENSUS", v, sizeof(v)) > 0 && v[0] == '1') ? 1 : 0;
+        }
+        return g_uiCensusOn == 1;
+    }
+
+    void uiCensusRecord(const RenderedState& rs, const FragmentState& frs, bool mainView, bool rtNormal) {
+        char key[320];
+        unsigned tw = 0, th = 0, tf = 0, tlev = 0;
+        if (rs.texture) {
+            D3DSURFACE_DESC d = {};
+            if (SUCCEEDED(rs.texture->GetLevelDesc(0, &d))) { tw = d.Width; th = d.Height; tf = d.Format; }
+            tlev = rs.texture->GetLevelCount();
+            if (d.Usage & D3DUSAGE_RENDERTARGET) { tf |= 0x80000000u; }   // a texture MW renders into
+        }
+        unsigned nStages = 0;
+        while (nStages < 8 && frs.stage[nStages].colorOp != D3DTOP_DISABLE) { ++nStages; }
+        std::snprintf(key, sizeof(key),
+            "prim=%u fvf=0x%X stride=%u tex=%ux%u fmt=0x%X lv=%u stages=%u op0=%u/%u blend=%u(%u,%u) atest=%u(%u,%u) "
+            "light=%u fog=%u zw=%u view=%s rt=%s",
+            (unsigned)rs.primType, (unsigned)rs.fvf, rs.vbStride, tw, th, tf, tlev, nStages,
+            frs.stage[0].colorOp, frs.stage[0].alphaOp,
+            rs.blendEnable, rs.srcBlend, rs.destBlend, rs.alphaTest, rs.alphaFunc, rs.alphaRef,
+            rs.useLighting, rs.useFog, (unsigned)rs.zWrite,
+            mainView ? "main" : "OTHER", rtNormal ? "backbuffer" : "OFFSCREEN");
+        ++g_uiCensus[key];
+        ++g_uiCensusDraws;
+        g_uiCensusPrims += rs.primCount;
+    }
+
+    void uiCensusFrame() {
+        if (!uiCensusOn()) { return; }
+        if (++g_uiCensusFrames < 300) { return; }
+        std::vector<std::pair<unsigned, std::string>> rows;
+        for (auto& kv : g_uiCensus) { rows.push_back({ kv.second, kv.first }); }
+        std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        LOG::logline(">> [ui-census] %u frames: %.1f UI draws/frame, %.1f prims/frame, %zu signatures",
+                     g_uiCensusFrames, g_uiCensusDraws / (double)g_uiCensusFrames,
+                     g_uiCensusPrims / (double)g_uiCensusFrames, rows.size());
+        for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+            LOG::logline(">> [ui-census]   %7.2f/frame  %s", rows[i].first / (double)g_uiCensusFrames, rows[i].second.c_str());
+        }
+        g_uiCensus.clear();
+        g_uiCensusFrames = g_uiCensusDraws = g_uiCensusPrims = 0;
+    }
+}
+
 // Per-stage draw-call breakdown. Emits a Tracy plot per stage every frame and a
 // 60-frame summary line to mgexe.log (gated on LogDistantPipeline) so the totals
 // can be eyeballed against the single draw-call number DXVK reports. Counters are
@@ -34,6 +94,7 @@ void DrawStats::logFrame() {
 
     std::uint32_t totalCalls = 0, totalPrims = 0;
     for (int i = 0; i < COUNT; ++i) { totalCalls += g_calls[i]; totalPrims += g_prims[i]; }
+    uiCensusFrame();
 
 #ifdef TRACY_ENABLE
     if (g_tracyActive) {
@@ -1072,6 +1133,11 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             g_s0DrawTicks += (t1.QuadPart - t0->QuadPart);
         }
     } s0probeGuard{ s0probe, &s0t0 };
+
+    if (DrawStats::g_stage == DrawStats::UI && uiCensusOn()) {
+        rs.primType = a; rs.vertCount = c; rs.primCount = e;
+        uiCensusRecord(rs, frs, isMainView, rendertargetNormal);
+    }
 
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
