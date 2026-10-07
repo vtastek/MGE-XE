@@ -23803,6 +23803,10 @@ namespace {
             { "pbrEnable", &g_pbrEnable },
             { "drawDLStatics", &g_drawDLStatics },
             { "staticsLayerPasses", &g_staticsLayerPasses },
+            // Scene colour FORMAT + domain (read at init, so env/replay only): 0 = the BGRA8 display-
+            // referred path the fp16 build replaced. Here to PRICE the format on a replay, not to ship.
+            { "hdrSceneColor", &g_hdrSceneColor },
+            { "linearScene", &g_linearScene },
             // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
             // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
             // cost has to be measured on a minimized harness run with nobody at the panel.
