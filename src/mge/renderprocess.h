@@ -161,6 +161,8 @@ namespace RenderProcess {
     // renders its own scene. That vanilla-Morrowind fallback is also what a dead host or a
     // failed seam falls back to (g_initOk false), and it is the ONLY fallback.
     bool forgeOwnsFrame();
+    // MGE_SEAM_PROBE bits (measurement only; renderprocess.cpp g_seamProbe).
+    unsigned seamProbe();
 
     // True when this frame's classify will be FIRED to the host next frame with a newer camera
     // (produce mode 3, park-and-fire). The early classify then collects a lead band past the

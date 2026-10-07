@@ -128,7 +128,8 @@ namespace {
     // numpad-* cycles off -> 1-ahead -> 1.5-ahead; MGE_COPY_AT_BLIT=0|1 sets it at seam init.
     bool   g_copyAtBlit = true;
     // MGE_SEAM_PROBE (measurement only, the picture is WRONG while set): bit 0 skips the host-RT copy,
-    // bit 1 the composite blit. Prices the client's own GPU share of a frame against the host's.
+    // bit 1 the composite blit, bit 2 MW's UI draws AND the real Present (mged3d8device.cpp) — with all
+    // three the client issues no GPU work in a game frame: the ceiling of tasks/forge-host-ui.md.
     unsigned g_seamProbe = 0;
 
     // The pipelining mode as ONE value (numpad-* and the panel's radio set it; both flags derive).
@@ -2333,9 +2334,10 @@ namespace {
                              g_copyAtBlit ? "at the blit (1.5-ahead)" : "at the collect (1-ahead)");
             }
             if (GetEnvironmentVariableA("MGE_SEAM_PROBE", v, sizeof(v)) > 0) {
-                g_seamProbe = static_cast<unsigned>(v[0] - '0') & 3u;
-                LOG::logline("!! [seam] MGE_SEAM_PROBE=%u — measurement only: %s%s", g_seamProbe,
-                             (g_seamProbe & 1u) ? "RT copy SKIPPED " : "", (g_seamProbe & 2u) ? "composite SKIPPED" : "");
+                g_seamProbe = static_cast<unsigned>(v[0] - '0') & 7u;
+                LOG::logline("!! [seam] MGE_SEAM_PROBE=%u — measurement only: %s%s%s", g_seamProbe,
+                             (g_seamProbe & 1u) ? "RT copy SKIPPED " : "", (g_seamProbe & 2u) ? "composite SKIPPED " : "",
+                             (g_seamProbe & 4u) ? "UI + Present SKIPPED" : "");
             }
             // MGE_FRAME_AHEAD=0: boot with frame-ahead OFF — the third numpad-* state, which the
             // harness cannot reach by key. Exists so the OFF path gets tested at all (it once froze).
@@ -9617,6 +9619,8 @@ namespace RenderProcess {
         const unsigned until = g_frame + frames;
         if ((int)(until - g_captureGraceUntil) > 0) g_captureGraceUntil = until;
     }
+
+    unsigned seamProbe() { return g_seamProbe; }
 
     bool forgeOwnsFrame() {
         // The one mode predicate — see the header. Seam live + composite ON (F11) means the host

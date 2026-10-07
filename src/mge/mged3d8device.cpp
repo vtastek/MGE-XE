@@ -676,7 +676,8 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     HRESULT hr;
     {
         MGE_ZoneScopedN("engPresent");
-        hr = ProxyDevice::Present(a, b, c, d);
+        hr = ((RenderProcess::seamProbe() & 4u) && RenderProcess::forgeOwnsFrame())
+           ? D3D_OK : ProxyDevice::Present(a, b, c, d);   // MGE_SEAM_PROBE bit 2: measurement only
     }
     // A0 Cut-4 probe: stamp the engine-Present return; the span to the next
     // BeginScene(0) (MW input/sim/AI/animation — never zoned) lands in [hb] mwstart=.
@@ -1134,6 +1135,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
     } s0probeGuard{ s0probe, &s0t0 };
 
+    if (DrawStats::g_stage == DrawStats::UI && (RenderProcess::seamProbe() & 4u) && RenderProcess::forgeOwnsFrame()) {
+        return D3D_OK;   // MGE_SEAM_PROBE bit 2: the client draws no UI (measurement only)
+    }
     if (DrawStats::g_stage == DrawStats::UI && uiCensusOn()) {
         rs.primType = a; rs.vertCount = c; rs.primCount = e;
         uiCensusRecord(rs, frs, isMainView, rendertargetNormal);
