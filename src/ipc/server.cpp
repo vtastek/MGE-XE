@@ -1,6 +1,7 @@
 #include "ipc/dlshare.h"
 #include "ipc/server.h"
 #include "ipc/geomwire.h"
+#include "ipc/ipcrecord.h"
 #include "support/log.h"
 #include "vkrender.h"
 #include "forgerender.h"
@@ -125,6 +126,7 @@ namespace IPC {
 	}
 
 	bool Server::init() {
+		Rec::openFromEnv();
 		if (m_ipcParameters != nullptr) {
 			UnmapViewOfFile(m_ipcParameters);
 			m_ipcParameters = nullptr;
@@ -271,6 +273,7 @@ namespace IPC {
 				// Acknowledge FIRST: the client goes straight on (MW loads the save meanwhile) and
 				// anything it sends next simply queues behind the load on this single thread.
 				SetEvent(m_rpcCompleteEvent);
+				Rec::write(Command::DlPrewarm, nullptr, 0, nullptr, 0);
 				ForgeRender::dlPrewarm();
 				continue;
 			case Command::RenderFrame:
@@ -355,6 +358,14 @@ namespace IPC {
 	void Server::updateDynVis() {
 		auto& params = m_ipcParameters->params.dynVisParams;
 		auto& vec = getVec<DynVisFlag>(params.id);
+		if (Rec::active()) {
+			std::vector<DynVisFlag> flat;
+			for (auto& update : vec) {
+				flat.push_back(update);
+			}
+			const Rec::Blob b = { flat.data(), static_cast<std::uint32_t>(flat.size() * sizeof(DynVisFlag)) };
+			Rec::write(Command::UpdateDynVis, nullptr, 0, &b, 1);
+		}
 		for (auto& update : vec) {
 			// The Forge DL renderer keeps its own instance list and is the only thing that draws
 			// distant land now, so the group state has to reach IT — otherwise every gated instance
@@ -383,6 +394,10 @@ namespace IPC {
 			if (n++ >= params.count) break;
 			refs.push_back({ r.x, r.y, r.z, r.cellX, r.cellY });
 		}
+		if (Rec::active()) {
+			const Rec::Blob b = { refs.data(), static_cast<std::uint32_t>(refs.size() * sizeof(ForgeRender::NearRef)) };
+			Rec::write(Command::UpdateNearRefs, &params.version, 4, &b, 1);
+		}
 		ForgeRender::setNearRefs(refs.data(), (unsigned)refs.size(), params.version);
 	}
 
@@ -400,6 +415,7 @@ namespace IPC {
 
 	void Server::setWorldSpace() {
 		auto& params = m_ipcParameters->params.worldSpaceParams;
+		Rec::write(Command::SetWorldSpace, params.cellname, sizeof(params.cellname), nullptr, 0);
 		params.cellFound = DistantLandShare::setCurrentWorldSpace(params.cellname);
 	}
 
@@ -481,6 +497,10 @@ namespace IPC {
 		params.frameEventHandle1 = nullptr;   // ... and its frame event
 		params.ok = false;
 
+		if (Rec::active()) {
+			const std::uint32_t initArgs[4] = { params.width, params.height, params.sampleCount, params.anisoLevel };
+			Rec::write(Command::RenderInit, initArgs, sizeof(initArgs), nullptr, 0);
+		}
 		if (!ForgeRender::init(params.width, params.height, params.sampleCount, params.anisoLevel)) {
 			LOG::logline("!! [seam] ForgeRender::init(%ux%u, %ux MSAA, AF %u) failed", params.width, params.height, params.sampleCount, params.anisoLevel);
 			return;
@@ -568,8 +588,73 @@ namespace IPC {
 	// fence for this submit, which the client waits on an imported Vulkan timeline semaphore before
 	// its RT copy. 0 ⇒ no shared fence, and the client must fall back to not overlapping.
 	// tasks/forge-host-gpu-lane.md.
+	// Clamp a list's requested byte count to its mapped window (0 or oversized ⇒ the whole window), so a
+	// stale/oversized count can't over-read. An Invalid id or an empty vec resolves to {nullptr, 0}.
+	template<typename V>
+	static Rec::Blob resolveList(V& vec, std::uint32_t requested) {
+		const std::uint32_t avail = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+		std::uint32_t bytes = requested;
+		if (bytes == 0 || bytes > avail) {
+			bytes = avail;
+		}
+		return { vec.size() ? &vec[0] : nullptr, bytes };
+	}
+
 	void Server::renderFrame() {
 		auto& params = m_ipcParameters->params.renderFrameParams;
+		FrameLists L = {};
+		auto list = [&](FrameList ix, VecId id, std::uint32_t requested) {
+			if (id != InvalidVector) {
+				const Rec::Blob b = resolveList(getVec<IPC::GeomChunk>(id), requested);
+				L.ptr[ix] = b.ptr;
+				L.bytes[ix] = b.bytes;
+			}
+		};
+		list(kListDraw, params.drawList, params.drawBytes);
+		list(kListSkinned, params.skinnedList, params.skinnedBytes);
+		list(kListMultiMap, params.multiMapList, params.multiMapBytes);
+		list(kListLight, params.lightList, params.lightBytes);
+		list(kListSky, params.skyList, params.skyBytes);
+		list(kListAlpha, params.alphaList, params.alphaBytes);
+		// AT3 captured-alpha geometry: one GeomChunk vec holding [verts][indices] (indices at
+		// capturedVertBytes). The host memcpy's the two ranges into pCapAlphaVB/pCapAlphaIB
+		// and draws sentinel-slot AlphaDrawWire items from them. Clamp both byte counts to the
+		// mapped window so a stale/oversized count can't over-read.
+		if (params.capturedAlpha != InvalidVector) {
+			auto& cvec = getVec<IPC::GeomChunk>(params.capturedAlpha);
+			const std::uint32_t cavail = cvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+			std::uint32_t capVertBytes = params.capturedVertBytes;
+			std::uint32_t capIdxBytes = params.capturedIdxBytes;
+			if (capVertBytes > cavail) { capVertBytes = cavail; }
+			if (capIdxBytes > cavail - capVertBytes) { capIdxBytes = cavail - capVertBytes; }
+			L.ptr[kListCaptured] = cvec.size() ? &cvec[0] : nullptr;
+			L.bytes[kListCaptured] = capVertBytes + capIdxBytes;
+			L.capVertBytes = capVertBytes;
+		}
+		// FP1a first-person bundle: resolve the fp vec pointers only when the client enabled the pass
+		// this frame (the ids are not promised live otherwise).
+		if (params.fpEnabled) {
+			list(kListFpDraw, params.fpDrawList, params.fpDrawBytes);
+			list(kListFpSkinned, params.fpSkinnedList, params.fpSkinnedBytes);
+			list(kListFpAlpha, params.fpAlphaList, params.fpAlphaBytes);
+			// FP1e: multi-map FP parts (MultiMapDrawWire[]), same clamp as every other list.
+			list(kListFpMM, params.fpMMList, params.fpMMBytes);
+		}
+
+		if (Rec::active()) {
+			Rec::Blob blobs[kFrameListCount];
+			for (unsigned i = 0; i < kFrameListCount; ++i) {
+				blobs[i] = { L.ptr[i], L.bytes[i] };
+			}
+			Rec::write(Command::RenderFrame, &params, sizeof(params), blobs, kFrameListCount);
+		}
+		renderFrameCore(params, L);
+		Rec::frameDone();
+	}
+
+	// The body of a RenderFrame RPC once its lists are resolved to plain pointers: shared by the live
+	// server and by --forge-replay, which resolves them from a recording instead.
+	void renderFrameCore(RenderFrameParameters& params, const FrameLists& L) {
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		params.frameFenceValue = 0;
@@ -595,146 +680,38 @@ namespace IPC {
 			|| params.alphaList != InvalidVector || params.fpEnabled) {
 			// M1c/M-Skinning scene path: static DrawItemWire[] (drawList) and/or skinned
 			// [SkinnedDrawWire][palette]* (skinnedList) + inline camera. Either may be Invalid.
-			const void* drawPtr = nullptr;
-			std::uint32_t bytes = 0;
-			if (params.drawList != InvalidVector) {
-				auto& vec = getVec<IPC::GeomChunk>(params.drawList);
-				const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				bytes = params.drawBytes;
-				if (bytes == 0 || bytes > availBytes) {
-					bytes = availBytes;
-				}
-				drawPtr = vec.size() ? &vec[0] : nullptr;
-			}
-			const void* skinnedPtr = nullptr;
-			std::uint32_t skinnedBytes = 0;
-			if (params.skinnedList != InvalidVector) {
-				auto& svec = getVec<IPC::GeomChunk>(params.skinnedList);
-				const std::uint32_t savail = svec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				skinnedBytes = params.skinnedBytes;
-				if (skinnedBytes == 0 || skinnedBytes > savail) {
-					skinnedBytes = savail;
-				}
-				skinnedPtr = svec.size() ? &svec[0] : nullptr;
-			}
-			const void* multiMapPtr = nullptr;
-			std::uint32_t multiMapBytes = 0;
-			if (params.multiMapList != InvalidVector) {
-				auto& mvec = getVec<IPC::GeomChunk>(params.multiMapList);
-				const std::uint32_t mavail = mvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				multiMapBytes = params.multiMapBytes;
-				if (multiMapBytes == 0 || multiMapBytes > mavail) {
-					multiMapBytes = mavail;
-				}
-				multiMapPtr = mvec.size() ? &mvec[0] : nullptr;
-			}
-			const void* lightPtr = nullptr;
-			std::uint32_t lightBytes = 0;
-			if (params.lightList != InvalidVector) {
-				auto& lvec = getVec<IPC::GeomChunk>(params.lightList);
-				const std::uint32_t lavail = lvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				lightBytes = params.lightBytes;
-				if (lightBytes == 0 || lightBytes > lavail) {
-					lightBytes = lavail;
-				}
-				lightPtr = lvec.size() ? &lvec[0] : nullptr;
-			}
-			const void* skyPtr = nullptr;
-			std::uint32_t skyBytes = 0;
-			if (params.skyList != InvalidVector) {
-				auto& kvec = getVec<IPC::GeomChunk>(params.skyList);
-				const std::uint32_t kavail = kvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				skyBytes = params.skyBytes;
-				if (skyBytes == 0 || skyBytes > kavail) {
-					skyBytes = kavail;
-				}
-				skyPtr = kvec.size() ? &kvec[0] : nullptr;
-			}
-			const void* alphaPtr = nullptr;
-			std::uint32_t alphaBytes = 0;
-			if (params.alphaList != InvalidVector) {
-				auto& avec = getVec<IPC::GeomChunk>(params.alphaList);
-				const std::uint32_t aavail = avec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				alphaBytes = params.alphaBytes;
-				if (alphaBytes == 0 || alphaBytes > aavail) {
-					alphaBytes = aavail;
-				}
-				alphaPtr = avec.size() ? &avec[0] : nullptr;
-			}
-			// AT3 captured-alpha geometry: one GeomChunk vec holding [verts][indices] (indices at
-			// capturedVertBytes). The host memcpy's the two ranges into pCapAlphaVB/pCapAlphaIB
-			// and draws sentinel-slot AlphaDrawWire items from them. Clamp both byte counts to the
-			// mapped window so a stale/oversized count can't over-read.
-			const void* capturedAlphaPtr = nullptr;
-			std::uint32_t capVertBytes = 0, capIdxBytes = 0;
-			if (params.capturedAlpha != InvalidVector) {
-				auto& cvec = getVec<IPC::GeomChunk>(params.capturedAlpha);
-				const std::uint32_t cavail = cvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-				capVertBytes = params.capturedVertBytes;
-				capIdxBytes = params.capturedIdxBytes;
-				if (capVertBytes > cavail) { capVertBytes = cavail; }
-				if (capIdxBytes > cavail - capVertBytes) { capIdxBytes = cavail - capVertBytes; }
-				capturedAlphaPtr = cvec.size() ? &cvec[0] : nullptr;
-			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
 			// Not flushed (here or at DONE): logline is a direct WriteFile and survives a process
 			// crash; a FlushFileBuffers every 60 frames was a disk sync inside the frame RPC.
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u skinnedCount=%u skinnedBytes=%u mmCount=%u lightCount=%u",
-					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes, params.multiMapCount, params.lightCount);
+					params.frameIndex, params.drawCount, L.bytes[kListDraw], params.skinnedCount, L.bytes[kListSkinned], params.multiMapCount, params.lightCount);
 			}
-			// FP1a first-person bundle: resolve the fp vec pointers only when the client
-			// enabled the pass this frame. Byte counts clamp to the mapped windows like
-			// every other list; a missing/empty list just leaves that half null.
+			// FP1a first-person bundle: a missing/empty list just leaves that half null.
 			ForgeRender::FPScene fpScene;
 			const ForgeRender::FPScene* fpPtr = nullptr;
 			if (params.fpEnabled) {
 				fpScene.viewProj = params.fpViewProj;
 				if (params.fpDrawList != InvalidVector) {
-					auto& fvec = getVec<IPC::GeomChunk>(params.fpDrawList);
-					const std::uint32_t favail = fvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-					std::uint32_t fbytes = params.fpDrawBytes;
-					if (fbytes == 0 || fbytes > favail) {
-						fbytes = favail;
-					}
-					fpScene.drawBlob  = fvec.size() ? &fvec[0] : nullptr;
+					fpScene.drawBlob  = L.ptr[kListFpDraw];
 					fpScene.drawCount = params.fpDrawCount;
-					fpScene.drawBytes = fbytes;
+					fpScene.drawBytes = L.bytes[kListFpDraw];
 				}
 				if (params.fpSkinnedList != InvalidVector) {
-					auto& fsvec = getVec<IPC::GeomChunk>(params.fpSkinnedList);
-					const std::uint32_t fsavail = fsvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-					std::uint32_t fsbytes = params.fpSkinnedBytes;
-					if (fsbytes == 0 || fsbytes > fsavail) {
-						fsbytes = fsavail;
-					}
-					fpScene.skinnedBlob  = fsvec.size() ? &fsvec[0] : nullptr;
+					fpScene.skinnedBlob  = L.ptr[kListFpSkinned];
 					fpScene.skinnedCount = params.fpSkinnedCount;
-					fpScene.skinnedBytes = fsbytes;
+					fpScene.skinnedBytes = L.bytes[kListFpSkinned];
 				}
 				if (params.fpAlphaList != InvalidVector) {
-					auto& favec = getVec<IPC::GeomChunk>(params.fpAlphaList);
-					const std::uint32_t faavail = favec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-					std::uint32_t fabytes = params.fpAlphaBytes;
-					if (fabytes == 0 || fabytes > faavail) {
-						fabytes = faavail;
-					}
-					fpScene.alphaBlob  = favec.size() ? &favec[0] : nullptr;
+					fpScene.alphaBlob  = L.ptr[kListFpAlpha];
 					fpScene.alphaCount = params.fpAlphaCount;
-					fpScene.alphaBytes = fabytes;
+					fpScene.alphaBytes = L.bytes[kListFpAlpha];
 				}
-				// FP1e: multi-map FP parts (MultiMapDrawWire[]), same clamp as every other list.
 				if (params.fpMMList != InvalidVector) {
-					auto& fmvec = getVec<IPC::GeomChunk>(params.fpMMList);
-					const std::uint32_t fmavail = fmvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-					std::uint32_t fmbytes = params.fpMMBytes;
-					if (fmbytes == 0 || fmbytes > fmavail) {
-						fmbytes = fmavail;
-					}
-					fpScene.mmBlob  = fmvec.size() ? &fmvec[0] : nullptr;
+					fpScene.mmBlob  = L.ptr[kListFpMM];
 					fpScene.mmCount = params.fpMMCount;
-					fpScene.mmBytes = fmbytes;
+					fpScene.mmBytes = L.bytes[kListFpMM];
 				}
 				fpPtr = &fpScene;
 			}
@@ -781,13 +758,15 @@ namespace IPC {
 			// through its own per-weather table (atmosphere.h) — this is the ONLY place a weather
 			// index crosses the wire, and the only place it becomes a medium.
 			ForgeRender::setWeather(params.weather);
-			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
-				skinnedPtr, params.skinnedCount, skinnedBytes,
-				multiMapPtr, params.multiMapCount, multiMapBytes,
-				lightPtr, params.lightCount, lightBytes,
-				skyPtr, params.skyCount, skyBytes,
-				alphaPtr, params.alphaCount, alphaBytes,
-				capturedAlphaPtr, capVertBytes, capIdxBytes,
+			const std::uint32_t capBytes = L.bytes[kListCaptured];
+			ok = ForgeRender::renderScene(params.viewProj, params.lighting,
+				L.ptr[kListDraw], params.drawCount, L.bytes[kListDraw],
+				L.ptr[kListSkinned], params.skinnedCount, L.bytes[kListSkinned],
+				L.ptr[kListMultiMap], params.multiMapCount, L.bytes[kListMultiMap],
+				L.ptr[kListLight], params.lightCount, L.bytes[kListLight],
+				L.ptr[kListSky], params.skyCount, L.bytes[kListSky],
+				L.ptr[kListAlpha], params.alphaCount, L.bytes[kListAlpha],
+				L.ptr[kListCaptured], L.capVertBytes, capBytes - L.capVertBytes,
 				params.waterParams, params.waterEnabled, fpPtr,
 				params.actorRipples, params.actorRippleCount);
 			if (logScene) {
@@ -866,6 +845,10 @@ namespace IPC {
 				params.partCount, vec.size(), availBytes, params.byteCount, bytes,
 				h0.slot, h0.revisionID, h0.vertexCount, h0.indexCount);
 		}
+		if (Rec::active()) {
+			const Rec::Blob b = { p, bytes };
+			Rec::write(Command::GeomUpload, &params.partCount, 4, &b, 1);
+		}
 		params.partsUploaded = ForgeRender::uploadGeometry(p, bytes, params.partCount);
 		if (logThis || params.partsUploaded != params.partCount) {
 			LOG::logline(">> [geom] geomUpload DONE: built %u/%u", params.partsUploaded, params.partCount);
@@ -887,6 +870,10 @@ namespace IPC {
 		std::uint32_t bytes = params.byteCount;
 		if (bytes == 0 || bytes > availBytes) {
 			bytes = availBytes;
+		}
+		if (Rec::active()) {
+			const Rec::Blob b = { &vec[0], bytes };
+			Rec::write(Command::TexUpload, &params.texCount, 4, &b, 1);
 		}
 		params.texturesUploaded = ForgeRender::uploadTextures(&vec[0], bytes, params.texCount);
 		// No per-call log + FlushFileBuffers here: this RPC BLOCKS the client, and a disk sync on
@@ -931,6 +918,10 @@ namespace IPC {
 			if (vec.size() != 0) {
 				blob = &vec[0];   // the host maps the whole reservation: stable for the worker
 			}
+		}
+		if (Rec::active() && blob != nullptr) {
+			const Rec::Blob b = { blob, bytes };
+			Rec::write(Command::StreamUpload, &params.texCount, 4, &b, 1);
 		}
 		if (ForgeRender::streamTexturesBegin(blob, bytes, params.texCount, &params.built, &params.failedMask)) {
 			m_streamPending = true;   // completion comes from the worker's done event

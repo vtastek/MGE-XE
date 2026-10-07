@@ -47,7 +47,7 @@ SCALE="${4:-}"
 KNOBS="${5:-}"
 if [ -n "${6:-}" ]; then MGE_FRAME_TRACE=1; fi
 CLIENTENV="${7:-}"
-CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_GEOM_KEEP_MB MGE_FREEZE_CLOCK MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_STEP_DOWN MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR MGE_CLIENT_MSAA"
+CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_GEOM_KEEP_MB MGE_FREEZE_CLOCK MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_STEP_DOWN MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR MGE_CLIENT_MSAA MGE_IPC_RECORD MGE_IPC_RECORD_FRAMES"
 LOG="$DIR/mgeHost64.log"
 CFG="$DIR/Data Files/MWSE/config/instant load.json"
 CFGBAK="$(mktemp)"
@@ -212,9 +212,19 @@ fi
 # dx12 + vulkan GPU workloads in submit batches). MGE_NSYS_DELAY / MGE_NSYS_DURATION in seconds; keep
 # delay + duration inside the run (samples x ~1.3 s after load) so the report finalises before the kill.
 if [ -n "${MGE_NSYS_OUT:-}" ]; then
+  # ELEVATED (one UAC prompt): nsys needs admin for the
+  # WDDM trace (both processes' GPU queues on one timeline). An elevated process does not inherit this
+  # shell's environment, so the knobs ride in a generated .ps1.
+  # NO -t vulkan: with nsys's Vulkan layer in MW's DXVK the seam composited nothing (clear colour only,
+  # 2026-10-06). WDDM already shows MW's GPU packets; nsys output lands in <out>.log.
+  # NO -t dx12 either: its injection killed the host during device init (client: renderInit RPC failed,
+  # seam disabled; host log ends after the terrain parse). WDDM alone = no hooks in either process.
   NSYS='C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.5.1\target-windows-x64\nsys.exe'
-  echo "[harness] Nsight Systems -> ${MGE_NSYS_OUT}.nsys-rep (delay ${MGE_NSYS_DELAY:-60}s, ${MGE_NSYS_DURATION:-5}s)"
-  powershell.exe -Command "${ENVSET}Start-Process -FilePath '$NSYS' -WorkingDirectory '$WINDIR' -WindowStyle Minimized -ArgumentList 'profile','-t','dx12,vulkan,nvtx','--dx12-gpu-workload=batch','--vulkan-gpu-workload=batch','--delay=${MGE_NSYS_DELAY:-60}','--duration=${MGE_NSYS_DURATION:-5}','-f','true','-o','${MGE_NSYS_OUT}','${WINDIR}\\Morrowind.exe'" >/dev/null 2>&1
+  echo "[harness] Nsight Systems (elevated) -> ${MGE_NSYS_OUT}.nsys-rep (delay ${MGE_NSYS_DELAY:-60}s, ${MGE_NSYS_DURATION:-5}s)"
+  NPS="$(dirname "$0")/.nsys-launch.ps1"
+  printf '%s\r\nSet-Location '"'"'%s'"'"'\r\n& '"'"'%s'"'"' profile -t wddm --wddm-additional-events=true --wddm-memory-trace=false --delay=%s --duration=%s -f true -o '"'"'%s'"'"' '"'"'%s\\Morrowind.exe'"'"' *> '"'"'%s.log'"'"'\r\n' \
+    "$ENVSET" "$WINDIR" "$NSYS" "${MGE_NSYS_DELAY:-60}" "${MGE_NSYS_DURATION:-5}" "$MGE_NSYS_OUT" "$WINDIR" "$MGE_NSYS_OUT" > "$NPS"
+  powershell.exe -Command "Start-Process powershell -Verb RunAs -WindowStyle Minimized -ArgumentList '-ExecutionPolicy','Bypass','-File','$(wslpath -w "$NPS")'" >/dev/null 2>&1
 else
 powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle Minimized" >/dev/null 2>&1
 fi
@@ -268,7 +278,8 @@ while :; do
   running=$([ "${nproc:-0}" -gt 0 ] && echo True || echo False)
   echo "[harness] t=${el}s newlines=$((mcur-mstartlines)) ${MLABEL}=$got running=$running"
   if [ "$got" -ge "$SAMPLES" ]; then echo "[harness] got $got samples"; break; fi
-  if [ "$running" = "False" ] && [ "$got" -eq 0 ]; then echo "[harness] Morrowind EXITED with 0 samples (crash?)"; break; fi
+  # Under Nsight Systems the game starts seconds after the launch (nsys spins up first): give it 120 s (and the UAC prompt).
+  if [ "$running" = "False" ] && [ "$got" -eq 0 ] && { [ -z "${MGE_NSYS_OUT:-}" ] || [ "$el" -gt 120 ]; }; then echo "[harness] Morrowind EXITED with 0 samples (crash?)"; break; fi
   if [ "$el" -ge "$TIMEOUT" ]; then echo "[harness] TIMEOUT after ${el}s ($got samples)"; break; fi
 done
 

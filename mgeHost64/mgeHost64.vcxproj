@@ -219,6 +219,8 @@
     <ClCompile Include="stbn_mask.cpp" />
     <ClCompile Include="..\src\ipc\bridge.cpp" />
     <ClCompile Include="..\src\ipc\dlshare.cpp" />
+    <ClCompile Include="..\src\ipc\ipcrecord.cpp" />
+    <ClCompile Include="..\src\ipc\replay.cpp" />
     <ClCompile Include="..\src\ipc\server.cpp" />
     <ClCompile Include="..\src\ipc\vec.cpp" />
     <ClCompile Include="..\src\ipc\vecbase.cpp" />
@@ -712,6 +714,7 @@
     <ClInclude Include="..\src\ipc\bridge.h" />
     <ClInclude Include="..\src\ipc\weatherwire.h" />
     <ClInclude Include="..\src\ipc\dlshare.h" />
+    <ClInclude Include="..\src\ipc\ipcrecord.h" />
     <ClInclude Include="..\src\ipc\server.h" />
     <ClInclude Include="..\src\ipc\vec.h" />
     <ClInclude Include="..\src\ipc\vecbase.h" />

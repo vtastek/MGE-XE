@@ -329,6 +329,15 @@ int main(int argc, char** argv) {
 	// no MGEgui bake, nothing to regenerate when the mod list changes.
 	Terrain::beginLoadAsync();
 
+	// Host-only replay of a recording (MGE_IPC_RECORD): no Morrowind, no client, no IPC handles.
+	// MUST run with cwd = the install dir, like the live host. See src/ipc/replay.cpp.
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-replay") == 0) {
+		Configuration.LoadSettings();
+		const int rc = IPC::replayMain(argc, argv);
+		LOG::flush();
+		return rc;
+	}
+
 	HANDLE sharedMem = INVALID_HANDLE_VALUE;
 	HANDLE clientProcess = INVALID_HANDLE_VALUE;
 	HANDLE rpcStartEvent = INVALID_HANDLE_VALUE;

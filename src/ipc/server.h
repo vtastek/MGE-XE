@@ -6,6 +6,24 @@
 #include <vector>
 
 namespace IPC {
+	// A RenderFrame's lists resolved to plain pointers (record order = this order). kListCaptured is
+	// [verts][indices] with the indices at capVertBytes.
+	enum FrameList : unsigned {
+		kListDraw, kListSkinned, kListMultiMap, kListLight, kListSky, kListAlpha, kListCaptured,
+		kListFpDraw, kListFpSkinned, kListFpAlpha, kListFpMM,
+		kFrameListCount
+	};
+	struct FrameLists {
+		const void* ptr[kFrameListCount];
+		std::uint32_t bytes[kFrameListCount];
+		std::uint32_t capVertBytes;
+	};
+	// The body of a RenderFrame RPC; the live server and --forge-replay both call it.
+	void renderFrameCore(RenderFrameParameters& params, const FrameLists& lists);
+
+	// mgeHost64.exe --forge-replay <file> [loops] [cpuMs] [window] (ipc/replay.cpp).
+	int replayMain(int argc, char** argv);
+
 	/**
 	* @class Server
 	* @brief Listener for RPC commands to the 64-bit server process.
