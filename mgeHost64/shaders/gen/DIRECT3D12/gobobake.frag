@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 986 "FSL/shaders.list"
+#line 992 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobobake.frag.fsl"
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobobake.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1733,4 +1733,4 @@ PsOut PS_MAIN( VSOutput In )
     Out.vis = f4(0.0f);
     return (Out);
 }
-#line 987 "FSL/shaders.list"
+#line 993 "FSL/shaders.list"

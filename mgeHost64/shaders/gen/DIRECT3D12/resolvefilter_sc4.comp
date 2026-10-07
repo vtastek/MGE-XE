@@ -1077,8 +1077,9 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         {
             float dx = abs(float(k) + subOffsets[s].x) / filtRad;
             float dy = abs(float(k) + subOffsets[s].y) / filtRad;
-            wx[k +  2 ] = (dx <= 1.0f) ? rfFilterCubic(dx * 2.0f, 0.0f, cubicC) : 0.0f;
-            wy[k +  2 ] = (dy <= 1.0f) ? rfFilterCubic(dy * 2.0f, 0.0f, cubicC) : 0.0f;
+
+            wx[k +  2 ] = (dx <= 1.0f) ? (filtRad <= 0.5f ? 1.0f : rfFilterCubic(dx * 2.0f, 0.0f, cubicC)) : 0.0f;
+            wy[k +  2 ] = (dy <= 1.0f) ? (filtRad <= 0.5f ? 1.0f : rfFilterCubic(dy * 2.0f, 0.0f, cubicC)) : 0.0f;
             swx += wx[k +  2 ];
             swy += wy[k +  2 ];
         }
@@ -1092,7 +1093,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                                int2(0, 0), maxP);
 
             float4 smp = max(LoadTex2DMS(gRFSource, NO_SAMPLER, sp, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
-#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolvefilter.comp.fsl"
+#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolvefilter.comp.fsl"
             if (invLuma > 0.5f)
             {
                 smp.rgb *= 1.0f / (1.0f + rfLuminance(smp.rgb));

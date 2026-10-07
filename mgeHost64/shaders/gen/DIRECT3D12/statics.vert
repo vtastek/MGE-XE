@@ -2919,9 +2919,7 @@ VSOutput VS_MAIN( VSInput In )
 {
     //INIT_MAIN;
     VSOutput Out;
-
-
-
+#line 136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
                     + In.Position.z * In.W2 + In.Position.w * In.W3;
     Out.WorldPos = worldPos.xyz;
@@ -2936,7 +2934,7 @@ VSOutput VS_MAIN( VSInput In )
     float3 n = normalize(2.0f * In.Normal.xyz - 1.0f);
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
     Out.WorldNormal = nWorld;
-#line 130 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 161 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     float3 vcol = decodeAuthored(In.Color.rgb);
 
 
@@ -2945,7 +2943,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     float emissive = decodeAuthored1(In.Normal.w) * gShadowParams.calParams.x;
-#line 155 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     float3 sunlit = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
 
 
@@ -2953,7 +2951,7 @@ VSOutput VS_MAIN( VSInput In )
 
     Out.Color = float4(vcol * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz)
                           * waterAmbTransmit(worldPos.xyz) + emissive, In.Color.a);
-#line 184 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 215 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     Out.SunLight = (gShadowParams.pbrStatics.z != 0.0f) ? (vcol * gFrameData.sunCol.rgb)
                                                        : (vcol * sunlit);
 
@@ -2970,7 +2968,7 @@ VSOutput VS_MAIN( VSInput In )
     if ((Out.Flags & 0x4u) != 0u) {
         Out.Uv.y += frac(0.08f * gFrameData.timeParams.x);
     }
-#line 212 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 243 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     uint animSlot = (Out.Flags >> 16) & 0xFFu;
     if (animSlot != 0u) {
         float4 uvAnim = gFrameData.uvOffsets[animSlot - 1u];
@@ -2985,7 +2983,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     float waterClip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
-#line 255 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 286 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     float slabDepth = 0.0f;
     if (In.InstParams.w > 0.0f) {
         slabDepth = dot(handoverForward(), worldPos.xyz);
@@ -2994,7 +2992,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     if (In.InstParams.w > 0.0f) { Out.Position.z *= (1.0f -  4.0e-5f ); }
-#line 280 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 311 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     if ((Out.Flags & 0x18u) != 0u) {
         bool lit = (gFrameData.timeParams.z + In.InstParams.z) > 0.0f;
         bool want = lit ? ((Out.Flags & 0x8u) != 0u)
@@ -3018,7 +3016,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     bool heroBlend = (Out.Flags & 0x20u) != 0u;
-#line 326 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 357 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     if (heroBlend && gFrameData.timeParams.y > 0.5f) { Out.Position = float4(1e9f, 1e9f, 1e9f, 1.0f); }
 
     return (Out);

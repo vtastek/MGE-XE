@@ -1267,6 +1267,13 @@ float4 PS_MAIN(PsIn In): SV_TARGET
     float cubicC = gResolveParams.opts.z;
 
 
+
+
+
+
+    const bool boxKernel = (filtRad <= 0.5f);
+
+
     float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float totalWeight = 0.0f;
 
@@ -1304,9 +1311,10 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
 
 
-                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
+                    float w = boxKernel ? 1.0f
+                            : rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
                               rFilterCubic(sampleDist.y * 2.0f, 0.0f, cubicC);
-#line 310 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 318 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
                     if (invLuma > 0.5f)
                     {
                         smp.rgb *= 1.0f / (1.0f + rLuminance(smp.rgb));
@@ -1321,7 +1329,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
     }
 
     float4 outRgba = sum / max(totalWeight, 1.0e-5f);
-#line 335 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 343 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     if (invLuma > 0.5f)
     {
         float Lc = rLuminance(max(outRgba.rgb, float3(0.0f, 0.0f, 0.0f)));
@@ -1329,7 +1337,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
         if (Lc > LcCap) { outRgba.rgb *= LcCap / Lc; Lc = LcCap; }
         outRgba.rgb *= 1.0f / (1.0f - Lc);
     }
-#line 354 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 362 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float aRaw = outRgba.a;
     float3 rgb = outRgba.rgb;
     if (aRaw > 1.0f) { rgb *= 1.0f / aRaw; }
@@ -1338,7 +1346,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
     rgb = max(rgb, float3(0.0f, 0.0f, 0.0f));
     float aOut = saturate(aRaw);
-#line 377 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 385 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     if (gResolveParams.opts.y > 0.5f)
     {
         float3 straight = rgb / max(aOut, 1.0e-4f);
@@ -1352,16 +1360,16 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
 
         straight *= gResolveParams.tone.x;
-#line 416 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 424 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
         float bloomK = gResolveParams.bloom.x;
         if (bloomK > 0.0f)
         {
-#line 430 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 438 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
             float4 bloomPre = rBloomTap(pixelPos, gResolveParams.bloom.yz);
             float3 bloomStraight = bloomPre.rgb / max(bloomPre.a, 1.0e-3f);
             straight = lerp(straight, bloomStraight, bloomK);
         }
-#line 447 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 455 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
         if (gResolveParams.tone.y > 0.5f)
         {
 
