@@ -67,6 +67,31 @@
 #include "wavefield.h.fsl" // W1: the procedural wave field (height + exact gradient + variance)
 #include "waterripple.h.fsl" // R1: analytic travelling-packet impulse ripples (rain/snow now, actors next)
 
+// ─── THE SCENE DEPTH, READ IN PLACE (knob waterDepthDirect; water_dd1/water_dd4) ──────────────────
+// The default build reads gSceneLinDepth, the R32F copy of pDepth's sample 0 that the colour->water
+// seam re-fills every frame (a full-screen dispatch). The direct variants read that same sample 0 out
+// of pDepth itself (gSceneDepthMS), which the host has put in DEPTH_READ | SHADER_RESOURCE and bound
+// through a READ-ONLY DSV for this draw — so the depth test and this fetch share one buffer and the
+// copy never runs. Same texel: point-clamp at uv is texel floor(uv * dims) clamped into the image,
+// and pDepth and pLinearDepth are both allocation-sized.
+#ifdef WATER_DEPTH_DIRECT
+float waterSceneDevZ(float2 uvAlloc)
+{
+    const int2 dims = GetDimensions(gSceneLinDepth, NO_SAMPLER);
+    const int2 px   = clamp(int2(uvAlloc * float2(dims)), int2(0, 0), dims - int2(1, 1));
+#if WATER_DEPTH_SAMPLES > 1
+    return LoadTex2DMS(gSceneDepthMS, NO_SAMPLER, px, 0).r;
+#else
+    return LoadTex2D(gSceneDepthMS, NO_SAMPLER, px, 0).r;
+#endif
+}
+#else
+float waterSceneDevZ(float2 uvAlloc)
+{
+    return SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, uvAlloc, 0.0f).r;
+}
+#endif
+
 // ⚠ THIS SHADER NO LONGER OWNS A WATER FOG. It used to own THREE, all private and all disagreeing:
 // exp(-dist/500) toward fogColNear on the underwater refraction, exp(-depth/500) toward an XE
 // `depthColor` tint on the above-water refraction, and two hand-tuned absorption/scattering tints
@@ -313,7 +338,7 @@ float occlusionFrom(float waterDist, float sceneDist, float nearRange)
 // normalisations PS_MAIN documents at invAlloc, and mixing them up is the trap that block is about.
 float sceneOcclusionAt(float4x4 invVP, float2 uvVp, float2 texToVp, float waterDist, float nearRange)
 {
-    float devZ      = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, uvVp / texToVp, 0.0f).r;
+    float devZ      = waterSceneDevZ(uvVp / texToVp);
     float sceneDist = length(reconstructWorld(invVP, uvVp, devZ));
     return occlusionFrom(waterDist, sceneDist, nearRange);
 }
@@ -1923,7 +1948,7 @@ float4 PS_MAIN( VSOutput In )
     // every rock, which is the same rim wearing a third costume.
     float shorePre = 0.0f;
     if (shoreDepthMax > 0.0f) {
-        float  shoreDevZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, baseUV, 0.0f).r;
+        float  shoreDevZ = waterSceneDevZ(baseUV);
         float  shoreDist = length(reconstructWorld(invVP, baseUV * texToVp, shoreDevZ));
         float  shoreDepth = max(shoreDist - dist, 0.0f) + shoreBreath * (0.95f - normal.z);
         shorePre = (1.0f - smoothstep(0.0f, shoreDepthMax, shoreDepth))
@@ -1962,7 +1987,7 @@ float4 PS_MAIN( VSOutput In )
 
     // --- refraction (depth-gated, distorted) ---
     float2 distUV   = clampAllocUV(baseUV + reffactorR.yx * invAlloc);
-    float  sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
+    float  sceneDevZ= waterSceneDevZ(distUV);
     float3 sceneW   = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
     float  sceneDist= length(sceneW);
     // ⚠ W22e — `depth` AND ITS RAMP ARE GONE. `saturate(depth / 100.0f)` used to scale the tap

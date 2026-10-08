@@ -677,6 +677,20 @@ BEGIN_SRT_NO_AB(SrtData)
         // Appended AFTER gGoboArray — append only, FSL assigns descriptor offsets from one running
         // counter and an insertion silently re-points every later binding.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyVisScreen)
+        // pDepth ITSELF, for the water surface (knob waterDepthDirect, water_dd1/water_dd4.frag): sample
+        // 0 read in place while the draw depth-tests through a READ-ONLY DSV, instead of the seam's
+        // R32F copy (gSceneLinDepth). The type forks on its OWN macro, exactly like gPortalGate, so
+        // nothing else on this root signature can flip it; both branches are one SRV slot. Bound ONLY
+        // into the main pPerFrameSet and read only by the direct water variants; unbound elsewhere.
+        // Appended AFTER gSkyVisScreen — append only (one running descriptor counter).
+#ifndef WATER_DEPTH_SAMPLES
+#define WATER_DEPTH_SAMPLES 1
+#endif
+#if WATER_DEPTH_SAMPLES > 1
+        DECL_TEXTURE(PerFrame, Depth2DMS(float, WATER_DEPTH_SAMPLES), gSceneDepthMS)
+#else
+        DECL_TEXTURE(PerFrame, Depth2D(float), gSceneDepthMS)
+#endif
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

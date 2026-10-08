@@ -404,6 +404,20 @@
 #include "water.frag.fsl"
 #end
 
+// ...and the DIRECT-DEPTH variants (knob waterDepthDirect): sample 0 of pDepth read in place through
+// gSceneDepthMS under a read-only DSV, instead of the seam's copy. Host picks by g_live.sampleCount.
+#frag water_dd1.frag
+#define WATER_DEPTH_DIRECT
+#define WATER_DEPTH_SAMPLES 1
+#include "water.frag.fsl"
+#end
+
+#frag water_dd4.frag
+#define WATER_DEPTH_DIRECT
+#define WATER_DEPTH_SAMPLES 4
+#include "water.frag.fsl"
+#end
+
 // CUSTOM MSAA RESOLVE (tasks/forge-postprocess.md step 4): filtered Catmull-Rom reconstruction with
 // inverse-luminance firefly weighting, replacing cl->ResolveSubresource. It has to exist before HDR
 // can, because a hardware resolve cannot format-convert — fp16 MSAA -> BGRA8 shared RT is not a
@@ -522,6 +536,20 @@
 
 #comp linearizedepth_sc4.comp
 #define SAMPLE_COUNT 4
+#include "linearizedepth.comp.fsl"
+#end
+
+// APL's depth lattice (waterDepthDirect frames): grid x grid taps of pDepth sample 0 at the exact pixels
+// APL would have read, packed into pLinearDepth's top-left corner. Same SRT and set as linearize.
+#comp linlattice_sc1.comp
+#define SAMPLE_COUNT 1
+#define LIN_LATTICE
+#include "linearizedepth.comp.fsl"
+#end
+
+#comp linlattice_sc4.comp
+#define SAMPLE_COUNT 4
+#define LIN_LATTICE
 #include "linearizedepth.comp.fsl"
 #end
 

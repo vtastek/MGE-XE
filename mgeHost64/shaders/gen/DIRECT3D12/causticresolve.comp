@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 915 "FSL/shaders.list"
+#line 943 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/causticresolve.comp.fsl"
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/causticresolve.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
@@ -1082,4 +1082,4 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     Write3D(gCausticOut, int3((int)did.x, (int)did.y, (int)slice), gain - 1.0f);
     return;
 }
-#line 916 "FSL/shaders.list"
+#line 944 "FSL/shaders.list"

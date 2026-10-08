@@ -3780,6 +3780,14 @@ namespace {
         // while waterDebugBitsSet(). Optional — without it the views simply show the normal water.
         Shader*        pWaterShaderDbg = nullptr;
         Pipeline*      pWaterPipelineDbg = nullptr;
+        // waterDepthDirect: the water variant that reads pDepth in place, APL's depth lattice, and
+        // the two one-descriptor CPU heaps for the native read-only bind (Forge has no RO DSV).
+        Shader*        pWaterShaderDD = nullptr;
+        Pipeline*      pWaterPipelineDD = nullptr;
+        Shader*        pLinLatticeShader = nullptr;
+        Pipeline*      pLinLatticePipeline = nullptr;
+        ID3D12DescriptorHeap* pWddRtvHeap = nullptr;
+        ID3D12DescriptorHeap* pWddDsvHeap = nullptr;
         Buffer*        pWaterWorldsBuf = nullptr;          // gBatch: worlds[0..5]=LOD levels, [6]=params, [7]=invVP
         DescriptorSet* pPerBatchSetWater = nullptr;        // gBatch bound to pWaterWorldsBuf, 1 instance
         Buffer*        pWaterInstanceBuf = nullptr;        // per-draw instance VB: DrawIndex=level (kMaxWaterLevels)
@@ -9612,6 +9620,26 @@ namespace {
         if (!g_live.pWaterPipelineDbg) {
             LOG::logline("!! [forge][water] debug variant (water_dbg.frag) FAILED — water debug views off");
         }
+
+        // The direct-depth variant (waterDepthDirect): same desc, the frag reads gSceneDepthMS, whose
+        // type must match pDepth's sample count — only 1x and 4x are compiled. Non-fatal: without it
+        // the seam keeps its copy.
+        if (g_live.pWaterPipelineDD) { removePipeline(R, g_live.pWaterPipelineDD); g_live.pWaterPipelineDD = nullptr; }
+        if (g_live.pWaterShaderDD)   { removeShader(R, g_live.pWaterShaderDD);     g_live.pWaterShaderDD = nullptr; }
+        if (g_live.sampleCount == 1u || g_live.sampleCount == 4u) {
+            ShaderLoadDesc ddDesc = {};
+            ddDesc.mVert.pFileName = "water.vert";
+            ddDesc.mFrag.pFileName = (g_live.sampleCount > 1u) ? "water_dd4.frag" : "water_dd1.frag";
+            addShader(R, &ddDesc, &g_live.pWaterShaderDD);
+            if (g_live.pWaterShaderDD) {
+                wg.pShaderProgram = g_live.pWaterShaderDD;
+                addPipeline(R, &wPd, &g_live.pWaterPipelineDD);
+                wg.pShaderProgram = g_live.pWaterShader;
+            }
+        }
+        if (!g_live.pWaterPipelineDD) {
+            LOG::logline("!! [forge][water] direct-depth variant (water_dd*.frag) unavailable — seam keeps the depth copy");
+        }
         return true;
     }
 
@@ -13507,6 +13535,14 @@ namespace {
                 lp.mCount = 1; lp.ppTextures = &g_live.pLinearDepth;
                 updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &lp);
             }
+            // gSceneDepthMS = pDepth itself, for the direct water variant only (waterDepthDirect).
+            // pDepth is created once (dynamic resolution draws a sub-rect), so one write holds.
+            if (g_live.pDepth && g_live.pDepth->pTexture) {
+                DescriptorData dp = {};
+                dp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneDepthMS);
+                dp.mCount = 1; dp.ppTextures = &g_live.pDepth->pTexture;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &dp);
+            }
             // gSkyColor into the MAIN PerFrame set. Deliberately OUTSIDE the waterReady gate above:
             // "fog samples the sky" has nothing to do with water, and hanging it off water's readiness
             // is how a feature ends up silently off in the one install where water failed to build.
@@ -14313,6 +14349,19 @@ namespace {
             lpd.mType = PIPELINE_TYPE_COMPUTE;
             lpd.mComputeDesc.pShaderProgram = g_live.pLinearizeShader;
             addPipeline(R, &lpd, &g_live.pLinearizePipeline);
+            // waterDepthDirect: APL's depth lattice. Same SRT and set as the linearize (pDepth in,
+            // pLinearDepth out). Optional — without it the seam keeps the full copy.
+            if (g_live.sampleCount == 1u || g_live.sampleCount == 4u) {
+                ShaderLoadDesc lld = {};
+                lld.mComp.pFileName = (g_live.sampleCount > 1u) ? "linlattice_sc4.comp" : "linlattice_sc1.comp";
+                addShader(R, &lld, &g_live.pLinLatticeShader);
+                if (g_live.pLinLatticeShader) {
+                    PipelineDesc llp = {};
+                    llp.mType = PIPELINE_TYPE_COMPUTE;
+                    llp.mComputeDesc.pShaderProgram = g_live.pLinLatticeShader;
+                    addPipeline(R, &llp, &g_live.pLinLatticePipeline);
+                }
+            }
             bool aoPipesOk = true;
             for (uint32_t m = 0; m < kAOModeCount; ++m) {
                 PipelineDesc gpd = {};
@@ -18151,6 +18200,13 @@ namespace {
     // pLinearDepth — the two were the same read of sample 0 of pDepth into the same value. OFF = the
     // hiz mip 0 and re-linearize dispatches, the A/B.
     bool g_hizLinFused = true;
+    // waterDepthDirect: the colour->water seam stops copying pDepth into pLinearDepth. Water reads
+    // sample 0 of pDepth in place (water_dd1/dd4.frag, gSceneDepthMS) while it depth-tests through a
+    // READ-ONLY DSV, and APL's 128x128 depth taps come from a tiny lattice dispatch instead of the
+    // full-screen copy. Taken per frame only when nothing else after the seam reads the refreshed copy
+    // (volfog, motion vectors / MB / upscaler, debug views) — see the gate at the seam.
+    bool g_waterDepthDirect = true;
+    bool g_wddFrame = false;   // this frame's seam took the direct path (water binds RO DSV; APL reads the lattice)
     // preLinSkip: skip the PRE-colour pLinearDepth copy (a full-screen MSAA sample-0 depth copy, ~0.11 ms
     // at 2560x1600 on the laptop 4070) on frames where nothing before the colour pass reads it — GTAO,
     // bent normals, the shadow mask, the sky-visibility screen pass, a debug view. The VRS rate image
@@ -23960,6 +24016,7 @@ namespace {
             { "cullScanWave",        &g_cullScanWave        },
             { "terrainMorph",        &g_terrainMorph        },
             { "hizLinFused",         &g_hizLinFused         },
+            { "waterDepthDirect",    &g_waterDepthDirect    },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
             { "cullSurvivorList",    &g_cullSurvivorList    },
@@ -33736,6 +33793,51 @@ void destroyHostWindow(Renderer* R);
         cl5->Release();
     }
 
+    // waterDepthDirect: pDepth between DEPTH_WRITE and DEPTH_READ | shader-readable (the water frag
+    // and the lattice compute read it while the water draw depth-tests it read-only).
+    void wddDepthBarrier(bool toRead) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = g_live.pDepth->pTexture->mDx.pResource;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        const D3D12_RESOURCE_STATES rd = D3D12_RESOURCE_STATE_DEPTH_READ
+                                       | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                       | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateBefore = toRead ? D3D12_RESOURCE_STATE_DEPTH_WRITE : rd;
+        b.Transition.StateAfter  = toRead ? rd : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        g_live.pCmd->mDx.pCmdList->ResourceBarrier(1, &b);
+    }
+
+    // Bind `colorTarget` + pDepth through a READ_ONLY_DEPTH DSV, natively: Forge's
+    // cmdBindRenderTargets has no read-only depth. Both views are rewritten into their own
+    // one-descriptor CPU heaps on every call — OMSetRenderTargets captures CPU descriptors at record
+    // time, so rewriting them for the next frame cannot disturb one still in flight.
+    bool wddBindTargets(RenderTarget* colorTarget) {
+        ID3D12Device* dev = g_live.pRenderer->mDx.pDevice;
+        if (!g_live.pWddRtvHeap || !g_live.pWddDsvHeap) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+            hd.NumDescriptors = 1;
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            if (!g_live.pWddRtvHeap && FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_live.pWddRtvHeap)))) { return false; }
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            if (!g_live.pWddDsvHeap && FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_live.pWddDsvHeap)))) { return false; }
+        }
+        const bool ms = g_live.sampleCount > 1u;
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_live.pWddRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_live.pWddDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+        rv.Format = (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat);
+        rv.ViewDimension = ms ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+        dev->CreateRenderTargetView(colorTarget->pTexture->mDx.pResource, &rv, rtv);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dv = {};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = ms ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+        dv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+        dev->CreateDepthStencilView(g_live.pDepth->pTexture->mDx.pResource, &dv, dsv);
+        g_live.pCmd->mDx.pCmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        return true;
+    }
+
     void vrsBind(bool on) {
         ID3D12GraphicsCommandList5* cl5 = nullptr;
         if (FAILED(g_live.pCmd->mDx.pCmdList->QueryInterface(IID_PPV_ARGS(&cl5))) || !cl5) { return; }
@@ -33973,7 +34075,8 @@ void destroyHostWindow(Renderer* R);
             wbind.mRenderTargetCount = 1;
             wbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
             wbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &wbind);
+            if (g_wddFrame) { wddBindTargets(colorTarget); }   // read-only DSV: the frag reads pDepth too
+            else            { cmdBindRenderTargets(g_live.pCmd, &wbind); }
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
             // ⚠ THE DEPTH WRITE IS ASYMMETRIC, BECAUSE THE SURFACE IS. Seen from ABOVE it is nearly
@@ -33990,7 +34093,8 @@ void destroyHostWindow(Renderer* R);
             // no per-draw sort can place it). Until that exists, side with the medium that is closer to
             // opaque. Inside the window — straight up from below — this still hides what should show.
             const bool waterZWrite = g_waterZWrite || underwater;
-            cmdBindPipeline(g_live.pCmd, (waterDebugBitsSet() && g_live.pWaterPipelineDbg)
+            cmdBindPipeline(g_live.pCmd, g_wddFrame ? g_live.pWaterPipelineDD
+                                             : (waterDebugBitsSet() && g_live.pWaterPipelineDbg)
                                              ? g_live.pWaterPipelineDbg
                                              : (waterZWrite && g_live.pWaterPipelineZ)
                                              ? g_live.pWaterPipelineZ : g_live.pWaterPipeline);
@@ -34028,6 +34132,7 @@ void destroyHostWindow(Renderer* R);
         }
 
         cmdBindRenderTargets(g_live.pCmd, nullptr);
+        if (g_wddFrame) { wddDepthBarrier(false); }   // the seam left it read-only for this draw
 
         gpuPhaseEnd(kGpuPhaseWater);
     }
@@ -43539,10 +43644,23 @@ void destroyHostWindow(Renderer* R);
         // are drawn straight into the colour pass and never reach it. Reprojecting that snapshot
         // gives every distant building the SKY's motion, which is the far plane's — a smooth, plausible,
         // completely wrong field over exactly the geometry a long view distance is for.
-        const bool doSeamLinearize = aoBlockRan && g_live.pLinearizeSet
-                                  && ((g_live.waterReady && waterEnabled && g_drawWater) || g_volFog
-                                      || mvActive);
-        if (doHizMip0 || doSeamLinearize) {
+        // waterDepthDirect: when WATER is the only reader of the refreshed copy, skip the copy. Water
+        // reads pDepth in place under a read-only DSV and APL takes its 128x128 taps from a lattice
+        // dispatch. Every other post-seam reader of pLinearDepth forces the copy back: volfog, the
+        // motion vectors (and MB / a temporal upscaler, which mvActive already folds in), the debug
+        // views, the depth-writing water (submerged, or g_waterZWrite — a writer cannot use a
+        // read-only DSV), and a render rect smaller than the allocation (the lattice indexes the
+        // allocation; APL indexes the render rect).
+        const bool waterWillDraw = g_live.waterReady && waterEnabled && g_drawWater;
+        g_wddFrame = g_waterDepthDirect && waterWillDraw && aoBlockRan && g_live.pLinearizeSet
+                  && g_live.pWaterPipelineDD && g_live.pLinLatticePipeline
+                  && !g_volFog && !mvActive && !g_waterZWrite
+                  && !(waterParams && waterParams[7] > 0.5f)
+                  && !waterDebugBitsSet() && g_debugMode == 0u
+                  && g_live.width == g_live.allocWidth && g_live.height == g_live.allocHeight;
+        const bool doSeamLinearize = !g_wddFrame && aoBlockRan && g_live.pLinearizeSet
+                                  && (waterWillDraw || g_volFog || mvActive);
+        if (doHizMip0 || doSeamLinearize || g_wddFrame) {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             {
                 RenderTargetBarrier rtb = {};
@@ -43557,13 +43675,17 @@ void destroyHostWindow(Renderer* R);
                     tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
                     ++nt;
                 }
-                if (doSeamLinearize) {
+                if (doSeamLinearize || g_wddFrame) {
                     tb[nt].pTexture = g_live.pLinearDepth;
                     tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                     tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
                     ++nt;
                 }
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+                // The direct path takes pDepth to DEPTH_READ | shader-readable and LEAVES it there
+                // through the water draw (passForgeWaterSurface returns it to DEPTH_WRITE).
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, g_wddFrame ? 0 : 1,
+                                   g_wddFrame ? nullptr : &rtb);
+                if (g_wddFrame) { wddDepthBarrier(true); }
             }
             // hizLinFused: the Hi-Z dispatch also writes pLinearDepth (same sample-0 read, same value),
             // and the re-linearize below is skipped. Its full-allocation extent covers the render
@@ -43599,6 +43721,18 @@ void destroyHostWindow(Renderer* R);
                 cmdEndDebugMarker(g_live.pCmd);
                 gpuPhaseEnd(kGpuPhaseReLinear);
             }
+            if (g_wddFrame) {
+                // APL's taps only: 128x128 texels of pDepth sample 0 into pLinearDepth's top-left
+                // corner (linearizedepth.comp.fsl LIN_LATTICE). Booked under the re-linearize phase
+                // it replaces, so `relin=` in the split reads the saving directly.
+                gpuPhaseBegin(kGpuPhaseReLinear);
+                cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "APL DEPTH LATTICE (pDepth sample 0 -> 128x128)");
+                cmdBindPipeline(g_live.pCmd, g_live.pLinLatticePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
+                cmdDispatch(g_live.pCmd, 16u, 16u, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseReLinear);
+            }
             {
                 RenderTargetBarrier rtb = {};
                 rtb.pRenderTarget = g_live.pDepth;
@@ -43612,13 +43746,14 @@ void destroyHostWindow(Renderer* R);
                     tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                     ++nt;
                 }
-                if (doSeamLinearize) {
+                if (doSeamLinearize || g_wddFrame) {
                     tb[nt].pTexture = g_live.pLinearDepth;
                     tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                     tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                     ++nt;
                 }
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, g_wddFrame ? 0 : 1,
+                                   g_wddFrame ? nullptr : &rtb);
             }
 
             // --- M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md) ---------------------------
@@ -44760,12 +44895,17 @@ void destroyHostWindow(Renderer* R);
                 g_lastMvRan = true;
             }
 
-            // Re-bind the colour pass (LOAD/LOAD) so the water-off path below is unaffected.
-            BindRenderTargetsDesc hbind = {};
-            hbind.mRenderTargetCount = 1;
-            hbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            hbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &hbind);
+            // Re-bind the colour pass (LOAD/LOAD) so the water-off path below is unaffected. On the
+            // direct path pDepth is read-only now, so it goes back on through the read-only DSV.
+            if (g_wddFrame) {
+                wddBindTargets(colorTarget);
+            } else {
+                BindRenderTargetsDesc hbind = {};
+                hbind.mRenderTargetCount = 1;
+                hbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+                hbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                cmdBindRenderTargets(g_live.pCmd, &hbind);
+            }
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
             hizMip0Filled = doHizMip0;
@@ -46655,8 +46795,10 @@ void destroyHostWindow(Renderer* R);
                     // Measured at input scale 0.5 before the fix: `scene sky` 26% -> 81%,
                     // `exp` 0.0914 -> 0.0403. ⚠ THE PICTURE WAS CORRECT AND THE METER WAS NOT —
                     // which is the worse failure of the two, because the servo then drives E off it.
-                    p[24] = (float)g_live.width;
-                    p[25] = (float)g_live.height;
+                    // waterDepthDirect frames: the depth is the 128x128 lattice, already sampled at
+                    // the render-rect pixels this would have indexed, so pd = the lattice cell.
+                    p[24] = g_wddFrame ? (float)aplGrid : (float)g_live.width;
+                    p[25] = g_wddFrame ? (float)aplGrid : (float)g_live.height;
                     p[26] = 0.0f;
                     p[27] = 0.0f;
                     std::memcpy(fbw(g_live.pAplParamsCbv), p, sizeof(p));
@@ -64156,6 +64298,12 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pWaterPipelineZ)         { removePipeline(R, g_live.pWaterPipelineZ); }
         if (g_live.pWaterPipelineDbg)       { removePipeline(R, g_live.pWaterPipelineDbg); g_live.pWaterPipelineDbg = nullptr; }
         if (g_live.pWaterShaderDbg)         { removeShader(R, g_live.pWaterShaderDbg);     g_live.pWaterShaderDbg = nullptr; }
+        if (g_live.pWaterPipelineDD)        { removePipeline(R, g_live.pWaterPipelineDD); g_live.pWaterPipelineDD = nullptr; }
+        if (g_live.pWaterShaderDD)          { removeShader(R, g_live.pWaterShaderDD);     g_live.pWaterShaderDD = nullptr; }
+        if (g_live.pLinLatticePipeline)     { removePipeline(R, g_live.pLinLatticePipeline); g_live.pLinLatticePipeline = nullptr; }
+        if (g_live.pLinLatticeShader)       { removeShader(R, g_live.pLinLatticeShader);     g_live.pLinLatticeShader = nullptr; }
+        if (g_live.pWddRtvHeap)             { g_live.pWddRtvHeap->Release(); g_live.pWddRtvHeap = nullptr; }
+        if (g_live.pWddDsvHeap)             { g_live.pWddDsvHeap->Release(); g_live.pWddDsvHeap = nullptr; }
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
         // Host-drawn UI teardown.
         if (g_pUiPipeline) { removePipeline(R, g_pUiPipeline); g_pUiPipeline = nullptr; }

@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 440 "FSL/shaders.list"
+#line 454 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 37 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
@@ -1413,4 +1413,4 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
     return (float4(rgb, aOut));
 }
-#line 441 "FSL/shaders.list"
+#line 455 "FSL/shaders.list"

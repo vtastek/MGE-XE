@@ -17,11 +17,30 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
     int2 coord = int2(DispatchThreadID.xy);
+#ifdef LIN_LATTICE
+    // linlattice: thread (gx, gy) reads the pixel APL's lattice point lands on — apl.comp.fsl's
+    // int(((g + 0.5) / grid) * srcDims), srcDims = pDepth's extent (the host only runs this when the
+    // render rect IS the allocation) — and stores it at (gx, gy). APL then reads it with srcDims = grid.
+    // pDepth's extent = pLinearDepth's (both allocation-sized); FSL has no GetDimensions for Depth2DMS.
+    const int  grid  = 128;
+    if (coord.x < grid && coord.y < grid)
+    {
+        const int2  ldims = GetDimensions(gLinearDepthOut, NO_SAMPLER);
+        const float2 lat  = (float2(coord) + 0.5f) * (1.0f / 128.0f);
+        const int2  src   = int2(int(lat.x * float(ldims.x)), int(lat.y * float(ldims.y)));
+#if SAMPLE_COUNT > 1
+        Write2D(gLinearDepthOut, coord, LoadTex2DMS(gSceneDepth, NO_SAMPLER, src, 0).r);
+#else
+        Write2D(gLinearDepthOut, coord, LoadTex2D(gSceneDepth, NO_SAMPLER, src, 0).r);
+#endif
+    }
+#else
 #if SAMPLE_COUNT > 1
     float d = LoadTex2DMS(gSceneDepth, NO_SAMPLER, coord, 0).r;
 #else
     float d = LoadTex2D(gSceneDepth, NO_SAMPLER, coord, 0).r;
 #endif
     Write2D(gLinearDepthOut, coord, d);
+#endif
     RETURN();
 }

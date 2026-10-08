@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 572 "FSL/shaders.list"
+#line 600 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosview.frag.fsl"
 #line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosview.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1669,6 +1669,9 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gSkyVisScreen :  register(t152,space1);
+#line 692 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Depth2D(float) gSceneDepthMS :  register(t153,space1);
+
 
 
 
@@ -1685,7 +1688,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 710 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 724 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1696,7 +1699,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 734 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 748 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosview.frag.fsl"
 
@@ -1739,4 +1742,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     return (float4(v, 1.0f));
 }
-#line 573 "FSL/shaders.list"
+#line 601 "FSL/shaders.list"
