@@ -130,6 +130,7 @@ namespace {
     // MGE_SEAM_PROBE (measurement only, the picture is WRONG while set): bit 0 skips the host-RT copy,
     // bit 1 the composite blit, bit 2 MW's UI draws AND the real Present (mged3d8device.cpp) — with all
     // three the client issues no GPU work in a game frame: the ceiling of tasks/forge-host-ui.md.
+    // Bit 3 (8) skips the kickoff's wait for F-2's RT copy (the slot-reuse wait): its ceiling.
     unsigned g_seamProbe = 0;
 
     // The pipelining mode as ONE value (numpad-* and the panel's radio set it; both flags derive).
@@ -2065,7 +2066,7 @@ namespace {
 
     // Before a kickoff: the copy that reads the RT slot the kicked frame will draw into (g_copyRec).
     void waitCopyForSlotReuse() {
-        if (!g_copySemOk) {
+        if (!g_copySemOk || (g_seamProbe & 8u)) {   // MGE_SEAM_PROBE bit 3: measurement only
             return;
         }
         std::uint64_t v;
@@ -2334,10 +2335,11 @@ namespace {
                              g_copyAtBlit ? "at the blit (1.5-ahead)" : "at the collect (1-ahead)");
             }
             if (GetEnvironmentVariableA("MGE_SEAM_PROBE", v, sizeof(v)) > 0) {
-                g_seamProbe = static_cast<unsigned>(v[0] - '0') & 7u;
-                LOG::logline("!! [seam] MGE_SEAM_PROBE=%u — measurement only: %s%s%s", g_seamProbe,
+                g_seamProbe = static_cast<unsigned>(std::atoi(v)) & 15u;
+                LOG::logline("!! [seam] MGE_SEAM_PROBE=%u — measurement only: %s%s%s%s", g_seamProbe,
                              (g_seamProbe & 1u) ? "RT copy SKIPPED " : "", (g_seamProbe & 2u) ? "composite SKIPPED " : "",
-                             (g_seamProbe & 4u) ? "UI + Present SKIPPED" : "");
+                             (g_seamProbe & 4u) ? "UI + Present SKIPPED " : "",
+                             (g_seamProbe & 8u) ? "slot-reuse copy wait SKIPPED (may tear)" : "");
             }
             // MGE_FRAME_AHEAD=0: boot with frame-ahead OFF — the third numpad-* state, which the
             // harness cannot reach by key. Exists so the OFF path gets tested at all (it once froze).
@@ -8888,20 +8890,26 @@ namespace RenderProcess {
         {
             markWorkerPhase(WK_KICKOFF);
             MGE_ZoneScopedN("Forge renderSceneKickoff");
-            waitCopyForSlotReuse();   // F-2's RT copy must have EXECUTED before F may redraw it
-            ok = g_client->renderSceneKickoff(frame, (const float*)&viewProj, lighting,
-                     haveDraw ? g_drawVec->id() : IPC::InvalidVector,
-                     haveDraw ? drawCount : 0,
-                     haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
-                     skinnedId, skinnedCount, skinnedBytes,
-                     multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
-                     lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
-                     skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
-                     alphaId, (alphaId != IPC::InvalidVector) ? alphaCount : 0, alphaBytes,
-                     capturedId, capVertBytes, capIdxBytes,
-                     (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn,
-                     fpHave ? &fpFrame : nullptr,
-                     ripplePack, rippleCount);
+            {
+                MGE_ZoneScopedN("kick:copyReuseWait");
+                waitCopyForSlotReuse();   // F-2's RT copy must have EXECUTED before F may redraw it
+            }
+            {
+                MGE_ZoneScopedN("kick:rpc");
+                ok = g_client->renderSceneKickoff(frame, (const float*)&viewProj, lighting,
+                         haveDraw ? g_drawVec->id() : IPC::InvalidVector,
+                         haveDraw ? drawCount : 0,
+                         haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
+                         skinnedId, skinnedCount, skinnedBytes,
+                         multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
+                         lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
+                         skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
+                         alphaId, (alphaId != IPC::InvalidVector) ? alphaCount : 0, alphaBytes,
+                         capturedId, capVertBytes, capIdxBytes,
+                         (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn,
+                         fpHave ? &fpFrame : nullptr,
+                         ripplePack, rippleCount);
+            }
         }
         if (!ok) {
             return;     // rpcPending stays false → Finish no-ops

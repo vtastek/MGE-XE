@@ -2179,6 +2179,11 @@ namespace {
     // MGE_SEAM_PROBE=7 (no copy / composite / UI / Present) to measure a frame the client issues no
     // GPU work for, with the picture actually on screen. No UI yet: that is P1.
     bool         g_hostPresent = false;
+    // hostPresentDirect=1 (with hostPresent): the swapchain goes on MW's OWN window, no child. Tests
+    // whether DXGI lets this process own the flip chain of a foreign HWND that DXVK already made a
+    // Vulkan swapchain on (the client must not present: MGE_SEAM_PROBE=7). Child = independent-flip
+    // black (G-Sync off), so this is the remaining single-swapchain shape.
+    bool         g_hostPresentDirect = false;
     HWND         g_mwHwnd = nullptr;
     bool         g_hostPresentTried = false;   // the lazy swapchain create ran (success or not)
     // Run the full alpha classification beside the sampled one and log disagreements (classifyAlpha).
@@ -23922,6 +23927,7 @@ namespace {
             { "hostWindow",          &g_hostWindow          },
             // Host-owned present into a child of MW's window (spike; READ AT INIT, like hostWindow).
             { "hostPresent",         &g_hostPresent         },
+            { "hostPresentDirect",   &g_hostPresentDirect   },
             // The oracle for the sampled DDS alpha classification: full scan beside it, mismatches
             // logged as `!! [classify]`, a running tally every 256 as `-- [classify] verify:`.
             { "texClassifyVerify",   &g_texClassifyVerify   },
@@ -30649,6 +30655,11 @@ void destroyHostWindow(Renderer* R);
         wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
         wc.lpszClassName = L"mgeHost64Overlay";
         RegisterClassExW(&wc);   // ERROR_CLASS_ALREADY_EXISTS on a re-init is fine and expected
+        if (g_hostPresent && g_hostPresentDirect) {
+            // No window of our own: the swapchain goes straight onto MW's. Nothing to pump.
+            g_hostWndCreated.store(true, std::memory_order_release);
+            return;
+        }
         if (g_hostPresent) {
             // ⚠ WS_DISABLED is what keeps MW's input: a disabled child's mouse messages go to its
             // parent, and it can never take keyboard focus. MW reads DirectInput anyway.
@@ -30731,7 +30742,7 @@ void destroyHostWindow(Renderer* R);
     bool initHostWindowSwapchain(Renderer* R, uint32_t w, uint32_t h) {
         SwapChainDesc sd = {};
         sd.mWindowHandle.type = WINDOW_HANDLE_TYPE_WIN32;
-        sd.mWindowHandle.window = g_hostHwnd;
+        sd.mWindowHandle.window = (g_hostPresent && g_hostPresentDirect) ? g_mwHwnd : g_hostHwnd;
         sd.ppPresentQueues = &g_live.pQueue;
         sd.mPresentQueueCount = 1;
         sd.mImageCount = 2;
@@ -30808,7 +30819,7 @@ void destroyHostWindow(Renderer* R);
                          (void*)g_mwHwnd, cr.right - cr.left, cr.bottom - cr.top, (void*)g_hostHwnd,
                          (unsigned long)g_hostWndCreateError, g_live.pRT->mWidth, g_live.pRT->mHeight,
                          (unsigned)g_live.pRT->mFormat);
-            if (g_hostHwnd) {
+            if (g_hostHwnd || (g_hostPresentDirect && g_mwHwnd)) {
                 initHostWindowSwapchain(g_live.pRenderer, g_live.pRT->mWidth, g_live.pRT->mHeight);
             }
         }
