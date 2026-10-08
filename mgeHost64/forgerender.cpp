@@ -18145,6 +18145,11 @@ namespace {
     // opaque world, at z = 0 GEQUAL (only samples nothing drew on). Replaces a full-screen 4x sky and
     // the full-screen MSAA resolve that made gSkyColor. Same pixels. OFF = the old order, the A/B.
     bool g_skyDeferred = true;
+    // skyVrs: the full-screen physical-sky fill (skyhw.frag) shades at a 2x2 base rate. It is two
+    // bilinear taps of the sky-view LUT per pixel — no disc, no edge, nothing a 2x2 block can alias —
+    // and it was 0.17 ms of 4.1M invocations at 2560x1600 (PIX). Needs VRS (the rate-image path's
+    // device check); OFF = per-pixel, the A/B.
+    bool g_skyVrs = true;
     bool g_skyDeferredFrame = false;   // this frame's colour pass took the deferred path
     // Release 1: the water's refraction copy resolves only the rows a ray can reach the water plane
     // through (below its horizon), not the whole frame. OFF = the full-frame resolve, the A/B.
@@ -23940,6 +23945,7 @@ namespace {
             { "terrainMorph",        &g_terrainMorph        },
             { "hizLinFused",         &g_hizLinFused         },
             { "preLinSkip",          &g_preLinSkip          },
+            { "skyVrs",              &g_skyVrs              },
             { "cullSurvivorList",    &g_cullSurvivorList    },
             { "skyDeferred",         &g_skyDeferred         },
             { "waterRefractRegion",  &g_waterRefractRegion  },
@@ -33634,6 +33640,16 @@ void destroyHostWindow(Renderer* R);
 
     // Arm/disarm the rate image for the draws in between. OVERRIDE on the image combiner: the
     // image alone decides (the per-draw rate is 1x1 and there is no per-primitive rate).
+    // A per-DRAW base rate, no rate image (combiners passthrough). 1x1 restores the default.
+    void vrsBaseRate(D3D12_SHADING_RATE rate) {
+        ID3D12GraphicsCommandList5* cl5 = nullptr;
+        if (FAILED(g_live.pCmd->mDx.pCmdList->QueryInterface(IID_PPV_ARGS(&cl5))) || !cl5) { return; }
+        const D3D12_SHADING_RATE_COMBINER c[2] = { D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                                                   D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
+        cl5->RSSetShadingRate(rate, c);
+        cl5->Release();
+    }
+
     void vrsBind(bool on) {
         ID3D12GraphicsCommandList5* cl5 = nullptr;
         if (FAILED(g_live.pCmd->mDx.pCmdList->QueryInterface(IID_PPV_ARGS(&cl5))) || !cl5) { return; }
@@ -42609,7 +42625,10 @@ void destroyHostWindow(Renderer* R);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetSky);
+            const bool skyCoarse = g_skyVrs && g_live.vrsReady;
+            if (skyCoarse) { vrsBaseRate(D3D12_SHADING_RATE_2X2); }
             cmdDraw(g_live.pCmd, 3, 0);
+            if (skyCoarse) { vrsBaseRate(D3D12_SHADING_RATE_1X1); }
             cmdEndDebugMarker(g_live.pCmd);
         }
 
