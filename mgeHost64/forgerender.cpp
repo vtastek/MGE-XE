@@ -8485,6 +8485,9 @@ namespace {
     // Not a distance — the ladder does distance; this is the one rung that answers "how finely may
     // the carve be resolved".
     float    g_terrainPatchRung  = 0.0f;
+    // Per-patch frustum cull inside a patched cell (knob terrainPatchCull). Image-identical; 0 = A/B.
+    bool     g_terrainPatchCull  = true;
+    uint32_t g_lastTerrainPatchCulled = 0;   // patches skipped this frame, all views
     // Scale on the LOD ladder's distances (kTerrainLodDist). 1.0 = the original ladder: base 128-u
     // lattice out to 3 cells, then a rung per doubling. MEASURED against G7 v0.20.3 (a shipped release,
     // so its LOD sizes are a fair reference — user, 2026-10-06): bare wilderness 0.25M terrain tris
@@ -24017,6 +24020,7 @@ namespace {
             { "terrainMorph",        &g_terrainMorph        },
             { "hizLinFused",         &g_hizLinFused         },
             { "waterDepthDirect",    &g_waterDepthDirect    },
+            { "terrainPatchCull",    &g_terrainPatchCull    },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
             { "cullSurvivorList",    &g_cullSurvivorList    },
@@ -52517,6 +52521,7 @@ void destroyHostWindow(Renderer* R);
         if (primary) {
             g_lastTerrainCells = 0;
             g_lastTerrainTris  = 0;
+            g_lastTerrainPatchCulled = 0;
             std::memset(g_lastTerrainLodHist, 0, sizeof(g_lastTerrainLodHist));
         }
         if (!g_terrainReady || !g_drawTerrain) { return; }
@@ -52625,6 +52630,25 @@ void destroyHostWindow(Renderer* R);
             const float py0 = (float)t.gy * Terrain::kCellSize + (float)oy * Terrain::kVertSpacing;
             return discTouches(px0, py0, patchSize) ? patchRung : kTerrainBaseLod;
         };
+        // ── PER-PATCH FRUSTUM CULL (knob terrainPatchCull) ──────────────────────────────────
+        // The cell passed the frustum as a whole, but a patched cell draws as 256 independent
+        // patches and most of the disc around the eye lies behind or beside the camera. A patch the
+        // frustum cannot see is not emitted. Every patch's rung and its neighbours' rungs are pure
+        // functions of (patch, eye, disc), so the stitch of the patches that ARE drawn reads exactly
+        // what it read before and the picture is unchanged. Pass 1 (row counts) and pass 2 (rows)
+        // both ask THIS function, so the counts and the rows cannot disagree. Sphere: the patch's
+        // 512-unit square, the CELL's whole height range (zLo .. 2cz - zLo; no per-patch range is
+        // stored), and the carve's one-sided depth plus a margin.
+        auto patchVisible = [&](const TerrainCellCull& t, uint32_t ox, uint32_t oy) -> bool {
+            if (!g_terrainPatchCull) { return true; }
+            const float pHalf = 0.5f * patchSize;
+            const float pHz   = std::max(t.cz - t.zLo, 0.0f);
+            const float pR    = std::sqrt(2.0f * pHalf * pHalf + pHz * pHz)
+                              + std::fabs(g_terrainDispScale) + 16.0f;
+            const float pcx = (float)t.gx * Terrain::kCellSize + (float)ox * Terrain::kVertSpacing + pHalf;
+            const float pcy = (float)t.gy * Terrain::kCellSize + (float)oy * Terrain::kVertSpacing + pHalf;
+            return dlSphereInFrustum(planes, pcx - eye[0], pcy - eye[1], t.cz - eye[2], pR);
+        };
 
         // The patched-cell set, settled in pass 1 so pass 2 can ask a NEIGHBOUR whether it is
         // patched. Bounded by kTerrainMaxPatchCells, which the fade-end ceiling makes unreachable
@@ -52705,6 +52729,7 @@ void destroyHostWindow(Renderer* R);
                 patchedCells[nPatchedCells++] = s;
                 for (uint32_t py = 0; py < kTerrainPatchSide; ++py) {
                     for (uint32_t px = 0; px < kTerrainPatchSide; ++px) {
+                        if (!patchVisible(t, px * kTerrainPatchQuads, py * kTerrainPatchQuads)) { continue; }
                         ++V.drawCounts[kTerrainFamPatch]
                                       [patchRungAt(t, px * kTerrainPatchQuads, py * kTerrainPatchQuads)];
                     }
@@ -52809,6 +52834,7 @@ void destroyHostWindow(Renderer* R);
             for (uint32_t py = 0; py < kTerrainPatchSide; ++py) {
                 for (uint32_t px = 0; px < kTerrainPatchSide; ++px) {
                     const uint32_t ox = px * kTerrainPatchQuads, oy = py * kTerrainPatchQuads;
+                    if (!patchVisible(t, ox, oy)) { if (primary) { ++g_lastTerrainPatchCulled; } continue; }
                     const uint32_t rung = patchRungAt(t, ox, oy);
                     uint32_t nbrRungs = 0;
                     for (uint32_t k = 0; k < 4; ++k) {
