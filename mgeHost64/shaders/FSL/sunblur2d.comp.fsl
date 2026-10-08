@@ -1,0 +1,92 @@
+// mgeHost64 — the sun moments blur in ONE pass per cascade (knob sunBlurFused; sunblur.comp.fsl is
+// the two-pass original and the definition this reproduces).
+//
+// Same Gaussian, same 9 taps per axis, same per-axis clamp to the tile — the separable H-then-V
+// composition evaluated in groupshared memory instead of through a full-tile scratch texture. A
+// 16x16 output block loads its 24x24 source footprint once, runs the horizontal taps into LDS for all
+// 24 rows it needs, then the vertical taps out of LDS. The map is read once and written once per
+// cascade instead of twice each, and the intermediate stays in float rather than being rounded to
+// RGBA16_UNORM between the passes (the only numerical difference, and it is in the precise
+// direction).
+//
+// Source and destination are DIFFERENT textures (the caster renders pSunMomentsRaw; this writes the
+// pSunMoments every receiver samples): an in-place 2D blur would race, because one group's apron is
+// another group's output.
+//
+// params:  x = sigma (texels, <= 0 = copy), y = tile resolution.
+// params2: x = srcOriginX, y = dstOriginX (the tile's x offset in each atlas).
+
+#include "sunblur.srt.h"
+
+#define SB_R 4                       // MUST match SUN_BLUR_RADIUS (sunblur.comp.fsl) and kSunBlurRadius
+#define SB_T 16                      // output block side
+#define SB_A (SB_T + 2 * SB_R)       // 24: loaded footprint side
+
+GroupShared(float4, g_sbSrc[SB_A * SB_A]);
+GroupShared(float4, g_sbH[SB_A * SB_T]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(16, 16, 1)
+void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
+{
+    INIT_MAIN;
+    const int  res   = (int)gSunBlurParams.params.y;
+    const int  srcOx = (int)gSunBlurParams.params2.x;
+    const int  dstOx = (int)gSunBlurParams.params2.y;
+    const uint tid   = GroupThreadID.y * 16u + GroupThreadID.x;
+    const int2 org   = int2(GroupID.xy) * SB_T - int2(SB_R, SB_R);   // tile-local footprint origin
+
+    // (1) The footprint, each coordinate clamped to the tile on ITS axis — exactly the two passes'
+    // clamps (H clamps x to the tile, V clamps y to the tile), so an edge row/column repeats.
+    for (uint i = tid; i < (uint)(SB_A * SB_A); i += 256u)
+    {
+        const int2 lp = int2((int)(i % (uint)SB_A), (int)(i / (uint)SB_A));
+        const int2 tp = clamp(org + lp, int2(0, 0), int2(res - 1, res - 1));
+        g_sbSrc[i] = LoadTex2D(gSunBlurSrc, NO_SAMPLER, int2(tp.x + srcOx, tp.y), 0);
+    }
+    GroupMemoryBarrier();
+
+    const float sigma = gSunBlurParams.params.x;
+    const int2  px    = int2(GroupID.xy) * SB_T + int2(GroupThreadID.xy);
+    const bool  copy  = !(sigma > 0.0f);   // uniform (cbuffer), so the barrier below stays legal
+    const float inv2  = copy ? 0.0f : 1.0f / (2.0f * sigma * sigma);
+    float wsum = 0.0f;
+    UNROLL for (int k = -SB_R; k <= SB_R; ++k) { wsum += exp(-float(k * k) * inv2); }
+    const float invW = (wsum > 0.0f) ? (1.0f / wsum) : 0.0f;
+
+    // (2) Horizontal taps for all SB_A rows the vertical pass will read.
+    for (uint j = tid; j < (uint)(SB_A * SB_T); j += 256u)
+    {
+        const int row = (int)(j / (uint)SB_T);
+        const int col = (int)(j % (uint)SB_T);
+        float4 s = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        UNROLL for (int k = -SB_R; k <= SB_R; ++k)
+        {
+            s += g_sbSrc[row * SB_A + col + SB_R + k] * exp(-float(k * k) * inv2);
+        }
+        g_sbH[j] = s * invW;
+    }
+    GroupMemoryBarrier();
+
+    // (3) Vertical taps out of LDS (or the centre texel verbatim when sigma <= 0: the two-pass
+    // shader's passthrough copy).
+    if (px.x < res && px.y < res)
+    {
+        float4 o;
+        if (copy)
+        {
+            o = g_sbSrc[(GroupThreadID.y + SB_R) * SB_A + GroupThreadID.x + SB_R];
+        }
+        else
+        {
+            float4 s = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            UNROLL for (int k = -SB_R; k <= SB_R; ++k)
+            {
+                s += g_sbH[((int)GroupThreadID.y + SB_R + k) * SB_T + (int)GroupThreadID.x] * exp(-float(k * k) * inv2);
+            }
+            o = s * invW;
+        }
+        Write2D(gSunBlurDst, int2(px.x + dstOx, px.y), o);
+    }
+    RETURN();
+}

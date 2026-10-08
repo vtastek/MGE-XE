@@ -690,6 +690,12 @@
 #include "sunblur.comp.fsl"
 #end
 
+// ...and the same blur in one pass per cascade through groupshared memory (knob sunBlurFused):
+// pSunMomentsRaw -> pSunMoments, read once and written once.
+#comp sunblur2d.comp
+#include "sunblur2d.comp.fsl"
+#end
+
 // P1 point-light shadows: screen-space visibility mask. Reads the RESOLVED single-sample
 // prepass depth (pLinearDepth) — no MSAA variants needed — plus the shadow atlas; writes the
 // R32G32_UINT per-slot mask the forward frags load. Hot-reloadable (rides the gtao mtime poll).

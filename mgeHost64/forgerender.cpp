@@ -3880,6 +3880,8 @@ namespace {
         bool           skyVisReady = false;
         bool           svmScreenInSR = false;        // resting state after the first dispatch
         Texture*       pSunMomentsScratch = nullptr;        // separable-blur ping-pong, ONE TILE (kSunShadowRes²)
+        RenderTarget*  pSunMomentsRaw = nullptr;            // sunBlurFused: the caster's target; the blur writes pSunMoments
+        bool           sunBlurFused = false;                // the fused pass is live (pipeline + raw atlas + set)
         Buffer*        pSunBlurParamsCbv[2 * kSunCascades] = {};   // [2c] horizontal, [2c+1] vertical
         DescriptorSet* pSunBlurSet = nullptr;               // 2*kSunCascades instances, same order
         Pipeline*      pSunBlurPipeline = nullptr;
@@ -8506,6 +8508,10 @@ namespace {
     // terraindisp.h.fsl). Only with the near rung at 0 (it adds exactly one step) and only while D1 is
     // inside the fade end (past it there is nothing displaced to step). 0 = off.
     float    g_terrainPatchStep  = 800.0f;
+    // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
+    // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
+    // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
+    bool     g_sunBlurFused      = true;
     uint32_t g_lastTerrainPatchCulled = 0;   // patches skipped this frame, all views
     // Scale on the LOD ladder's distances (kTerrainLodDist). 1.0 = the original ladder: base 128-u
     // lattice out to 3 cells, then a rung per doubling. MEASURED against G7 v0.20.3 (a shipped release,
@@ -9909,6 +9915,13 @@ namespace {
                 smd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
                 smd.pName = "sunMoments";
                 addRenderTarget(R, &smd, &g_live.pSunMoments);
+                if (g_sunBlurFused) {
+                    // The caster's own target: same format, same clear (the far-occluder moments), read
+                    // only by the fused blur. Rests SHADER_RESOURCE like pSunMoments.
+                    smd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                    smd.pName = "sunMomentsRaw";
+                    addRenderTarget(R, &smd, &g_live.pSunMomentsRaw);
+                }
 
                 // Blur scratch — a plain texture (never a render target), same format, ONE TILE. The
                 // blur runs tile-at-a-time, so the scratch never needs the atlas's full width (which
@@ -9924,7 +9937,7 @@ namespace {
                 TextureLoadDesc sbl = {};
                 sbl.ppTexture = &g_live.pSunMomentsScratch;
                 sbl.pDesc = &sbd;
-                addResource(&sbl, nullptr);
+                if (!g_live.pSunMomentsRaw) { addResource(&sbl, nullptr); }   // the fused blur needs no scratch
 
                 // One tiny param cbuffer per blur dispatch (2 per cascade: H then V) — the set has
                 // that many INSTANCES and each binds its own, so every dispatch rides one descriptor
@@ -16170,10 +16183,11 @@ namespace {
             // Instances rather than N sets is the same pattern the per-face shadow passes use, and it
             // keeps the ping-pong to one bind point. Created only if the sun RTs exist; failure just
             // leaves the blur off. ---
-            if (g_live.pSunMoments && g_live.pSunMomentsScratch
+            if (g_live.pSunMoments && (g_live.pSunMomentsScratch || g_live.pSunMomentsRaw)
                 && g_live.pSunBlurParamsCbv[0] && g_live.pSunBlurParamsCbv[2 * kSunCascades - 1]) {
+                const bool fused = g_sunBlurFused && g_live.pSunMomentsRaw;
                 ShaderLoadDesc sbs = {};
-                sbs.mComp.pFileName = "sunblur.comp";
+                sbs.mComp.pFileName = fused ? "sunblur2d.comp" : "sunblur.comp";
                 addShader(R, &sbs, &g_live.pSunBlurShader);
                 if (g_live.pSunBlurShader) {
                     PipelineDesc sbp = {};
@@ -16190,7 +16204,14 @@ namespace {
                     d[1].mCount = 1;
                     d[2].mIndex = SRT_RES_IDX(SunBlurSrtData, PerFrame, gSunBlurDst);
                     d[2].mCount = 1;
-                    for (uint32_t c = 0; c < kSunCascades; ++c) {
+                    for (uint32_t c = 0; fused && c < kSunCascades; ++c) {
+                        // sunBlurFused: instance 2c = the one pass, raw atlas (SRV) -> pSunMoments (UAV).
+                        d[0].ppBuffers  = &g_live.pSunBlurParamsCbv[2 * c];
+                        d[1].ppTextures = &g_live.pSunMomentsRaw->pTexture;
+                        d[2].ppTextures = &g_live.pSunMoments->pTexture;
+                        updateDescriptorSet(R, 2 * c, g_live.pSunBlurSet, 3, d);
+                    }
+                    for (uint32_t c = 0; !fused && c < kSunCascades; ++c) {
                         // Instance 2c — horizontal: atlas tile c (SRV) -> scratch (UAV).
                         d[0].ppBuffers  = &g_live.pSunBlurParamsCbv[2 * c];
                         d[1].ppTextures = &g_live.pSunMoments->pTexture;
@@ -16204,6 +16225,8 @@ namespace {
                         updateDescriptorSet(R, 2 * c + 1, g_live.pSunBlurSet, 3, d);
                     }
                     g_live.sunBlurReady = true;
+                    g_live.sunBlurFused = fused;
+                    LOG::logline(">> [forge][sun-shadow] moments blur: %s", fused ? "FUSED (one pass per cascade)" : "two-pass");
                 } else {
                     std::printf("[forge][sun-shadow] blur pipeline/set FAILED — moments stay unblurred\n");
                 }
@@ -24058,6 +24081,7 @@ namespace {
             { "waterDepthDirect",    &g_waterDepthDirect    },
             { "terrainPatchCull",    &g_terrainPatchCull    },
             { "terrainVcacheOpt",    &g_terrainVcacheOpt    },
+            { "sunBlurFused",        &g_sunBlurFused        },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
             { "cullSurvivorList",    &g_cullSurvivorList    },
@@ -62689,8 +62713,40 @@ void destroyHostWindow(Renderer* R);
     // extent changes. The near cascade's fine texels usually make its request exceed the tap radius
     // and clamp there — near shadows therefore come out tighter than far ones, which reads as contact
     // hardening; the receiver cross-fades across the boundary so it is a ramp, not a ring.
+    // Where the sun caster pass renders: the raw atlas the fused blur reads, or (two-pass blur)
+    // pSunMoments itself, which the blur then ping-pongs in place.
+    RenderTarget* sunCasterTarget() {
+        return (g_live.sunBlurFused && g_live.pSunMomentsRaw) ? g_live.pSunMomentsRaw : g_live.pSunMoments;
+    }
+
     void blurSunMoments() {
         if (!g_live.sunBlurReady || !g_live.pSunBlurPipeline || !g_live.pSunBlurSet) { return; }
+        if (g_live.sunBlurFused) {
+            // ONE pass per cascade, raw -> pSunMoments. It must run even at softness 0: the receivers
+            // read pSunMoments, which only this pass writes (sigma 0 = the verbatim copy).
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "SUN MOMENTS BLUR (fused)");
+            TextureBarrier tb = {}; tb.pTexture = g_live.pSunMoments->pTexture;
+            tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE; tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            cmdBindPipeline(g_live.pCmd, g_live.pSunBlurPipeline);
+            const uint32_t groups2 = (kSunShadowRes + 15u) / 16u;
+            for (uint32_t c = 0; c < kSunCascades; ++c) {
+                const float tileTexel = (2.0f * sunCascadeExtent(c)) / (float)kSunShadowRes;
+                const float sigma = (g_sunShadowSoftness <= 0.0f) ? 0.0f
+                    : std::min(std::max(g_sunShadowSoftness / std::max(tileTexel, 1e-3f), kSunBlurSigmaMin),
+                               (float)kSunBlurRadius);
+                const float ox = (float)(c * kSunShadowRes);
+                float* pf = (float*)fbw(g_live.pSunBlurParamsCbv[2 * c]);
+                pf[0] = sigma; pf[1] = (float)kSunShadowRes; pf[2] = 0.0f; pf[3] = 0.0f;
+                pf[4] = ox;    pf[5] = ox;                   pf[6] = 0.0f; pf[7] = 0.0f;
+                cmdBindDescriptorSet(g_live.pCmd, 2 * c, g_live.pSunBlurSet);
+                cmdDispatch(g_live.pCmd, groups2, groups2, 1);
+            }
+            tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+            return;
+        }
         if (g_sunShadowSoftness <= 0.0f) { return; }   // 0 = raw map (the A/B against no blur)
 
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "SUN MOMENTS BLUR");
@@ -62812,7 +62868,7 @@ void destroyHostWindow(Renderer* R);
             // Both attachments rest in SHADER_RESOURCE (the moments feed the MSM receiver, the depth
             // feeds the near cascade's PCSS) and are acquired together for the caster pass.
             RenderTargetBarrier rtb[2] = {};
-            rtb[0].pRenderTarget = g_live.pSunMoments;
+            rtb[0].pRenderTarget = sunCasterTarget();
             rtb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
             rtb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
             rtb[1].pRenderTarget = g_live.pSunMomentsDepth;
@@ -62824,7 +62880,7 @@ void destroyHostWindow(Renderer* R);
         // then walk the cascades with nothing but a viewport + descriptor-instance change per tile.
         BindRenderTargetsDesc sb = {};
         sb.mRenderTargetCount = 1;
-        sb.mRenderTargets[0] = { g_live.pSunMoments, LOAD_ACTION_CLEAR };
+        sb.mRenderTargets[0] = { sunCasterTarget(), LOAD_ACTION_CLEAR };
         sb.mDepthStencil = { g_live.pSunMomentsDepth, LOAD_ACTION_CLEAR };
         cmdBindRenderTargets(g_live.pCmd, &sb);
 
@@ -62893,7 +62949,7 @@ void destroyHostWindow(Renderer* R);
         cmdBindRenderTargets(g_live.pCmd, nullptr);
         {
             RenderTargetBarrier rtb[2] = {};
-            rtb[0].pRenderTarget = g_live.pSunMoments;
+            rtb[0].pRenderTarget = sunCasterTarget();
             rtb[0].mCurrentState = RESOURCE_STATE_RENDER_TARGET;
             rtb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
             rtb[1].pRenderTarget = g_live.pSunMomentsDepth;
@@ -64830,6 +64886,7 @@ void destroyHostWindow(Renderer* R);
         }
         if (g_live.pSunMomentsScratch)   { removeResource(g_live.pSunMomentsScratch); g_live.pSunMomentsScratch = nullptr; }
         if (g_live.pSunMoments)          { removeRenderTarget(R, g_live.pSunMoments); g_live.pSunMoments = nullptr; }
+        if (g_live.pSunMomentsRaw)       { removeRenderTarget(R, g_live.pSunMomentsRaw); g_live.pSunMomentsRaw = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
         if (g_live.pSvmDepth)            { removeRenderTarget(R, g_live.pSvmDepth); g_live.pSvmDepth = nullptr; }
         if (g_live.pSkyVisSet)           { removeDescriptorSet(R, g_live.pSkyVisSet); g_live.pSkyVisSet = nullptr; }
