@@ -4704,7 +4704,14 @@ namespace {
     constexpr uint32_t kMaxWaterLevels = 6;
     constexpr uint32_t kWaterLevels    = 6;
     // WT2 reflection RT side (matches MGE texReflection's 1024² budget; sampled with normalized UV).
-    constexpr uint32_t kReflectSize = 1024;
+    // A STARTUP knob (reflectSize, applied before init like every knob): the RTs, the pyramid and every
+    // pass that addresses them read reflectSize(), never a literal. Clamped to [256, 2048] and to a
+    // multiple of 32 so the 6-level pyramid stays integral (side / 32 at the last level).
+    float g_reflectSizeKnob = 1024.0f;
+    inline uint32_t reflectSize() {
+        const uint32_t v = (uint32_t)std::clamp(g_reflectSizeKnob, 256.0f, 2048.0f);
+        return std::max(256u, v & ~31u);
+    }
     // WT4d/P2 pre-filtered reflection pyramid: 1024, 512, 256, 128, 64, 32. Stops at 32² rather than
     // running to 1x1 because the roughness LOD saturates long before then — alpha would have to
     // reach ~0.03 rad of surface slope spread for LOD 5, which is already fully diffuse water — and
@@ -13448,7 +13455,7 @@ namespace {
             // pSkyColor is ALLOC-sized like pRefractColor (screen RTs are allocated at the render-scale
             // ceiling and the frame draws a sub-viewport), so it is addressed pixel/ALLOC.
             // pReflectSkyColor matches pReflectColor's fixed kReflectSize² and a FULL viewport, so it
-            // is addressed pixel/kReflectSize. Both scales are published per-pass rather than derived
+            // is addressed pixel/reflectSize(). Both scales are published per-pass rather than derived
             // in-shader — see fogTargetColor().
             {
                 TextureDesc sd = {};
@@ -13474,7 +13481,7 @@ namespace {
                 g_live.pSkyColor = g_live.pSkyColorRT ? g_live.pSkyColorRT->pTexture : nullptr;
 
                 TextureDesc rsd = sd;
-                rsd.mWidth = kReflectSize; rsd.mHeight = kReflectSize;
+                rsd.mWidth = reflectSize(); rsd.mHeight = reflectSize();
                 rsd.pName = "reflectSkyColor";
                 TextureLoadDesc rsld = {};
                 rsld.ppTexture = &g_live.pReflectSkyColor;
@@ -13610,7 +13617,7 @@ namespace {
             // Following sampleCount rather than hard-coding 4 keeps the 1x configuration working and
             // keeps the PSOs matched either way — the whole point is that these must agree.
             RenderTargetDesc rcd = {};
-            rcd.mWidth = kReflectSize; rcd.mHeight = kReflectSize; rcd.mDepth = 1;
+            rcd.mWidth = reflectSize(); rcd.mHeight = reflectSize(); rcd.mDepth = 1;
             rcd.mArraySize = 1; rcd.mMipLevels = 1;
             rcd.mSampleCount = (SampleCount)g_live.sampleCount;
             // NOT a free choice: pSkyPipeline (and the DL/near colour PSOs) draw into pSceneColor in
@@ -13628,7 +13635,7 @@ namespace {
             addRenderTarget(R, &rcd, &g_live.pReflectColor);
 
             RenderTargetDesc rdd = {};
-            rdd.mWidth = kReflectSize; rdd.mHeight = kReflectSize; rdd.mDepth = 1;
+            rdd.mWidth = reflectSize(); rdd.mHeight = reflectSize(); rdd.mDepth = 1;
             rdd.mArraySize = 1; rdd.mMipLevels = 1;
             rdd.mSampleCount = (SampleCount)g_live.sampleCount;   // W5: must match the colour RT
             rdd.mFormat = TinyImageFormat_D32_SFLOAT;
@@ -14190,7 +14197,7 @@ namespace {
                 rp.mCount = 1; rp.ppTextures = &reflTex;
                 updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rp);
             }
-            std::printf("[forge][reflect] build ready=%d (%u²)\n", (int)g_live.reflectReady, kReflectSize);
+            std::printf("[forge][reflect] build ready=%d (%u²)\n", (int)g_live.reflectReady, reflectSize());
 
             // --- WT4d/P2: the pre-filtered reflection pyramid (Hi-Z shape, box average) ----------
             // NON-FATAL, following the Hi-Z precedent: any failure leaves reflectMipReady=false, the
@@ -14199,7 +14206,7 @@ namespace {
             // valid placeholder in that case so the SRV slot is never null.
             if (g_live.reflectReady) {
                 TextureDesc rmd = {};
-                rmd.mWidth = kReflectSize; rmd.mHeight = kReflectSize; rmd.mDepth = 1;
+                rmd.mWidth = reflectSize(); rmd.mHeight = reflectSize(); rmd.mDepth = 1;
                 rmd.mArraySize = 1; rmd.mMipLevels = kReflectMipCount;
                 rmd.mSampleCount = SAMPLE_COUNT_1;
                 // fp16 REGARDLESS of sceneColorFormat: B8G8R8A8_UNORM is not in D3D12's
@@ -14217,7 +14224,7 @@ namespace {
 
                 // W5: the single-sample mirror depth the resolve writes for water.frag (W4c).
                 TextureDesc rdrd = {};
-                rdrd.mWidth = kReflectSize; rdrd.mHeight = kReflectSize; rdrd.mDepth = 1;
+                rdrd.mWidth = reflectSize(); rdrd.mHeight = reflectSize(); rdrd.mDepth = 1;
                 rdrd.mArraySize = 1; rdrd.mMipLevels = 1; rdrd.mSampleCount = SAMPLE_COUNT_1;
                 rdrd.mFormat = TinyImageFormat_R32_SFLOAT;   // raw reverse-Z device depth, full precision
                 rdrd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
@@ -14339,7 +14346,7 @@ namespace {
                 }
                 std::printf("[forge][reflect] mip pyramid %s (%u², %u mips, RGBA16F)\n",
                             g_live.reflectMipReady ? "ready" : "DISABLED (resource/shader/pipeline create failed)",
-                            kReflectSize, kReflectMipCount);
+                            reflectSize(), kReflectMipCount);
             }
         }
 
@@ -23982,6 +23989,7 @@ namespace {
             // frame at all, and that is the regression test for the whole of part 2's plumbing.
             { "reflFidelity",        &g_reflFidelity        },
             { "reflDistScale",       &g_reflDistScale       },
+            { "reflectSize",         &g_reflectSizeKnob     },
             { "reflTerrainFullRungs", &g_reflTerrainFullRungs },
             { "reflLodBias",         &g_reflLodBias         },
             { "mbShutter",           &g_mbShutter           },
@@ -34142,7 +34150,7 @@ void destroyHostWindow(Renderer* R);
                 p[11] = std::max(0.0f, g_waterDistortFrac);
                 p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
                 p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
-                p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
+                p[14] = (float)reflectSize();       // gReflectMips side, for the reflection LOD
                 p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
                 std::memcpy(wbuf + 6 * 64, p, 64);
                 // eyeAbs so the R2 block can make MW's absolute ripple centres eye-relative.
@@ -38364,7 +38372,7 @@ void destroyHostWindow(Renderer* R);
             // ALLOC-sized (screen RTs are allocated at the render-scale ceiling and the frame draws a
             // sub-viewport), NOT render-sized — the distinction that has bitten six shaders before, and
             // using 1/render here would stretch the sky by the scale ratio. The mirror overwrites these
-            // two with its own 1/kReflectSize in dlReflectGeoCull. Both lanes carried wind/cell-epoch,
+            // two with its own 1/reflectSize() in dlReflectGeoCull. Both lanes carried wind/cell-epoch,
             // which the host reads CPU-side straight off `lighting` and no shader ever read.
             {
                 const float aw = (float)(g_live.allocWidth  ? g_live.allocWidth  : g_live.width);
@@ -42649,7 +42657,7 @@ void destroyHostWindow(Renderer* R);
             rbind.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_CLEAR };
             rbind.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_CLEAR };
             cmdBindRenderTargets(g_live.pCmd, &rbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kReflectSize, (float)kReflectSize, 0.0f, 1.0f);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflectSize(), (float)reflectSize(), 0.0f, 1.0f);
 
             // Horizon scissor (parity-safe perf): the water plane can never project ABOVE its own
             // horizon line, so the water frag never samples the reflect RT above it — scissor the WHOLE
@@ -42679,14 +42687,14 @@ void destroyHostWindow(Renderer* R);
                     if (yfrac < minYfrac) { minYfrac = yfrac; }
                 }
                 if (anyFront) {
-                    float topPx = minYfrac * (float)kReflectSize - 16.0f;   // 16px pad (waves/numerical)
+                    float topPx = minYfrac * (float)reflectSize() - 16.0f;   // 16px pad (waves/numerical)
                     if (topPx < 0.0f) { topPx = 0.0f; }
-                    if (topPx > (float)kReflectSize) { topPx = (float)kReflectSize; }
+                    if (topPx > (float)reflectSize()) { topPx = (float)reflectSize(); }
                     reflScissorTop = (uint32_t)topPx;
                 }
             }
-            const uint32_t reflScissorH = (reflScissorTop < kReflectSize) ? (kReflectSize - reflScissorTop) : 1u;
-            cmdSetScissor(g_live.pCmd, 0, reflScissorTop, kReflectSize, reflScissorH);
+            const uint32_t reflScissorH = (reflScissorTop < reflectSize()) ? (reflectSize() - reflScissorTop) : 1u;
+            cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflectSize(), reflScissorH);
 
             // Sky draw (mirror): fill the reflect sky buffers + replay the shapes. Cull NONE in the
             // sky PSO makes the mirror's winding flip irrelevant. Same per-shape data as the main sky
@@ -42824,11 +42832,11 @@ void destroyHostWindow(Renderer* R);
                 rsb.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_LOAD };
                 rsb.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_LOAD };
                 cmdBindRenderTargets(g_live.pCmd, &rsb);
-                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kReflectSize, (float)kReflectSize, 0.0f, 1.0f);
+                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflectSize(), (float)reflectSize(), 0.0f, 1.0f);
                 // Restore the horizon scissor the reflect pass set for itself — rebinding does not
                 // touch scissor state, but the viewport call above pairs with it and leaving the two
                 // out of step is the kind of thing that only shows up as a clipped mirror later.
-                cmdSetScissor(g_live.pCmd, 0, reflScissorTop, kReflectSize, reflScissorH);
+                cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflectSize(), reflScissorH);
             }
 
             // ---- WV2 (real reflection): reflected LAND + STATICS over the reflected sky --------------
@@ -42908,9 +42916,9 @@ void destroyHostWindow(Renderer* R);
                 }
                 cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipelineFirst);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflectMipSet);
-                cmdDispatch(g_live.pCmd, (kReflectSize + 7u) / 8u, (kReflectSize + 7u) / 8u, 1);
+                cmdDispatch(g_live.pCmd, (reflectSize() + 7u) / 8u, (reflectSize() + 7u) / 8u, 1);
                 cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipeline);
-                uint32_t mw = kReflectSize;
+                uint32_t mw = reflectSize();
                 for (uint32_t m = 1; m < kReflectMipCount; ++m) {
                     TextureBarrier tb = {};
                     tb.pTexture = g_live.pReflectMips;
@@ -54753,7 +54761,7 @@ void destroyHostWindow(Renderer* R);
                                                             // disagree with the game about water.
             p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
             p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
-            p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
+            p[14] = (float)reflectSize();       // gReflectMips side, for the reflection LOD
             p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
             std::memcpy(wbuf + 6 * 64, p, 64);
             // Viewer path: no client, so no actor ripples — the default 0,0 eye is unused.
@@ -63560,8 +63568,8 @@ void destroyHostWindow(Renderer* R);
             // kReflectSize² one, drawn with a FULL viewport — not the alloc-sized screen copy the
             // memcpy just brought over. Leaving the main view's scale here would sample the reflected
             // sky at the wrong rate and slide it against the geometry it is supposed to melt into.
-            gp[34] = 1.0f / (float)kReflectSize;
-            gp[35] = 1.0f / (float)kReflectSize;
+            gp[34] = 1.0f / (float)reflectSize();
+            gp[35] = 1.0f / (float)reflectSize();
             // ...and S2j's haze target (skyZenith.y, float 69) is aimed from THIS view's eye. MG above
             // reflects about z = dRel, so the mirror renders from a virtual eye at z = 2*dRel relative
             // to the real one, and its sky copy was drawn along that eye's rays. worldPosRel stays
