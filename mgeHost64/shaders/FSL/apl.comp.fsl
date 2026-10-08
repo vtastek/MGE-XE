@@ -27,7 +27,13 @@
 
 #include "apl.srt.h"
 
-#define APL_THREADS 256u
+// 1024 threads, not 256: the lattice walk is latency-bound (two dependent loads, an unproject and an
+// LDS atomic per sample), and one group of 8 warps left the SM idle between them — 97 us at 2560x1600
+// on the laptop 4070 (PIX). 32 warps hide that latency; the lattice, the sums and the histogram are
+// unchanged. The LDS arrays stay 256 wide (the 32 KB cap): the extra 768 partial sums fold into them
+// in three barrier steps before the tree below.
+#define APL_THREADS 1024u
+#define APL_LDS     256u
 
 GroupShared(float4, g_apl[256]);
 
@@ -69,7 +75,7 @@ GroupShared(float4, g_aplW[256]);
 GroupShared(uint,   g_histW[256]);
 
 ROOT_SIGNATURE(ComputeRootSignature)
-NUM_THREADS(256, 1, 1)
+NUM_THREADS(1024, 1, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
@@ -84,8 +90,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float4 accW = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     // One bin per thread — exactly 256 of each, so the clear needs no loop and no bounds test.
-    g_hist[tid]  = 0u;
-    g_histW[tid] = 0u;
+    if (tid < APL_LDS)
+    {
+        g_hist[tid]  = 0u;
+        g_histW[tid] = 0u;
+    }
     GroupMemoryBarrier();
 
     // Strided walk over the lattice. No barriers in here, so the divergent tail is free.
@@ -160,14 +169,26 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         }
     }
 
-    g_apl[tid]  = acc;
-    g_aplW[tid] = accW;
+    if (tid < APL_LDS)
+    {
+        g_apl[tid]  = acc;
+        g_aplW[tid] = accW;
+    }
     GroupMemoryBarrier();
+    for (uint k = 1u; k < APL_THREADS / APL_LDS; ++k)
+    {
+        if ((tid / APL_LDS) == k)
+        {
+            g_apl[tid % APL_LDS]  = g_apl[tid % APL_LDS] + acc;
+            g_aplW[tid % APL_LDS] = g_aplW[tid % APL_LDS] + accW;
+        }
+        GroupMemoryBarrier();
+    }
 
     // Tree reduce. Read into a register, barrier, guarded write, barrier — cullscan.comp.fsl's
     // idiom, and for its reason: EVERY thread must reach EVERY GroupMemoryBarrier, so the guard
     // wraps only the write, never the barrier.
-    for (uint s = APL_THREADS / 2u; s > 0u; s >>= 1u)
+    for (uint s = APL_LDS / 2u; s > 0u; s >>= 1u)
     {
         float4 v  = (tid < s) ? g_apl[tid + s]  : float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 vW = (tid < s) ? g_aplW[tid + s] : float4(0.0f, 0.0f, 0.0f, 0.0f);
