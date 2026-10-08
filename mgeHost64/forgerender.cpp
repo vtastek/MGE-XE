@@ -2614,6 +2614,17 @@ namespace {
         Cmd*            pCmd = nullptr;
         Cmd*            pCmdA[kFrameSlots] = {};
         Cmd*            pCmdB[kFrameSlots] = {};   // O1 split-submit chunk B (same pool; A closes before B opens)
+        // ASYNC AO (knob asyncAO, tasks/full-feature-budget.md): a COMPUTE queue runs the AO chain
+        // while the graphics queue draws the mirror. Chunk B splits into B (reflect) and B2 (colour
+        // onward), and B2 waits the compute queue's semaphore. Same pool as A/B (each closes before
+        // the next opens); the compute cmd has its own pool on its own queue.
+        Cmd*            pCmdB2[kFrameSlots] = {};
+        Queue*          pComputeQueue = nullptr;
+        CmdPool*        pComputePool[kFrameSlots] = {};
+        Cmd*            pComputeCmd[kFrameSlots] = {};
+        Semaphore*      pSemPreAO = nullptr;    // graphics chunk A done -> compute may start
+        Semaphore*      pSemAODone = nullptr;   // compute AO done -> graphics chunk B2 may start
+        bool            asyncReady = false;
         Fence*          pFence[kFrameSlots] = {};
         QueryPool*      pGpuQueryPool[kFrameSlots] = {};   // GPU timestamp pool (per-phase 4ms breakdown)
         uint32_t        recSlot = 0;               // slot of the frame being / last recorded
@@ -17292,6 +17303,15 @@ namespace {
     // the GPU executes it while the CPU records chunk B (reflect→resolve) into pCmdB. gpuOverlap
     // = submit-A → record-end-of-B: the window where CPU record and GPU execution ran concurrently.
     bool      g_splitSubmit = true;
+    // ASYNC AO (tasks/full-feature-budget.md): the AO chain on a compute queue, overlapping the
+    // mirror pass. Needs splitSubmit (it rides chunk A's submit). Image-identical by construction:
+    // the same dispatches over the same inputs, only the queue moves.
+    // ⚠ SHIPS OFF: MEASURED NO WIN (docks replay, 2026-10-08: 14.99 vs 14.69 ms/frame, noise). PIX
+    // shows chunk B2 waiting 1.35 ms on the compute semaphore — the mirror pass saturates the GPU,
+    // so the AO chain stretches to fit beside it instead of filling idle units. Overlap pays only
+    // beside graphics work that leaves the SMs idle. Kept as the second-queue plumbing GI needs.
+    bool      g_asyncAO = false;
+    bool      g_aoAsyncFrame = false;   // this frame recorded AO into the compute cmd
     double    g_lastGpuOverlapMs = 0.0;
     // GPU-side per-phase ms (breaks down the ~4ms gpu via timestamp queries). kGpuPhase* enum
     // is defined up near kMaxDraws (used in buildOpaquePath, earlier in the TU than this block).
@@ -24087,6 +24107,7 @@ namespace {
             // stall latch says something external to every pass is costing up to 2.1 ms in 43-71% of
             // frames. Whether the split helps or hurts is now measurable rather than assumed.
             { "splitSubmit",         &g_splitSubmit         },
+            { "asyncAO",             &g_asyncAO             },
             // P2's oracle (tasks/forge-pipeline-depth.md): read every FrameBuf back after its
             // upload and compare it with the CPU shadow. A dev cost, off by default.
             { "frameBufVerify",      &g_frameBufVerify      },
@@ -30708,7 +30729,30 @@ void destroyHostWindow(Renderer* R);
             cmdDesc.pPool = g_live.pCmdPool[s];
             initCmd(R, &cmdDesc, &g_live.pCmdA[s]);
             initCmd(R, &cmdDesc, &g_live.pCmdB[s]);   // O1: chunk-B cmd for the intra-frame split-submit
+            initCmd(R, &cmdDesc, &g_live.pCmdB2[s]);  // async AO: chunk B2 (colour onward)
             initFence(R, &g_live.pFence[s]);
+        }
+        // Async AO's compute queue. Optional: without it asyncAO simply never engages.
+        {
+            QueueDesc cq = {};
+            cq.mType = QUEUE_TYPE_COMPUTE;
+            initQueue(R, &cq, &g_live.pComputeQueue);
+            bool ok = g_live.pComputeQueue != nullptr;
+            for (uint32_t s = 0; ok && s < kFrameSlots; ++s) {
+                CmdPoolDesc cpd = {};
+                cpd.pQueue = g_live.pComputeQueue;
+                initCmdPool(R, &cpd, &g_live.pComputePool[s]);
+                if (!g_live.pComputePool[s]) { ok = false; break; }
+                CmdDesc ccd = {};
+                ccd.pPool = g_live.pComputePool[s];
+                initCmd(R, &ccd, &g_live.pComputeCmd[s]);
+                ok = ok && g_live.pComputeCmd[s] != nullptr;
+            }
+            if (ok) { initSemaphore(R, &g_live.pSemPreAO); initSemaphore(R, &g_live.pSemAODone); }
+            ok = ok && g_live.pSemPreAO && g_live.pSemAODone;
+            LOG::logline(">> [forge] async compute queue: %s", ok ? "ready" : "UNAVAILABLE (asyncAO off)");
+            if (!ok) { g_live.pComputeQueue = g_live.pComputeQueue; }   // teardown frees whatever was made
+            g_live.asyncReady = ok;
         }
         g_live.recSlot = 0;
         g_live.pCmd = g_live.pCmdA[0];
@@ -34199,6 +34243,39 @@ void destroyHostWindow(Renderer* R);
         // Latched the first time the half chain actually runs — see the barrier block below for why
         // g_live.firstFrame cannot stand in for it.
         static bool s_aoHalfPrimed = false;
+        // ASYNC AO (g_asyncAO): the four AO dispatches go into the COMPUTE queue's cmd and run while
+        // the graphics queue draws the mirror; colour waits them (chunk B2). Not on the first frame
+        // or a half chain's first run (their resources leave CREATION states the sync path walks),
+        // nor under a debug view (some read pAO from a pixel shader before colour).
+        //
+        // ⚠ STATES. A compute queue can neither hold nor transition PIXEL_SHADER_RESOURCE, so every
+        // resource the two queues share rests in NON_PIXEL_SHADER_RESOURCE across the handoff: the
+        // graphics queue drops the PS bit before it signals, the compute queue works in NPS/UAV, and
+        // chunk B2 puts the PS bit back after its wait (asyncAORestoreStates). Outside the window the
+        // resting states are exactly the sync path's (SHADER_RESOURCE).
+        const bool aoAsync = g_asyncAO && g_live.asyncReady && aoBlockRan && aoDispatchRuns
+                          && !g_live.firstFrame && (!aoHalf || s_aoHalfPrimed) && g_debugMode == 0u
+                          && g_splitSubmit && g_live.pCmdB[g_live.recSlot] && g_live.pCmdB2[g_live.recSlot]
+                          && g_live.pComputeCmd[g_live.recSlot];
+        g_aoAsyncFrame = aoAsync;
+        auto nativeBarriers = [&](std::initializer_list<std::tuple<Texture*, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES>> l) {
+            D3D12_RESOURCE_BARRIER b[8] = {};
+            UINT n = 0;
+            for (const auto& e : l) {
+                if (!std::get<0>(e) || n >= 8) { continue; }
+                b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b[n].Transition.pResource   = std::get<0>(e)->mDx.pResource;
+                b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b[n].Transition.StateBefore = std::get<1>(e);
+                b[n].Transition.StateAfter  = std::get<2>(e);
+                ++n;
+            }
+            if (n) { g_live.pCmd->mDx.pCmdList->ResourceBarrier(n, b); }
+        };
+        constexpr D3D12_RESOURCE_STATES kSR  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                             | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        constexpr D3D12_RESOURCE_STATES kNPS = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        constexpr D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         if (aoBlockRan) {
             // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
             // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
@@ -34312,7 +34389,7 @@ void destroyHostWindow(Renderer* R);
                 // they are created UNORDERED_ACCESS and only reach SHADER_RESOURCE at the end of a
                 // frame that actually ran the half chain, which may be any frame (or never). Using
                 // firstFrame here would issue an SR->UAV from a state they were never in.
-                if (aoHalf && s_aoHalfPrimed) {
+                if (aoHalf && s_aoHalfPrimed && !aoAsync) {
                     tb[nt].pTexture = g_live.pLinearDepthHalf;
                     tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                     tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -34327,6 +34404,13 @@ void destroyHostWindow(Renderer* R);
                     ++nt;
                 }
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+                if (aoAsync) {
+                    // Hand-off prep: drop the PS bit on what the compute queue will touch.
+                    nativeBarriers({ { g_live.pAO, kSR, kNPS }, { g_live.pAOBlur, kSR, kNPS },
+                                     { aoHalf ? g_live.pLinearDepthHalf : nullptr, kSR, kNPS },
+                                     { aoHalf ? g_live.pAOHalf : nullptr, kSR, kNPS },
+                                     { aoHalf ? g_live.pAOBlurHalf : nullptr, kSR, kNPS } });
+                }
             }
 
             // (1) Linearize/resolve dispatch — only when something BEFORE the colour pass reads
@@ -34346,7 +34430,19 @@ void destroyHostWindow(Renderer* R);
             }
 
             // pLinearDepth UAV -> SRV (GTAO reads it); pAO SRV -> UAV (skip on frame 0).
-            {
+            Cmd* const aoGfxCmd = g_live.pCmd;
+            if (aoAsync) {
+                // pLinearDepth to NPS on graphics (the compute queue, the shadow mask and sky-vis all
+                // read it from compute shaders; nothing reads it from a pixel shader before colour),
+                // then everything up to the end of the AO chain records into the COMPUTE cmd.
+                nativeBarriers({ { g_live.pLinearDepth, kUAV, kNPS } });
+                g_live.pCmd = g_live.pComputeCmd[g_live.recSlot];
+                beginCmd(g_live.pCmd);
+                nativeBarriers({ { g_live.pAO, kNPS, kUAV },
+                                 { aoHalf ? g_live.pLinearDepthHalf : nullptr, kNPS, kUAV },
+                                 { aoHalf ? g_live.pAOHalf : nullptr, kNPS, kUAV },
+                                 { aoHalf ? g_live.pAOBlurHalf : nullptr, kNPS, kUAV } });
+            } else {
                 TextureBarrier tb[2] = {};
                 uint32_t nt = 0;
                 tb[nt].pTexture = g_live.pLinearDepth;
@@ -34371,11 +34467,15 @@ void destroyHostWindow(Renderer* R);
                 cmdDispatch(g_live.pCmd, gxH, gyH, 1);
                 cmdEndDebugMarker(g_live.pCmd);
                 gpuPhaseEnd(kGpuPhaseAODown);
+                if (aoAsync) {
+                    nativeBarriers({ { g_live.pLinearDepthHalf, kUAV, kNPS } });
+                } else {
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pLinearDepthHalf;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                }
             }
 
             // (2) AO dispatch — pAOPipeline[g_aoMode] over the ONE shared PerDraw set (cbuffer +
@@ -34420,12 +34520,16 @@ void destroyHostWindow(Renderer* R);
                 g_live.aoLastHalf = aoHalf;
             }
 
-            // VRS reads pDepth itself, so it runs while pDepth is still SHADER_RESOURCE.
-            vrsBuildRateImage(rzViewProj);
+            // VRS reads pDepth itself, so it runs while pDepth is still SHADER_RESOURCE. (On the async
+            // path it is recorded on the graphics cmd after the AO chain, below.)
+            if (!aoAsync) { vrsBuildRateImage(rzViewProj); }
 
             // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
             // pDepth SRV -> DEPTH_WRITE (colour LOADs it). pLinearDepth STAYS SRV — the blur reads it.
-            {
+            if (aoAsync) {
+                nativeBarriers({ { g_live.pAO, kUAV, kNPS }, { aoHalf ? g_live.pAOHalf : nullptr, kUAV, kNPS },
+                                 { g_live.pAOBlur, kNPS, kUAV } });
+            } else {
                 RenderTargetBarrier rtb = {};
                 rtb.pRenderTarget = g_live.pDepth;
                 rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
@@ -34474,11 +34578,15 @@ void destroyHostWindow(Renderer* R);
                 // Lanczos-2 upscale writes the FULL pAOBlur — so everything downstream, colour
                 // frags included, sees exactly the resource it always did.
                 if (aoHalf) {
+                    if (aoAsync) {
+                        nativeBarriers({ { g_live.pAOBlurHalf, kUAV, kNPS } });
+                    } else {
                     TextureBarrier hb = {};
                     hb.pTexture = g_live.pAOBlurHalf;
                     hb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                     hb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &hb, 0, nullptr);
+                    }
 
                     gpuPhaseBegin(kGpuPhaseAOUp);
                     cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.3f, "AO LANCZOS UPSCALE (half -> pAOBlur)");
@@ -34492,11 +34600,26 @@ void destroyHostWindow(Renderer* R);
                     s_aoHalfPrimed = true;
                 }
                 // pAOBlur UAV -> SRV for the colour pass.
+                if (aoAsync) {
+                    nativeBarriers({ { g_live.pAOBlur, kUAV, kNPS } });
+                } else {
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pAOBlur;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                }
+            }
+            if (aoAsync) {
+                // The compute cmd is complete; chunk A's submit sends it (renderScene's O1 split).
+                endCmd(g_live.pCmd);
+                g_live.pCmd = aoGfxCmd;
+                vrsBuildRateImage(rzViewProj);
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pDepth;
+                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
             }
         }
 
@@ -41303,6 +41426,10 @@ void destroyHostWindow(Renderer* R);
         // shared D3D12 fence signalled after the submit below (see ipc/server.cpp renderFrame,
         // tasks/forge-host-gpu-lane.md).
         resetCmdPool(R, g_live.pCmdPool[g_live.recSlot]);
+        // The slot's compute cmd ran before this slot's B2 (B2 waited it), and B2 is under the
+        // slot fence the settle just waited, so its pool is free too.
+        if (g_live.pComputePool[g_live.recSlot]) { resetCmdPool(R, g_live.pComputePool[g_live.recSlot]); }
+        g_aoAsyncFrame = false;
         beginCmd(g_live.pCmd);
         const double tRec0 = hostNowMs();   // start of CPU command recording
         g_lastSetupMs = tCull0 - tEntry;    // hot-reload check + cbuffers + per-draw memcpy loop
@@ -42319,7 +42446,25 @@ void destroyHostWindow(Renderer* R);
             submitA.mCmdCount = 1;
             submitA.ppCmds = &pCmdChunkA;
             submitA.mSubmitDone = true;   // no signal fence — chunk B's fence covers both
+            if (g_aoAsyncFrame) {
+                submitA.ppSignalSemaphores    = &g_live.pSemPreAO;
+                submitA.mSignalSemaphoreCount = 1;
+            }
             frameSubmit(&submitA, /*frameEnd*/false, kGpuPhaseFbCopyA);
+            if (g_aoAsyncFrame) {
+                // The AO chain, on the compute queue, as soon as chunk A (linearize + the FrameBuf
+                // copies that carry the AO cbuffers) is done. Chunk B2 waits pSemAODone.
+                Cmd* cc = g_live.pComputeCmd[g_live.recSlot];
+                QueueSubmitDesc cs = {};
+                cs.mCmdCount = 1;
+                cs.ppCmds = &cc;
+                cs.ppWaitSemaphores = &g_live.pSemPreAO;
+                cs.mWaitSemaphoreCount = 1;
+                cs.ppSignalSemaphores = &g_live.pSemAODone;
+                cs.mSignalSemaphoreCount = 1;
+                cs.mSubmitDone = true;
+                queueSubmit(g_live.pComputeQueue, &cs);
+            }
             tSubmitA = hostNowMs();
             g_live.pCmd = g_live.pCmdB[g_live.recSlot];   // everything below (incl. drawDevUI) records into B
             beginCmd(g_live.pCmd);
@@ -42750,6 +42895,42 @@ void destroyHostWindow(Renderer* R);
         }
 
         gpuPhaseEnd(kGpuPhaseReflect);
+        if (g_aoAsyncFrame) {
+            // ASYNC AO: chunk B (the mirror) ran beside the compute queue's AO. Send it, make the
+            // graphics queue wait the AO, and record the rest of the frame into B2 — whose first act
+            // is to give the shared resources their PS bit back (see passLinearizeAndGtao).
+            endCmd(g_live.pCmd);
+            Cmd* cb = g_live.pCmd;
+            QueueSubmitDesc sb = {};
+            sb.mCmdCount = 1;
+            sb.ppCmds = &cb;
+            sb.mSubmitDone = true;
+            frameSubmit(&sb, /*frameEnd*/false);
+            g_live.pQueue->mDx.pQueue->Wait(g_live.pSemAODone->mDx.pFence, g_live.pSemAODone->mDx.mFenceValue);
+            g_live.pCmd = g_live.pCmdB2[g_live.recSlot];
+            beginCmd(g_live.pCmd);
+            D3D12_RESOURCE_BARRIER rb[6] = {};
+            UINT nrb = 0;
+            auto back = [&](Texture* t) {
+                if (!t) { return; }
+                rb[nrb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                rb[nrb].Transition.pResource   = t->mDx.pResource;
+                rb[nrb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                rb[nrb].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                rb[nrb].Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                               | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                ++nrb;
+            };
+            back(g_live.pLinearDepth);
+            back(g_live.pAO);
+            back(g_live.pAOBlur);
+            if (g_live.aoLastHalf) {
+                back(g_live.pLinearDepthHalf);
+                back(g_live.pAOHalf);
+                back(g_live.pAOBlurHalf);
+            }
+            g_live.pCmd->mDx.pCmdList->ResourceBarrier(nrb, rb);
+        }
         gpuPhaseBegin(kGpuPhaseColor);
         // ===================== COLOUR PASS (early-Z: CMP_EQUAL, no depth write) =====================
         BindRenderTargetsDesc bind = {};
@@ -64874,9 +65055,15 @@ void destroyHostWindow(Renderer* R);
             if (g_live.pFence[s])        { exitFence(R, g_live.pFence[s]); }
             if (g_live.pCmdA[s])         { exitCmd(R, g_live.pCmdA[s]); }
             if (g_live.pCmdB[s])         { exitCmd(R, g_live.pCmdB[s]); }
+            if (g_live.pCmdB2[s])        { exitCmd(R, g_live.pCmdB2[s]); }
+            if (g_live.pComputeCmd[s])   { exitCmd(R, g_live.pComputeCmd[s]); }
+            if (g_live.pComputePool[s])  { exitCmdPool(R, g_live.pComputePool[s]); }
             if (g_live.pCmdPool[s])      { exitCmdPool(R, g_live.pCmdPool[s]); }
             if (g_live.pGpuQueryPool[s]) { exitQueryPool(R, g_live.pGpuQueryPool[s]); }
         }
+        if (g_live.pSemPreAO)     { exitSemaphore(R, g_live.pSemPreAO); }
+        if (g_live.pSemAODone)    { exitSemaphore(R, g_live.pSemAODone); }
+        if (g_live.pComputeQueue) { exitQueue(R, g_live.pComputeQueue); }
         if (g_live.pPipeline) { removePipeline(R, g_live.pPipeline); }
         if (g_live.ntFenceHandle) { CloseHandle(g_live.ntFenceHandle); }
         if (g_live.pSharedFence)  { g_live.pSharedFence->Release(); }
