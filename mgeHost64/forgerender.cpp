@@ -29679,8 +29679,11 @@ namespace {
         // real configuration now, and it is the one an upscaler runs in — an instrument that declined
         // exactly there would be missing from every session it is most wanted in. The sample count
         // only decides whether the landing pad is filled by a resolve or a copy, below.
+        // R11G11B10F (sceneR11G11B10) dumps too: its channels are unsigned floats with half's own 5-bit
+        // exponent and bias, so widening them to half is an exact shift (see below), alpha = 1.
+        const bool dumpR11 = (g_live.sceneColorFormat == TinyImageFormat_B10G11R11_UFLOAT);
         if (!R || !g_live.pRT || !g_live.pSceneColor || !g_live.sceneReferred
-            || g_live.sceneColorFormat != TinyImageFormat_R16G16B16A16_SFLOAT) {
+            || (g_live.sceneColorFormat != TinyImageFormat_R16G16B16A16_SFLOAT && !dumpR11)) {
             LOG::logline("!! [hdrdump] DECLINED — needs a scene-referred build (fp16). "
                          "sceneReferred=%d samples=%u sceneRT=%d fp16=%d",
                          g_live.sceneReferred ? 1 : 0, g_live.sampleCount,
@@ -29718,7 +29721,7 @@ namespace {
             RenderTargetDesc d = {};
             d.mWidth = texW; d.mHeight = texH; d.mDepth = 1; d.mArraySize = 1; d.mMipLevels = 1;
             d.mSampleCount = SAMPLE_COUNT_1;
-            d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            d.mFormat = g_live.sceneColorFormat;   // a resolve cannot convert: same format as the scene
             d.mStartState = RESOURCE_STATE_RENDER_TARGET;
             d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             d.pName = "hdrDumpResolve";
@@ -29762,7 +29765,8 @@ namespace {
                                                      : D3D12_RESOURCE_STATE_COPY_DEST;
             cl->ResourceBarrier(2, pre);
 
-            if (dumpMsaa) { cl->ResolveSubresource(tmpRes, 0, sceneRes, 0, DXGI_FORMAT_R16G16B16A16_FLOAT); }
+            if (dumpMsaa) { cl->ResolveSubresource(tmpRes, 0, sceneRes, 0, dumpR11 ? DXGI_FORMAT_R11G11B10_FLOAT
+                                                                                     : DXGI_FORMAT_R16G16B16A16_FLOAT); }
             else          { cl->CopyResource(tmpRes, sceneRes); }
 
             D3D12_RESOURCE_BARRIER post[2] = {};
@@ -29786,7 +29790,7 @@ namespace {
                                           ? R->pGpu->mUploadBufferTextureAlignment : 1u;
             // Pitches come from the TEXTURE's own width, never the render width — a readback of an
             // alloc-sized target laid out at render-width stride would shear the image.
-            const uint32_t hdrPitch = roundUp(texW * 8u, rowAlign);   // RGBA16F
+            const uint32_t hdrPitch = roundUp(texW * (dumpR11 ? 4u : 8u), rowAlign);   // RGBA16F / R11G11B10F
             const uint32_t ldrPitch = roundUp(g_live.pRT->mWidth * 4u, rowAlign);   // BGRA8
 
             auto makeReadback = [&](uint64_t size) -> Buffer* {
@@ -29847,7 +29851,26 @@ namespace {
                           g_lastApl[0], g_lastApl[1], g_lastApl[2]);
 
             bool exrOK = false, tgaOK = false;
-            if (pHdrRb && pHdrRb->pCpuMappedAddress) {
+            if (pHdrRb && pHdrRb->pCpuMappedAddress && dumpR11) {
+                // Widen R11G11B10F to RGBA16F rows. Each channel is an unsigned float with half's 5-bit
+                // exponent (bias 15): R/G carry a 6-bit mantissa, B a 5-bit one, so placing exponent and
+                // mantissa into half's fields is exact. Alpha (no channel) = 1.0.
+                std::vector<uint16_t> rows((size_t)W * H * 4u);
+                const uint8_t* src = (const uint8_t*)pHdrRb->pCpuMappedAddress;
+                for (uint32_t y = 0; y < H; ++y) {
+                    const uint32_t* in = (const uint32_t*)(src + (size_t)y * hdrPitch);
+                    uint16_t* out = rows.data() + (size_t)y * W * 4u;
+                    for (uint32_t x = 0; x < W; ++x) {
+                        const uint32_t v = in[x];
+                        const uint32_t r = v & 0x7FFu, g = (v >> 11) & 0x7FFu, b = (v >> 22) & 0x3FFu;
+                        out[x * 4 + 0] = (uint16_t)(((r >> 6) << 10) | ((r & 0x3Fu) << 4));
+                        out[x * 4 + 1] = (uint16_t)(((g >> 6) << 10) | ((g & 0x3Fu) << 4));
+                        out[x * 4 + 2] = (uint16_t)(((b >> 5) << 10) | ((b & 0x1Fu) << 5));
+                        out[x * 4 + 3] = 0x3C00u;
+                    }
+                }
+                exrOK = writeExrHalfRGBA(exrPath, W, H, (const uint8_t*)rows.data(), W * 8u, E, state);
+            } else if (pHdrRb && pHdrRb->pCpuMappedAddress) {
                 exrOK = writeExrHalfRGBA(exrPath, W, H,
                                          (const uint8_t*)pHdrRb->pCpuMappedAddress, hdrPitch,
                                          E, state);
