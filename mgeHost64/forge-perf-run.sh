@@ -226,7 +226,11 @@ if [ -n "${MGE_NSYS_OUT:-}" ]; then
     "$ENVSET" "$WINDIR" "$NSYS" "${MGE_NSYS_DELAY:-60}" "${MGE_NSYS_DURATION:-5}" "$MGE_NSYS_OUT" "$WINDIR" "$MGE_NSYS_OUT" > "$NPS"
   powershell.exe -Command "Start-Process powershell -Verb RunAs -WindowStyle Minimized -ArgumentList '-ExecutionPolicy','Bypass','-File','$(wslpath -w "$NPS")'" >/dev/null 2>&1
 else
-powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle Minimized" >/dev/null 2>&1
+# MGE_HARNESS_SHOW=1: launch with a NORMAL window instead (steals focus). Needed whenever the run
+# measures a PRESENT path: a minimized window's presents are occluded/throttled by DWM, so a
+# host-owned present (hostPresent=1) measures the compositor, not the renderer.
+WSTYLE=Minimized; [ "${MGE_HARNESS_SHOW:-0}" = 1 ] && WSTYLE=Normal
+powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle $WSTYLE" >/dev/null 2>&1
 fi
 
 # A watcher for Morrowind's NATIVE warning boxes (Win32 #32770), kept as cheap insurance.

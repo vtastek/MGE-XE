@@ -76,6 +76,7 @@
 #include "upscale.h"
 
 #include "OS/Interfaces/IOperatingSystem.h"
+#include <tlhelp32.h>   // hostPresent: the parent process (Morrowind) -> its window
 #include "Utilities/Interfaces/IFileSystem.h"
 #include "Utilities/Log/Log.h"
 #include "Graphics/GraphicsConfig.h"
@@ -2171,6 +2172,15 @@ namespace {
     // ⚠ OPT-IN and OFF by default: it costs a window, a swapchain, and one extra submit+present per
     // frame, for a feature only a dev with an injected overlay wants.
     bool         g_hostWindow = false;
+    // HOST-OWNED PRESENT (tasks/forge-host-ui.md P2, spike; init-time, default OFF). The same window
+    // + swapchain machinery, but the window is a CHILD of Morrowind's (WS_DISABLED, so mouse input
+    // falls through to MW) covering its client area, and each host frame COPIES the delivered pRT
+    // into it instead of clearing — the browser-GPU-process pattern. Pair with the client's
+    // MGE_SEAM_PROBE=7 (no copy / composite / UI / Present) to measure a frame the client issues no
+    // GPU work for, with the picture actually on screen. No UI yet: that is P1.
+    bool         g_hostPresent = false;
+    HWND         g_mwHwnd = nullptr;
+    bool         g_hostPresentTried = false;   // the lazy swapchain create ran (success or not)
     // Run the full alpha classification beside the sampled one and log disagreements (classifyAlpha).
     bool         g_texClassifyVerify = false;
     // Async texture stream: fail every Nth streamed entry on purpose (0 = never), so the client's
@@ -19871,7 +19881,12 @@ namespace {
     // "R11G11B10F"). Half the colour bandwidth of every scene pass + both MSAA resolves. It has NO alpha
     // channel (reads 1.0), so the scene's coverage alpha is gone with it. Init-time (formats are baked
     // into the PSOs), so env / replay only for now.
-    bool     g_sceneR11G11B10 = false;
+    // DEFAULT ON 2026-10-08: live MATCHED A/B, 2 rounds x 3 saves, p50 ms fp16 -> R11: Ascadian
+    // 4.35/4.12 -> 3.91/3.81, BC55 2.68/2.99 -> 2.58/2.79, docks 4.20/3.80 -> 3.78/3.57 (6/6 pairs).
+    // Final-frame shots: exteriors inside their noise pairs (the GPU TRUNCATES into 11/11/10 — blue
+    // mean -1.6%, R/G -0.6% in the EXR); Balmora guild interior max 2 levels, 0% > 8.
+    // sceneR11G11B10=0 restores fp16.
+    bool     g_sceneR11G11B10 = true;
 
     // STEP 5 — THE LINEAR MIGRATION. tasks/forge-postprocess.md.
     //
@@ -23905,6 +23920,8 @@ namespace {
             // are created at all), which is why it is here and has no panel checkbox — the panel it
             // would live on is drawn into the game's frame, not this window.
             { "hostWindow",          &g_hostWindow          },
+            // Host-owned present into a child of MW's window (spike; READ AT INIT, like hostWindow).
+            { "hostPresent",         &g_hostPresent         },
             // The oracle for the sampled DDS alpha classification: full scan beside it, mismatches
             // logged as `!! [classify]`, a running tally every 256 as `-- [classify] verify:`.
             { "texClassifyVerify",   &g_texClassifyVerify   },
@@ -30576,8 +30593,51 @@ void destroyHostWindow(Renderer* R);
     // A window belongs to the thread that CREATED it — messages are delivered to that thread's
     // queue — so decoupling the pump means creating the window here too. Presenting its swapchain
     // from the render thread is unaffected: DXGI has no such affinity.
+    // Morrowind's window: the visible, unowned top-level window of the process that spawned us.
+    DWORD parentProcessId() {
+        const DWORD me = GetCurrentProcessId();
+        DWORD parent = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) { return 0; }
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+            if (pe.th32ProcessID == me) { parent = pe.th32ParentProcessID; break; }
+        }
+        CloseHandle(snap);
+        return parent;
+    }
+    HWND findMwWindow(DWORD pid) {
+        struct Ctx { DWORD pid; HWND found; } ctx = { pid, nullptr };
+        EnumWindows([](HWND h, LPARAM l) -> BOOL {
+            Ctx* c = reinterpret_cast<Ctx*>(l);
+            DWORD p = 0;
+            GetWindowThreadProcessId(h, &p);
+            if (p != c->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER)) { return TRUE; }
+            c->found = h;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.found;
+    }
+
     void hostWindowThreadMain() {
         g_hostWndThreadId = GetCurrentThreadId();
+        if (g_hostPresent) {
+            // Match MW's DPI handling: a child window lives in its parent's client coordinates, and
+            // a DPI-virtualised host would read (and size against) a scaled rect.
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            const DWORD pid = parentProcessId();
+            // The client spawns us around device creation; its window can lag that by a moment.
+            for (int i = 0; i < 600 && pid && !g_mwHwnd; ++i) {
+                g_mwHwnd = findMwWindow(pid);
+                if (!g_mwHwnd) { Sleep(100); }
+            }
+            if (!g_mwHwnd) {
+                g_hostWndCreateError = ERROR_NOT_FOUND;
+                g_hostWndCreated.store(true, std::memory_order_release);
+                return;
+            }
+        }
 
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
@@ -30589,6 +30649,25 @@ void destroyHostWindow(Renderer* R);
         wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
         wc.lpszClassName = L"mgeHost64Overlay";
         RegisterClassExW(&wc);   // ERROR_CLASS_ALREADY_EXISTS on a re-init is fine and expected
+        if (g_hostPresent) {
+            // ⚠ WS_DISABLED is what keeps MW's input: a disabled child's mouse messages go to its
+            // parent, and it can never take keyboard focus. MW reads DirectInput anyway.
+            RECT cr = {};
+            GetClientRect(g_mwHwnd, &cr);
+            g_hostHwnd = CreateWindowExW(WS_EX_NOPARENTNOTIFY, wc.lpszClassName, L"MGE XE host present",
+                                         WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS,
+                                         0, 0, cr.right - cr.left, cr.bottom - cr.top,
+                                         g_mwHwnd, nullptr, wc.hInstance, nullptr);
+            if (!g_hostHwnd) { g_hostWndCreateError = GetLastError(); }
+            g_hostWndCreated.store(true, std::memory_order_release);
+            if (!g_hostHwnd) { return; }
+            MSG m;
+            while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            return;
+        }
         RECT r = { 0, 0, (LONG)kHostWindowW, (LONG)kHostWindowH };
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         g_hostHwnd = CreateWindowExW(0, wc.lpszClassName,
@@ -30623,11 +30702,17 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
+    bool initHostWindowSwapchain(Renderer* R, uint32_t w, uint32_t h);
+
     void createHostWindow(Renderer* R) {
+        if (g_hostPresent) { g_hostWindow = true; }
         if (!g_hostWindow || !R || !g_live.pQueue) { return; }
 
         g_hostWndCreated.store(false, std::memory_order_relaxed);
         g_hostWndThread = std::thread(hostWindowThreadMain);
+        // Host present: MW's window may not exist yet, so the thread searches for it and the
+        // swapchain is made by the first presentHostWindow that finds the child window up.
+        if (g_hostPresent) { return; }
         // Bounded wait: the swapchain below needs the HWND, and a window thread that never reports
         // must not hang host startup. 2s is far beyond a CreateWindowExW that is going to succeed.
         for (int i = 0; i < 1000 && !g_hostWndCreated.load(std::memory_order_acquire); ++i) {
@@ -30640,15 +30725,18 @@ void destroyHostWindow(Renderer* R);
             if (g_hostWndThread.joinable()) { g_hostWndThread.join(); }
             return;
         }
+        initHostWindowSwapchain(R, kHostWindowW, kHostWindowH);
+    }
 
+    bool initHostWindowSwapchain(Renderer* R, uint32_t w, uint32_t h) {
         SwapChainDesc sd = {};
         sd.mWindowHandle.type = WINDOW_HANDLE_TYPE_WIN32;
         sd.mWindowHandle.window = g_hostHwnd;
         sd.ppPresentQueues = &g_live.pQueue;
         sd.mPresentQueueCount = 1;
         sd.mImageCount = 2;
-        sd.mWidth = kHostWindowW;
-        sd.mHeight = kHostWindowH;
+        sd.mWidth = w;
+        sd.mHeight = h;
         sd.mColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
         sd.mColorClearValue = { { 0.05f, 0.06f, 0.08f, 1.0f } };
         // ⚠ VSYNC OFF. This swapchain is presented once per HOST frame, so vsync here would pace the
@@ -30660,7 +30748,7 @@ void destroyHostWindow(Renderer* R);
             LOG::logline("!! [hostwnd] addSwapChain FAILED — the window exists but ReShade gets no "
                          "runtime, so its overlay stays absent");
             LOG::flush();
-            return;
+            return false;
         }
         // Its own pool/cmd/fence: the frame's primary command list is in flight when this records,
         // and a shared allocator cannot be reset under a submission it already fed (the same reason
@@ -30697,13 +30785,13 @@ void destroyHostWindow(Renderer* R);
                      "Ctrl+Alt+Insert to bring it forward, THEN the overlay's own key (HOME for "
                      "ReShade, INSERT for OptiScaler).",
                      g_hostWindowReady ? "ready" : "PARTIAL (present will be skipped)",
-                     kHostWindowW, kHostWindowH, (void*)g_hostHwnd,
+                     w, h, (void*)g_hostHwnd,
                      (unsigned long)g_hostWndThreadId,
                      g_hostWndHotkey ? "REGISTERED"
                                      : "FAILED to register (already taken by another process)");
         LOG::flush();
-        std::printf("[forge][hostwnd] %s %ux%u\n", g_hostWindowReady ? "ready" : "PARTIAL",
-                    kHostWindowW, kHostWindowH);
+        std::printf("[forge][hostwnd] %s %ux%u\n", g_hostWindowReady ? "ready" : "PARTIAL", w, h);
+        return g_hostWindowReady;
     }
 
     // ─── THE OVERLAY WINDOW: PRESENT, ONCE PER HOST FRAME ────────────────────────────────────────
@@ -30711,6 +30799,19 @@ void destroyHostWindow(Renderer* R);
     // the window's own thread (hostWindowThreadMain), because a queue drained only while the client
     // is feeding frames is a queue that stops exactly when the window is asked for input.
     void presentHostWindow() {
+        if (g_hostPresent && !g_hostPresentTried && g_hostWndCreated.load(std::memory_order_acquire)
+            && g_live.pRT) {
+            g_hostPresentTried = true;
+            RECT cr = {};
+            if (g_mwHwnd) { GetClientRect(g_mwHwnd, &cr); }
+            LOG::logline(">> [hostpresent] MW hwnd=%p client %ldx%ld, child=%p (error %lu), pRT %ux%u fmt %u",
+                         (void*)g_mwHwnd, cr.right - cr.left, cr.bottom - cr.top, (void*)g_hostHwnd,
+                         (unsigned long)g_hostWndCreateError, g_live.pRT->mWidth, g_live.pRT->mHeight,
+                         (unsigned)g_live.pRT->mFormat);
+            if (g_hostHwnd) {
+                initHostWindowSwapchain(g_live.pRenderer, g_live.pRT->mWidth, g_live.pRT->mHeight);
+            }
+        }
         if (!g_hostWindowReady || !g_pHostSwapChain) { return; }
         Renderer* R = g_live.pRenderer;
         const uint32_t s = g_hostWndSlot;
@@ -30740,21 +30841,34 @@ void destroyHostWindow(Renderer* R);
         beginCmd(cmd);
         RenderTargetBarrier b = {};
         b.pRenderTarget = rt;
-        b.mCurrentState = RESOURCE_STATE_PRESENT;
-        b.mNewState     = RESOURCE_STATE_RENDER_TARGET;
-        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
-        // A clear and nothing else. ReShade's overlay is drawn by ReShade, in its Present hook,
-        // on top of whatever this leaves — so the host does not need to render anything at all
-        // for the UI to appear. A flat field is also the honest picture: this window is not
-        // showing the game.
-        BindRenderTargetsDesc bind = {};
-        bind.mRenderTargetCount = 1;
-        bind.mRenderTargets[0] = { rt, LOAD_ACTION_CLEAR };
-        cmdBindRenderTargets(cmd, &bind);
-        cmdBindRenderTargets(cmd, nullptr);
-        b.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-        b.mNewState     = RESOURCE_STATE_PRESENT;
-        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
+        if (g_hostPresent && g_live.pRT) {
+            // The delivered frame (pRT rests in COMMON between frames) copied 1:1 into the back
+            // buffer. Same size by construction (the swapchain was made at pRT's size).
+            RenderTargetBarrier cb[2] = {};
+            cb[0].pRenderTarget = rt;        cb[0].mCurrentState = RESOURCE_STATE_PRESENT; cb[0].mNewState = RESOURCE_STATE_COPY_DEST;
+            cb[1].pRenderTarget = g_live.pRT; cb[1].mCurrentState = RESOURCE_STATE_COMMON;  cb[1].mNewState = RESOURCE_STATE_COPY_SOURCE;
+            cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 2, cb);
+            cmd->mDx.pCmdList->CopyResource(rt->pTexture->mDx.pResource, g_live.pRT->pTexture->mDx.pResource);
+            cb[0].mCurrentState = RESOURCE_STATE_COPY_DEST;   cb[0].mNewState = RESOURCE_STATE_PRESENT;
+            cb[1].mCurrentState = RESOURCE_STATE_COPY_SOURCE; cb[1].mNewState = RESOURCE_STATE_COMMON;
+            cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 2, cb);
+        } else {
+            b.mCurrentState = RESOURCE_STATE_PRESENT;
+            b.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
+            // A clear and nothing else. ReShade's overlay is drawn by ReShade, in its Present hook,
+            // on top of whatever this leaves — so the host does not need to render anything at all
+            // for the UI to appear. A flat field is also the honest picture: this window is not
+            // showing the game.
+            BindRenderTargetsDesc bind = {};
+            bind.mRenderTargetCount = 1;
+            bind.mRenderTargets[0] = { rt, LOAD_ACTION_CLEAR };
+            cmdBindRenderTargets(cmd, &bind);
+            cmdBindRenderTargets(cmd, nullptr);
+            b.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            b.mNewState     = RESOURCE_STATE_PRESENT;
+            cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
+        }
         endCmd(cmd);
 
         QueueSubmitDesc sub = {};
