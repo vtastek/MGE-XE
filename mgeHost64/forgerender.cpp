@@ -460,6 +460,7 @@ extern "C" void uiSetExternalInput(float x, float y, float wheel, bool l, bool r
 // write is then always safe; the cost is visible (the overlap lost on that frame) and attributable.
 // At depth 1 nothing is ever in flight at a write, so the guard is a pair of fence reads.
 namespace ForgeRender { void descWriteGuard(int line); }
+namespace ForgeRender { void aplBindSwapchainSets(Renderer* R); }   // hostZeroCopy
 #define updateDescriptorSet(R_, i_, set_, n_, d_) \
     (ForgeRender::descWriteGuard(__LINE__), ::updateDescriptorSet((R_), (i_), (set_), (n_), (d_)))
 
@@ -2184,6 +2185,17 @@ namespace {
     // Vulkan swapchain on (the client must not present: MGE_SEAM_PROBE=7). Child = independent-flip
     // black (G-Sync off), so this is the remaining single-swapchain shape.
     bool         g_hostPresentDirect = false;
+    // hostZeroCopy (with hostPresent + hostPresentDirect): the frame RESOLVES into the swapchain image
+    // it will present, instead of into pRT followed by a full-screen CopyResource on present — the
+    // copy G7 never pays, 16 MB of read + 16 MB of write at 2560x1600. beginFrameSlot acquires the
+    // image and points pRT / pSharedRes at it for the frame (PRESENT is COMMON, so the resolve's own
+    // COMMON <-> RENDER_TARGET walk applies unchanged); APL reads it through its own set instances
+    // (kFrameSlots + image). Frames with a dump near are left on pRT, which the dump reads later.
+    bool         g_hostZeroCopy = true;
+    bool         g_hostZcFrame = false;      // this frame records into swapchain image g_hostZcIdx
+    uint32_t     g_hostZcIdx = 0;
+    bool         g_hostZcSetsReady = false;  // the APL set instances for the swapchain images exist
+    uint32_t     g_aplSetIdx = 0;            // the APL instance the dispatch binds this frame
     // HOST-DRAWN UI (tasks/forge-host-ui.md P1): the client's captured UI list for this frame (a view
     // into IPC shared memory, valid for the duration of renderScene) and the one pipeline that draws
     // it into pRT after the resolve. Built on first use.
@@ -15142,7 +15154,7 @@ namespace {
                 }
                 if (g_live.pAplPipeline) {
                     // One instance per frame slot: gAplColor is the slot's shared RT (P3).
-                    DescriptorSetDesc aset = SRT_SET_DESC(AplSrtData, PerBatch, kFrameSlots, 0);
+                    DescriptorSetDesc aset = SRT_SET_DESC(AplSrtData, PerBatch, kFrameSlots + kHostWndRing, 0);   // + hostZeroCopy images
                     addDescriptorSet(R, &aset, &g_live.pAplSet);
 
                     BufferLoadDesc acb = {};
@@ -15595,6 +15607,7 @@ namespace {
                 d[3].ppBuffers = &g_live.pAplOut;
                 updateDescriptorSet(R, s, g_live.pAplSet, 4, d);
                 }
+                ForgeRender::aplBindSwapchainSets(R);   // hostZeroCopy instances, if a swapchain already exists
             }
             // ─── MB-2: THE MOTION BLUR FILTER (tasks/forge-postprocess.md) ───────────────────────
             // Built HERE, immediately BEFORE the resolve's set instances, and the ordering is forced
@@ -23995,6 +24008,7 @@ namespace {
             // Host-owned present into a child of MW's window (spike; READ AT INIT, like hostWindow).
             { "hostPresent",         &g_hostPresent         },
             { "hostPresentDirect",   &g_hostPresentDirect   },
+            { "hostZeroCopy",        &g_hostZeroCopy        },
             // The pyramid build itself (mip-0 fill + reduce). hizOff only stops the TEST; this stops the
             // work, so it prices what occlusion costs where it removes nothing (docks, top-down).
             { "hizPrologue",        &g_hizPrologue        },
@@ -30915,6 +30929,34 @@ void destroyHostWindow(Renderer* R);
         initHostWindowSwapchain(R, kHostWindowW, kHostWindowH);
     }
 
+    // hostZeroCopy: APL instances kFrameSlots + i read swapchain image i (same other bindings). Called
+    // when the swapchain is made AND wherever the APL set is (re)filled: a target rebuild after the
+    // swapchain exists recreates the set with only the slot instances, and an empty instance reads
+    // ZERO — the exposure servo then runs to its rail and the frame goes white.
+    void aplBindSwapchainSets(Renderer* R) {
+        g_hostZcSetsReady = false;
+        if (!g_pHostSwapChain || !g_live.pAplSet || !g_live.pAplOut || !g_live.pAplParamsCbv || !g_live.pLinearDepth
+            || g_pHostSwapChain->mImageCount > kHostWndRing) {
+            return;
+        }
+        for (uint32_t i = 0; i < g_pHostSwapChain->mImageCount; ++i) {
+            Texture* src = g_pHostSwapChain->ppRenderTargets[i]->pTexture;
+            DescriptorData d[4] = {};
+            d[0].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplParams);
+            d[0].ppBuffers = &g_live.pAplParamsCbv;
+            d[1].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplColor);
+            d[1].mCount    = 1;
+            d[1].ppTextures = &src;
+            d[2].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplDepth);
+            d[2].mCount    = 1;
+            d[2].ppTextures = &g_live.pLinearDepth;
+            d[3].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplOut);
+            d[3].ppBuffers = &g_live.pAplOut;
+            updateDescriptorSet(R, kFrameSlots + i, g_live.pAplSet, 4, d);
+        }
+        g_hostZcSetsReady = true;
+    }
+
     bool initHostWindowSwapchain(Renderer* R, uint32_t w, uint32_t h) {
         SwapChainDesc sd = {};
         sd.mWindowHandle.type = WINDOW_HANDLE_TYPE_WIN32;
@@ -30937,6 +30979,7 @@ void destroyHostWindow(Renderer* R);
             LOG::flush();
             return false;
         }
+        aplBindSwapchainSets(R);
         // Its own pool/cmd/fence: the frame's primary command list is in flight when this records,
         // and a shared allocator cannot be reset under a submission it already fed (the same reason
         // pAuxCmdPool exists).
@@ -31000,6 +31043,16 @@ void destroyHostWindow(Renderer* R);
             }
         }
         if (!g_hostWindowReady || !g_pHostSwapChain) { return; }
+        if (g_hostZcFrame) {
+            // The frame already resolved into this image and left it in PRESENT (= COMMON).
+            g_hostZcFrame = false;
+            QueuePresentDesc zp = {};
+            zp.pSwapChain = g_pHostSwapChain;
+            zp.mIndex = (uint8_t)g_hostZcIdx;
+            zp.mSubmitDone = true;
+            queuePresent(g_live.pQueue, &zp);
+            return;
+        }
         Renderer* R = g_live.pRenderer;
         const uint32_t s = g_hostWndSlot;
         g_hostWndSlot = (g_hostWndSlot + 1u) % kHostWndRing;
@@ -31075,6 +31128,8 @@ void destroyHostWindow(Renderer* R);
     }
 
     void destroyHostWindow(Renderer* R) {
+        g_hostZcSetsReady = false;   // the APL instances name images that are about to go
+        g_hostZcFrame = false;
         // ⚠ EVERY RING SLOT MAY STILL BE IN FLIGHT now that the present no longer waits, so drain
         // the ones that were submitted before freeing anything they reference.
         for (uint32_t i = 0; i < kHostWndRing; ++i) {
@@ -33317,6 +33372,32 @@ void destroyHostWindow(Renderer* R);
         return true;
     }
 
+    // hostZeroCopy: point this frame's delivery target at the swapchain image it will present.
+    void hostZeroCopyAcquire() {
+        g_hostZcFrame = false;
+        if (!(g_hostPresent && g_hostPresentDirect && g_hostZeroCopy) || !g_hostWindowReady || !g_pHostSwapChain
+            || !g_hostZcSetsReady || !g_live.pRT) {
+            return;
+        }
+        if (g_hdrDumpArmed || g_dumpBurstLeft > 0u
+            || (g_dumpAtFrame > 0.0f && (float)g_renderFrame + 4.0f >= g_dumpAtFrame)) {
+            return;   // the dump reads pRT after the frame retires; a swapchain image is reused by then
+        }
+        uint32_t idx = UINT32_MAX;
+        acquireNextImage(g_live.pRenderer, g_pHostSwapChain, nullptr, nullptr, &idx);
+        if (idx >= g_pHostSwapChain->mImageCount || idx >= kHostWndRing) { return; }
+        RenderTarget* rt = g_pHostSwapChain->ppRenderTargets[idx];
+        if (!rt || rt->mWidth != g_live.pRT->mWidth || rt->mHeight != g_live.pRT->mHeight
+            || rt->mFormat != g_live.pRT->mFormat) {
+            return;
+        }
+        g_live.pRT        = rt;
+        g_live.pSharedRes = rt->pTexture->mDx.pResource;
+        g_hostZcIdx       = idx;
+        g_hostZcFrame     = true;
+        g_aplSetIdx       = kFrameSlots + idx;
+    }
+
     // Top of renderScene: take the slot frame F (= g_frameSerial + 1) records into. Its previous
     // frame, F-2, must have retired before the pool, lists and lanes are reused — the only wait on
     // the frame path. Frame F-1, in the other slot, is drained too if it has already finished, so
@@ -33337,6 +33418,8 @@ void destroyHostWindow(Renderer* R);
         g_live.pRT         = g_live.pRTs[s];
         g_live.pSharedRes  = g_live.pSharedResS[s];
         g_live.hFrameEvent = g_live.hFrameEvents[s];
+        g_aplSetIdx        = s;
+        hostZeroCopyAcquire();
     }
 
     // Every frame retired and drained, oldest first. For the between-frames paths that use the
@@ -46584,7 +46667,7 @@ void destroyHostWindow(Renderer* R);
                 gpuPhaseBegin(kGpuPhaseApl);
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "APL (delivered colour -> mean RGB + log luma)");
                 cmdBindPipeline(g_live.pCmd, g_live.pAplPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, g_live.recSlot, g_live.pAplSet);   // slot's RT
+                cmdBindDescriptorSet(g_live.pCmd, g_aplSetIdx, g_live.pAplSet);   // slot's RT, or the swapchain image (hostZeroCopy)
                 cmdDispatch(g_live.pCmd, 1, 1, 1);   // ONE group by design — see apl.comp.fsl
                 cmdEndDebugMarker(g_live.pCmd);
 
