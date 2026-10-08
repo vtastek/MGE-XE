@@ -8498,6 +8498,9 @@ namespace {
     float    g_terrainPatchRung  = 0.0f;
     // Per-patch frustum cull inside a patched cell (knob terrainPatchCull). Image-identical; 0 = A/B.
     bool     g_terrainPatchCull  = true;
+    // Vertex-cache order for the terrain templates (meshopt). Image-identical; 0 = the old row order.
+    // Read once, when the templates are built at startup.
+    bool     g_terrainVcacheOpt  = true;
     uint32_t g_lastTerrainPatchCulled = 0;   // patches skipped this frame, all views
     // Scale on the LOD ladder's distances (kTerrainLodDist). 1.0 = the original ladder: base 128-u
     // lattice out to 3 cells, then a rung per doubling. MEASURED against G7 v0.20.3 (a shipped release,
@@ -24041,6 +24044,7 @@ namespace {
             { "hizLinFused",         &g_hizLinFused         },
             { "waterDepthDirect",    &g_waterDepthDirect    },
             { "terrainPatchCull",    &g_terrainPatchCull    },
+            { "terrainVcacheOpt",    &g_terrainVcacheOpt    },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
             { "cullSurvivorList",    &g_cullSurvivorList    },
@@ -51520,6 +51524,18 @@ void destroyHostWindow(Renderer* R);
                 }
             }
             rg.indexCount = (uint32_t)indices.size() - rg.firstIndex;
+            // ⚠ ROW-MAJOR ORDER DEFEATS THE POST-TRANSFORM CACHE. A row of quads reuses the previous
+            // row's vertices only after n+1 others have gone through, which for n = 64 is far past
+            // any vertex cache, so nearly every vertex was shaded twice — PIX on the docks: 362k VS
+            // invocations for the ~173k distinct vertices of 41 fine patches, under a vertex shader
+            // heavy enough (carve + four-square blend + normals) that it IS the patches' cost. The
+            // reorder keeps the same triangles with the same winding (each triangle's indices stay
+            // in order), so the raster output is identical; only the order they are issued in moves.
+            if (g_terrainVcacheOpt && rg.indexCount >= 3u) {
+                std::vector<uint32_t> src(indices.begin() + rg.firstIndex, indices.end());
+                meshopt_optimizeVertexCache(&indices[rg.firstIndex], src.data(), src.size(),
+                                            (size_t)(n + 1) * (size_t)(n + 1));
+            }
           }
         }
 
