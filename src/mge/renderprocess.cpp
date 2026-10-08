@@ -1089,7 +1089,7 @@ namespace {
     std::vector<IPC::UiVertexWire> g_uiIn, g_uiReady;
     std::vector<std::uint16_t>     g_uiInIdx, g_uiReadyIdx;
     std::optional<IPC::VecView<IPC::GeomChunk>> g_uiVec;
-    struct UiTex { std::uint32_t slot; std::string name; };
+    struct UiTex { std::uint32_t slot; std::string name; std::uint32_t serial; };   // serial: proxyTexWriteSerial at upload
     std::unordered_map<IDirect3DTexture9*, UiTex> g_uiTex;
     std::uint32_t g_uiTexSerial = 0, g_uiRejects = 0;
     // At the kick: the UI MW drew last frame goes out with this frame's world.
@@ -9915,8 +9915,18 @@ namespace RenderProcess {
             // HUD drew WHITE). A slot that no longer carries our name was evicted or recycled anyway
             // (a purge, an LRU wrap): forget it and stage the texture again below.
             const UiTex& u = it->second;
-            if (!u.slot) { return 0; }
-            {
+            // Morrowind wrote it since the snapshot (the local map is redrawn as the player walks):
+            // read it again under a new name. The old slot ages out through the LRU like any other.
+            const bool fresh = proxyTexWriteSerial(tex) == u.serial;
+            if (!u.slot && fresh) { return 0; }
+            if (!fresh) {
+                static std::uint32_t s_reread = 0;
+                if (s_reread++ < 32) {
+                    LOG::logline(">> [hostui-tex] %p rewritten (serial %u -> %u): re-read", (void*)tex, u.serial,
+                                 proxyTexWriteSerial(tex));
+                }
+            }
+            if (fresh) {
                 std::lock_guard<std::mutex> lk(g_texResidencyMx);
                 if (u.slot < g_slotName.size() && g_slotName[u.slot] == u.name) {
                     g_slotLastUsed[u.slot] = g_frame;
@@ -9934,6 +9944,7 @@ namespace RenderProcess {
         D3DSURFACE_DESC d = {};
         tex->GetLevelDesc(0, &d);
         std::uint32_t slot = 0;
+        const std::uint32_t serial = proxyTexWriteSerial(tex);
         std::vector<std::uint8_t> dds;
         std::string staged;
         if (!(d.Usage & D3DUSAGE_RENDERTARGET) && buildUiDds(tex, dds)) {
@@ -9953,7 +9964,21 @@ namespace RenderProcess {
                          (void*)tex, d.Width, d.Height, (unsigned)d.Format, (unsigned)d.Usage, (unsigned)d.Pool);
         }
         tex->AddRef();
-        g_uiTex.emplace(tex, UiTex{ slot, std::move(staged) });
+        {
+            static std::uint32_t s_texDiag = 0;
+            static const bool s_dumpTex = [] { char v[4] = {}; return GetEnvironmentVariableA("MGE_HOSTUI_DUMPTEX", v, sizeof(v)) > 0 && v[0] == '1'; }();
+            if (s_dumpTex && slot && !dds.empty()) {   // diagnostic: the exact DDS the host was given
+                char path[160];
+                std::snprintf(path, sizeof(path), "C:\\mgem\\agentscratch\\uitex\\%u_%ux%u.dds", slot, d.Width, d.Height);
+                if (FILE* f = std::fopen(path, "wb")) { std::fwrite(dds.data(), 1, dds.size(), f); std::fclose(f); }
+            }
+            if (s_texDiag++ < 400) {
+                LOG::logline(">> [hostui-tex] %p %ux%u fmt=0x%X usage=0x%X pool=%u serial=%u -> slot %u",
+                             (void*)tex, d.Width, d.Height, (unsigned)d.Format, (unsigned)d.Usage, (unsigned)d.Pool,
+                             serial, slot);
+            }
+        }
+        g_uiTex.emplace(tex, UiTex{ slot, std::move(staged), serial });
         return slot;
     }
 
@@ -10030,13 +10055,17 @@ namespace RenderProcess {
             if (rs->useLighting) {
                 const float vr = ((vc >> 16) & 255u) / 255.0f, vg = ((vc >> 8) & 255u) / 255.0f, vb = (vc & 255u) / 255.0f,
                             va = (vc >> 24) / 255.0f;
-                const bool difV = hasCol && rs->matSrcDiffuse == D3DMCS_COLOR1;
-                const bool emiV = hasCol && rs->matSrcEmissive == D3DMCS_COLOR1;
+                // A material source names the vertex colour only when D3DRS_COLORVERTEX is on.
+                const bool cv   = hasCol && rs->colorVertex;
+                const bool difV = cv && rs->matSrcDiffuse == D3DMCS_COLOR1;
+                const bool emiV = cv && rs->matSrcEmissive == D3DMCS_COLOR1;
+                const bool ambV = cv && rs->matSrcAmbient == D3DMCS_COLOR1;
                 const float dr = difV ? vr : m.diffuse.r, dg = difV ? vg : m.diffuse.g, db = difV ? vb : m.diffuse.b,
                             da = difV ? va : m.diffuse.a;
-                float r = (emiV ? vr : m.emissive.r) + m.ambient.r * lrs->deviceAmbient.r;
-                float g = (emiV ? vg : m.emissive.g) + m.ambient.g * lrs->deviceAmbient.g;
-                float b = (emiV ? vb : m.emissive.b) + m.ambient.b * lrs->deviceAmbient.b;
+                const float ar = ambV ? vr : m.ambient.r, ag = ambV ? vg : m.ambient.g, ab = ambV ? vb : m.ambient.b;
+                float r = (emiV ? vr : m.emissive.r) + ar * lrs->deviceAmbient.r;
+                float g = (emiV ? vg : m.emissive.g) + ag * lrs->deviceAmbient.g;
+                float b = (emiV ? vb : m.emissive.b) + ab * lrs->deviceAmbient.b;
                 if (hasNorm && !lrs->active.empty()) {
                     D3DXVECTOR3 n(((const float*)(v + normOff))[0], ((const float*)(v + normOff))[1], ((const float*)(v + normOff))[2]);
                     D3DXVec3TransformNormal(&n, &n, &world);
@@ -10050,7 +10079,7 @@ namespace RenderProcess {
                         D3DXVECTOR3 ld; float att = 1.0f;
                         if (L.type == D3DLIGHT_DIRECTIONAL) {
                             ld = -*(const D3DXVECTOR3*)&L.position;
-                            r += m.ambient.r * L.ambient.x; g += m.ambient.g * L.ambient.y; b += m.ambient.b * L.ambient.z;
+                            r += ar * L.ambient.x; g += ag * L.ambient.y; b += ab * L.ambient.z;
                         } else {
                             ld = *(const D3DXVECTOR3*)&L.position - wp;
                             const float dist = D3DXVec3Length(&ld);
@@ -10078,10 +10107,11 @@ namespace RenderProcess {
             if (s_diag < 24 && rs->vertCount > 0) {
                 ++s_diag;
                 const IPC::UiVertexWire& o0 = g_uiIn[vBase];
-                LOG::logline(">> [hostui-diag] slot=%u mode=0x%08X lit=%u srcD=%u srcE=%u fvf=0x%X matD=(%.2f,%.2f,%.2f,%.2f) "
+                LOG::logline(">> [hostui-diag] slot=%u mode=0x%08X lit=%u srcD=%u srcE=%u srcA=%u cv=%u fvf=0x%X matD=(%.2f,%.2f,%.2f,%.2f) "
                              "matA=(%.2f,%.2f,%.2f) matE=(%.2f,%.2f,%.2f) amb=(%.2f,%.2f,%.2f) lights=%zu ops=%u/%u args=%u,%u "
                              "v0 clip=(%.3f,%.3f,%.3f,%.3f) col=0x%08X uv=(%.3f,%.3f)",
                              slot, mode, (unsigned)rs->useLighting, (unsigned)rs->matSrcDiffuse, (unsigned)rs->matSrcEmissive,
+                             (unsigned)rs->matSrcAmbient, (unsigned)rs->colorVertex,
                              (unsigned)rs->fvf, m.diffuse.r, m.diffuse.g, m.diffuse.b, m.diffuse.a,
                              m.ambient.r, m.ambient.g, m.ambient.b, m.emissive.r, m.emissive.g, m.emissive.b,
                              lrs->deviceAmbient.r, lrs->deviceAmbient.g, lrs->deviceAmbient.b, lrs->active.size(),

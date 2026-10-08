@@ -421,6 +421,8 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
 
     rs.matSrcDiffuse = D3DMCS_COLOR1;
     rs.matSrcEmissive = D3DMCS_MATERIAL;
+    rs.matSrcAmbient = D3DMCS_MATERIAL;   // the D3D defaults
+    rs.colorVertex = TRUE;
 
     memset(&frs, 0, sizeof(frs));
     for (FragmentState::Stage* s = &frs.stage[0]; s != &frs.stage[8]; ++s) {
@@ -1382,6 +1384,12 @@ void captureRenderState(D3DRENDERSTATETYPE a, DWORD b) {
         break;
     case D3DRS_DIFFUSEMATERIALSOURCE:
         rs.matSrcDiffuse = (BYTE)b;
+        break;
+    case D3DRS_AMBIENTMATERIALSOURCE:
+        rs.matSrcAmbient = (BYTE)b;
+        break;
+    case D3DRS_COLORVERTEX:
+        rs.colorVertex = (BYTE)b;
         break;
     case D3DRS_EMISSIVEMATERIALSOURCE:
         rs.matSrcEmissive = (BYTE)b;

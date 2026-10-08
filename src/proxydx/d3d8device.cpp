@@ -295,6 +295,13 @@ HRESULT _stdcall ProxyDevice::CreateImageSurface(UINT a, UINT b, D3DFORMAT c, ID
 HRESULT _stdcall ProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, UINT c, IDirect3DSurface8* d, const POINT* e) {
     IDirect3DSurface9* a_real = static_cast<ProxySurface*>(a)->realSurface;
     IDirect3DSurface9* d_real = static_cast<ProxySurface*>(d)->realSurface;
+    {
+        IDirect3DTexture9* dt = nullptr;
+        if (SUCCEEDED(d_real->GetContainer(IID_IDirect3DTexture9, (void**)&dt)) && dt) {
+            proxyTexNoteWrite(dt);
+            dt->Release();
+        }
+    }
 
     if (b == NULL && e == NULL) {
         D3DSURFACE_DESC9 source;
@@ -320,6 +327,7 @@ HRESULT _stdcall ProxyDevice::UpdateTexture(IDirect3DBaseTexture8* a, IDirect3DB
     ProxyTexture* src = static_cast<ProxyTexture*>(a);
     ProxyTexture* dst = static_cast<ProxyTexture*>(b);
     HRESULT hr = realDevice->UpdateTexture(src->realTexture, dst->realTexture);
+    if (hr == D3D_OK) { proxyTexNoteWrite(dst->realTexture); }
     // A capped destination (the map cap) has fewer levels than its full-chain SYSTEMMEM source; the
     // copy lands the source's bottom levels, which are exactly the kept ones. This is how Morrowind
     // fills its textures, so it is the cap's receipt -- and a refusal here is a BLANK texture.

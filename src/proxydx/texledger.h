@@ -38,6 +38,13 @@ ProxyTexLedger& proxyTexLedger();
 // listening. A plain function pointer keeps the proxy free of the mge headers.
 extern void (*g_onProxyTextureDestroyed)(void* realTexture);
 
+// WRITE SERIALS, per real D3D9 texture: bumped whenever Morrowind writes texels into one after creation
+// (UpdateTexture from its SYSTEMMEM twin, CopyRects into a level, a LockRect/UnlockRect of a kept
+// level). The host-drawn UI snapshots a texture once and re-reads it when this moves -- the local map
+// is redrawn as the player walks. 0 = never written since creation (or since the map was reset).
+void     proxyTexNoteWrite(void* realTexture);
+uint32_t proxyTexWriteSerial(void* realTexture);
+
 // Largest level-0 edge Morrowind's own mip-mapped MANAGED textures are created at; 0 = off. Armed
 // at device creation, only under the Forge takeover (d3d8texture.cpp).
 extern uint32_t g_proxyTexCapDim;

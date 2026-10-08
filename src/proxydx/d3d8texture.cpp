@@ -4,6 +4,26 @@
 #include "d3d8texture.h"
 
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+
+namespace {
+    std::mutex g_texWriteMx;
+    std::unordered_map<void*, uint32_t> g_texWrites;
+}
+void proxyTexNoteWrite(void* realTexture) {
+    if (!realTexture) { return; }
+    std::lock_guard<std::mutex> lk(g_texWriteMx);
+    // Bounded by a reset: every serial reads 0 again, which a reader holding a non-zero serial sees as
+    // one more change (a redundant re-read), never as a missed one.
+    if (g_texWrites.size() > 65536) { g_texWrites.clear(); }
+    ++g_texWrites[realTexture];
+}
+uint32_t proxyTexWriteSerial(void* realTexture) {
+    std::lock_guard<std::mutex> lk(g_texWriteMx);
+    auto it = g_texWrites.find(realTexture);
+    return it == g_texWrites.end() ? 0u : it->second;
+}
 
 
 
@@ -263,6 +283,7 @@ HRESULT _stdcall ProxyTexture::UnlockRect(UINT Level) {
         capScratch[Level] = nullptr;
         return D3D_OK;
     }
+    proxyTexNoteWrite(realTexture);
     return realTexture->UnlockRect(Level - capSkip);
 }
 HRESULT _stdcall ProxyTexture::AddDirtyRect(CONST RECT* pDirtyRect ) {

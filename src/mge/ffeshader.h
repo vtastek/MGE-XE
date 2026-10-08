@@ -31,6 +31,7 @@ struct RenderedState {
     BYTE blendEnable, srcBlend, destBlend;
     BYTE alphaTest, alphaFunc, alphaRef;
     BYTE useLighting, useFog, matSrcDiffuse, matSrcEmissive;
+    BYTE matSrcAmbient, colorVertex;   // D3DRS_AMBIENTMATERIALSOURCE, D3DRS_COLORVERTEX (host-drawn UI)
 
     D3DPRIMITIVETYPE primType;
     UINT baseIndex, minIndex, vertCount, startIndex, primCount;
