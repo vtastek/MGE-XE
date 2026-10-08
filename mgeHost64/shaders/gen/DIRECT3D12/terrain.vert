@@ -2516,7 +2516,27 @@ float terrainDispLevel(float rung)
 {
     return gShadowParams.terrainDisp2.z + rung -  4.0f ;
 }
-#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+
+
+
+
+
+
+float terrainPatchStepDist() { return gShadowParams.pbrTerrainAO.w; }
+float terrainPatchMorph(float dist)
+{
+    const float D = terrainPatchStepDist();
+    if (!(D > 0.0f)) { return 0.0f; }
+    return saturate((dist - 0.7f * D) / (0.3f * D));
+}
+
+float terrainDispFade(float dist)
+{
+    const float r0 = gShadowParams.terrainDisp2.x;
+    const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+    return 1.0f - smoothstep(r0, r1, dist);
+}
+#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
 float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gyf,
                      float lvl, float sc, float gm, float pv)
 {
@@ -2552,7 +2572,7 @@ float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gy
     }
     return dz;
 }
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
 float terrainCarveWorld(float2 worldXY, float lvl, float sc, float gm, float pv)
 {
     const uint spanX = (uint)gShadowParams.terrainDisp3.z;
@@ -2709,7 +2729,21 @@ float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, in
     const float d = 2.0f *  128.0f ;
     return normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
 }
-#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 241 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+float terrainCarveDisplayed(uint slot, int lx, int ly, uint spanX, uint spanY, float2 origin,
+                            float gx, float gy, float rung)
+{
+    const float hb = loadHeightAt(slot, gx, gy, true);
+    const float3 p = float3(origin.x + gx *  128.0f , origin.y + gy *  128.0f ,
+                             hb - gFrameData.lodEye.z);
+    const float f = terrainDispFade(length(p - gFrameData.eyePos.xyz));
+    if (!(f > 0.0f)) { return 0.0f; }
+    return f * terrainCarveAt(lx, ly, spanX, spanY, gx, gy, terrainDispLevel(rung),
+                              gShadowParams.terrainDisp.y, gShadowParams.terrainDisp.z,
+                              gShadowParams.terrainDisp.w);
+}
+
+
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 VSOutput VS_MAIN( VSInput In )
 {
@@ -2741,7 +2775,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     const bool fine = (float(rung) <  4.0f );
-#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 298 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
     uint snapR = rung;
     uint axis = 0u;
     if (In.Grid.y == 0.0f) { uint nr = (nbrR >> 16u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 1u; } }
@@ -2750,8 +2784,9 @@ VSOutput VS_MAIN( VSInput In )
     else if (In.Grid.x == span) { uint nr = (nbrR >> 8u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 2u; } }
 
     float h;
+    float stitchCarve = 0.0f;
     if (axis != 0u) {
-#line 300 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 320 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
         const float snap = exp2(float(snapR) -  4.0f );
         const float g = (axis == 1u) ? gxf : gyf;
         const float a0 = floor(g / snap) * snap;
@@ -2766,6 +2801,19 @@ VSOutput VS_MAIN( VSInput In )
         } else {
             h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
                              : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
+
+
+
+
+
+            if (isPatch && gShadowParams.terrainDisp.x != 0.0f && terrainPatchStepDist() > 0.0f) {
+                stitchCarve = (axis == 1u)
+                    ? lerp(terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, a0, gyf, float(snapR)),
+                           terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, a1, gyf, float(snapR)), t)
+                    : lerp(terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, a0, float(snapR)),
+                           terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, a1, float(snapR)), t);
+            }
+
         }
     } else if (!fine) {
         h = terrainHeightOnRung(slot, float(rung), In.Origin.xy, (int)gxf, (int)gyf);
@@ -2794,8 +2842,12 @@ VSOutput VS_MAIN( VSInput In )
 
     if (gShadowParams.terrainDisp.x != 0.0f)
     {
-#line 355 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
-        if (axis == 0u)
+#line 388 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+        if (axis != 0u)
+        {
+            worldPos.z += stitchCarve;
+        }
+        else
         {
 
 
@@ -2803,21 +2855,48 @@ VSOutput VS_MAIN( VSInput In )
             const float r0 = gShadowParams.terrainDisp2.x;
             const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
             const float fade = 1.0f - smoothstep(r0, r1, dist);
+            float carve = 0.0f;
             if (fade > 0.0f)
             {
 
 
 
 
-                worldPos.z += fade * terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf,
-                                                    terrainDispLevel(float(rung)),
-                                                    gShadowParams.terrainDisp.y,
-                                                    gShadowParams.terrainDisp.z,
-                                                    gShadowParams.terrainDisp.w);
+                carve = fade * terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf,
+                                              terrainDispLevel(float(rung)),
+                                              gShadowParams.terrainDisp.y,
+                                              gShadowParams.terrainDisp.z,
+                                              gShadowParams.terrainDisp.w);
             }
+
+
+
+
+            const float pm = (isPatch && rung == 0u) ? terrainPatchMorph(dist) : 0.0f;
+            if (pm > 0.0f)
+            {
+                const float sx = 1.0f / 16.0f;
+                const bool ox = frac(gxf * 8.0f) != 0.0f;
+                const bool oy = frac(gyf * 8.0f) != 0.0f;
+                float tgt;
+                if (ox && oy) {
+                    tgt = 0.5f * (terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf + sx, gyf - sx, 1.0f)
+                                + terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf - sx, gyf + sx, 1.0f));
+                } else if (ox) {
+                    tgt = 0.5f * (terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf - sx, gyf, 1.0f)
+                                + terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf + sx, gyf, 1.0f));
+                } else if (oy) {
+                    tgt = 0.5f * (terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, gyf - sx, 1.0f)
+                                + terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, gyf + sx, 1.0f));
+                } else {
+                    tgt = terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, gyf, 1.0f);
+                }
+                carve = lerp(carve, tgt, pm);
+            }
+            worldPos.z += carve;
         }
     }
-#line 394 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 458 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
     if (!fine) {
         Out.Normal = terrainCornerNormal(slot, lx, ly, spanX, spanY, (int)gxf, (int)gyf);
     } else {

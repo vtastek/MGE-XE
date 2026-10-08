@@ -90,6 +90,26 @@ float terrainDispLevel(float rung)
     return gShadowParams.terrainDisp2.z + rung - TERRAIN_BASE_RUNG;
 }
 
+// ─── DISTANCE-STEPPED PATCH DENSITY (knob terrainPatchStep; gShadowParams.pbrTerrainAO.w) ───────────
+// Inside the displacement disc a patch whose nearest point is past D1 draws at rung 1 (16 u) instead
+// of rung 0 (8 u). A rung-0 vertex MORPHS toward the rung-1 surface over [0.7 D1, D1] of its OWN
+// distance, so by the time the host flips a patch (its nearest point crossing D1, every vertex then
+// at or past D1) the 8-u mesh already lies exactly on the 16-u surface. 0 = off (the old fixed rung).
+float terrainPatchStepDist() { return gShadowParams.pbrTerrainAO.w; }
+float terrainPatchMorph(float dist)
+{
+    const float D = terrainPatchStepDist();
+    if (!(D > 0.0f)) { return 0.0f; }
+    return saturate((dist - 0.7f * D) / (0.3f * D));
+}
+// The displacement fade, one definition for every caller that must agree on it.
+float terrainDispFade(float dist)
+{
+    const float r0 = gShadowParams.terrainDisp2.x;
+    const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+    return 1.0f - smoothstep(r0, r1, dist);
+}
+
 // ─── D6: THE CARVE AT A LATTICE COORD, ACROSS ITS FOUR TEXTURE SQUARES ──────────────────────────
 // The four squares bracketing this point, and the same bilinear weights the FRAG resolves them with
 // (terrain.frag.fsl's i00..i11). On the base lattice a vertex IS a square corner and this collapses

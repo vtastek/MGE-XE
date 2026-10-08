@@ -2515,7 +2515,27 @@ float terrainDispLevel(float rung)
 {
     return gShadowParams.terrainDisp2.z + rung -  4.0f ;
 }
-#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+
+
+
+
+
+
+float terrainPatchStepDist() { return gShadowParams.pbrTerrainAO.w; }
+float terrainPatchMorph(float dist)
+{
+    const float D = terrainPatchStepDist();
+    if (!(D > 0.0f)) { return 0.0f; }
+    return saturate((dist - 0.7f * D) / (0.3f * D));
+}
+
+float terrainDispFade(float dist)
+{
+    const float r0 = gShadowParams.terrainDisp2.x;
+    const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+    return 1.0f - smoothstep(r0, r1, dist);
+}
+#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
 float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gyf,
                      float lvl, float sc, float gm, float pv)
 {
@@ -2551,7 +2571,7 @@ float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gy
     }
     return dz;
 }
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
 float terrainCarveWorld(float2 worldXY, float lvl, float sc, float gm, float pv)
 {
     const uint spanX = (uint)gShadowParams.terrainDisp3.z;
@@ -3079,11 +3099,22 @@ VSOutput VS_MAIN( VSInput In )
 
 
 
-            worldPos.z += fade * terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
-                                                   terrainDispLevel(gShadowParams.terrainDisp2.w),
-                                                   gShadowParams.terrainDisp.y,
-                                                   gShadowParams.terrainDisp.z,
-                                                   gShadowParams.terrainDisp.w);
+            float c = terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
+                                        terrainDispLevel(gShadowParams.terrainDisp2.w),
+                                        gShadowParams.terrainDisp.y,
+                                        gShadowParams.terrainDisp.z,
+                                        gShadowParams.terrainDisp.w);
+
+
+            const float gm = terrainPatchMorph(length(In.W3.xyz - gFrameData.eyePos.xyz));
+            if (gm > 0.0f) {
+                c = lerp(c, terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
+                                              terrainDispLevel(gShadowParams.terrainDisp2.w + 1.0f),
+                                              gShadowParams.terrainDisp.y,
+                                              gShadowParams.terrainDisp.z,
+                                              gShadowParams.terrainDisp.w), gm);
+            }
+            worldPos.z += fade * c;
         }
     }
 
@@ -3116,7 +3147,7 @@ VSOutput VS_MAIN( VSInput In )
         nFace = nWorld;
     }
     lambert = max(0.0f, lambert);
-#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 648 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens) * (1.0f - crushPin),
                         1.0f,
                         saturate(In.Position.z * gShadowParams.grassParams5.y));

@@ -8501,6 +8501,11 @@ namespace {
     // Vertex-cache order for the terrain templates (meshopt). Image-identical; 0 = the old row order.
     // Read once, when the templates are built at startup.
     bool     g_terrainVcacheOpt  = true;
+    // terrainPatchStep — D1, world units: displacement patches whose nearest point is past it draw at
+    // 16 u instead of 8 u, and 8-u vertices morph onto the 16-u surface over [0.7 D1, D1] (terrain.vert,
+    // terraindisp.h.fsl). Only with the near rung at 0 (it adds exactly one step) and only while D1 is
+    // inside the fade end (past it there is nothing displaced to step). 0 = off.
+    float    g_terrainPatchStep  = 800.0f;
     uint32_t g_lastTerrainPatchCulled = 0;   // patches skipped this frame, all views
     // Scale on the LOD ladder's distances (kTerrainLodDist). 1.0 = the original ladder: base 128-u
     // lattice out to 3 cells, then a rung per doubling. MEASURED against G7 v0.20.3 (a shipped release,
@@ -18079,6 +18084,13 @@ namespace {
     inline uint32_t terrainPatchRung() {
         return (uint32_t)std::clamp((int)std::lround(g_terrainPatchRung), 0, (int)kTerrainBaseLod);
     }
+    // D1 as the host cull and the shaders must BOTH see it — one accessor, so the rung pick and the
+    // morph cannot disagree about whether the step is on. 0 = off.
+    inline float terrainPatchStepActive() {
+        const bool on = g_terrainPatchStep > 0.0f && terrainPatchRung() == 0u && g_terrainDisp && g_pbrTerrain
+                     && g_terrainPatchStep < terrainDispFadeEnd();
+        return on ? g_terrainPatchStep : 0.0f;
+    }
     // Residency is live (heights/VCLR/VTEX uploaded, cull table built). Declared HERE, with the
     // toggles, rather than down in the terrain block: fillFrameTimings — which sits above that
     // block — reports `g_terrainReady && g_drawTerrain` to the client as terrainOwned, and that is
@@ -23871,6 +23883,7 @@ namespace {
             { "terrainDispFade",     &g_terrainDispFade     },
             { "terrainDispLod",      &g_terrainDispLod      },
             { "terrainPatchRung",    &g_terrainPatchRung    },
+            { "terrainPatchStep",    &g_terrainPatchStep    },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -40996,7 +41009,7 @@ void destroyHostWindow(Renderer* R);
             mp[kPbrTerrainAOFloat + 0] = g_pbrTerrainHeightAO ? 1.0f : 0.0f;
             mp[kPbrTerrainAOFloat + 1] = std::clamp(g_pbrTerrainHeightAOStr, 0.0f, 1.0f);
             mp[kPbrTerrainAOFloat + 2] = std::clamp(g_pbrTerrainHeightAOLod, 0.0f, 12.0f);
-            mp[kPbrTerrainAOFloat + 3] = 0.0f;
+            mp[kPbrTerrainAOFloat + 3] = terrainPatchStepActive();   // terrainPatchStep D1 (0 = off)
             // Distant-statics PBR. A lane for terrain's reason exactly (see g_pbrStatics): the param
             // slot map is built once at the first exterior, so a pack-time gate would not be live.
             mp[kPbrStaticsFloat + 0] = g_pbrStatics ? 1.0f : 0.0f;
@@ -52822,10 +52835,20 @@ void destroyHostWindow(Renderer* R);
         // the patch family's coarsest rung is also the base rung, so every ladder answer a patched
         // cell could produce clamps to the same value. Writing it directly says that, rather than
         // implying the two ends might differ.
+        // terrainPatchStep (D1): inside the disc, a rung-0 patch whose NEAREST point (XY — never more
+        // than any vertex's 3D distance, which is what the shader's morph runs on) is past D1 takes
+        // rung 1. The shader has every vertex of it fully morphed by D1, so the flip is invisible.
+        const float patchStep = terrainPatchStepActive();
         auto patchRungAt = [&](const TerrainCellCull& t, uint32_t ox, uint32_t oy) -> uint32_t {
             const float px0 = (float)t.gx * Terrain::kCellSize + (float)ox * Terrain::kVertSpacing;
             const float py0 = (float)t.gy * Terrain::kCellSize + (float)oy * Terrain::kVertSpacing;
-            return discTouches(px0, py0, patchSize) ? patchRung : kTerrainBaseLod;
+            if (!discTouches(px0, py0, patchSize)) { return kTerrainBaseLod; }
+            if (patchStep > 0.0f) {
+                const float nx = std::clamp(eye[0], px0, px0 + patchSize) - eye[0];
+                const float ny = std::clamp(eye[1], py0, py0 + patchSize) - eye[1];
+                if (nx * nx + ny * ny >= patchStep * patchStep) { return patchRung + 1u; }
+            }
+            return patchRung;
         };
         // ── PER-PATCH FRUSTUM CULL (knob terrainPatchCull) ──────────────────────────────────
         // The cell passed the frustum as a whole, but a patched cell draws as 256 independent

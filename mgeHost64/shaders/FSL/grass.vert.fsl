@@ -564,11 +564,22 @@ VSOutput VS_MAIN( VSInput In )
             // exists for the wind phase, where it is not.
             // terrainDisp2.w is the RUNG the ground is actually drawn at, so the blade reads the
             // carve at the same band-limit the surface under it did.
-            worldPos.z += fade * terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
-                                                   terrainDispLevel(gShadowParams.terrainDisp2.w),
-                                                   gShadowParams.terrainDisp.y,
-                                                   gShadowParams.terrainDisp.z,
-                                                   gShadowParams.terrainDisp.w);
+            float c = terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
+                                        terrainDispLevel(gShadowParams.terrainDisp2.w),
+                                        gShadowParams.terrainDisp.y,
+                                        gShadowParams.terrainDisp.z,
+                                        gShadowParams.terrainDisp.w);
+            // terrainPatchStep: past D1 the ground is the 16-u surface at the next band-limit, and in
+            // the morph band it is on its way there — follow it the same way, by the root's distance.
+            const float gm = terrainPatchMorph(length(In.W3.xyz - gFrameData.eyePos.xyz));
+            if (gm > 0.0f) {
+                c = lerp(c, terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
+                                              terrainDispLevel(gShadowParams.terrainDisp2.w + 1.0f),
+                                              gShadowParams.terrainDisp.y,
+                                              gShadowParams.terrainDisp.z,
+                                              gShadowParams.terrainDisp.w), gm);
+            }
+            worldPos.z += fade * c;
         }
     }
 

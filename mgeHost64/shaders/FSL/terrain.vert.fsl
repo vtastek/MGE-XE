@@ -233,6 +233,25 @@ float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, in
 // (SampleLvlDispArray, the texture-square resolve and terrainDispZ live in terraindisp.h.fsl —
 //  grass.vert calls all three.)
 
+#ifndef TERRAIN_NO_DISP
+// What a rung-`rung` vertex at lattice point (gx, gy) DISPLAYS: the carve at that rung's band-limit,
+// times the fade at that point's OWN undisplaced distance. A neighbour that resamples onto this
+// vertex's edge (the stitch) or a finer vertex morphing toward it must compute exactly this, from the
+// same inputs, so the shared surface is one surface.
+float terrainCarveDisplayed(uint slot, int lx, int ly, uint spanX, uint spanY, float2 origin,
+                            float gx, float gy, float rung)
+{
+    const float  hb = loadHeightAt(slot, gx, gy, true);
+    const float3 p  = float3(origin.x + gx * TERRAIN_SPACING, origin.y + gy * TERRAIN_SPACING,
+                             hb - gFrameData.lodEye.z);
+    const float  f  = terrainDispFade(length(p - gFrameData.eyePos.xyz));
+    if (!(f > 0.0f)) { return 0.0f; }
+    return f * terrainCarveAt(lx, ly, spanX, spanY, gx, gy, terrainDispLevel(rung),
+                              gShadowParams.terrainDisp.y, gShadowParams.terrainDisp.z,
+                              gShadowParams.terrainDisp.w);
+}
+#endif
+
 ROOT_SIGNATURE(DefaultRootSignature)
 VSOutput VS_MAIN( VSInput In )
 {
@@ -284,6 +303,7 @@ VSOutput VS_MAIN( VSInput In )
     else if (In.Grid.x == span)   { uint nr = (nbrR >>  8u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 2u; } }
 
     float h;
+    float stitchCarve = 0.0f;   // the coarser neighbour's displayed carve along this edge (patch rungs)
     if (axis != 0u) {
         // The neighbour is coarser, so its step is the one both sides must land on. A rung-0 vertex
         // snapping to a rung-1 neighbour lands on HALF-step lattice coords, which is exactly the
@@ -311,6 +331,19 @@ VSOutput VS_MAIN( VSInput In )
         } else {
             h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
                              : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
+#ifndef TERRAIN_NO_DISP
+            // A finer patch beside a coarser PATCH inside the disc (terrainPatchStep): the neighbour
+            // is displaced along this edge, so the stitched vertex follows its displaced polyline
+            // rather than skipping the carve. Outside that case the old identity holds (a coarser
+            // neighbour is outside the disc, fade == 0 on the edge) and this stays 0.
+            if (isPatch && gShadowParams.terrainDisp.x != 0.0f && terrainPatchStepDist() > 0.0f) {
+                stitchCarve = (axis == 1u)
+                    ? lerp(terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, a0, gyf, float(snapR)),
+                           terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, a1, gyf, float(snapR)), t)
+                    : lerp(terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, a0, float(snapR)),
+                           terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, a1, float(snapR)), t);
+            }
+#endif
         }
     } else if (!fine) {
         h = terrainHeightOnRung(slot, float(rung), In.Origin.xy, (int)gxf, (int)gyf);
@@ -352,7 +385,11 @@ VSOutput VS_MAIN( VSInput In )
         // That identity is also why the FADE END carries the hard ceiling and the derived patch set
         // does not: capping the SET would leave a fine unit beside a coarse one with fade > 0 on
         // the edge between them, which is precisely the crack this guard cannot close.
-        if (axis == 0u)
+        if (axis != 0u)
+        {
+            worldPos.z += stitchCarve;
+        }
+        else
         {
             // 1 inside the radius, smoothly to 0 by the fade end. SMOOTHSTEP and not a linear ramp:
             // a linear fade has a slope discontinuity at both ends, and a crease in the GROUND that
@@ -360,18 +397,45 @@ VSOutput VS_MAIN( VSInput In )
             const float r0 = gShadowParams.terrainDisp2.x;
             const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
             const float fade = 1.0f - smoothstep(r0, r1, dist);
+            float carve = 0.0f;
             if (fade > 0.0f)
             {
                 // D5: the band-limit follows the rung (terrainDispLevel). The knob means "the right
                 // level for the BASE lattice", so a rung three octaves finer reads three levels
                 // finer — ONE knob that keeps meaning one thing at every rung instead of splitting
                 // into five. D6's four-square blend is terrainCarveAt, shared with grass.vert.
-                worldPos.z += fade * terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf,
-                                                    terrainDispLevel(float(rung)),
-                                                    gShadowParams.terrainDisp.y,
-                                                    gShadowParams.terrainDisp.z,
-                                                    gShadowParams.terrainDisp.w);
+                carve = fade * terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf,
+                                              terrainDispLevel(float(rung)),
+                                              gShadowParams.terrainDisp.y,
+                                              gShadowParams.terrainDisp.z,
+                                              gShadowParams.terrainDisp.w);
             }
+            // terrainPatchStep: a rung-0 patch vertex morphs toward the rung-1 SURFACE (the 16-u
+            // triangles' displayed carve at this point: the vertex's own value where it is on the
+            // 16-u lattice, the b–c-split interpolation between its two 16-u neighbours where it is
+            // not — the same split terrainHeightOnRung morphs along).
+            const float pm = (isPatch && rung == 0u) ? terrainPatchMorph(dist) : 0.0f;
+            if (pm > 0.0f)
+            {
+                const float sx = 1.0f / 16.0f;          // rung-0 step, lattice units
+                const bool  ox = frac(gxf * 8.0f) != 0.0f;
+                const bool  oy = frac(gyf * 8.0f) != 0.0f;
+                float tgt;
+                if (ox && oy) {
+                    tgt = 0.5f * (terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf + sx, gyf - sx, 1.0f)
+                                + terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf - sx, gyf + sx, 1.0f));
+                } else if (ox) {
+                    tgt = 0.5f * (terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf - sx, gyf, 1.0f)
+                                + terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf + sx, gyf, 1.0f));
+                } else if (oy) {
+                    tgt = 0.5f * (terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, gyf - sx, 1.0f)
+                                + terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, gyf + sx, 1.0f));
+                } else {
+                    tgt = terrainCarveDisplayed(slot, lx, ly, spanX, spanY, In.Origin.xy, gxf, gyf, 1.0f);
+                }
+                carve = lerp(carve, tgt, pm);
+            }
+            worldPos.z += carve;
         }
     }
 #endif
