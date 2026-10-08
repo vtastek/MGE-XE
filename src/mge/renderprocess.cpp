@@ -10119,6 +10119,23 @@ namespace RenderProcess {
                              o0.x, o0.y, o0.z, o0.w, o0.color, o0.u, o0.v);
             }
         }
+        // A blended draw whose alpha comes from the vertex colour and is 0 at every vertex changes no
+        // pixel (SRCALPHA / INVSRCALPHA with a = 0): Morrowind's full-screen fader sits at alpha 0 in
+        // play, and drawn anyway it was ~0.1 ms of blending at 2560x1600. Dropped here, uploaded never.
+        if (!(mode & IPC::kUiOpaque) && !(mode & IPC::kUiAlphaTexOnly)) {
+            bool allZero = true;
+            for (std::size_t j = vBase; j < g_uiIn.size() && allZero; ++j) { allZero = (g_uiIn[j].color >> 24) == 0u; }
+            if (allZero) {
+                g_uiIn.resize(vBase);
+                rs->ib->Unlock();
+                rs->vb->Unlock();
+                static std::uint32_t s_skips = 0;
+                if (s_skips++ < 4) {
+                    LOG::logline(">> [hostui] alpha-0 draw skipped (%u verts, %u tris)", rs->vertCount, rs->primCount);
+                }
+                return;
+            }
+        }
         bool bad = false;
         const std::size_t iBase = g_uiInIdx.size();
         for (UINT i = 0; i < idxCount; ++i) {

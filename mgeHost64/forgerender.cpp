@@ -2219,7 +2219,10 @@ namespace {
     // Matches the swapchain's image count: the ring exists to let the submit for frame N stay in
     // flight while frame N+1 records, so it has to be at least as deep as the back buffers it
     // presents into.
-    constexpr uint32_t kHostWndRing = 2;
+    // THREE, not two (2026-10-08): with hostZeroCopy the frame WRITES the swapchain image, and the
+    // host keeps two frames in flight — at two images the one acquired was usually still queued for
+    // flip, and DXGI's wait for it landed inside the next GPU chunk (distant land read +0.2 ms live).
+    constexpr uint32_t kHostWndRing = 3;
 
     // ─── FRAME SLOTS (tasks/forge-pipeline-depth.md) ────────────────────────────────────────────
     // The host keeps up to kFrameSlots frames in flight. Frame serial F records into slot F & 1, and
@@ -30963,7 +30966,7 @@ void destroyHostWindow(Renderer* R);
         sd.mWindowHandle.window = (g_hostPresent && g_hostPresentDirect) ? g_mwHwnd : g_hostHwnd;
         sd.ppPresentQueues = &g_live.pQueue;
         sd.mPresentQueueCount = 1;
-        sd.mImageCount = 2;
+        sd.mImageCount = kHostWndRing;
         sd.mWidth = w;
         sd.mHeight = h;
         sd.mColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
