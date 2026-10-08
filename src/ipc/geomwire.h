@@ -785,6 +785,27 @@ namespace IPC {
     constexpr std::uint32_t kMaxCapturedAlphaVerts   = 20000;
     constexpr std::uint32_t kMaxCapturedAlphaIndices = 60000;
 
+    // HOST-DRAWN UI (tasks/forge-host-ui.md P1). Morrowind's UI-stage draws, captured at the proxy,
+    // transformed and fixed-function LIT on the client, so the host draws them with one pipeline
+    // (texture x colour, SRCALPHA/INVSRCALPHA) into the delivered BGRA8 image before it presents.
+    // Positions are CLIP space with the D3D9 half-pixel already removed. One 1-chunk vec carries
+    // [verts][uint16 indices]; indices are absolute into the shipped verts, in MW's draw order.
+    struct UiVertexWire {
+        float         x, y, z, w;     // clip space
+        std::uint32_t color;          // D3DCOLOR (A8R8G8B8), the lit colour + alpha
+        float         u, v;
+        std::uint32_t texMode;        // bits 0-15 texture slot (0 = white); see kUiMode*
+    };
+    static_assert(sizeof(UiVertexWire) == 32, "UiVertexWire is 32 bytes on both sides");
+    constexpr std::uint32_t kUiColorTexOnly    = 1u << 16;   // colour = texture (SELECTARG1 texture)
+    constexpr std::uint32_t kUiColorDiffOnly   = 1u << 17;   // colour = diffuse (no texture)
+    constexpr std::uint32_t kUiAlphaTexOnly    = 1u << 18;
+    constexpr std::uint32_t kUiAlphaDiffOnly   = 1u << 19;
+    constexpr std::uint32_t kUiOpaque          = 1u << 20;   // blending was off: alpha forced to 1
+    constexpr std::uint32_t kUiAlphaTest       = 1u << 21;   // discard a <= ref (bits 24-31)
+    constexpr std::uint32_t kMaxUiVerts   = 24000;           // 768 KB
+    constexpr std::uint32_t kMaxUiIndices = 60000;           // 120 KB: one 1 MB GeomChunk
+
 #pragma pack(pop)
 
     // Transport chunk for the shared upload vector. The IPC Vec reserves

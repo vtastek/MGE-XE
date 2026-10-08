@@ -696,6 +696,14 @@ namespace IPC {
         // client copies from THAT RT. Slot = host frame serial & 1; the RT of frame N is reused by
         // N+2, whose kick the client only sends after its copy of N completes. Appended at the end.
         OUT std::uint32_t rtSlot;
+
+        // HOST-DRAWN UI (tasks/forge-host-ui.md P1): one GeomChunk vec of [UiVertexWire verts][uint16
+        // indices], the UI MW drew in the PREVIOUS frame (captured during its UI stage, shipped with
+        // this kick). Invalid / zero bytes = no host UI. Appended at the VERY END, after the OUT
+        // fields, so recordings made before it replay with these zeroed (replay copies min(size)).
+        IN VecId         uiList;
+        IN std::uint32_t uiVertBytes;
+        IN std::uint32_t uiIdxBytes;
     };
 
     // M1b geometry upload. blob = a byte VecId holding partCount packed parts

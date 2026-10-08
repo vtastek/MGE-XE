@@ -8,6 +8,7 @@
 namespace IPC { class Client; }
 struct RenderedState;
 struct FragmentState;
+struct LightState;
 
 // Present-seam spike (client side). Coordinates the out-of-process 64-bit Vulkan
 // renderer: maps the host's framebuffer, drives the per-frame RenderFrame RPC, and
@@ -163,6 +164,17 @@ namespace RenderProcess {
     bool forgeOwnsFrame();
     // MGE_SEAM_PROBE bits (measurement only; renderprocess.cpp g_seamProbe).
     unsigned seamProbe();
+
+    // HOST-DRAWN UI (tasks/forge-host-ui.md P1; client env MGE_HOST_UI=1, with the host presenting:
+    // hostPresent=1,hostPresentDirect=1 and MGE_SEAM_PROBE=7). True while the Forge host owns the frame
+    // and MW's UI draws are captured instead of drawn: the device's DIP hands them to captureUiDraw.
+    bool hostUiActive();
+    // One UI-stage DrawIndexedPrimitive: transformed to clip space and fixed-function lit on the CPU,
+    // appended to this frame's UI list. proj = the projection MW set (not tracked in RenderedState).
+    void captureUiDraw(const RenderedState* rs, const FragmentState* frs, const LightState* lrs,
+                       const D3DMATRIX* proj);
+    // At MW's Present: this frame's UI list becomes the one the NEXT kick ships.
+    void endUiFrame();
 
     // True when this frame's classify will be FIRED to the host next frame with a newer camera
     // (produce mode 3, park-and-fire). The early classify then collects a lead band past the

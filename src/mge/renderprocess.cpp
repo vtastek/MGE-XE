@@ -1084,6 +1084,27 @@ namespace {
     std::vector<std::uint16_t>       g_capIdxScratch;    // consumed/shipped indices (frame N-1)
     std::vector<CapturedAlphaRec>    g_capRecs;          // consumed records (frame N-1)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_capturedVec;   // shipped at kickoff ([verts][indices])
+    // Host-drawn UI state (tasks/forge-host-ui.md P1; see hostUiActive / captureUiDraw).
+    int  g_hostUiEnv = -1;
+    std::vector<IPC::UiVertexWire> g_uiIn, g_uiReady;
+    std::vector<std::uint16_t>     g_uiInIdx, g_uiReadyIdx;
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_uiVec;
+    struct UiTex { std::uint32_t slot; };
+    std::unordered_map<IDirect3DTexture9*, UiTex> g_uiTex;
+    std::uint32_t g_uiTexSerial = 0, g_uiRejects = 0;
+    // At the kick: the UI MW drew last frame goes out with this frame's world.
+    void shipUiList() {
+        if (g_hostUiEnv != 1 || !g_uiVec || g_uiReady.empty() || g_uiReadyIdx.empty() || !g_client) { return; }
+        const std::uint32_t vb = (std::uint32_t)(g_uiReady.size() * sizeof(IPC::UiVertexWire));
+        const std::uint32_t ib = (std::uint32_t)(g_uiReadyIdx.size() * sizeof(std::uint16_t));
+        static std::vector<std::uint8_t> blob;
+        blob.resize((size_t)vb + ib);
+        std::memcpy(blob.data(), g_uiReady.data(), vb);
+        std::memcpy(blob.data() + vb, g_uiReadyIdx.data(), ib);
+        if (g_uiVec->assign_bytes(blob.data(), (std::uint32_t)blob.size())) {
+            g_client->setNextUiList(g_uiVec->id(), vb, ib);
+        }
+    }
     // Old-msoc double-draw guard: (bindless slot << 32 | vertCount) of every cached blended shape
     // the host already draws; a captured DIP that matches one is a duplicate and is skipped.
     //
@@ -2665,6 +2686,14 @@ namespace {
             g_capturedVec.emplace(std::move(*cv));
         }
 
+        // Host-drawn UI (P1): one 1-chunk vec, [UiVertexWire][uint16] (geomwire.h kMaxUi*).
+        auto uv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!uv) {
+            LOG::logline("!! [seam] host UI vec alloc failed — host-drawn UI disabled");
+        } else {
+            g_uiVec.emplace(std::move(*uv));
+        }
+
         // Texture upload vec: kTexChunks (32MB window) — larger than geometry because a single DDS
         // must fit one window (oversize textures are dropped to white in resolveTextureSlot).
         auto tv = g_client->allocVecBlocking<IPC::GeomChunk>(
@@ -2792,22 +2821,11 @@ namespace {
     // quietMiss: a miss is the EXPECTED answer (probing for a companion file most textures do not
     //   have), so it must not spend the 20-line "not found (white)" budget — which exists to
     //   surface textures that SHOULD resolve — on files that were never there.
-    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss,
-                                       TexIoRead* supplied) {
-        if (!textureName || !*textureName || !g_texVec) {
-            return 0;
-        }
-        std::string name = normalizeTextureName(textureName);
-        if (name.empty()) {
-            return 0;
-        }
-        // Serialise the whole residency mutation against the other thread (see g_texResidencyMx).
-        // ⚠ NOT ACROSS THE DISK READ (P1, tasks/forge-crossing-frame.md). It used to be: the build's
-        // first sights and the prefetch drain held the lock through every read, so main's
-        // captureAlphaDraw waited on the worker's disk I/O. BSA reads are positional now and need no
-        // lock, so the lookup takes the lock, the read runs without it, and the assignment takes it
-        // again and RE-CHECKS: the other thread may have resolved the same name meanwhile, and then
-        // its slot wins and these bytes are dropped.
+    // The second half of a first sight, split out of resolveTextureSlotEx so a texture whose bytes do
+    // not come from a file (host-drawn UI: DDS built from a locked surface) takes the SAME slot
+    // assignment, LRU recycle, cold bit and staging. Takes ownership of r.data (std::malloc'd).
+    std::uint32_t stageFirstSight(const std::string& name, const FirstSightBytes& r, bool dataTexture,
+                                  bool quietMiss) {
         const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;   // client range [1, cap)
         auto lookup = [&](std::uint32_t* out) {
             if (g_slotName.size() != IPC::kMaxTextures) {
@@ -2827,25 +2845,6 @@ namespace {
             *out = it->second;   // already resolved (slot, encoded flip slot, or cached-miss 0)
             return true;
         };
-        // First-sight streaming (see g_texStreamQueue): a texture the DL bake has a LOD copy of goes
-        // in as that copy now and streams its full file later; a _paramh that exists is deferred with
-        // nothing to show. Both skip the full read here, which is the whole point. A load's first
-        // build (g_texSyncFrame) reads full files.
-        bool deferAllowed;
-        {
-            std::lock_guard<std::mutex> lk(g_texResidencyMx);
-            std::uint32_t known = 0;
-            if (lookup(&known)) { return known; }
-            deferAllowed = g_texStreamBudgetMB != 0 && g_frame != g_texSyncFrame;
-        }
-        FirstSightBytes r;
-        if (supplied && supplied->done.load(std::memory_order_acquire) && supplied->deferAllowed == deferAllowed
-            && supplied->dataTexture == dataTexture && supplied->name == name) {
-            r = takeBytes(*supplied);
-        } else {
-            MGE_ZoneScopedN("tex:firstSight read");
-            r = readFirstSight(name, dataTexture, deferAllowed);
-        }
         void* data = r.data;
         unsigned size = r.size;
         const bool deferred = r.deferred;
@@ -2958,6 +2957,63 @@ namespace {
             return 0;
         }
         return slot;
+    }
+
+    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss,
+                                       TexIoRead* supplied) {
+        if (!textureName || !*textureName || !g_texVec) {
+            return 0;
+        }
+        std::string name = normalizeTextureName(textureName);
+        if (name.empty()) {
+            return 0;
+        }
+        // Serialise the whole residency mutation against the other thread (see g_texResidencyMx).
+        // ⚠ NOT ACROSS THE DISK READ (P1, tasks/forge-crossing-frame.md). It used to be: the build's
+        // first sights and the prefetch drain held the lock through every read, so main's
+        // captureAlphaDraw waited on the worker's disk I/O. BSA reads are positional now and need no
+        // lock, so the lookup takes the lock, the read runs without it, and the assignment takes it
+        // again and RE-CHECKS: the other thread may have resolved the same name meanwhile, and then
+        // its slot wins and these bytes are dropped.
+        auto lookup = [&](std::uint32_t* out) {
+            if (g_slotName.size() != IPC::kMaxTextures) {
+                g_slotName.assign(IPC::kMaxTextures, std::string());
+                g_slotLastUsed.assign(IPC::kMaxTextures, 0u);
+                g_slotBytes.assign(IPC::kMaxTextures, 0u);
+                g_slotStagedBatch.assign(IPC::kMaxTextures, 0u);
+            }
+            auto it = g_texSlot.find(name);
+            if (it == g_texSlot.end()) { return false; }
+            // A flip-book frame resolves to an ENCODED array slot, not an index into the LRU range —
+            // subscripting g_slotLastUsed with it would run ~0x8000 past the end. Array-backed
+            // textures are resident for the session and never recycled, so they have no LRU age.
+            if (it->second != 0 && !IPC::isFlipSlot(it->second)) {
+                g_slotLastUsed[it->second] = g_frame;   // refresh LRU age
+            }
+            *out = it->second;   // already resolved (slot, encoded flip slot, or cached-miss 0)
+            return true;
+        };
+        // First-sight streaming (see g_texStreamQueue): a texture the DL bake has a LOD copy of goes
+        // in as that copy now and streams its full file later; a _paramh that exists is deferred with
+        // nothing to show. Both skip the full read here, which is the whole point. A load's first
+        // build (g_texSyncFrame) reads full files.
+        bool deferAllowed;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            std::uint32_t known = 0;
+            if (lookup(&known)) { return known; }
+            deferAllowed = g_texStreamBudgetMB != 0 && g_frame != g_texSyncFrame;
+        }
+        FirstSightBytes r;
+        if (supplied && supplied->done.load(std::memory_order_acquire) && supplied->deferAllowed == deferAllowed
+            && supplied->dataTexture == dataTexture && supplied->name == name) {
+            r = takeBytes(*supplied);
+        } else {
+            MGE_ZoneScopedN("tex:firstSight read");
+            r = readFirstSight(name, dataTexture, deferAllowed);
+        }
+
+        return stageFirstSight(name, r, dataTexture, quietMiss);
     }
 
     // Minimal DDS header identity for bucketing: (pixel-format, width, height). We never decode —
@@ -8890,6 +8946,7 @@ namespace RenderProcess {
         {
             markWorkerPhase(WK_KICKOFF);
             MGE_ZoneScopedN("Forge renderSceneKickoff");
+            shipUiList();
             {
                 MGE_ZoneScopedN("kick:copyReuseWait");
                 waitCopyForSlotReuse();   // F-2's RT copy must have EXECUTED before F may redraw it
@@ -9627,6 +9684,267 @@ namespace RenderProcess {
         const unsigned until = g_frame + frames;
         if ((int)(until - g_captureGraceUntil) > 0) g_captureGraceUntil = until;
     }
+
+    // ─── HOST-DRAWN UI (tasks/forge-host-ui.md P1) ─────────────────────────────────────────────
+    // MW's UI-stage DIPs, captured instead of drawn while the host presents. Each is turned into
+    // clip-space, fixed-function-LIT vertices here (the P0 census: one texture stage, model-space XYZ
+    // under the menu camera, lighting on with material/vertex colour, SRCALPHA blending), so the host
+    // needs one trivial pipeline and no FFP emulation. Textures go up as DATA (UNORM) DDS built from
+    // the locked surface, one slot per IDirect3DTexture9 (held by a ref so the address cannot be
+    // recycled under the memo). Main thread only: capture at the UI stage, swap at Present, ship at
+    // the next kick (which also runs on main).
+
+    bool hostUiActive() {
+        if (g_hostUiEnv < 0) {
+            char v[4] = {};
+            g_hostUiEnv = (GetEnvironmentVariableA("MGE_HOST_UI", v, sizeof(v)) > 0 && v[0] == '1') ? 1 : 0;
+            if (g_hostUiEnv) { LOG::logline(">> [hostui] MGE_HOST_UI=1: MW's UI is captured and drawn by the host"); }
+        }
+        return g_hostUiEnv == 1 && forgeOwnsFrame() && g_uiVec.has_value();
+    }
+
+    // A DDS the host's parseDds reads: DXT1/3/5 passed through, everything else expanded to 32-bit
+    // BGRA (its only uncompressed format). Every mip level. False = a format or pool we cannot read.
+    bool buildUiDds(IDirect3DTexture9* tex, std::vector<std::uint8_t>& out) {
+        D3DSURFACE_DESC d0 = {};
+        if (FAILED(tex->GetLevelDesc(0, &d0))) { return false; }
+        const DWORD levels = tex->GetLevelCount();
+        const bool dxt = d0.Format == D3DFMT_DXT1 || d0.Format == D3DFMT_DXT3 || d0.Format == D3DFMT_DXT5;
+        const std::uint32_t blockBytes = (d0.Format == D3DFMT_DXT1) ? 8u : 16u;
+        out.assign(128, 0);
+        auto w32 = [&](size_t off, std::uint32_t v) { std::memcpy(out.data() + off, &v, 4); };
+        w32(0, 0x20534444u);                     // 'DDS '
+        w32(4, 124u);
+        w32(8, 0x1u | 0x2u | 0x4u | 0x1000u | 0x20000u);   // CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT
+        w32(12, d0.Height);
+        w32(16, d0.Width);
+        w32(28, levels);
+        w32(76, 32u);                            // pixel format size
+        if (dxt) {
+            w32(80, 0x4u);                       // DDPF_FOURCC
+            w32(84, d0.Format == D3DFMT_DXT1 ? 0x31545844u : d0.Format == D3DFMT_DXT3 ? 0x33545844u : 0x35545844u);
+        } else {
+            w32(80, 0x40u | 0x1u);               // DDPF_RGB | DDPF_ALPHAPIXELS
+            w32(88, 32u);
+            w32(92, 0x00FF0000u); w32(96, 0x0000FF00u); w32(100, 0x000000FFu); w32(104, 0xFF000000u);
+        }
+        w32(108, 0x1000u | 0x400000u | 0x8u);    // TEXTURE | MIPMAP | COMPLEX
+        for (DWORD lv = 0; lv < levels; ++lv) {
+            D3DSURFACE_DESC d = {};
+            tex->GetLevelDesc(lv, &d);
+            D3DLOCKED_RECT lr = {};
+            if (FAILED(tex->LockRect(lv, &lr, nullptr, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) { return false; }
+            const std::uint8_t* src = (const std::uint8_t*)lr.pBits;
+            bool ok = true;
+            if (dxt) {
+                const UINT bw = std::max(1u, (d.Width + 3) / 4), bh = std::max(1u, (d.Height + 3) / 4);
+                for (UINT y = 0; y < bh; ++y) {
+                    out.insert(out.end(), src + (size_t)y * lr.Pitch, src + (size_t)y * lr.Pitch + (size_t)bw * blockBytes);
+                }
+            } else {
+                for (UINT y = 0; y < d.Height && ok; ++y) {
+                    const std::uint8_t* row = src + (size_t)y * lr.Pitch;
+                    for (UINT x = 0; x < d.Width; ++x) {
+                        std::uint32_t c;   // A8R8G8B8
+                        switch (d.Format) {
+                            case D3DFMT_A8R8G8B8: c = ((const std::uint32_t*)row)[x]; break;
+                            case D3DFMT_X8R8G8B8: c = ((const std::uint32_t*)row)[x] | 0xFF000000u; break;
+                            case D3DFMT_A4R4G4B4: { const std::uint32_t p = ((const std::uint16_t*)row)[x];
+                                c = (((p >> 12) & 15u) * 17u << 24) | (((p >> 8) & 15u) * 17u << 16) | (((p >> 4) & 15u) * 17u << 8) | ((p & 15u) * 17u); break; }
+                            case D3DFMT_A1R5G5B5: case D3DFMT_X1R5G5B5: { const std::uint32_t p = ((const std::uint16_t*)row)[x];
+                                const std::uint32_t a = (d.Format == D3DFMT_X1R5G5B5 || (p & 0x8000u)) ? 255u : 0u;
+                                c = (a << 24) | ((((p >> 10) & 31u) * 255u / 31u) << 16) | ((((p >> 5) & 31u) * 255u / 31u) << 8) | ((p & 31u) * 255u / 31u); break; }
+                            case D3DFMT_R5G6B5: { const std::uint32_t p = ((const std::uint16_t*)row)[x];
+                                c = 0xFF000000u | ((((p >> 11) & 31u) * 255u / 31u) << 16) | ((((p >> 5) & 63u) * 255u / 63u) << 8) | ((p & 31u) * 255u / 31u); break; }
+                            case D3DFMT_A8: c = (std::uint32_t)row[x] << 24 | 0x00FFFFFFu; break;
+                            case D3DFMT_L8: c = 0xFF000000u | row[x] * 0x010101u; break;
+                            case D3DFMT_A8L8: { const std::uint16_t p = ((const std::uint16_t*)row)[x];
+                                c = ((std::uint32_t)(p >> 8) << 24) | (p & 0xFFu) * 0x010101u; break; }
+                            default: ok = false; c = 0; break;
+                        }
+                        if (!ok) { break; }
+                        const std::uint8_t* b = (const std::uint8_t*)&c;   // little endian: B G R A
+                        out.insert(out.end(), b, b + 4);
+                    }
+                }
+            }
+            tex->UnlockRect(lv);
+            if (!ok) { return false; }
+        }
+        w32(20, dxt ? std::max(1u, (d0.Width + 3) / 4) * std::max(1u, (d0.Height + 3) / 4) * blockBytes : d0.Width * 4u);
+        return true;
+    }
+
+    std::uint32_t uiTextureSlot(IDirect3DTexture9* tex) {
+        if (!tex) { return 0; }
+        auto it = g_uiTex.find(tex);
+        if (it != g_uiTex.end()) { return it->second.slot; }
+        if (g_uiTex.size() >= 4096) {
+            // Bound what the refs keep alive. Every entry re-uploads on next sight (a new name).
+            for (auto& kv : g_uiTex) { kv.first->Release(); }
+            g_uiTex.clear();
+        }
+        D3DSURFACE_DESC d = {};
+        tex->GetLevelDesc(0, &d);
+        std::uint32_t slot = 0;
+        std::vector<std::uint8_t> dds;
+        if (!(d.Usage & D3DUSAGE_RENDERTARGET) && buildUiDds(tex, dds)) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "@ui/%p/%u", (void*)tex, ++g_uiTexSerial);
+            FirstSightBytes r;
+            r.size = (unsigned)dds.size();
+            r.data = std::malloc(r.size);
+            if (r.data) {
+                std::memcpy(r.data, dds.data(), r.size);
+                r.found = true;
+                slot = stageFirstSight(name, r, /*dataTexture=*/true, /*quietMiss=*/false);
+            }
+        } else if (g_uiRejects++ < 16) {
+            LOG::logline("!! [hostui] texture %p %ux%u fmt=0x%X usage=0x%X pool=%u not readable — white",
+                         (void*)tex, d.Width, d.Height, (unsigned)d.Format, (unsigned)d.Usage, (unsigned)d.Pool);
+        }
+        tex->AddRef();
+        g_uiTex.emplace(tex, UiTex{ slot });
+        return slot;
+    }
+
+    void captureUiDraw(const RenderedState* rs, const FragmentState* frs, const LightState* lrs,
+                       const D3DMATRIX* proj) {
+        auto reject = [&](const char* why) {
+            if (g_uiRejects++ < 32) {
+                LOG::logline("!! [hostui] draw dropped (%s): prim=%d fvf=0x%X vc=%u tri=%u blend=%u(%u,%u)", why,
+                             (int)rs->primType, (unsigned)rs->fvf, rs->vertCount, rs->primCount,
+                             (unsigned)rs->blendEnable, (unsigned)rs->srcBlend, (unsigned)rs->destBlend);
+            }
+        };
+        if (rs->primType != D3DPT_TRIANGLELIST) { reject("primtype"); return; }
+        if (!rs->vb || !rs->ib || rs->vbStride == 0) { reject("no vb/ib"); return; }
+        if ((rs->fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZ) { reject("fvf"); return; }
+        if (rs->vertCount == 0 || rs->primCount == 0) { return; }
+        const std::uint32_t idxCount = rs->primCount * 3;
+        if (g_uiIn.size() + rs->vertCount > IPC::kMaxUiVerts || g_uiInIdx.size() + idxCount > IPC::kMaxUiIndices) {
+            reject("cap"); return;
+        }
+        if (rs->blendEnable && !(rs->srcBlend == D3DBLEND_SRCALPHA && rs->destBlend == D3DBLEND_INVSRCALPHA)) {
+            reject("blend (drawn as SRCALPHA/INVSRCALPHA)");
+        }
+
+        // Stage 0 ops -> mode bits.
+        const std::uint32_t slot = uiTextureSlot(rs->texture);
+        const auto& st = frs->stage[0];
+        std::uint32_t mode = slot & 0xFFFFu;
+        auto opBits = [&](BYTE op, BYTE a1, BYTE a2, std::uint32_t texOnly, std::uint32_t diffOnly) -> std::uint32_t {
+            if (!rs->texture || op == D3DTOP_DISABLE) { return diffOnly; }
+            if (op == D3DTOP_SELECTARG1 || op == D3DTOP_SELECTARG2) {
+                const BYTE arg = (op == D3DTOP_SELECTARG1 ? a1 : a2) & D3DTA_SELECTMASK;
+                return arg == D3DTA_TEXTURE ? texOnly : diffOnly;
+            }
+            return 0u;   // MODULATE (and anything unmodelled)
+        };
+        mode |= opBits(st.colorOp, st.colorArg1, st.colorArg2, IPC::kUiColorTexOnly, IPC::kUiColorDiffOnly);
+        mode |= opBits(st.alphaOp, st.alphaArg1, st.alphaArg2, IPC::kUiAlphaTexOnly, IPC::kUiAlphaDiffOnly);
+        if (!rs->blendEnable) { mode |= IPC::kUiOpaque; }
+        if (rs->alphaTest) { mode |= IPC::kUiAlphaTest | ((std::uint32_t)rs->alphaRef << 24); }
+
+        // world x view x proj (D3DX row vectors: v * M).
+        D3DXMATRIX wvp;
+        D3DXMatrixMultiply(&wvp, &rs->worldViewTransforms[0], (const D3DXMATRIX*)proj);
+        const D3DXMATRIX& world = rs->worldTransforms[0];
+        const float hx = g_bbW ? 1.0f / (float)g_bbW : 0.0f, hy = g_bbH ? 1.0f / (float)g_bbH : 0.0f;
+
+        const UINT stride = rs->vbStride;
+        UINT off = 12;
+        const bool hasNorm = (rs->fvf & D3DFVF_NORMAL) != 0;  const UINT normOff = off; if (hasNorm) off += 12;
+        if (rs->fvf & D3DFVF_PSIZE) off += 4;
+        const bool hasCol = (rs->fvf & D3DFVF_DIFFUSE) != 0;  const UINT colOff = off; if (hasCol) off += 4;
+        if (rs->fvf & D3DFVF_SPECULAR) off += 4;
+        const bool hasUV = ((rs->fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT) >= 1;  const UINT uvOff = off;
+
+        void* pVerts = nullptr;
+        if (FAILED(rs->vb->Lock(rs->vbOffset, 0, &pVerts, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) { reject("vb lock"); return; }
+        void* pIdx = nullptr;
+        if (FAILED(rs->ib->Lock(0, 0, &pIdx, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) { rs->vb->Unlock(); reject("ib lock"); return; }
+        D3DINDEXBUFFER_DESC ibd; rs->ib->GetDesc(&ibd);
+        const bool is16 = (ibd.Format == D3DFMT_INDEX16);
+
+        const FragmentState::Material& m = frs->material;
+        const std::size_t vBase = g_uiIn.size();
+        const UINT srcVBase = rs->baseIndex + rs->minIndex;
+        for (UINT j = 0; j < rs->vertCount; ++j) {
+            const BYTE* v = (const BYTE*)pVerts + (size_t)(srcVBase + j) * stride;
+            const D3DXVECTOR3 p(((const float*)v)[0], ((const float*)v)[1], ((const float*)v)[2]);
+            D3DXVECTOR4 c4;
+            D3DXVec3Transform(&c4, &p, &wvp);
+            IPC::UiVertexWire o;
+            o.x = c4.x - c4.w * hx; o.y = c4.y + c4.w * hy; o.z = c4.z; o.w = c4.w;   // D3D9 half pixel
+            const std::uint32_t vc = hasCol ? *(const std::uint32_t*)(v + colOff) : 0xFFFFFFFFu;
+            if (rs->useLighting) {
+                const float vr = ((vc >> 16) & 255u) / 255.0f, vg = ((vc >> 8) & 255u) / 255.0f, vb = (vc & 255u) / 255.0f,
+                            va = (vc >> 24) / 255.0f;
+                const bool difV = hasCol && rs->matSrcDiffuse == D3DMCS_COLOR1;
+                const bool emiV = hasCol && rs->matSrcEmissive == D3DMCS_COLOR1;
+                const float dr = difV ? vr : m.diffuse.r, dg = difV ? vg : m.diffuse.g, db = difV ? vb : m.diffuse.b,
+                            da = difV ? va : m.diffuse.a;
+                float r = (emiV ? vr : m.emissive.r) + m.ambient.r * lrs->globalAmbient.r;
+                float g = (emiV ? vg : m.emissive.g) + m.ambient.g * lrs->globalAmbient.g;
+                float b = (emiV ? vb : m.emissive.b) + m.ambient.b * lrs->globalAmbient.b;
+                if (hasNorm && !lrs->active.empty()) {
+                    D3DXVECTOR3 n(((const float*)(v + normOff))[0], ((const float*)(v + normOff))[1], ((const float*)(v + normOff))[2]);
+                    D3DXVec3TransformNormal(&n, &n, &world);
+                    D3DXVec3Normalize(&n, &n);
+                    D3DXVECTOR3 wp;
+                    D3DXVec3TransformCoord(&wp, &p, &world);
+                    for (DWORD li : lrs->active) {
+                        auto lit = lrs->lights.find(li);
+                        if (lit == lrs->lights.end()) { continue; }
+                        const LightState::Light& L = lit->second;
+                        D3DXVECTOR3 ld; float att = 1.0f;
+                        if (L.type == D3DLIGHT_DIRECTIONAL) {
+                            ld = -*(const D3DXVECTOR3*)&L.position;
+                            r += m.ambient.r * L.ambient.x; g += m.ambient.g * L.ambient.y; b += m.ambient.b * L.ambient.z;
+                        } else {
+                            ld = *(const D3DXVECTOR3*)&L.position - wp;
+                            const float dist = D3DXVec3Length(&ld);
+                            if (dist > 0.0f) { ld /= dist; }
+                            const float den = L.falloff.x + L.falloff.y * dist + L.falloff.z * dist * dist;
+                            att = den > 0.0f ? 1.0f / den : 1.0f;
+                        }
+                        const float nl = std::max(0.0f, D3DXVec3Dot(&n, &ld)) * att;
+                        r += dr * L.diffuse.r * nl; g += dg * L.diffuse.g * nl; b += db * L.diffuse.b * nl;
+                    }
+                }
+                auto u8 = [](float x) { return (std::uint32_t)(std::min(1.0f, std::max(0.0f, x)) * 255.0f + 0.5f); };
+                o.color = (u8(da) << 24) | (u8(r) << 16) | (u8(g) << 8) | u8(b);
+            } else {
+                o.color = vc;
+            }
+            if (hasUV) { o.u = ((const float*)(v + uvOff))[0]; o.v = ((const float*)(v + uvOff))[1]; }
+            else { o.u = 0.0f; o.v = 0.0f; }
+            o.texMode = mode;
+            g_uiIn.push_back(o);
+        }
+        bool bad = false;
+        const std::size_t iBase = g_uiInIdx.size();
+        for (UINT i = 0; i < idxCount; ++i) {
+            const UINT raw = is16 ? ((const WORD*)pIdx)[rs->startIndex + i] : ((const DWORD*)pIdx)[rs->startIndex + i];
+            const long rel = (long)raw - (long)rs->minIndex;
+            const long abs = rel + (long)vBase;
+            if (rel < 0 || rel >= (long)rs->vertCount || abs > 0xFFFF) { bad = true; break; }
+            g_uiInIdx.push_back((std::uint16_t)abs);
+        }
+        rs->ib->Unlock();
+        rs->vb->Unlock();
+        if (bad) { g_uiIn.resize(vBase); g_uiInIdx.resize(iBase); reject("index range"); }
+    }
+
+    void endUiFrame() {
+        if (g_hostUiEnv != 1) { return; }
+        g_uiReady.swap(g_uiIn);
+        g_uiReadyIdx.swap(g_uiInIdx);
+        g_uiIn.clear();
+        g_uiInIdx.clear();
+    }
+
 
     unsigned seamProbe() { return g_seamProbe; }
 

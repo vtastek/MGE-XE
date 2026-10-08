@@ -640,6 +640,10 @@ namespace IPC {
 			// FP1e: multi-map FP parts (MultiMapDrawWire[]), same clamp as every other list.
 			list(kListFpMM, params.fpMMList, params.fpMMBytes);
 		}
+		// Host-drawn UI: [verts][indices] in one vec, the two counts clamped to its window.
+		if (params.uiList != InvalidVector) {
+			list(kListUi, params.uiList, params.uiVertBytes + params.uiIdxBytes);
+		}
 
 		if (Rec::active()) {
 			Rec::Blob blobs[kFrameListCount];
@@ -759,6 +763,12 @@ namespace IPC {
 			// index crosses the wire, and the only place it becomes a medium.
 			ForgeRender::setWeather(params.weather);
 			const std::uint32_t capBytes = L.bytes[kListCaptured];
+			{
+				// Host-drawn UI (P1): verts then indices; the vert count is clamped into the list.
+				const std::uint32_t uiBytes = L.bytes[kListUi];
+				const std::uint32_t uiVert = (std::min)(params.uiVertBytes, uiBytes);
+				ForgeRender::setUiList(L.ptr[kListUi], uiVert, uiBytes - uiVert);
+			}
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting,
 				L.ptr[kListDraw], params.drawCount, L.bytes[kListDraw],
 				L.ptr[kListSkinned], params.skinnedCount, L.bytes[kListSkinned],

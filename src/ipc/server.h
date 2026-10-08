@@ -11,6 +11,7 @@ namespace IPC {
 	enum FrameList : unsigned {
 		kListDraw, kListSkinned, kListMultiMap, kListLight, kListSky, kListAlpha, kListCaptured,
 		kListFpDraw, kListFpSkinned, kListFpAlpha, kListFpMM,
+		kListUi,   // host-drawn UI: [UiVertexWire][uint16], indices at RenderFrameParameters::uiVertBytes
 		kFrameListCount
 	};
 	struct FrameLists {

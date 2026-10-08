@@ -77,6 +77,8 @@ namespace IPC {
 		float m_nearCellReach = 0.0f;
 		std::uint32_t m_nearRefsVersion = 0;
 		float m_nearFwd[3] = { 0.0f, 1.0f, 0.0f };
+		VecId m_uiList = InvalidVector;
+		std::uint32_t m_uiVertBytes = 0, m_uiIdxBytes = 0;
 		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting,
 		// 1 = semaphore, 2 = event.
 		std::uint32_t m_clientSyncsOnFence = 0;
@@ -471,6 +473,13 @@ namespace IPC {
 		// at seam bring-up and stamped into every render RPC. Defaults 0 so a client that never calls
 		// it can never be handed a half-drawn frame.
 		void setClientSyncsOnFence(std::uint32_t mode) { m_clientSyncsOnFence = mode; }
+
+		// Host-drawn UI (tasks/forge-host-ui.md P1): the vec holding this kick's captured UI and its
+		// two byte counts. Stamped into the NEXT render RPC only, then cleared, so a frame that
+		// captured no UI never re-ships a stale list.
+		void setNextUiList(VecId id, std::uint32_t vertBytes, std::uint32_t idxBytes) {
+			m_uiList = id; m_uiVertBytes = vertBytes; m_uiIdxBytes = idxBytes;
+		}
 
 		// (eyeNow - bakeEye), the mode-3 park delta the sky payload was pre-cancelled by. The host
 		// needs it to place the REFLECT pass's sky mirror plane at the FIRE-time camera height rather

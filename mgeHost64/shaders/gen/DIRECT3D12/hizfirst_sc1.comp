@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 670 "FSL/shaders.list"
+#line 680 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
 #line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.srt.h"
@@ -1003,4 +1003,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 #line 73 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
     return;
 }
-#line 671 "FSL/shaders.list"
+#line 681 "FSL/shaders.list"

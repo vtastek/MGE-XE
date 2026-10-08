@@ -317,7 +317,10 @@ void DistantLand::frameSetupEarly() {
     const bool freezeEligible = earlyForgeKickoff
                              && (Configuration.MGEFlags & USE_MENU_CACHING)
                              && mwBridge->IsMenu()
-                             && RenderProcess::hasCompositeFrame();
+                             && RenderProcess::hasCompositeFrame()
+                             // Host-drawn UI: a frozen world sends no kick, and the kick is what
+                             // carries the UI to the host that presents it. The menu would freeze.
+                             && !RenderProcess::hostUiActive();
     if (!freezeEligible) {
         // Leaving the menu (or losing the composite) resets the cadence so the next menu always
         // opens on a freshly rendered frame rather than mid-cycle.

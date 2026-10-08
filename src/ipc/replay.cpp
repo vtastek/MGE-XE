@@ -132,10 +132,16 @@ namespace IPC {
 		if (!rd.open(path)) {
 			return 1;
 		}
-		if (rd.frameParamBytes != sizeof(RenderFrameParameters)) {
+		// Fields are only ever APPENDED to RenderFrameParameters, so an older (smaller) recording replays
+		// with the new tail zeroed (the per-frame copy is min(size)). Larger = a newer wire: refuse.
+		if (rd.frameParamBytes > sizeof(RenderFrameParameters)) {
 			LOG::logline("!! [replay] recording has RenderFrameParameters of %u bytes, this host %u: rebuilt bridge.h",
 				rd.frameParamBytes, static_cast<unsigned>(sizeof(RenderFrameParameters)));
 			return 1;
+		}
+		if (rd.frameParamBytes < sizeof(RenderFrameParameters)) {
+			LOG::logline(">> [replay] recording's RenderFrameParameters is %u bytes, this host %u: the appended tail replays zeroed",
+				rd.frameParamBytes, static_cast<unsigned>(sizeof(RenderFrameParameters)));
 		}
 
 		// Census: what the file holds, per command.
@@ -233,7 +239,9 @@ namespace IPC {
 						break;
 					}
 					RenderFrameParameters params;
-					std::memcpy(&params, r.fixed, sizeof(params));
+					// min(): recordings made before a field was appended replay with that field zeroed.
+					std::memset(&params, 0, sizeof(params));
+					std::memcpy(&params, r.fixed, (std::min<std::size_t>)(r.fixedBytes, sizeof(params)));
 					// One-shot dev edges fire where they were recorded only on pass 1's live twin; a replay
 					// re-firing a shader reload or a capture every loop would measure the edge, not the frame.
 					params.devReloadShaders = 0;

@@ -673,6 +673,8 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         framePaceLimit();
     }
 
+    RenderProcess::endUiFrame();   // this frame's captured UI ships with the next kick
+
     HRESULT hr;
     {
         MGE_ZoneScopedN("engPresent");
@@ -994,8 +996,13 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
 
 // SetTransform
 // Projection needs modifying to allow room for distant land
+// The projection MW last set, as MW set it. RenderedState does not track it; host-drawn UI needs it
+// to put the menu camera's vertices in clip space (RenderProcess::captureUiDraw).
+static D3DMATRIX s_lastProj = {};
+
 HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
     captureTransform(a, b);
+    if (a == D3DTS_PROJECTION && b) { s_lastProj = *b; }
 
     if (rendertargetNormal) {
         if (a == D3DTS_VIEW) {
@@ -1135,6 +1142,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
     } s0probeGuard{ s0probe, &s0t0 };
 
+    if (DrawStats::g_stage == DrawStats::UI && RenderProcess::hostUiActive()) {
+        // Host-drawn UI (tasks/forge-host-ui.md P1): captured for the host, never drawn here.
+        rs.primType = a; rs.baseIndex = baseVertexIndex; rs.minIndex = b;
+        rs.vertCount = c; rs.startIndex = d; rs.primCount = e;
+        RenderProcess::captureUiDraw(&rs, &frs, &lightrs, &s_lastProj);
+        return D3D_OK;
+    }
     if (DrawStats::g_stage == DrawStats::UI && (RenderProcess::seamProbe() & 4u) && RenderProcess::forgeOwnsFrame()) {
         return D3D_OK;   // MGE_SEAM_PROBE bit 2: the client draws no UI (measurement only)
     }

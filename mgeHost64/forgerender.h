@@ -138,6 +138,9 @@ namespace ForgeRender {
     // atmosphere.h) — the only place in the renderer where a weather index becomes physics. An
     // invalid row (interior, menu, no world) parks the medium at Clear. Call before renderScene.
     void setWeather(const IPC::WeatherWire& w);
+    // Host-drawn UI (tasks/forge-host-ui.md P1): this frame's [UiVertexWire][uint16] list, a view into
+    // IPC memory valid for the next renderScene. Null / 0 = no host UI this frame.
+    void setUiList(const void* blob, unsigned vertBytes, unsigned idxBytes);
 
     // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
     // built successfully in init(). False ⇒ renderScene returns false and the seam

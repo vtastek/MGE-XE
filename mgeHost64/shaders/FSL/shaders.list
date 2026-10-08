@@ -220,6 +220,16 @@
 #include "glow.frag.fsl"
 #end
 
+// HOST-DRAWN UI (tasks/forge-host-ui.md P1): MW's UI, clip-space and pre-lit by the client, drawn
+// into the delivered BGRA8 image after the resolve. Shares opaque.srt.h / DefaultRootSignature.
+#vert ui.vert
+#include "ui.vert.fsl"
+#end
+
+#frag ui.frag
+#include "ui.frag.fsl"
+#end
+
 // Host-owned TERRAIN (tasks/forge-terrain.md): the real Morrowind heightfield, read from the plugin
 // LAND records at launch and drawn as one shared 65x65 lattice VB instanced per cell, with the
 // height fetched per-vertex out of gTerrainHeights in the VS. LOD = index-buffer stride, cracks

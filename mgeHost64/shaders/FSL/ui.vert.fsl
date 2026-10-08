@@ -1,0 +1,37 @@
+// mgeHost64 — HOST-DRAWN UI, vertex stage (tasks/forge-host-ui.md P1).
+//
+// Morrowind's UI arrives already in CLIP space (the client multiplied world x view x projection and
+// removed D3D9's half-pixel), already lit (the client evaluated the fixed-function lighting with the
+// bound material and lights), in MW's own draw order. So this stage only forwards. TexMode carries
+// the texture slot (bits 0-15) and the stage-0 colour/alpha ops (geomwire.h kUi*), flat.
+// Shares opaque.srt.h / DefaultRootSignature for the bindless gTextures array.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float4, Position, POSITION);
+    DATA(float4, Color,    COLOR);       // D3DCOLOR through a B8G8R8A8_UNORM attribute
+    DATA(float2, Uv,       TEXCOORD0);
+    DATA(uint,   TexMode,  TEXCOORD1);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,     Position, SV_Position);
+    DATA(float4,     Color,    COLOR);
+    DATA(float2,     Uv,       TEXCOORD0);
+    DATA(FLAT(uint), TexMode,  TEXCOORD1);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+    Out.Position = In.Position;
+    Out.Color    = In.Color;
+    Out.Uv       = In.Uv;
+    Out.TexMode  = In.TexMode;
+    RETURN(Out);
+}

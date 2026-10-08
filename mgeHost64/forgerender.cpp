@@ -2184,6 +2184,17 @@ namespace {
     // Vulkan swapchain on (the client must not present: MGE_SEAM_PROBE=7). Child = independent-flip
     // black (G-Sync off), so this is the remaining single-swapchain shape.
     bool         g_hostPresentDirect = false;
+    // HOST-DRAWN UI (tasks/forge-host-ui.md P1): the client's captured UI list for this frame (a view
+    // into IPC shared memory, valid for the duration of renderScene) and the one pipeline that draws
+    // it into pRT after the resolve. Built on first use.
+    const void*  g_uiBlob = nullptr;
+    unsigned     g_uiVertBytes = 0, g_uiIdxBytes = 0;
+    Shader*      g_pUiShader = nullptr;
+    Pipeline*    g_pUiPipeline = nullptr;
+    Buffer*      g_pUiVB = nullptr;
+    Buffer*      g_pUiIB = nullptr;
+    bool         g_uiPathFailed = false;
+    uint32_t     g_lastUiVerts = 0, g_lastUiIdx = 0;
     HWND         g_mwHwnd = nullptr;
     bool         g_hostPresentTried = false;   // the lazy swapchain create ran (success or not)
     // Run the full alpha classification beside the sampled one and log disagreements (classifyAlpha).
@@ -17390,6 +17401,7 @@ namespace {
         uint64_t sharedFenceValue = 0;   // the frame's shared-fence value (its frame-trace id)
         bool     phaseIssued[kGpuPhaseCount] = {};
         bool     atmosShArmed = false;
+        bool     hizTestOn = false;      // this frame's statics cull ran the Hi-Z test (hizParams.w = 1)
         bool     reflGpuCullRan = false;
         uint32_t reflCpuCull = 0;        // the frame's own CPU mirror-cull count (H2a parity)
         bool     aplSplitRan = false;
@@ -18175,6 +18187,17 @@ namespace {
     // Hi-Z pyramid A/B: OFF = neither the mip-0 seam fill nor the tail reduce happens; g_hizValid
     // drops the same frame (a skipped rebuild means a stale pyramid), so occlusion passes through.
     bool g_hizPrologue   = true;
+    // ADAPTIVE Hi-Z (2026-10-08). The pyramid costs ~0.19 ms host GPU at 2560x1600 4x (docks replay:
+    // hs.gpu 2.615 -> 2.428 with hizPrologue=0) and removes NOTHING where nothing hides anything — the
+    // docks camera looks straight down on the city: occluded 0 of 7685. When a frame whose test was
+    // armed comes back with occluded/survivors < hizAdaptiveMin, the pyramid sleeps kHizSleepFrames;
+    // the frame after the sleep rebuilds it and the next readback decides again. Ground level in a
+    // town (where occlusion pays) keeps it every frame. hizAdaptive=0 = always build, the A/B.
+    bool     g_hizAdaptive    = true;
+    float    g_hizAdaptiveMin = 0.10f;
+    constexpr uint32_t kHizSleepFrames = 15;
+    uint32_t g_hizSleep       = 0;       // frames left to skip the pyramid
+    bool     g_hizTestOnFrame = false;   // this frame's hizParams.w, snapshotted per slot
     bool g_drawWater     = true;
     bool g_heroBlendPass = true;   // Phase 4: draw the post-water hero (ghostfence/lava) blend pass
     // AT1 bring-up: draw the alpha list with the depth-OFF debug PSO (panel toggle) —
@@ -23482,6 +23505,7 @@ namespace {
             { "dumpBurstY",         &g_dumpBurstY         },
             { "dumpBurstR",         &g_dumpBurstR         },
             { "hizOff",             &g_hizOffKnob         },
+            { "hizAdaptiveMin",     &g_hizAdaptiveMin     },
             { "fogSkyKnee",         &g_fogSkyKnee         },
             { "fogHazeLiftDeg",     &g_fogHazeLiftDeg     },
             { "fogHazeSunFloorDeg", &g_fogHazeSunFloorDeg },
@@ -23928,6 +23952,10 @@ namespace {
             // Host-owned present into a child of MW's window (spike; READ AT INIT, like hostWindow).
             { "hostPresent",         &g_hostPresent         },
             { "hostPresentDirect",   &g_hostPresentDirect   },
+            // The pyramid build itself (mip-0 fill + reduce). hizOff only stops the TEST; this stops the
+            // work, so it prices what occlusion costs where it removes nothing (docks, top-down).
+            { "hizPrologue",        &g_hizPrologue        },
+            { "hizAdaptive",        &g_hizAdaptive        },
             // The oracle for the sampled DDS alpha classification: full scan beside it, mismatches
             // logged as `!! [classify]`, a running tally every 256 as `-- [classify] verify:`.
             { "texClassifyVerify",   &g_texClassifyVerify   },
@@ -27161,6 +27189,111 @@ namespace {
 
     // Per-frame: push forwarded input, build the ImGui frame, and draw it into pRT. Called from
     // renderScene with pRT in RENDER_TARGET state (caller restores COMMON for the DXVK handoff).
+    // ─── HOST-DRAWN UI (tasks/forge-host-ui.md P1) ─────────────────────────────────────────────
+    // MW's UI, already transformed to clip space and fixed-function lit by the client, drawn in MW's
+    // order with one alpha-blended pipeline into the DELIVERED image (display-referred, like the dev
+    // UI below it: MW authored its UI for the back buffer, so it never sees exposure or the curve).
+    bool buildHostUiPath(Renderer* R) {
+        if (g_pUiPipeline && g_pUiVB && g_pUiIB) { return true; }
+        if (g_uiPathFailed || !g_live.pRT) { return false; }
+        if (!g_pUiShader) {
+            ShaderLoadDesc sd = {};
+            sd.mVert.pFileName = "ui.vert";
+            sd.mFrag.pFileName = "ui.frag";
+            addShader(R, &sd, &g_pUiShader);
+            if (!g_pUiShader) { g_uiPathFailed = true; LOG::logline("!! [hostui] addShader(ui) FAILED"); return false; }
+        }
+        if (!g_pUiPipeline) {
+            VertexLayout vl = {};
+            vl.mBindingCount = 1;
+            vl.mBindings[0].mStride = sizeof(IPC::UiVertexWire);
+            vl.mBindings[0].mRate   = VERTEX_BINDING_RATE_VERTEX;
+            vl.mAttribCount = 4;
+            vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;  vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+            vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
+            vl.mAttribs[1].mSemantic = SEMANTIC_COLOR;     vl.mAttribs[1].mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+            vl.mAttribs[1].mLocation = 1; vl.mAttribs[1].mOffset = 16;
+            vl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD0; vl.mAttribs[2].mFormat = TinyImageFormat_R32G32_SFLOAT;
+            vl.mAttribs[2].mLocation = 2; vl.mAttribs[2].mOffset = 20;
+            vl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD1; vl.mAttribs[3].mFormat = TinyImageFormat_R32_UINT;
+            vl.mAttribs[3].mLocation = 3; vl.mAttribs[3].mOffset = 28;
+            DepthStateDesc ds = {};
+            RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE;
+            BlendStateDesc bs = {};
+            bs.mSrcFactors[0] = BC_SRC_ALPHA;      bs.mDstFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+            bs.mSrcAlphaFactors[0] = BC_ONE;       bs.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+            bs.mBlendModes[0] = BM_ADD;            bs.mBlendAlphaModes[0] = BM_ADD;
+            bs.mColorWriteMasks[0] = COLOR_MASK_ALL; bs.mRenderTargetMask = BLEND_STATE_TARGET_0;
+            PipelineDesc pd = {};
+            pd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+            g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            g.mRenderTargetCount = 1;
+            g.pColorFormats = &g_live.pRT->mFormat;
+            g.mSampleCount = SAMPLE_COUNT_1;
+            g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+            g.pDepthState = &ds;
+            g.pVertexLayout = &vl;
+            g.pRasterizerState = &rs;
+            g.pBlendState = &bs;
+            g.pShaderProgram = g_pUiShader;
+            addPipeline(R, &pd, &g_pUiPipeline);
+            if (!g_pUiPipeline) { g_uiPathFailed = true; LOG::logline("!! [hostui] addPipeline(ui) FAILED"); return false; }
+        }
+        if (!g_pUiVB) {
+            BufferLoadDesc vb = {};
+            vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            vb.mDesc.mSize = (uint64_t)IPC::kMaxUiVerts * sizeof(IPC::UiVertexWire);
+            vb.mDesc.pName = "hostUiVB";
+            vb.ppBuffer = &g_pUiVB;
+            addFrameBuf(&vb);
+            BufferLoadDesc ib = {};
+            ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+            ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            ib.mDesc.mSize = (uint64_t)IPC::kMaxUiIndices * sizeof(uint16_t);
+            ib.mDesc.pName = "hostUiIB";
+            ib.ppBuffer = &g_pUiIB;
+            addFrameBuf(&ib);
+            waitForAllResourceLoads();
+            if (!g_pUiVB || !g_pUiIB) { g_uiPathFailed = true; LOG::logline("!! [hostui] VB/IB alloc FAILED"); return false; }
+        }
+        LOG::logline(">> [hostui] pipeline built (%u verts / %u indices max)", IPC::kMaxUiVerts, IPC::kMaxUiIndices);
+        return true;
+    }
+
+    void drawHostUi() {
+        g_lastUiVerts = g_lastUiIdx = 0;
+        if (!g_uiBlob || g_uiVertBytes < sizeof(IPC::UiVertexWire) || g_uiIdxBytes < 3 * sizeof(uint16_t)) { return; }
+        if (!buildHostUiPath(g_live.pRenderer)) { return; }
+        const uint32_t nv = std::min<uint32_t>(g_uiVertBytes / (uint32_t)sizeof(IPC::UiVertexWire), IPC::kMaxUiVerts);
+        uint32_t ni = std::min<uint32_t>(g_uiIdxBytes / (uint32_t)sizeof(uint16_t), IPC::kMaxUiIndices);
+        ni -= ni % 3;
+        if (!nv || !ni) { return; }
+        const uint8_t* blob = (const uint8_t*)g_uiBlob;
+        std::memcpy(fbwRange(g_pUiVB, 0, (uint64_t)nv * sizeof(IPC::UiVertexWire)), blob, (size_t)nv * sizeof(IPC::UiVertexWire));
+        std::memcpy(fbwRange(g_pUiIB, 0, (uint64_t)ni * sizeof(uint16_t)), blob + g_uiVertBytes, (size_t)ni * sizeof(uint16_t));
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.9f, 0.4f, "HOST UI");
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_LOAD };
+        cmdBindRenderTargets(g_live.pCmd, &bind);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.outWidth, (float)g_live.outHeight, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.outWidth, g_live.outHeight);
+        cmdBindPipeline(g_live.pCmd, g_pUiPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        uint32_t stride = (uint32_t)sizeof(IPC::UiVertexWire);
+        cmdBindVertexBuffer(g_live.pCmd, 1, &g_pUiVB, &stride, nullptr);
+        cmdBindIndexBuffer(g_live.pCmd, g_pUiIB, INDEX_TYPE_UINT16, 0);
+        cmdDrawIndexed(g_live.pCmd, ni, 0, 0);
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+        cmdEndDebugMarker(g_live.pCmd);
+        g_lastUiVerts = nv; g_lastUiIdx = ni;
+    }
+
     void drawDevUI() {
         if (!g_uiInited) {
             return;
@@ -31142,6 +31275,12 @@ void destroyHostWindow(Renderer* R);
     // proven is that the pair (cur, next) changing does NOT step the medium. Printing the row at the
     // instant the pair flips puts the two sides of the discontinuity next to each other in the log,
     // where a step is a diff and not an impression.
+    void setUiList(const void* blob, unsigned vertBytes, unsigned idxBytes) {
+        g_uiBlob = blob;
+        g_uiVertBytes = blob ? vertBytes : 0u;
+        g_uiIdxBytes  = blob ? idxBytes  : 0u;
+    }
+
     void setWeather(const IPC::WeatherWire& w) {
         const Atmosphere::Live prev = Atmosphere::live();
         Atmosphere::setWeather(w);
@@ -32852,6 +32991,7 @@ void destroyHostWindow(Renderer* R);
         ss.reflCpuCull      = liveReflInstCount();
         ss.aplSplitRan      = g_aplSplitRan;
         ss.mbRan            = g_lastMbRan;
+        ss.hizTestOn        = g_hizTestOnFrame;
         ss.mbPixels         = g_lastMbPixels;
     }
 
@@ -32944,6 +33084,12 @@ void destroyHostWindow(Renderer* R);
             const uint32_t* rb = (const uint32_t*)rbLane(g_live.pCullCountReadback);
             g_lastGpuCullCount = rb[0];
             g_lastGpuOccluded  = rb[1];
+            // Adaptive Hi-Z: judge only frames whose test was armed (a skipped pyramid occludes 0 by
+            // construction and must not keep itself asleep).
+            if (g_hizAdaptive && ss.hizTestOn) {
+                const float frac = rb[0] ? (float)rb[1] / (float)rb[0] : 0.0f;
+                g_hizSleep = (frac < g_hizAdaptiveMin) ? kHizSleepFrames : 0u;
+            }
         }
         // H2a: the MIRROR lane's survivor count, and the parity check that is this step's whole
         // acceptance. [0] = Σ numSubsets over the frustum survivors — exactly what the CPU cull's
@@ -43191,7 +43337,9 @@ void destroyHostWindow(Renderer* R);
         //      which all run before the colour pass and cannot use this one. (This becomes deletable
         //      the day DL statics gain a prepass entry of their own.)
         bool hizMip0Filled = false;
-        const bool doHizMip0 = g_live.hizReady && g_hizPrologue;
+        bool hizAsleep = false;
+        if (g_hizSleep > 0) { --g_hizSleep; hizAsleep = g_hizAdaptive; }
+        const bool doHizMip0 = g_live.hizReady && g_hizPrologue && !hizAsleep;
         // M1 MOTION VECTORS. ⚠ THE F12 VIEW FORCES THE PASS ON — a "show me the motion vectors" mode
         // that leaves the producing dispatch disabled would be
         // [[feedback_isolation_lever_killed_its_own_subject]] to the letter: the lever kills its own
@@ -46426,6 +46574,7 @@ void destroyHostWindow(Renderer* R);
                 cmdBindRenderTargets(g_live.pCmd, nullptr);
             }
 
+            drawHostUi();
             drawDevUI();
         };
 
@@ -58878,7 +59027,8 @@ void destroyHostWindow(Renderer* R);
             const bool eyeJump = (dEx*dEx + dEy*dEy + dEz*dEz) > (2048.0f * 2048.0f);
             cp[52] = (float)g_live.width; cp[53] = (float)g_live.height;                            // hizParams.xy = mip0 dims
             cp[54] = (float)(g_live.hizMips > 0 ? g_live.hizMips - 1 : 0);                          // hizParams.z = mipCount-1
-            cp[55] = (g_hizValid && g_hizOcclusion && g_hizOffKnob < 0.5f && !eyeJump) ? 1.0f : 0.0f;                      // hizParams.w = valid
+            cp[55] = (g_hizValid && g_hizOcclusion && g_hizOffKnob < 0.5f && !eyeJump) ? 1.0f : 0.0f;
+            g_hizTestOnFrame = cp[55] > 0.5f;                      // hizParams.w = valid
             cp[56] = dEx; cp[57] = dEy; cp[58] = dEz; cp[59] = 0.0f;                                // hizEyeDelta
             // Dynamic visibility mask (floats 60..123). Stored as raw bits — the shaders asuint it
             // back. The CPU gate above (dlVisEnabled) reads the SAME g_visMask, so the two cull paths
@@ -63849,6 +63999,11 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pWaterPipelineDbg)       { removePipeline(R, g_live.pWaterPipelineDbg); g_live.pWaterPipelineDbg = nullptr; }
         if (g_live.pWaterShaderDbg)         { removeShader(R, g_live.pWaterShaderDbg);     g_live.pWaterShaderDbg = nullptr; }
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
+        // Host-drawn UI teardown.
+        if (g_pUiPipeline) { removePipeline(R, g_pUiPipeline); g_pUiPipeline = nullptr; }
+        if (g_pUiShader)   { removeShader(R, g_pUiShader);     g_pUiShader = nullptr; }
+        if (g_pUiVB)       { removeFrameBuf(g_pUiVB);          g_pUiVB = nullptr; }
+        if (g_pUiIB)       { removeFrameBuf(g_pUiIB);          g_pUiIB = nullptr; }
         // Phase F glow-billboard teardown.
         if (g_live.pGlowPipeline)           { removePipeline(R, g_live.pGlowPipeline); }
         if (g_live.pGlowShader)             { removeShader(R, g_live.pGlowShader); }

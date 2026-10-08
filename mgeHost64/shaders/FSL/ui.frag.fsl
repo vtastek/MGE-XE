@@ -1,0 +1,42 @@
+// mgeHost64 — HOST-DRAWN UI, fragment stage (tasks/forge-host-ui.md P1).
+//
+// Stage 0 of the fixed-function texture chain, which is all MW's UI uses (P0 census): MODULATE, or
+// SELECTARG of the texture or of the diffuse colour, separately for colour and alpha. The UI is
+// display-referred: the client uploads its textures as DATA (UNORM, no sRGB decode) and this writes
+// into the BGRA8 delivered image after the resolve, so the bytes compose exactly as on MW's back
+// buffer. Blending (SRCALPHA / INVSRCALPHA) is the pipeline's.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,     Position, SV_Position);
+    DATA(float4,     Color,    COLOR);
+    DATA(float2,     Uv,       TEXCOORD0);
+    DATA(FLAT(uint), TexMode,  TEXCOORD1);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    const uint mode = In.TexMode;
+    const uint slot = mode & 0xFFFFu;
+    float4 tex = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    if (slot != 0u)
+    {
+        tex = SampleLvlTex2D(gTextures[slot], gSamplerBilinearWrap, In.Uv, 0.0f);
+    }
+    float3 rgb = tex.rgb * In.Color.rgb;                      // MODULATE
+    if ((mode & (1u << 16)) != 0u) { rgb = tex.rgb; }         // kUiColorTexOnly
+    if ((mode & (1u << 17)) != 0u) { rgb = In.Color.rgb; }    // kUiColorDiffOnly
+    float a = tex.a * In.Color.a;
+    if ((mode & (1u << 18)) != 0u) { a = tex.a; }             // kUiAlphaTexOnly
+    if ((mode & (1u << 19)) != 0u) { a = In.Color.a; }        // kUiAlphaDiffOnly
+    if ((mode & (1u << 21)) != 0u)                            // kUiAlphaTest: D3DCMP_GREATER ref
+    {
+        if (a * 255.0f <= (float)(mode >> 24)) { discard; }
+    }
+    if ((mode & (1u << 20)) != 0u) { a = 1.0f; }              // kUiOpaque: blending was off
+    RETURN(float4(rgb, a));
+}
