@@ -17,7 +17,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     const float thr   = gVrsParams.p.x;
     const int   tile  = max((int)gVrsParams.p.z, 1);
     const int   taps  = clamp((int)gVrsParams.p.w, 1, 16);
-    const int2  dims  = int2(GetDimensions(gVrsDepth, NO_SAMPLER));
+    const int2  dims  = int2(gVrsParams.dims.xy);
     const int2  mx    = dims - int2(1, 1);
     const int2  o     = t * tile;
     const int   step  = max(tile / taps, 1);
@@ -32,7 +32,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             int2 p = o + int2(x, y) * step + int2(step / 2, step / 2);
             if (x == taps - 1) { p.x = o.x + tile - 1; }
             if (y == taps - 1) { p.y = o.y + tile - 1; }
+#if SAMPLE_COUNT > 1
+            nearest = max(nearest, LoadTex2DMS(gVrsDepth, NO_SAMPLER, min(p, mx), 0).r);
+#else
             nearest = max(nearest, LoadTex2D(gVrsDepth, NO_SAMPLER, min(p, mx), 0).r);
+#endif
         }
     }
     const uint rate = (thr > 0.0f && nearest < thr) ? (uint)gVrsParams.p.y : 0u;

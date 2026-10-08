@@ -705,7 +705,13 @@
 #end
 
 // VRS Tier 2 rate image from the prepass depth (vrsrate.srt.h): far tiles 2x2, near tiles 1x1.
-#comp vrsrate.comp
+#comp vrsrate_sc1.comp
+#define SAMPLE_COUNT 1
+#include "vrsrate.comp.fsl"
+#end
+
+#comp vrsrate_sc4.comp
+#define SAMPLE_COUNT 4
 #include "vrsrate.comp.fsl"
 #end
 

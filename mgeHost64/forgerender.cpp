@@ -4586,6 +4586,34 @@ namespace {
            kGpuPhaseStaticsDepth,  // inside Prepass: the distant statics Z-prepass (staticsPrepass)
            kGpuPhaseCount };
 
+    // MGE_GPU_MARKERS=1: every phase bracket also opens a D3D12 event named after its phase, so an
+    // Nsight GPU Trace splits the frame into per-pass regimes (wait-for-idle, SM throughput, draw
+    // count). Forge's own markers need FORGE_DEBUG/FORGE_PROFILE plus the PIX runtime; this needs
+    // neither and costs nothing when unset. A diagnostic only: a phase that is begun twice before it
+    // ends (the timestamp pairs tolerate it) leaves the event stack unbalanced for that frame.
+    const char* const kGpuPhaseNames[kGpuPhaseCount] = {
+        "Prepass", "PostDepth", "Reflect", "Color", "Water", "Resolve", "Cull", "Frame", "ReflGeo",
+        "ColorSky", "ColorNear", "ColorSkin", "ColorMM", "ColorDL", "ColorAlpha", "Shadow",
+        "ShadowMask", "Linearize", "ShadowStatic", "ShadowDyn", "ShadowSun", "ColorFP", "ColorGlow",
+        "FroxelNear", "VolFog", "Bloom", "Caustic", "GrassCrush", "Atmos", "MotionVec", "Upscale",
+        "ObjVel", "ObjVelFP", "MotionBlur", "AODown", "AOSearch", "AOBlur", "AOUp", "ResolveFilter",
+        "HizMip0", "ReLinear", "Apl", "GrassDepth", "GrassColor", "SkyVis", "SkyVisScreen",
+        "RippleSim", "FbCopyA", "FbCopyB", "CullCam", "CullScan", "CullSun", "CullGrass", "CullCount",
+        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth"
+    };
+    bool gpuMarkersOn() {
+        static const bool on = [] { const char* e = std::getenv("MGE_GPU_MARKERS"); return e && e[0] == '1'; }();
+        return on;
+    }
+    void gpuMarkerBegin(Cmd* pCmd, uint32_t i) {
+        if (!gpuMarkersOn() || !pCmd || i >= kGpuPhaseCount) { return; }
+        const char* n = kGpuPhaseNames[i];
+        pCmd->mDx.pCmdList->BeginEvent(1u /*ANSI*/, n, (UINT)std::strlen(n) + 1u);
+    }
+    void gpuMarkerEnd(Cmd* pCmd) {
+        if (gpuMarkersOn() && pCmd) { pCmd->mDx.pCmdList->EndEvent(); }
+    }
+
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
     // capped far lower (the arm scene is ~10-30 parts); ONE 64KB bone window bounds the
     // skinned list; with contiguous packing the real bound is kBatchSize matrices in that window,
@@ -16326,7 +16354,7 @@ namespace {
                 waitForAllResourceLoads();
 
                 ShaderLoadDesc vsd = {};
-                vsd.mComp.pFileName = "vrsrate.comp";
+                vsd.mComp.pFileName = (g_live.sampleCount > 1) ? "vrsrate_sc4.comp" : "vrsrate_sc1.comp";
                 addShader(R, &vsd, &g_live.pVrsShader);
                 if (g_live.pVrsShader) {
                     PipelineDesc pd = {};
@@ -16334,7 +16362,7 @@ namespace {
                     pd.mComputeDesc.pShaderProgram = g_live.pVrsShader;
                     addPipeline(R, &pd, &g_live.pVrsPipeline);
                 }
-                if (g_live.pVrsRate && g_live.pVrsCbv && g_live.pVrsPipeline && g_live.pLinearDepth) {
+                if (g_live.pVrsRate && g_live.pVrsCbv && g_live.pVrsPipeline && g_live.pDepth) {
                     DescriptorSetDesc vset = SRT_SET_DESC(VrsSrtData, Persistent, 1, 0);
                     addDescriptorSet(R, &vset, &g_live.pVrsSet);
                 }
@@ -16344,7 +16372,7 @@ namespace {
                     d[0].ppBuffers = &g_live.pVrsCbv;
                     d[1].mIndex = SRT_RES_IDX(VrsSrtData, Persistent, gVrsDepth);
                     d[1].mCount = 1;
-                    d[1].ppTextures = &g_live.pLinearDepth;
+                    d[1].ppTextures = &g_live.pDepth->pTexture;
                     d[2].mIndex = SRT_RES_IDX(VrsSrtData, Persistent, gVrsRate);
                     d[2].mCount = 1;
                     d[2].ppTextures = &g_live.pVrsRate;
@@ -17258,10 +17286,12 @@ namespace {
     // bracketed with these therefore reads 0.00 in `rec split`, and that is not a bug to chase.
     void gpuPhaseBeginG(uint32_t i) {
         g_gpuPhaseIssued[i] = true;
+        gpuMarkerBegin(g_live.pCmd, i);
         if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, qp, &q); }
     }
     void gpuPhaseEndG(uint32_t i) {
         if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, qp, &q); }
+        gpuMarkerEnd(g_live.pCmd);
     }
     // CPU-side per-phase RECORD ms (breaks down g_lastRecMs): the same gpuPhaseBegin/End
     // brackets also capture hostNowMs() deltas — CPU cost of RECORDING each phase's commands
@@ -18105,6 +18135,12 @@ namespace {
     // pLinearDepth — the two were the same read of sample 0 of pDepth into the same value. OFF = the
     // hiz mip 0 and re-linearize dispatches, the A/B.
     bool g_hizLinFused = true;
+    // preLinSkip: skip the PRE-colour pLinearDepth copy (a full-screen MSAA sample-0 depth copy, ~0.11 ms
+    // at 2560x1600 on the laptop 4070) on frames where nothing before the colour pass reads it — GTAO,
+    // bent normals, the shadow mask, the sky-visibility screen pass, a debug view. The VRS rate image
+    // used to be the one reader left in a MATCHED frame; it now loads pDepth itself. The post-colour
+    // RE-LINEARIZE (or the fused Hi-Z) still refreshes pLinearDepth for water / volfog / MV / APL.
+    bool g_preLinSkip = true;
     // Release 1: draw the sky into gSkyColor (1x) and composite it into the MSAA target after the
     // opaque world, at z = 0 GEQUAL (only samples nothing drew on). Replaces a full-screen 4x sky and
     // the full-screen MSAA resolve that made gSkyColor. Same pixels. OFF = the old order, the A/B.
@@ -23903,6 +23939,7 @@ namespace {
             { "cullScanWave",        &g_cullScanWave        },
             { "terrainMorph",        &g_terrainMorph        },
             { "hizLinFused",         &g_hizLinFused         },
+            { "preLinSkip",          &g_preLinSkip          },
             { "cullSurvivorList",    &g_cullSurvivorList    },
             { "skyDeferred",         &g_skyDeferred         },
             { "waterRefractRegion",  &g_waterRefractRegion  },
@@ -33581,6 +33618,9 @@ void destroyHostWindow(Renderer* R);
         p[1] = (float)D3D12_SHADING_RATE_2X2;
         p[2] = (float)g_live.vrsTile;
         p[3] = 4.0f;
+        p[4] = (float)g_live.width;    // dims: the taps clamp to the RENDER rect of pDepth
+        p[5] = (float)g_live.height;
+        p[6] = 0.0f; p[7] = 0.0f;
         if (g_live.vrsInRateState) { vrsRawTransition(false); }
         cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "VRS RATE IMAGE");
         cmdBindPipeline(g_live.pCmd, g_live.pVrsPipeline);
@@ -33942,6 +33982,9 @@ void destroyHostWindow(Renderer* R);
         // gated off there is nothing to downsample FOR, and pAOBlur must be left exactly as the
         // full-res path leaves it (stale but state-valid) rather than half-written.
         const bool aoHalf = g_aoHalfRes && g_live.aoHalfReady && aoDispatchRuns;
+        // Hoisted from the shadow-mask dispatch below: the pre-colour linearize gate reads it too.
+        const bool maskNeeded = !g_live.shadowMaskPrimed || g_lastShadowActive > 0u || g_debugMode == 10u
+                             || g_shadowFaceDebug || g_shadowAtlasDebug;
         // Latched the first time the half chain actually runs — see the barrier block below for why
         // g_live.firstFrame cannot stand in for it.
         static bool s_aoHalfPrimed = false;
@@ -34075,14 +34118,21 @@ void destroyHostWindow(Renderer* R);
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
             }
 
-            // (1) Linearize/resolve dispatch.
-            gpuPhaseBegin(kGpuPhaseLinearize);
-            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "LINEARIZE (writes pLinearDepth)");
-            cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
-            cmdDispatch(g_live.pCmd, gx, gy, 1);
-            cmdEndDebugMarker(g_live.pCmd);
-            gpuPhaseEnd(kGpuPhaseLinearize);
+            // (1) Linearize/resolve dispatch — only when something BEFORE the colour pass reads
+            // pLinearDepth (g_preLinSkip). Its barriers stay unconditional so the resource walks the
+            // same states every frame; the copy itself is what costs.
+            const bool preLinNeeded = !g_preLinSkip || g_live.firstFrame || aoDispatchRuns
+                                   || (g_live.shadowReady && maskNeeded) || skyVisArmed()
+                                   || g_debugMode != 0u;
+            if (preLinNeeded) {
+                gpuPhaseBegin(kGpuPhaseLinearize);
+                cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "LINEARIZE (writes pLinearDepth)");
+                cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
+                cmdDispatch(g_live.pCmd, gx, gy, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseLinearize);
+            }
 
             // pLinearDepth UAV -> SRV (GTAO reads it); pAO SRV -> UAV (skip on frame 0).
             {
@@ -34158,6 +34208,9 @@ void destroyHostWindow(Renderer* R);
                 }
                 g_live.aoLastHalf = aoHalf;
             }
+
+            // VRS reads pDepth itself, so it runs while pDepth is still SHADER_RESOURCE.
+            vrsBuildRateImage(rzViewProj);
 
             // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
             // pDepth SRV -> DEPTH_WRITE (colour LOADs it). pLinearDepth STAYS SRV — the blur reads it.
@@ -34246,8 +34299,6 @@ void destroyHostWindow(Renderer* R);
         // slot nibble (the frags read the mask only for a light with a slot), the mask is already in
         // SHADER_RESOURCE from its last run, and the full-screen dispatch is pure cost (0.19 ms bare
         // village on the 1660S). The first run is what takes it out of its UAV creation state.
-        const bool maskNeeded = !g_live.shadowMaskPrimed || g_lastShadowActive > 0u || g_debugMode == 10u
-                             || g_shadowFaceDebug || g_shadowAtlasDebug;
         if (g_live.shadowReady && aoBlockRan && maskNeeded) {
             g_live.shadowMaskPrimed = true;
             gpuPhaseBegin(kGpuPhaseShadowMask);
@@ -34273,8 +34324,8 @@ void destroyHostWindow(Renderer* R);
             gpuPhaseEnd(kGpuPhaseShadowMask);
         }
 
-        // VRS: the rate image reads this frame's pLinearDepth, which only exists when the block ran.
-        if (aoBlockRan) { vrsBuildRateImage(rzViewProj); } else { g_live.vrsBuilt = false; }
+        // VRS: built inside the block above, off pDepth; no block, no rate image this frame.
+        if (!aoBlockRan) { g_live.vrsBuilt = false; }
 
         gpuPhaseEnd(kGpuPhasePostDepth);
 
@@ -41067,10 +41118,12 @@ void destroyHostWindow(Renderer* R);
         auto gpuPhaseBegin = [&](uint32_t i) {
             cpuPhaseT0[i] = hostNowMs();
             g_gpuPhaseIssued[i] = true;
+            gpuMarkerBegin(g_live.pCmd, i);
             if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, qp, &q); }
         };
         auto gpuPhaseEnd = [&](uint32_t i) {
             if (QueryPool* qp = g_live.pGpuQueryPool[g_live.recSlot]) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, qp, &q); }
+            gpuMarkerEnd(g_live.pCmd);
             cpuPhaseAcc[i] += hostNowMs() - cpuPhaseT0[i];
         };
         // Whole-frame GPU execution timer (beginCmd..resolve). Compared to the submit->fence wall clock

@@ -1089,7 +1089,7 @@ namespace {
     std::vector<IPC::UiVertexWire> g_uiIn, g_uiReady;
     std::vector<std::uint16_t>     g_uiInIdx, g_uiReadyIdx;
     std::optional<IPC::VecView<IPC::GeomChunk>> g_uiVec;
-    struct UiTex { std::uint32_t slot; };
+    struct UiTex { std::uint32_t slot; std::string name; };
     std::unordered_map<IDirect3DTexture9*, UiTex> g_uiTex;
     std::uint32_t g_uiTexSerial = 0, g_uiRejects = 0;
     // At the kick: the UI MW drew last frame goes out with this frame's world.
@@ -1699,6 +1699,14 @@ namespace {
         PFN_vkCreateSemaphore            CreateSemaphore;
         PFN_vkDestroySemaphore           DestroySemaphore;
         PFN_vkWaitSemaphores             WaitSemaphores;   // optional: the async copy needs it
+        // Optional: host-drawn UI reads back DEFAULT-pool textures once, at first sight.
+        PFN_vkCreateBuffer               CreateBuffer;
+        PFN_vkDestroyBuffer              DestroyBuffer;
+        PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
+        PFN_vkBindBufferMemory           BindBufferMemory;
+        PFN_vkMapMemory                  MapMemory;
+        PFN_vkUnmapMemory                UnmapMemory;
+        PFN_vkCmdCopyImageToBuffer       CmdCopyImageToBuffer;
     } vk = {};
 
     bool loadVulkan() {
@@ -1752,6 +1760,10 @@ namespace {
         vk.CreateSemaphore  = (PFN_vkCreateSemaphore)vk.GetDeviceProcAddr(g_dev, "vkCreateSemaphore");
         vk.DestroySemaphore = (PFN_vkDestroySemaphore)vk.GetDeviceProcAddr(g_dev, "vkDestroySemaphore");
         vk.WaitSemaphores   = (PFN_vkWaitSemaphores)vk.GetDeviceProcAddr(g_dev, "vkWaitSemaphores");
+        #define OPT(name) vk.name = (PFN_vk##name)vk.GetDeviceProcAddr(g_dev, "vk" #name)
+        OPT(CreateBuffer); OPT(DestroyBuffer); OPT(GetBufferMemoryRequirements); OPT(BindBufferMemory);
+        OPT(MapMemory); OPT(UnmapMemory); OPT(CmdCopyImageToBuffer);
+        #undef OPT
         if (!ok) {
             LOG::logline("!! [seam] failed to resolve required Vulkan entry points — seam disabled");
         }
@@ -9703,6 +9715,116 @@ namespace RenderProcess {
         return g_hostUiEnv == 1 && forgeOwnsFrame() && g_uiVec.has_value();
     }
 
+    // Every mip of a DEFAULT-pool texture, read back once through DXVK's Vulkan image (Morrowind fills
+    // these from SYSTEMMEM twins it then drops, so there is nothing left to Lock). BGRA8 and BC1-3 only
+    // — the formats the UI census found. Synchronous: first sight of a UI texture, a few per session.
+    bool readbackTexVk(IDirect3DTexture9* tex, std::vector<std::uint8_t>& bytes) {
+        if (!g_vki || !g_dev || !vk.CreateBuffer || !vk.CmdCopyImageToBuffer || !vk.MapMemory) { return false; }
+        ID3D9VkInteropTexture* vt = nullptr;
+        if (FAILED(tex->QueryInterface(__uuidof(ID3D9VkInteropTexture), (void**)&vt)) || !vt) { return false; }
+        VkImage img = VK_NULL_HANDLE; VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+        VkImageCreateInfo ci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        const HRESULT hr = vt->GetVulkanImageInfo(&img, &layout, &ci);
+        vt->Release();
+        if (FAILED(hr) || !img) { return false; }
+        std::uint32_t blockBytes = 0; bool bc = false;
+        switch (ci.format) {
+            case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: blockBytes = 4; break;
+            case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+            case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:  case VK_FORMAT_BC1_RGB_SRGB_BLOCK: blockBytes = 8; bc = true; break;
+            case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK:
+            case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: blockBytes = 16; bc = true; break;
+            default: return false;
+        }
+        const std::uint32_t levels = std::max(1u, ci.mipLevels);
+        std::vector<VkBufferImageCopy> regions(levels);
+        VkDeviceSize total = 0;
+        for (std::uint32_t lv = 0; lv < levels; ++lv) {
+            const std::uint32_t w = std::max(1u, ci.extent.width >> lv), h = std::max(1u, ci.extent.height >> lv);
+            const VkDeviceSize sz = bc ? (VkDeviceSize)std::max(1u, (w + 3) / 4) * std::max(1u, (h + 3) / 4) * blockBytes
+                                       : (VkDeviceSize)w * h * 4;
+            VkBufferImageCopy& r = regions[lv];
+            r = {};
+            r.bufferOffset = total;
+            r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1 };
+            r.imageExtent = { w, h, 1 };
+            total += sz;
+        }
+        VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bi.size = total; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer buf = VK_NULL_HANDLE;
+        if (vk.CreateBuffer(g_dev, &bi, nullptr, &buf) != VK_SUCCESS) { return false; }
+        VkMemoryRequirements mr = {};
+        vk.GetBufferMemoryRequirements(g_dev, buf, &mr);
+        VkPhysicalDeviceMemoryProperties mp = {};
+        vk.GetPhysicalDeviceMemoryProperties(g_phys, &mp);
+        std::uint32_t mt = UINT32_MAX;
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+            if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) { mt = i; break; }
+        }
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        ai.allocationSize = mr.size; ai.memoryTypeIndex = mt;
+        if (mt == UINT32_MAX || vk.AllocateMemory(g_dev, &ai, nullptr, &mem) != VK_SUCCESS) { vk.DestroyBuffer(g_dev, buf, nullptr); return false; }
+        vk.BindBufferMemory(g_dev, buf, mem, 0);
+
+        static VkCommandPool s_pool = VK_NULL_HANDLE;
+        static VkCommandBuffer s_cmd = VK_NULL_HANDLE;
+        static VkFence s_fence = VK_NULL_HANDLE;
+        bool ok = true;
+        if (!s_pool) {
+            VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+            pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = g_qFamily;
+            ok = vk.CreateCommandPool(g_dev, &pci, nullptr, &s_pool) == VK_SUCCESS;
+            VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+            cai.commandPool = s_pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+            ok = ok && vk.AllocateCommandBuffers(g_dev, &cai, &s_cmd) == VK_SUCCESS;
+            VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            ok = ok && vk.CreateFence(g_dev, &fci, nullptr, &s_fence) == VK_SUCCESS;
+        }
+        if (ok) {
+            // DXVK may still hold the texture's upload in its own queue: get it submitted and done.
+            g_vki->FlushRenderingCommands();
+            g_vki->WaitForResource(tex, 0);
+            vk.ResetCommandBuffer(s_cmd, 0);
+            VkCommandBufferBeginInfo cbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vk.BeginCommandBuffer(s_cmd, &cbi);
+            VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            b.oldLayout = layout; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img; b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1 };
+            vk.CmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &b);
+            vk.CmdCopyImageToBuffer(s_cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, levels, regions.data());
+            b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = layout;
+            vk.CmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                  0, nullptr, 0, nullptr, 1, &b);
+            vk.EndCommandBuffer(s_cmd);
+            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            si.commandBufferCount = 1; si.pCommandBuffers = &s_cmd;
+            g_vki->LockSubmissionQueue();
+            ok = vk.QueueSubmit(g_queue, 1, &si, s_fence) == VK_SUCCESS;
+            g_vki->ReleaseSubmissionQueue();
+            if (ok) {
+                vk.WaitForFences(g_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
+                vk.ResetFences(g_dev, 1, &s_fence);
+                void* p = nullptr;
+                ok = vk.MapMemory(g_dev, mem, 0, total, 0, &p) == VK_SUCCESS && p;
+                if (ok) {
+                    bytes.assign((const std::uint8_t*)p, (const std::uint8_t*)p + total);
+                    vk.UnmapMemory(g_dev, mem);
+                }
+            }
+        }
+        vk.DestroyBuffer(g_dev, buf, nullptr);
+        vk.FreeMemory(g_dev, mem, nullptr);
+        return ok;
+    }
+
     // A DDS the host's parseDds reads: DXT1/3/5 passed through, everything else expanded to 32-bit
     // BGRA (its only uncompressed format). Every mip level. False = a format or pool we cannot read.
     bool buildUiDds(IDirect3DTexture9* tex, std::vector<std::uint8_t>& out) {
@@ -9729,6 +9851,15 @@ namespace RenderProcess {
             w32(92, 0x00FF0000u); w32(96, 0x0000FF00u); w32(100, 0x000000FFu); w32(104, 0xFF000000u);
         }
         w32(108, 0x1000u | 0x400000u | 0x8u);    // TEXTURE | MIPMAP | COMPLEX
+        if (d0.Pool == D3DPOOL_DEFAULT) {
+            if (!dxt && d0.Format != D3DFMT_A8R8G8B8 && d0.Format != D3DFMT_X8R8G8B8) { return false; }
+            std::vector<std::uint8_t> raw;
+            if (!readbackTexVk(tex, raw)) { return false; }
+            if (d0.Format == D3DFMT_X8R8G8B8) { for (size_t i = 3; i < raw.size(); i += 4) { raw[i] = 255; } }
+            out.insert(out.end(), raw.begin(), raw.end());
+            w32(20, dxt ? std::max(1u, (d0.Width + 3) / 4) * std::max(1u, (d0.Height + 3) / 4) * blockBytes : d0.Width * 4u);
+            return true;
+        }
         for (DWORD lv = 0; lv < levels; ++lv) {
             D3DSURFACE_DESC d = {};
             tex->GetLevelDesc(lv, &d);
@@ -9778,7 +9909,23 @@ namespace RenderProcess {
     std::uint32_t uiTextureSlot(IDirect3DTexture9* tex) {
         if (!tex) { return 0; }
         auto it = g_uiTex.find(tex);
-        if (it != g_uiTex.end()) { return it->second.slot; }
+        if (it != g_uiTex.end()) {
+            // The memo skips stageFirstSight, which is what stamps a slot's LRU age, so it stamps the
+            // age itself: an unstamped UI slot reads as cold and the world's eviction frees it (the
+            // HUD drew WHITE). A slot that no longer carries our name was evicted or recycled anyway
+            // (a purge, an LRU wrap): forget it and stage the texture again below.
+            const UiTex& u = it->second;
+            if (!u.slot) { return 0; }
+            {
+                std::lock_guard<std::mutex> lk(g_texResidencyMx);
+                if (u.slot < g_slotName.size() && g_slotName[u.slot] == u.name) {
+                    g_slotLastUsed[u.slot] = g_frame;
+                    return u.slot;
+                }
+            }
+            it->first->Release();
+            g_uiTex.erase(it);
+        }
         if (g_uiTex.size() >= 4096) {
             // Bound what the refs keep alive. Every entry re-uploads on next sight (a new name).
             for (auto& kv : g_uiTex) { kv.first->Release(); }
@@ -9788,6 +9935,7 @@ namespace RenderProcess {
         tex->GetLevelDesc(0, &d);
         std::uint32_t slot = 0;
         std::vector<std::uint8_t> dds;
+        std::string staged;
         if (!(d.Usage & D3DUSAGE_RENDERTARGET) && buildUiDds(tex, dds)) {
             char name[64];
             std::snprintf(name, sizeof(name), "@ui/%p/%u", (void*)tex, ++g_uiTexSerial);
@@ -9798,13 +9946,14 @@ namespace RenderProcess {
                 std::memcpy(r.data, dds.data(), r.size);
                 r.found = true;
                 slot = stageFirstSight(name, r, /*dataTexture=*/true, /*quietMiss=*/false);
+                staged = name;
             }
         } else if (g_uiRejects++ < 16) {
             LOG::logline("!! [hostui] texture %p %ux%u fmt=0x%X usage=0x%X pool=%u not readable — white",
                          (void*)tex, d.Width, d.Height, (unsigned)d.Format, (unsigned)d.Usage, (unsigned)d.Pool);
         }
         tex->AddRef();
-        g_uiTex.emplace(tex, UiTex{ slot });
+        g_uiTex.emplace(tex, UiTex{ slot, std::move(staged) });
         return slot;
     }
 
@@ -9885,9 +10034,9 @@ namespace RenderProcess {
                 const bool emiV = hasCol && rs->matSrcEmissive == D3DMCS_COLOR1;
                 const float dr = difV ? vr : m.diffuse.r, dg = difV ? vg : m.diffuse.g, db = difV ? vb : m.diffuse.b,
                             da = difV ? va : m.diffuse.a;
-                float r = (emiV ? vr : m.emissive.r) + m.ambient.r * lrs->globalAmbient.r;
-                float g = (emiV ? vg : m.emissive.g) + m.ambient.g * lrs->globalAmbient.g;
-                float b = (emiV ? vb : m.emissive.b) + m.ambient.b * lrs->globalAmbient.b;
+                float r = (emiV ? vr : m.emissive.r) + m.ambient.r * lrs->deviceAmbient.r;
+                float g = (emiV ? vg : m.emissive.g) + m.ambient.g * lrs->deviceAmbient.g;
+                float b = (emiV ? vb : m.emissive.b) + m.ambient.b * lrs->deviceAmbient.b;
                 if (hasNorm && !lrs->active.empty()) {
                     D3DXVECTOR3 n(((const float*)(v + normOff))[0], ((const float*)(v + normOff))[1], ((const float*)(v + normOff))[2]);
                     D3DXVec3TransformNormal(&n, &n, &world);
@@ -9922,6 +10071,23 @@ namespace RenderProcess {
             else { o.u = 0.0f; o.v = 0.0f; }
             o.texMode = mode;
             g_uiIn.push_back(o);
+        }
+        {
+            // [hostui-diag] the inputs of the colour, for the first draws of the session.
+            static std::uint32_t s_diag = 0;
+            if (s_diag < 24 && rs->vertCount > 0) {
+                ++s_diag;
+                const IPC::UiVertexWire& o0 = g_uiIn[vBase];
+                LOG::logline(">> [hostui-diag] slot=%u mode=0x%08X lit=%u srcD=%u srcE=%u fvf=0x%X matD=(%.2f,%.2f,%.2f,%.2f) "
+                             "matA=(%.2f,%.2f,%.2f) matE=(%.2f,%.2f,%.2f) amb=(%.2f,%.2f,%.2f) lights=%zu ops=%u/%u args=%u,%u "
+                             "v0 clip=(%.3f,%.3f,%.3f,%.3f) col=0x%08X uv=(%.3f,%.3f)",
+                             slot, mode, (unsigned)rs->useLighting, (unsigned)rs->matSrcDiffuse, (unsigned)rs->matSrcEmissive,
+                             (unsigned)rs->fvf, m.diffuse.r, m.diffuse.g, m.diffuse.b, m.diffuse.a,
+                             m.ambient.r, m.ambient.g, m.ambient.b, m.emissive.r, m.emissive.g, m.emissive.b,
+                             lrs->deviceAmbient.r, lrs->deviceAmbient.g, lrs->deviceAmbient.b, lrs->active.size(),
+                             (unsigned)st.colorOp, (unsigned)st.alphaOp, (unsigned)st.colorArg1, (unsigned)st.colorArg2,
+                             o0.x, o0.y, o0.z, o0.w, o0.color, o0.u, o0.v);
+            }
         }
         bool bad = false;
         const std::size_t iBase = g_uiInIdx.size();

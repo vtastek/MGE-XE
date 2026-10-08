@@ -5,6 +5,12 @@
 // MSAA coverage stays per sample at any rate, so silhouettes keep their edges.
 #pragma once
 
+// Reads the PREPASS DEPTH BUFFER directly (sample 0 under MSAA), not the pLinearDepth copy, so the
+// rate image does not keep the full-screen pre-colour copy alive on its own (preLinSkip).
+#ifndef SAMPLE_COUNT
+#define SAMPLE_COUNT 1
+#endif
+
 STRUCT(VrsParams)
 {
     // x = device-depth threshold: a tile is COARSE when its NEAREST sample (largest reverse-Z) is
@@ -13,12 +19,18 @@ STRUCT(VrsParams)
     // w = taps per tile side (the tile is subsampled on a w x w grid — conservative enough for a
     //     distance test, and 16 loads instead of 256).
     DATA(float4, p, None);
+    // xy = the extent the taps clamp to (the RENDER rect, in pixels); zw unused.
+    DATA(float4, dims, None);
 };
 
 BEGIN_SRT(VrsSrtData)
     BEGIN_SRT_SET(Persistent)
         DECL_CBUFFER  (Persistent, CBUFFER(VrsParams), gVrsParams)
-        DECL_TEXTURE  (Persistent, Tex2D(float),       gVrsDepth)   // pLinearDepth: raw reverse-Z, 1x
+#if SAMPLE_COUNT > 1
+        DECL_TEXTURE  (Persistent, Depth2DMS(float, SAMPLE_COUNT), gVrsDepth)   // pDepth itself, sample 0
+#else
+        DECL_TEXTURE  (Persistent, Depth2D(float),     gVrsDepth)   // pDepth itself
+#endif
         DECL_RWTEXTURE(Persistent, WTex2D(uint),       gVrsRate)    // R8_UINT, one texel per tile
     END_SRT_SET(Persistent)
 END_SRT(VrsSrtData)

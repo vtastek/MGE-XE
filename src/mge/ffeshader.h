@@ -65,6 +65,10 @@ struct LightState {
     };
 
     D3DCOLORVALUE globalAmbient;
+    // The device's D3DRS_AMBIENT exactly as last set, pure white included. globalAmbient skips
+    // white (scene detection treats it as a sky/menu marker), but MW's UI is LIT under that white
+    // ambient, so the host-drawn UI evaluates its fixed-function colour against this one.
+    D3DCOLORVALUE deviceAmbient = { 0.0f, 0.0f, 0.0f, 0.0f };
     std::unordered_map<DWORD, Light> lights;
     std::unordered_map<DWORD, bool> lightsTransformed;
     std::vector<DWORD> active;

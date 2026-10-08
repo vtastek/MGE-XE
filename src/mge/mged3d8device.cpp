@@ -1085,6 +1085,12 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
         // Pure white ambient occurs with skydome and menu mode rendering
         // Ambient is also never set properly when high enough outside that Morrowind renders nothing
         isAmbientWhite = (b == 0xffffffff);
+        {
+            const RGBVECTOR dev = D3DCOLOR(b);
+            lightrs.deviceAmbient.r = dev.r;
+            lightrs.deviceAmbient.g = dev.g;
+            lightrs.deviceAmbient.b = dev.b;
+        }
 
         if (!isAmbientWhite) {
             // Save real ambient, can be used in future frames if no draw calls are provoked
