@@ -4629,6 +4629,7 @@ namespace {
            kGpuPhaseSkySnap,       // inside Color, after ColorSky: the gSkyColor snapshot (MSAA resolve)
            kGpuPhaseWaterRefr,     // inside Water: the pRefractColor copy (MSAA resolve)
            kGpuPhaseStaticsDepth,  // inside Prepass: the distant statics Z-prepass (staticsPrepass)
+           kGpuPhaseSunBlur,       // inside ShadowSun: the moments blur alone (fused or two-pass)
            kGpuPhaseCount };
 
     // MGE_GPU_MARKERS=1: every phase bracket also opens a D3D12 event named after its phase, so an
@@ -4644,7 +4645,7 @@ namespace {
         "ObjVel", "ObjVelFP", "MotionBlur", "AODown", "AOSearch", "AOBlur", "AOUp", "ResolveFilter",
         "HizMip0", "ReLinear", "Apl", "GrassDepth", "GrassColor", "SkyVis", "SkyVisScreen",
         "RippleSim", "FbCopyA", "FbCopyB", "CullCam", "CullScan", "CullSun", "CullGrass", "CullCount",
-        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth"
+        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur"
     };
     bool gpuMarkersOn() {
         static const bool on = [] { const char* e = std::getenv("MGE_GPU_MARKERS"); return e && e[0] == '1'; }();
@@ -8528,6 +8529,9 @@ namespace {
     // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
     // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
     // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
+    // ⚠ DEFAULT OFF UNDER WINE: on the 1660S/Proton the fused pass measured 0.21-0.26 ms SLOWER than
+    // the two-pass one (village replay, devkit cbea943), while the RTX/Windows gains 0.25. Resolved at
+    // init (sunBlurFusedDefault) unless the knob is set explicitly.
     bool     g_sunBlurFused      = true;
     uint32_t g_lastTerrainPatchCulled = 0;   // patches skipped this frame, all views
     // Scale on the LOD ladder's distances (kTerrainLodDist). 1.0 = the original ladder: base 128-u
@@ -9932,6 +9936,16 @@ namespace {
                 smd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
                 smd.pName = "sunMoments";
                 addRenderTarget(R, &smd, &g_live.pSunMoments);
+                // sunBlurFused default under Wine: OFF unless the knob was given explicitly (see
+                // g_sunBlurFused). wine_get_version is exported by Wine's ntdll only.
+                {
+                    const char* k = std::getenv("MGE_HOST_KNOBS");
+                    const bool explicitKnob = k && std::strstr(k, "sunBlurFused=");
+                    if (!explicitKnob && GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) {
+                        g_sunBlurFused = false;
+                        LOG::logline(">> [forge][sun-shadow] Wine detected: two-pass moments blur (fused is slower there)");
+                    }
+                }
                 if (g_sunBlurFused) {
                     // The caster's own target: same format, same clear (the far-occluder moments), read
                     // only by the fused blur. Rests SHADER_RESOURCE like pSunMoments.
@@ -33318,6 +33332,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseCullCount, "cull count" }, { kGpuPhaseCullScatter, "cull scatter" },
             { kGpuPhaseSkySnap, "sky snapshot" }, { kGpuPhaseWaterRefr, "water refract copy" },
             { kGpuPhaseStaticsDepth, "statics depth" },
+            { kGpuPhaseSunBlur, "sun blur" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -37278,6 +37293,9 @@ void destroyHostWindow(Renderer* R);
             char wakeTilesText[48], fineTilesText[48];
             tilesText(g_live.rippleWake, wakeTilesText, sizeof(wakeTilesText));
             tilesText(g_live.rippleFine, fineTilesText, sizeof(fineTilesText));
+            LOG::logline(">> [forge-hb] sun: blur=%.2f (%s) actorDraws=%u",
+                         g_lastGpuPhaseMs[kGpuPhaseSunBlur], g_live.sunBlurFused ? "fused" : "two-pass",
+                         g_lastSunActorDraws);
             LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s tiles=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
@@ -63197,7 +63215,9 @@ void destroyHostWindow(Renderer* R);
         // downstream bind has to know it ran.
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        gpuPhaseBeginG(kGpuPhaseSunBlur);
         blurSunMoments();
+        gpuPhaseEndG(kGpuPhaseSunBlur);
         g_live.sunShadowReady = true;
 
         static uint32_t s_sunLog = 0;
