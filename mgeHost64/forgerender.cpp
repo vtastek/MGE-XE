@@ -3526,6 +3526,11 @@ namespace {
         Pipeline*      pSkinnedShadowPipelineNone = nullptr;     // CULL_NONE (two-sided)
         Pipeline*      pSkinnedShadowPipelineFront = nullptr;    // CULL_FRONT CCW
         Pipeline*      pSkinnedShadowPipelineFrontMirror = nullptr; // CULL_FRONT CW
+        // SUN Phase C: actors into the sun moments atlas — skinned.vert + sunshadow.frag, RGBA16
+        // moments + D32, GEQUAL write like the statics sun caster, CULL_NONE (thin limbs, either
+        // winding). Optional: null = actors cast no sun shadow, exactly as before.
+        Shader*        pSkinnedSunShader = nullptr;
+        Pipeline*      pSkinnedSunPipeline = nullptr;
         // Blended skinned parts (ghosts, mane/hair cards): skinned.vert + alpha.frag, composited in
         // the alpha stage with REAL alpha instead of opaque.frag's forced 1.0. Depth GEQUAL test /
         // never write, same rule the AT1 colour PSOs follow. Cull honours the part's DRAW_BOTH flag.
@@ -11544,6 +11549,35 @@ namespace {
                     !g_live.pSkinnedShadowPipelineFrontMirror) {
                     std::printf("[forge] addPipeline(skinned shadow) FAILED\n");
                     return false;
+                }
+
+                // SUN Phase C: the skinned sun caster (see pSkinnedSunPipeline). Non-fatal.
+                {
+                    ShaderLoadDesc ssDesc = {};
+                    ssDesc.mVert.pFileName = "skinned.vert";
+                    ssDesc.mFrag.pFileName = "sunshadow.frag";
+                    addShader(R, &ssDesc, &g_live.pSkinnedSunShader);
+                    if (g_live.pSkinnedSunShader) {
+                        TinyImageFormat sunFmt = TinyImageFormat_R16G16B16A16_UNORM;
+                        RasterizerStateDesc sunRs = skRaster; sunRs.mCullMode = CULL_MODE_NONE;
+                        PipelineDesc ssPd = {};
+                        ssPd.mType = PIPELINE_TYPE_GRAPHICS;
+                        GraphicsPipelineDesc& ssg = ssPd.mGraphicsDesc;
+                        ssg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                        ssg.mRenderTargetCount = 1;
+                        ssg.pColorFormats = &sunFmt;
+                        ssg.mSampleCount = SAMPLE_COUNT_1;
+                        ssg.mSampleQuality = 0;
+                        ssg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                        ssg.pDepthState = &skPreDepth;
+                        ssg.pVertexLayout = &svl;
+                        ssg.pRasterizerState = &sunRs;
+                        ssg.pShaderProgram = g_live.pSkinnedSunShader;
+                        addPipeline(R, &ssPd, &g_live.pSkinnedSunPipeline);
+                    }
+                    if (!g_live.pSkinnedSunPipeline) {
+                        LOG::logline("!! [forge][sun-shadow] skinned sun caster unavailable — actors cast no sun shadow");
+                    }
                 }
 
                 // Blended skinned CASTER: skinned.vert + alphashadowdepth.frag into the same
@@ -23060,7 +23094,10 @@ namespace {
                                         // range), dimmer outer ring = 2·radius (atlas far / fade edge).
                                         // Colour-matched to the light's box (same debugIdColor). Shares the
                                         // debug-line pass/VB; independent of g_debugLightBoxes.
-    bool  g_shadowSkinnedCasters = true; // C4a: skinned NPC/creature/player parts CAST shadows (this-frame
+    bool  g_shadowSkinnedCasters = true;
+    // SUN Phase C: actors (skinned parts) cast into the sun moments atlas.
+    bool     g_sunActorCasters = true;
+    uint32_t g_lastSunActorDraws = 0; // C4a: skinned NPC/creature/player parts CAST shadows (this-frame
                                         // poses; reuses the resident bone windows). Off = pre-C4a behavior
                                         // (only rigid parts cast → partial body shadow). Default ON
                                         // (verified in-game 2026-07-07). Live A/B via checkbox.
@@ -24097,6 +24134,7 @@ namespace {
             { "terrainPatchCull",    &g_terrainPatchCull    },
             { "terrainVcacheOpt",    &g_terrainVcacheOpt    },
             { "reflHalfRate",        &g_reflHalfRate        },
+            { "sunActorCasters",     &g_sunActorCasters     },
             { "sunBlurFused",        &g_sunBlurFused        },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
@@ -62844,6 +62882,7 @@ void destroyHostWindow(Renderer* R);
     }
 
     void renderSunShadow() {
+        g_lastSunActorDraws = 0;
         // A2: prefer the sun cull (near + off-screen casters). Fall back to the camera-culled set (A1,
         // far/on-screen only) if the sun cull isn't ready — never break, just lose the near/off-screen fill.
         const bool sunDraw = g_live.sunCullReady && g_live.sunArgsInDrawState;
@@ -62996,6 +63035,31 @@ void destroyHostWindow(Renderer* R);
             if (g_pSunShadowTerrainPipeline) {
                 terrainRecord(g_live.pCmd, g_terrainSun, g_live.pPerFrameSetSun, /*mirror*/false,
                               /*frameSetIndex*/c, g_pSunShadowTerrainPipeline);
+            }
+
+            // SUN Phase C (knob sunActorCasters): actors, from the same per-part list the point-light
+            // shadow pass draws (g_skinnedCasters: this frame's poses, firstInstance = the skinned
+            // prepass slot, bone windows already filled). Translucent parts are skipped: this frag
+            // casts by the cutout ref, so a sheer part would cast as a solid one.
+            if (g_sunActorCasters && g_live.pSkinnedSunPipeline && !g_skinnedCasters.empty()) {
+                cmdBindPipeline(g_live.pCmd, g_live.pSkinnedSunPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, c, g_live.pPerFrameSetSun);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                uint32_t skWindow = UINT32_MAX;
+                for (const SkinnedCaster& sc : g_skinnedCasters) {
+                    if (sc.alphaCast) { continue; }
+                    if (sc.window != skWindow) {
+                        cmdBindDescriptorSet(g_live.pCmd, sc.window, g_live.pPerBatchSetSkin);
+                        skWindow = sc.window;
+                    }
+                    HostMesh& sm = g_meshes[sc.slot];
+                    Buffer*  svbs2[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                    uint32_t sstrides2[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, svbs2, sstrides2, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
+                    ++g_lastSunActorDraws;
+                }
             }
         }
         cmdBindRenderTargets(g_live.pCmd, nullptr);
