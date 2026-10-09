@@ -335,6 +335,11 @@ float3 skyAmbFactorAO(float3 N, float ao)
 // unbound in this set, outside the window, not yet settled) so a missing field reads as today.
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
+    // The sky AO is a POSITION measurement (is the sky above this point blocked?), so it may only
+    // occlude the share of the normal that LOOKS at the sky. The ground-facing share (0.5 - 0.5 N.z of
+    // the cosine lobe) sees the ground, which a cap or a roof above does not block: a mushroom's
+    // underside was losing its whole ambient to a cover it faces away from. GTAO still darkens contact.
+    ao = lerp(ao, 1.0f, gShadowParams.skyAOGround.x * saturate(0.5f - 0.5f * normalize(N).z));
     float3 f = skyAmbFactorAO(N, ao);
     float  g = gShadowParams.skyAOFloor.z;
     if (g <= 0.0f || ao >= 1.0f) { return f; }

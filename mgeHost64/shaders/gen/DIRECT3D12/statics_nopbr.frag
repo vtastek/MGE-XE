@@ -1284,7 +1284,9 @@ STRUCT(ShadowMaskParams)
     float4 waterFlowParams;
 
     float4 weatherState2;
-#line 1075
+
+    float4 skyAOGround;
+#line 1077
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2374,6 +2376,11 @@ float3 skyAmbFactorAO(float3 N, float ao)
 
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
+
+
+
+
+    ao = lerp(ao, 1.0f, gShadowParams.skyAOGround.x * saturate(0.5f - 0.5f * normalize(N).z));
     float3 f = skyAmbFactorAO(N, ao);
     float g = gShadowParams.skyAOFloor.z;
     if (g <= 0.0f || ao >= 1.0f) { return f; }

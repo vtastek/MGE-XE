@@ -1284,7 +1284,9 @@ STRUCT(ShadowMaskParams)
     float4 waterFlowParams;
 
     float4 weatherState2;
-#line 1075
+
+    float4 skyAOGround;
+#line 1077
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

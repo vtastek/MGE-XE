@@ -1072,4 +1072,6 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   waterFlowParams,  None);
     // PUDDLES (weather.h.fsl): x = standing-water level 0..1, y = max share of flat open ground covered.
     DATA(float4,   weatherState2,    None);
+    // x = share of a normal's GROUND-facing half exempt from the position-only sky AO (skyamb.h.fsl).
+    DATA(float4,   skyAOGround,      None);
 };

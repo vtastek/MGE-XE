@@ -6800,6 +6800,9 @@ namespace {
     // PUDDLES: x = standing-water level 0..1 (integrated slower than wetness), y = max ground share
     // they may cover, zw spare.
     constexpr uint32_t kWeather2Float         = kWaterFlowParamsFloat + 4;
+    // Sky AO ground share: x = how much of the GROUND-facing share of a normal is exempt from the
+    // position-only sky occlusion (skyamb.h.fsl skyAmbFactorAOp), yzw spare.
+    constexpr uint32_t kSkyAOGroundFloat      = kWeather2Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6837,6 +6840,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, weatherState2) == kWeather2Float * sizeof(float),
                   "kWeather2Float does not land on ShadowMaskParams::weatherState2");
+    static_assert((kSkyAOGroundFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, skyAOGround) == kSkyAOGroundFloat * sizeof(float),
+                  "kSkyAOGroundFloat does not land on ShadowMaskParams::skyAOGround");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8606,6 +8613,11 @@ namespace {
     // blend weight of each new field (~1 s to settle at 0.05 / 60 fps). Live in the dev panel.
     float    g_giGain  = 0.0f;
     float    g_giBlend = 0.05f;
+    // The sky AO is POSITION-only (gSkyHeight: is something above this point?), so it used to dim the
+    // whole ambient of a surface under a cover, including the half of a downward face that looks at the
+    // GROUND, which the cover does not block — "mushroom bottoms are too dark" (user, 2026-10-09).
+    // 1 = the ground-facing share (0.5 - 0.5 N.z) is exempt; 0 = the old behaviour.
+    float    g_skyAOGroundExempt = 1.0f;
     // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
     // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
     // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
@@ -24135,6 +24147,7 @@ namespace {
             { "waterFoam",           &g_waterFoam           },
             { "waterSwell",          &g_waterSwell          },
             { "giBlend",             &g_giBlend             },
+            { "skyAOGroundExempt",   &g_skyAOGroundExempt   },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -27102,6 +27115,7 @@ namespace {
           t.sliderF("Sky AO floor: interior ambient (authored grey, 0 = pitch black)", &g_skyAOFloorAmb, 0.0f, 0.5f, 0.01f);
           t.sliderF("Sky AO floor: cap (fraction of open-sky ambient)", &g_skyAOFloorMax, 0.0f, 1.0f, 0.05f);
           t.sliderF("GI field gain (bounce replaces the floor; 0 = off)", &g_giGain, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Sky AO: ground-facing share exempt (undersides; 0 = old)", &g_skyAOGroundExempt, 0.0f, 1.0f, 0.05f);
           t.sliderF("GI field blend per frame (lower = slower ease-in)", &g_giBlend, 0.005f, 1.0f, 0.005f);
           t.checkbox("Weather surface state (wet / snow from MW weather)", &g_weatherSurface);
           t.sliderF("Weather DEBUG wetness (-1 = live)", &g_weatherDebugWet, -1.0f, 1.0f, 0.05f);
@@ -61590,6 +61604,10 @@ void destroyHostWindow(Renderer* R);
             mp[kWeather2Float + 1] = std::clamp(g_weatherPuddleCover, 0.0f, 1.0f);
             mp[kWeather2Float + 2] = 0.0f;
             mp[kWeather2Float + 3] = 0.0f;
+            mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
+            mp[kSkyAOGroundFloat + 1] = 0.0f;
+            mp[kSkyAOGroundFloat + 2] = 0.0f;
+            mp[kSkyAOGroundFloat + 3] = 0.0f;
         }
         {
             const bool on = g_waterBodies && g_waterBodyBound && g_dlExterior;
