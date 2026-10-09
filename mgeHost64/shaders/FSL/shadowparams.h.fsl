@@ -1061,4 +1061,7 @@ STRUCT(ShadowMaskParams)
     //       upscaler runs; without one a per-frame offset is plain flicker.
     //   y = frame index (mod 64), read only in mode 2.   zw = spare
     DATA(float4,   sunNoise,         None);
+    // WEATHER SURFACE STATE (weather.h.fsl): x = wetness, y = snow cover (0..1, host-integrated from
+    // MW's precipitation counters), z = wet darkening depth, w = snow albedo. 0/0 = dry = identity.
+    DATA(float4,   weatherState,     None);
 };

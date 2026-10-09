@@ -38,6 +38,7 @@
 #include "texsample.h.fsl" // TEX_ADDR_MASK / the static samplers — pbrmaterial.h.fsl's prerequisite
 #include "pbrmaterial.h.fsl" // pbrPerturb / pbrSpecTerms / pbrEnvBRDF / pbrRoughness / pbrMetalness
 #include "skyamb.h.fsl"    // skyAmbFactor() — the SH1 sky the specular environment is read from
+#include "weather.h.fsl"   // weatherApply() — wetness + snow cover (identity when dry)
 #include "a2c.h.fsl"       // a2cCoverageMask() — SHARED cutout coverage
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
@@ -185,6 +186,7 @@ PSOut PS_MAIN( VSOutput In )
     uint cov = a2cCoverageMask(tex.a, ((In.Flags & 0x2u) != 0u) ? (133.0f / 255.0f) : 0.0f);
     if (cov == 0u) { discard; }
 #endif
+    weatherApply(tex.rgb, normalize(In.WorldNormal), In.WorldPos);   // wetness + snow (identity when dry)
 
     // Sun shadows (Phase B): statics.vert split its per-vertex lighting into Color (ambient +
     // emissive, never shadowed) and SunLight (the sun N.L term). Attenuating only the latter by the

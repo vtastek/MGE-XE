@@ -17,6 +17,7 @@
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "weather.h.fsl"   // weatherApply() — wetness + snow cover (identity when dry)
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
@@ -571,6 +572,7 @@ float4 PS_MAIN( VSOutput In )
         }
         albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
     }
+    weatherApply(albedo.rgb, normalize(In.Normal), In.WorldPos);   // wetness + snow (identity when dry)
 
     // AO, DEFERRED from the ambient block far above (see the note there for why moving it is exact).
     // Applied to `a` at the last moment before it folds into `lit`, because the multi-bounce term

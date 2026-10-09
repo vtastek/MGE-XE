@@ -6786,6 +6786,9 @@ namespace {
     constexpr uint32_t kSkyAOFloorFloat       = kSkyVisFloat + 4;
     // SUN PCSS NOISE (shadowparams.h.fsl sunNoise): x mode, y frame index.
     constexpr uint32_t kSunNoiseFloat         = kSkyAOFloorFloat + 4;
+    // WEATHER SURFACE STATE (weather.h.fsl): x = wetness 0..1, y = snow cover 0..1, z = wet darkening
+    // depth, w = snow albedo. Appended last.
+    constexpr uint32_t kWeatherFloat          = kSunNoiseFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6807,6 +6810,10 @@ namespace {
                   "sunNoise must fit inside the ShadowMaskParams CBV");
     static_assert(offsetof(ShadowMaskParams, sunNoise) == kSunNoiseFloat * sizeof(float),
                   "kSunNoiseFloat does not land on ShadowMaskParams::sunNoise");
+    static_assert((kWeatherFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, weatherState) == kWeatherFloat * sizeof(float),
+                  "kWeatherFloat does not land on ShadowMaskParams::weatherState");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8532,12 +8539,24 @@ namespace {
     // terraindisp.h.fsl). Only with the near rung at 0 (it adds exactly one step) and only while D1 is
     // inside the fade end (past it there is nothing displaced to step). 0 = off.
     float    g_terrainPatchStep  = 800.0f;
-    float    g_terrainFarNoPbrRung = 0.0f;
+    float    g_terrainFarNoPbrRung = 0.0f;   // cost probe (terrainRecord): cell rungs >= this draw no-PBR
+    // Weather surface state (weather.h.fsl): wetness + snow cover from MW's precipitation counters.
+    // Identity in dry weather (both 0), so the dry look is untouched.
+    bool     g_weatherSurface    = true;
+    float    g_weatherWetSec     = 10.0f;    // time constant to soak at full rain
+    float    g_weatherDrySec     = 120.0f;   // ...to dry once it stops
+    float    g_weatherSnowSec    = 180.0f;   // ...for snow to cover at full snowfall
+    float    g_weatherMeltSec    = 600.0f;   // ...to melt away after
+    float    g_weatherWetDarken  = 0.45f;    // wet albedo = albedo x (1 - this x wet x exposure)
+    float    g_weatherSnowAlbedo = 0.85f;    // snow's albedo
+    float    g_weatherWet = 0.0f, g_weatherSnow = 0.0f;   // last published (heartbeat)
+    float    g_weatherDebugWet  = -1.0f;   // >= 0 overrides the integrated wetness (A/B, screenshots)
+    float    g_weatherDebugSnow = -1.0f;   // >= 0 overrides the integrated snow cover
     // GI field (tasks/forge-gi.md v2): giGain > 0 replaces the occluded share's constant floor with the
     // field's bounce, at that gain. 0 = off (default until the user has seen it). giBlend = the per-frame
-    // blend weight of each new field (~1 s to settle at 0.05 / 60 fps).
+    // blend weight of each new field (~1 s to settle at 0.05 / 60 fps). Live in the dev panel.
     float    g_giGain  = 0.0f;
-    float    g_giBlend = 0.05f;   // cost probe (terrainRecord): cell rungs >= this draw no-PBR
+    float    g_giBlend = 0.05f;
     // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
     // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
     // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
@@ -24047,6 +24066,14 @@ namespace {
             { "terrainPatchStep",    &g_terrainPatchStep    },
             { "terrainFarNoPbrRung", &g_terrainFarNoPbrRung },
             { "giGain",              &g_giGain              },
+            { "weatherWetSec",       &g_weatherWetSec       },
+            { "weatherDrySec",       &g_weatherDrySec       },
+            { "weatherSnowSec",      &g_weatherSnowSec      },
+            { "weatherMeltSec",      &g_weatherMeltSec      },
+            { "weatherWetDarken",    &g_weatherWetDarken    },
+            { "weatherSnowAlbedo",   &g_weatherSnowAlbedo   },
+            { "weatherDebugWet",     &g_weatherDebugWet     },
+            { "weatherDebugSnow",    &g_weatherDebugSnow    },
             { "giBlend",             &g_giBlend             },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
@@ -24226,6 +24253,7 @@ namespace {
             { "terrainVcacheOpt",    &g_terrainVcacheOpt    },
             { "reflHalfRate",        &g_reflHalfRate        },
             { "sunActorCasters",     &g_sunActorCasters     },
+            { "weatherSurface",      &g_weatherSurface      },
             { "sunBlurFused",        &g_sunBlurFused        },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
@@ -27012,6 +27040,12 @@ namespace {
           t.sliderF("Sky AO maps: fill all in the entry frame (0 = one per frame)", &g_svmFill, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Sky AO floor: interior ambient (authored grey, 0 = pitch black)", &g_skyAOFloorAmb, 0.0f, 0.5f, 0.01f);
           t.sliderF("Sky AO floor: cap (fraction of open-sky ambient)", &g_skyAOFloorMax, 0.0f, 1.0f, 0.05f);
+          t.sliderF("GI field gain (bounce replaces the floor; 0 = off)", &g_giGain, 0.0f, 3.0f, 0.05f);
+          t.sliderF("GI field blend per frame (lower = slower ease-in)", &g_giBlend, 0.005f, 1.0f, 0.005f);
+          t.checkbox("Weather surface state (wet / snow from MW weather)", &g_weatherSurface);
+          t.sliderF("Weather DEBUG wetness (-1 = live)", &g_weatherDebugWet, -1.0f, 1.0f, 0.05f);
+          t.sliderF("Weather DEBUG snow (-1 = live)", &g_weatherDebugSnow, -1.0f, 1.0f, 0.05f);
+          t.sliderF("Weather wet darkening", &g_weatherWetDarken, 0.0f, 0.9f, 0.05f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -37309,6 +37343,8 @@ void destroyHostWindow(Renderer* R);
             char wakeTilesText[48], fineTilesText[48];
             tilesText(g_live.rippleWake, wakeTilesText, sizeof(wakeTilesText));
             tilesText(g_live.rippleFine, fineTilesText, sizeof(fineTilesText));
+            LOG::logline(">> [forge-hb] weather: wet=%.2f snow=%.2f (rain=%.0f snowCount=%.0f)",
+                         g_weatherWet, g_weatherSnow, g_rainWetRain, g_rainWetSnow);
             LOG::logline(">> [forge-hb] sun: blur=%.2f (%s) actorDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseSunBlur], g_live.sunBlurFused ? "fused" : "two-pass",
                          g_lastSunActorDraws);
@@ -61159,6 +61195,39 @@ void destroyHostWindow(Renderer* R);
         mp[kSunNoiseFloat + 1] = (float)(s_sunNoiseFrame & 63u);
         mp[kSunNoiseFloat + 2] = g_terrainMorph ? std::clamp(g_terrainLodScale, 0.25f, 4.0f) : 0.0f;  // terrain geomorph
         mp[kSunNoiseFloat + 3] = 0.0f;
+        // Weather surface state: integrated here, once per frame, off MW's own precipitation
+        // counters (the same ramped counters the ripples read), on wall time so it is frame-rate
+        // independent. Interiors publish 0 (no sky) but keep the state, so stepping out of a
+        // doorway in a storm finds the street still wet.
+        {
+            static double s_wTms = 0.0;
+            static bool   s_wInit = false;
+            static float  s_wet = 0.0f, s_snow = 0.0f;
+            const double now = hostNowMs();
+            const float  dt  = s_wInit ? (float)std::min((now - s_wTms) * 0.001, 0.25) : 0.0f;
+            s_wTms = now;
+            const float ref  = std::max(g_rainWeatherRef, 1.0f);
+            const float rain = std::clamp(g_rainWetRain / ref, 0.0f, 1.0f);
+            const float snow = std::clamp(g_rainWetSnow / ref, 0.0f, 1.0f);
+            if (!s_wInit) {
+                s_wet = rain; s_snow = snow; s_wInit = true;   // load INTO a storm: already wet
+            } else {
+                // Wetting toward 1 at a rate set by intensity (~10 s in a downpour); drying toward
+                // 0 over g_weatherDrySec once it stops (rain still falling holds the level).
+                s_wet  += (1.0f - s_wet) * std::min(1.0f, rain * dt / std::max(g_weatherWetSec, 0.1f));
+                s_wet  -= s_wet * std::min(1.0f, (1.0f - rain) * dt / std::max(g_weatherDrySec, 0.1f));
+                s_snow += (1.0f - s_snow) * std::min(1.0f, snow * dt / std::max(g_weatherSnowSec, 0.1f));
+                s_snow -= s_snow * std::min(1.0f, (1.0f - snow) * dt / std::max(g_weatherMeltSec, 0.1f));
+            }
+            g_weatherWet = s_wet; g_weatherSnow = s_snow;
+            const bool on = g_weatherSurface && g_dlExterior;
+            const float wPub = (g_weatherDebugWet  >= 0.0f) ? std::min(g_weatherDebugWet, 1.0f)  : s_wet;
+            const float sPub = (g_weatherDebugSnow >= 0.0f) ? std::min(g_weatherDebugSnow, 1.0f) : s_snow;
+            mp[kWeatherFloat + 0] = on ? wPub : 0.0f;
+            mp[kWeatherFloat + 1] = on ? sPub : 0.0f;
+            mp[kWeatherFloat + 2] = std::clamp(g_weatherWetDarken, 0.0f, 0.9f);
+            mp[kWeatherFloat + 3] = std::clamp(g_weatherSnowAlbedo, 0.0f, 1.0f);
+        }
     }
 
     // What the screen pass last received for the underwater Snell window — echoed in the [svm] line,

@@ -35,6 +35,7 @@
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "weather.h.fsl"   // weatherApply() — wetness + snow cover (identity when dry)
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
@@ -788,6 +789,7 @@ float4 PS_MAIN( VSOutput In )
         // multiply and the three sliders mean the same thing to the eye.
         albedo *= max(0.0f, 1.0f + macro);
     }
+    weatherApply(albedo, normal, In.WorldPos);   // wetness + snow (identity when dry)
 
     // (`normal` is declared up with the uv gradients now — the tangent frame the parallax block
     //  builds needs it before the albedo blend.)

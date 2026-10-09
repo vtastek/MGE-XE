@@ -1273,7 +1273,10 @@ STRUCT(ShadowMaskParams)
 
 
     float4 sunNoise;
-#line 1064
+
+
+    float4 weatherState;
+#line 1067
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2386,6 +2389,32 @@ float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
     return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 #line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/weather.h.fsl"
+#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/weather.h.fsl"
+float weatherCover(float3 worldPosRel)
+{
+    float4 m = gShadowParams.skyAOMap;
+    float2 uv = (worldPosRel.xy + gFrameData.lodEye.xy - m.xy) * m.z;
+    if (any(uv < float2(0.0f, 0.0f)) || any(uv > float2(1.0f, 1.0f))) { return 0.0f; }
+    float h = SampleLvlTex2D(gSkyHeight, gSamplerPointClamp, uv, 0.0f).r;
+    float z = worldPosRel.z + gFrameData.lodEye.z;
+
+    return saturate((h - z - 48.0f) / 64.0f);
+}
+
+
+void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel)
+{
+    float4 w = gShadowParams.weatherState;
+    if (w.x <= 0.0f && w.y <= 0.0f) { return; }
+    float open = 1.0f - weatherCover(worldPosRel);
+
+    float wetE = w.x * open * saturate(0.35f + 0.65f * N.z);
+    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f);
+    albedo *= (1.0f - w.z * wetE);
+    albedo = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
+}
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
 #line 53 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
 uint a2cCoverageMask(float alpha, float alphaRef)
@@ -2433,7 +2462,7 @@ uint a2cCoverageMaskFaded(float alpha, float alphaRef, float coverScale)
     if (n >= (uint)(samples)) { return ~0u; }
     return (1u << n) - 1u;
 }
-#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 #line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float4 UnpackMoments(float4 packedMoments)
@@ -2752,7 +2781,7 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     return sunShadowVisibilityMode(worldPosRel, N, 0);
 }
-#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 44 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 #line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 float3 tonemap(float3 c)
@@ -2767,7 +2796,7 @@ float3 inverseTonemap(float3 d)
     float3 s = sqrt(max(1.0f - clamp(d, 0.0f, 1.0f), 0.0f));
     return (1.0f - s) * (1.7636304f + s * (-0.4027722f + s * 0.4084603f));
 }
-#line 44 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 float3 srgbToLinear(float3 c)
@@ -2800,7 +2829,7 @@ float3 mod2xLinear(float3 tLinear)
 {
     return srgbToLinear(2.0f * linearToSrgb(tLinear));
 }
-#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 #line 112 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
@@ -2913,7 +2942,7 @@ float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
 {
     return expandExposedEmissive(emis, albedoRgb, cov) - emis;
 }
-#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
 #line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobo.h.fsl"
@@ -3041,7 +3070,7 @@ float goboSlotFade(float sv, float4 g, uint i, float3 toL, float3 worldPosRel, f
     if (t <= 0.0f) { return sv; }
     return lerp(sv, fixtureGoboNear(g, i, toL), t);
 }
-#line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
@@ -4381,7 +4410,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 
     return lerp(fogSkyTarget(s, fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir)), behind, fogAir);
 }
-#line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 49 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 
 
 
@@ -4397,14 +4426,14 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD4);
     DATA(float3, WorldNormal, TEXCOORD5);
     DATA(CENTROID(float3), SunLight, TEXCOORD6);
-#line 63
+#line 64
 };
-#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 STRUCT(PSOut)
 {
     DATA(float4, Color, SV_Target0);
-#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
-#line 84
+#line 85 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 85
 };
 
 
@@ -4431,7 +4460,7 @@ float4 sampleStaticsParam(uint slot, float2 uv)
     return SampleTex2DArray(gStaticsParamArrays[bucket], gSamplerAnisotropic,
                             float3(uv, (float)layer));
 }
-#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 float2 staticsParamDims(uint bucket)
 {
     uint w, h, e;
@@ -4446,10 +4475,10 @@ float staticsHeightLvl(uint slot, float2 uv, float lvl)
     uint bucket = slot >> 16u;
     uint layer = slot & 0xFFFFu;
     return  gStaticsParamArrays[bucket].SampleLevel(gSamplerBilinearWrap, float3(uv, (float)layer), lvl) .
-#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 138 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 a;
 }
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 float2 staticsGradCdblur(uint slot, float2 uv, float2 duvdx, float2 duvdy, float radius)
 {
     const float2 size0 = staticsParamDims(slot >> 16u);
@@ -4477,7 +4506,17 @@ PSOut PS_MAIN( VSOutput In )
     uint bucket = In.TexIndex >> 16;
     uint layer = In.TexIndex & 0xFFFFu;
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
-#line 197 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 189 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+    weatherApply(tex.rgb, normalize(In.WorldNormal), In.WorldPos);
+
+
+
+
+
+
+
+
+
     const float3 nGeom = normalize(In.WorldNormal);
     float sunVis = sunShadowVisibility(In.WorldPos, nGeom);
 
@@ -4486,14 +4525,14 @@ PSOut PS_MAIN( VSOutput In )
 
     float3 tSun, tAmb;
     waterLightTransmit(In.WorldPos, tSun, tAmb);
-#line 216 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 218 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     const float3 pbrDPdx = ddx(In.WorldPos);
     const float3 pbrDPdy = ddy(In.WorldPos);
     const float2 pbrDUVdx = ddx(In.Uv);
     const float2 pbrDUVdy = ddy(In.Uv);
 
     float3 nShade = nGeom;
-#line 250 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 252 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     const bool sunPerPixel = (gShadowParams.pbrStatics.z != 0.0f);
     const float sunNdl = sunPerPixel ? saturate(dot(nGeom, -gFrameData.sunDir.xyz)) : 1.0f;
     float3 sunTerm = In.SunLight * sunNdl;
@@ -4744,7 +4783,7 @@ PSOut PS_MAIN( VSOutput In )
 
 
     PSOut Out;
-#line 505 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 507 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
@@ -4764,7 +4803,7 @@ PSOut PS_MAIN( VSOutput In )
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f); RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     if (dbg == 19u) {
-#line 537 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 539 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
         const float3 srcCol = pbrLive ? float3(0.06f, 1.00f, 0.18f) : float3(0.10f, 0.10f, 0.11f);
 
 

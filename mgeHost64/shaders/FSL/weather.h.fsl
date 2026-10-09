@@ -1,0 +1,36 @@
+// mgeHost64 — WEATHER SURFACE STATE (receiver). The host integrates wetness and snow cover from MW's
+// own precipitation counters over wall time and publishes them in gShadowParams.weatherState:
+//   x = wetness 0..1, y = snow cover 0..1, z = wet darkening depth, w = snow albedo.
+// Both are 0 in dry weather and indoors, so this is the identity there and the dry look is untouched.
+//
+// EXPOSURE is what makes it read as weather rather than a tint: rain and snow land on surfaces that
+// FACE UP and are NOT COVERED. Covered = something stands above this point in gSkyHeight, the
+// top-down max(terrain, statics) height map the sky occlusion already marches (one sample) — so the
+// ground under an overhang, a balcony or a stilt-strider shell stays dry. Requires opaque.srt.h.
+#ifndef WEATHER_H
+#define WEATHER_H
+
+float weatherCover(float3 worldPosRel)
+{
+    float4 m  = gShadowParams.skyAOMap;
+    float2 uv = (worldPosRel.xy + gFrameData.lodEye.xy - m.xy) * m.z;
+    if (any(uv < float2(0.0f, 0.0f)) || any(uv > float2(1.0f, 1.0f))) { return 0.0f; }
+    float  h  = SampleLvlTex2D(gSkyHeight, gSamplerPointClamp, uv, 0.0f).r;
+    float  z  = worldPosRel.z + gFrameData.lodEye.z;
+    // Soft over 64 units above the point itself, so the surface that BUILT the max does not cover itself.
+    return saturate((h - z - 48.0f) / 64.0f);
+}
+
+// Wet darkening + snow on the albedo. N = the surface's geometric world normal.
+void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel)
+{
+    float4 w = gShadowParams.weatherState;
+    if (w.x <= 0.0f && w.y <= 0.0f) { return; }
+    float open = 1.0f - weatherCover(worldPosRel);
+    // Rain wets walls too (wind, splash), roofs and ground most; snow only settles on what faces up.
+    float wetE  = w.x * open * saturate(0.35f + 0.65f * N.z);
+    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f);
+    albedo *= (1.0f - w.z * wetE);
+    albedo  = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
+}
+#endif // WEATHER_H
