@@ -8621,12 +8621,13 @@ namespace {
     float    g_swHorizGain     = 1.0f;      // display: horizontal displacement x
     float    g_swNormalGain    = 1.0f;      // display: sim slope into the normal x
     float    g_swWWShow        = 1.0f;      // display: whitewater cover x
-    float    g_swHmax          = 60.0f;     // u: depth that sets the open-water wave speed (sqrt(g*H))
+    float    g_swHmax          = 150.0f;    // u: depth that sets the open-water wave speed (sqrt(g*H) = 322 u/s)
     float    g_swDamp          = 0.08f;     // 1/s velocity damping
     float    g_swSponge        = 20.0f;     // texels of edge held to the far-field swell
     float    g_swSpongeRate    = 4.0f;      // 1/s relax rate at the very edge
-    float    g_swSwellAmp      = 12.0f;     // u: swell amplitude entering the window (x body amp)
-    float    g_swSwellLam      = 420.0f;    // u: longest swell wavelength
+    float    g_swSwellAmp      = 30.0f;     // u: swell amplitude (x body amp x exposure)
+    float    g_swSwellPeriod   = 12.0f;     // s: longest swell period (12/9/7 s = 5-9 waves a minute)
+    float    g_swShelterDamp   = 0.5f;      // 1/s extra damping on enclosed water (exposure 0)
     float    g_swGust          = 1.5f;      // u of head: wind gust pressure (x body amp)
     float    g_swGustScale     = 220.0f;    // u: gust size
     float    g_swRiverChop     = 3.0f;      // u: river looping chop amplitude
@@ -8647,8 +8648,9 @@ namespace {
     float    g_swBreakWW       = 3.0f;      // whitewater per second of a fully breaking cell
     float    g_swEyeFadeLo     = 900.0f;    // u above the water: display starts fading
     float    g_swEyeFadeHi     = 2200.0f;   // u above the water: display gone (the sim parks)
-    float    g_swGeoFadeLo     = 1500.0f;   // u from the eye (Chebyshev): far-field GEOMETRY starts fading
-    float    g_swGeoFadeHi     = 1850.0f;   // ...and is gone (inside the 64 u ring's reach); normals go on
+    float    g_waterBodyView   = 0.0f;      // water.frag debug: 1 body colours, 2 flow direction (0 off)
+    float    g_swGeoFadeLo     = 6000.0f;   // u from the eye (Chebyshev): far-field GEOMETRY starts fading
+    float    g_swGeoFadeHi     = 7500.0f;   // ...and is gone (inside the 256 u ring; the swell is >2000 u long)
     uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
     float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
     Texture* g_pWaterBodyTex = nullptr;
@@ -24202,7 +24204,8 @@ namespace {
             { "swSponge",            &g_swSponge            },
             { "swSpongeRate",        &g_swSpongeRate        },
             { "swSwellAmp",          &g_swSwellAmp          },
-            { "swSwellLam",          &g_swSwellLam          },
+            { "swSwellPeriod",       &g_swSwellPeriod       },
+            { "swShelterDamp",       &g_swShelterDamp       },
             { "swGust",              &g_swGust              },
             { "swGustScale",         &g_swGustScale         },
             { "swRiverChop",         &g_swRiverChop         },
@@ -24215,6 +24218,7 @@ namespace {
             { "swImpRadius",         &g_swImpRadius         },
             { "swEdgeFade",          &g_swEdgeFade          },
             { "swDeepHold",          &g_swDeepHold          },
+            { "waterBodyView",       &g_waterBodyView       },
             { "swFriction",          &g_swFriction          },
             { "swAdvect",            &g_swAdvect            },
             { "swBreakRatio",        &g_swBreakRatio        },
@@ -27207,13 +27211,15 @@ namespace {
           t.sliderF("Water flow speed (rivers downstream, beach onshore; 0 = off)", &g_waterFlowSpeed, 0.0f, 300.0f, 5.0f);
           t.sliderF("Water foam (rivers + shore; 0 = off)", &g_waterFoam, 0.0f, 2.0f, 0.05f);
           t.sliderF("Water open-sea swell (0 = off)", &g_waterSwell, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Water BODY VIEW (1 = sea blue / river green / pond red / beach yellow, 2 = flow direction)", &g_waterBodyView, 0.0f, 2.0f, 1.0f, "%.0f");
           t.checkbox("Water SIM (local 44 m push-pull: 3D displacement + whitewater)", &g_waterSim);
           t.sliderF("Water sim: vertical gain", &g_swVertGain, 0.0f, 4.0f, 0.05f);
           t.sliderF("Water sim: horizontal gain", &g_swHorizGain, 0.0f, 4.0f, 0.05f);
           t.sliderF("Water sim: normal gain", &g_swNormalGain, 0.0f, 4.0f, 0.05f);
           t.sliderF("Water sim: whitewater show", &g_swWWShow, 0.0f, 4.0f, 0.05f);
           t.sliderF("Water sim: swell amp (u)", &g_swSwellAmp, 0.0f, 60.0f, 0.5f);
-          t.sliderF("Water sim: swell wavelength (u)", &g_swSwellLam, 64.0f, 1500.0f, 10.0f);
+          t.sliderF("Water sim: swell period (s; 6-15 = 10-4 waves/min)", &g_swSwellPeriod, 2.0f, 20.0f, 0.5f);
+          t.sliderF("Water sim: shelter damping (enclosed water, 1/s)", &g_swShelterDamp, 0.0f, 3.0f, 0.05f);
           t.sliderF("Water sim: gust head (u)", &g_swGust, 0.0f, 20.0f, 0.1f);
           t.sliderF("Water sim: river chop (u)", &g_swRiverChop, 0.0f, 20.0f, 0.1f);
           t.sliderF("Water sim: Hmax (wave speed depth, u)", &g_swHmax, 4.0f, 300.0f, 1.0f);
@@ -29731,7 +29737,7 @@ namespace {
         }
         base.wind[0] = wx; base.wind[1] = wy;
         base.wind[2] = std::max(g_swSwellAmp, 0.0f);
-        base.wind[3] = std::max(g_swSwellLam, 32.0f);
+        base.wind[3] = std::max(g_swSwellPeriod, 0.5f);
         base.chop[0] = std::max(g_swGust, 0.0f);
         base.chop[1] = std::max(g_swGustScale, 1.0f);
         base.chop[2] = std::max(g_swRiverChop, 0.0f);
@@ -29744,6 +29750,7 @@ namespace {
         base.brk[0] = std::clamp(g_swAdvect, 0.0f, 1.0f);
         base.brk[1] = std::max(g_swBreakRatio, 0.05f);
         base.brk[2] = std::max(g_swBreakWW, 0.0f);
+        base.brk[3] = std::max(g_swShelterDamp, 0.0f);
         base.bodyAmp[0] = g_waterAmpSea; base.bodyAmp[1] = g_waterAmpRiver;
         base.bodyAmp[2] = g_waterAmpPond; base.bodyAmp[3] = g_waterAmpBeach;
         // Swimmers: the wake tracks (moving, extrapolated), as moving pressure dips.
@@ -29829,7 +29836,7 @@ namespace {
         // the sim itself is running (from above its eye-height fade the train is all there is).
         const bool farOn = g_waterSim && exterior;
         w[14] = farOn ? std::max(g_swSwellAmp, 0.0f) : 0.0f;
-        w[15] = std::max(g_swSwellLam, 32.0f);
+        w[15] = std::max(g_swSwellPeriod, 0.5f);
         std::memcpy(wbuf + 15 * 64, w, 64);
         float q[16] = {};
         swWindDir(q[0], q[1]);
@@ -29837,6 +29844,8 @@ namespace {
         q[3] = std::sqrt((9.81f / kMwUnitMetres) * std::max(g_swHmax, 1.0f)); // its open-water speed
         q[4] = g_swGeoFadeLo;
         q[5] = std::max(g_swGeoFadeHi, g_swGeoFadeLo + 1.0f);
+        q[6] = std::max(g_swDispRelax, 0.0f);                    // the sim's D relax (far-field match)
+        q[8] = g_waterBodyView;                                  // water.frag BODY VIEW (0 off)
         std::memcpy(wbuf + 17 * 64, q, 64);
     }
 
@@ -34956,7 +34965,8 @@ void destroyHostWindow(Renderer* R);
             if (vrsW) { g_vrsMaskCur |= 8u; }
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const WaterLodLevelHost& lvl = g_waterLevels[k];
-                const bool wantVrs = vrsW && !(swShown && k < kWaterNearLevels);
+                // ...and the 128/256 u rings the far-field swell displaces (its reach, g_swGeoFadeHi).
+                const bool wantVrs = vrsW && !(swShown && k < kWaterNearLevels + 2u);
                 if (wantVrs != vrsOn) { vrsBind(wantVrs); vrsOn = wantVrs; }
                 uint32_t variant = 0;
                 if (lvl.numVariants > 1) {
@@ -53484,14 +53494,13 @@ void destroyHostWindow(Renderer* R);
                 const Terrain::LandCell* c = Terrain::cellAt(cx, cy);
                 const size_t i = (size_t)gy * W + gx;
                 if (!c) { wet[i] = 1; openSea[i] = 1; continue; }
+                // The height AT THE CELL CENTRE (the prototype samples the terrain there). The first
+                // port took the MIN over the cell's 5x5 vertices, so any bank dipping under the plane
+                // made the whole 512 u cell wet: rivers came out wider than the river half-width and
+                // classified as SEA — "the sea penetrating into the river" (user, 2026-10-09).
                 const int vx0 = (gx % kPerCell) * 4, vy0 = (gy % kPerCell) * 4;
-                int16_t mn = 32767;
-                for (int vy = vy0; vy <= vy0 + 4; ++vy) {
-                    for (int vx = vx0; vx <= vx0 + 4; ++vx) {
-                        mn = std::min(mn, c->height[vy * Terrain::kCellVerts + vx]);
-                    }
-                }
-                if ((float)mn * Terrain::kHeightScale < seaZ) { wet[i] = 1; }
+                const int16_t hc = c->height[(vy0 + 2) * Terrain::kCellVerts + vx0 + 2];
+                if ((float)hc * Terrain::kHeightScale < seaZ) { wet[i] = 1; }
             }
         }
         static const int nb[4][2] = { {1,0},{-1,0},{0,1},{0,-1} };
@@ -53541,6 +53550,73 @@ void destroyHostWindow(Renderer* R);
             else if (dWide[i] != INT_MAX && dWide[i] <= beachReach) { cat = 3; }
             else                                               { cat = 1; }
             w4[i * 4 + cat] = 1.0f; ++nCat[cat];
+        }
+        // BEACH EXTEND (prototype 5b): grow the beach SEAWARD into open sea by 30 cells — sea cells
+        // only, so it can neither create nor shorten rivers. Open sea is the far-offshore water.
+        {
+            constexpr int kBeachExtend = 30;
+            std::vector<int> dB(N, INT_MAX);
+            q.clear();
+            for (size_t i = 0; i < N; ++i) { if (w4[i * 4 + 3] > 0.5f) { dB[i] = 0; q.push_back((int)i); } }
+            for (size_t h = 0; h < q.size(); ++h) {
+                const int c = q[h];
+                if (dB[c] >= kBeachExtend) { continue; }
+                const int x = c % W, y = c / W;
+                for (auto& o : nb) {
+                    const int nx = x + o[0], ny = y + o[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                    const int ni = ny * W + nx;
+                    if (wet[ni] && dB[ni] == INT_MAX && w4[(size_t)ni * 4 + 0] > 0.5f) {
+                        dB[ni] = dB[c] + 1; q.push_back(ni);
+                        w4[(size_t)ni * 4 + 0] = 0.0f; w4[(size_t)ni * 4 + 3] = 1.0f;
+                        --nCat[0]; ++nCat[3];
+                    }
+                }
+            }
+        }
+        // BEACH RAMP (prototype 5c): phi = 0 at the beach's seaward front, 1 at its landward front,
+        // blurred over beach cells — the onshore drift grows smoothly toward land (no calm-sea ->
+        // violent-beach step) and the coastline's wiggles do not steer it.
+        std::vector<float> phi(N, 0.0f);
+        {
+            auto isBeach = [&](size_t j) { return wet[j] && w4[j * 4 + 3] > 0.5f; };
+            std::vector<int> dS(N, INT_MAX), dL(N, INT_MAX);
+            auto front = [&](std::vector<int>& d, auto touches) {
+                q.clear();
+                for (size_t i = 0; i < N; ++i) {
+                    if (!isBeach(i)) { continue; }
+                    const int x = (int)(i % W), y = (int)(i / W);
+                    for (auto& o : nb) {
+                        const int nx = x + o[0], ny = y + o[1];
+                        if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                        if (touches((size_t)ny * W + nx)) { d[i] = 0; q.push_back((int)i); break; }
+                    }
+                }
+                bfs(d, q, INT_MAX, [&](int ni) { return isBeach((size_t)ni); });
+            };
+            front(dS, [&](size_t j) { return wet[j] && w4[j * 4 + 0] > 0.5f; });
+            front(dL, [&](size_t j) { return !wet[j]; });
+            for (size_t i = 0; i < N; ++i) {
+                if (!isBeach(i)) { continue; }
+                const float a = (dS[i] == INT_MAX) ? (float)beachReach : (float)dS[i];
+                const float b = (dL[i] == INT_MAX) ? (float)beachReach : (float)dL[i];
+                phi[i] = (a + b > 0.0f) ? a / (a + b) : 0.5f;
+            }
+            for (int pass = 0; pass < 5; ++pass) {
+                std::vector<float> t(phi);
+                for (size_t i = 0; i < N; ++i) {
+                    if (!isBeach(i)) { continue; }
+                    const int x = (int)(i % W), y = (int)(i / W);
+                    float sP = t[i]; int n = 1;
+                    for (auto& o : nb) {
+                        const int nx = x + o[0], ny = y + o[1];
+                        if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                        const size_t j = (size_t)ny * W + nx;
+                        if (isBeach(j)) { sP += t[j]; ++n; }
+                    }
+                    phi[i] = sP / (float)n;
+                }
+            }
         }
         // FLOW (step 2). RIVERS run DOWNSTREAM = -grad(distance to open sea), off a box-blurred copy of
         // that integer field so the heading is continuous (the prototype's de-blocking): the river
@@ -53607,7 +53683,7 @@ void destroyHostWindow(Renderer* R);
                     if (l > 1e-6f) {
                         fdx[i] = gx / l; fdy[i] = gy / l;
                         // beach drifts onshore gently; open sea only near a coast (gradient ~ 1/Rc).
-                        fst[i] = (w[3] > 0.5f) ? 0.35f : std::min(1.0f, l * (float)Rc * 1.5f) * 0.15f;
+                        fst[i] = (w[3] > 0.5f) ? 0.35f * phi[i] : std::min(1.0f, l * (float)Rc * 1.5f) * 0.15f;
                     }
                 }
             }
@@ -53647,12 +53723,69 @@ void destroyHostWindow(Renderer* R);
                 }
             }
         }
+        // EXPOSURE (user, 2026-10-09: "add reflections so waves dissipate around inner parts instead of
+        // directions"): the share of water within ~4 km (8 cells, two box passes), ramped so enclosed
+        // bays, lagoons and inlets go to 0. The directional swell lives only on exposed water; the sim
+        // damps what reaches enclosed water, so it reflects off those shores and dies there.
+        std::vector<float> expo(N, 0.0f);
+        {
+            std::vector<float> wf(N), tmp(N), pre((size_t)std::max(W, H) + 1);
+            for (size_t i = 0; i < N; ++i) { wf[i] = wet[i] ? 1.0f : 0.0f; }
+            constexpr int R = 8;
+            for (int it = 0; it < 2; ++it) {
+                for (int y = 0; y < H; ++y) {
+                    pre[0] = 0.0f;
+                    for (int x = 0; x < W; ++x) { pre[x + 1] = pre[x] + wf[(size_t)y * W + x]; }
+                    for (int x = 0; x < W; ++x) {
+                        const int lo = std::max(0, x - R), hi = std::min(W - 1, x + R);
+                        tmp[(size_t)y * W + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                    }
+                }
+                for (int x = 0; x < W; ++x) {
+                    pre[0] = 0.0f;
+                    for (int y = 0; y < H; ++y) { pre[y + 1] = pre[y] + tmp[(size_t)y * W + x]; }
+                    for (int y = 0; y < H; ++y) {
+                        const int lo = std::max(0, y - R), hi = std::min(H - 1, y + R);
+                        wf[(size_t)y * W + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                    }
+                }
+            }
+            for (size_t i = 0; i < N; ++i) {
+                if (!wet[i]) { continue; }
+                const float t = std::clamp((wf[i] - 0.55f) / 0.35f, 0.0f, 1.0f);
+                expo[i] = t * t * (3.0f - 2.0f * t);
+            }
+        }
+        // DILATE (prototype 6b): carry the nearest wet cell's body + flow 3 cells into the dry border, so
+        // a shoreline texel's bilinear footprint samples a real body on BOTH sides.
+        {
+            constexpr int kDilate = 3;
+            std::vector<int> dD(N, INT_MAX);
+            q.clear();
+            for (size_t i = 0; i < N; ++i) { if (wet[i]) { dD[i] = 0; q.push_back((int)i); } }
+            for (size_t h = 0; h < q.size(); ++h) {
+                const int c = q[h];
+                if (dD[c] >= kDilate) { continue; }
+                const int x = c % W, y = c / W;
+                for (auto& o : nb) {
+                    const int nx = x + o[0], ny = y + o[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                    const int ni = ny * W + nx;
+                    if (dD[ni] == INT_MAX) {
+                        dD[ni] = dD[c] + 1; q.push_back(ni);
+                        for (int k = 0; k < 4; ++k) { w4[(size_t)ni * 4 + k] = w4[(size_t)c * 4 + k]; }
+                        fdx[ni] = fdx[c]; fdy[ni] = fdy[c]; fst[ni] = fst[c]; expo[ni] = expo[c];
+                    }
+                }
+            }
+        }
         g_waterFlowBytes.assign(N, 0);
         for (size_t i = 0; i < N; ++i) {
             const uint32_t r = (uint32_t)std::clamp((int)((fdx[i] * 0.5f + 0.5f) * 255.0f + 0.5f), 0, 255);
             const uint32_t g = (uint32_t)std::clamp((int)((fdy[i] * 0.5f + 0.5f) * 255.0f + 0.5f), 0, 255);
             const uint32_t b = (uint32_t)std::clamp((int)(fst[i] * 255.0f + 0.5f), 0, 255);
-            g_waterFlowBytes[i] = r | (g << 8) | (b << 16);
+            const uint32_t a = (uint32_t)std::clamp((int)(expo[i] * 255.0f + 0.5f), 0, 255);
+            g_waterFlowBytes[i] = r | (g << 8) | (b << 16) | (a << 24);   // a = EXPOSURE
         }
         g_waterBodyBytes.assign(N, 0);
         for (size_t i = 0; i < N; ++i) {

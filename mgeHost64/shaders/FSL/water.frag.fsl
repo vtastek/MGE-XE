@@ -1430,9 +1430,12 @@ float4 PS_MAIN( VSOutput In )
                 // The FAR FIELD: the same swell train the sim's deep water is held to, so the window
                 // edge is a crossfade, not a boundary. Footprint-faded per component (no far sparkle).
                 const float bAmp = (dot(bodyW, float4(1.0f, 1.0f, 1.0f, 1.0f)) > 0.5f)
-                                 ? dot(bodyW, gShadowParams.waterBodyAmp) : 1.0f;
+                                 ? (bodyW.r * gShadowParams.waterBodyAmp.x + bodyW.a * gShadowParams.waterBodyAmp.w)
+                                 : 1.0f;   // swell: sea + beach only
+                const float expo = (gShadowParams.waterFlowMap.z > 0.0f)
+                                 ? SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, bodyUV, 0.0f).a : 1.0f;
                 const float fpW  = dist / (focalPx * max(abs(EyeVec.z), 0.1f));
-                const float3 an  = swSwellEval(In.RestXY + gFrameData.lodEye.xy, SWQ[0].xy, s3.z * bAmp,
+                const float3 an  = swSwellEval(In.RestXY + gFrameData.lodEye.xy, SWQ[0].xy, s3.z * bAmp * expo,
                                                s3.w, SWQ[0].w, SWQ[0].z, fpW);
                 sslope = -an.yz * (1.0f - sw);
             }
@@ -2853,6 +2856,38 @@ float4 PS_MAIN( VSOutput In )
         wf *= 0.9f;
         result = lerp(result, wwCol, wf);
         kDst   = kDst * (1.0f - wf);
+    }
+
+    // BODY VIEW (scene-walk-v2's CLASSIFY / DIRECTION views; gBatch.worlds[17] row 2 x):
+    //   1 = body colours, blended by the baked weights: sea BLUE, river GREEN, pond RED, beach YELLOW;
+    //   2 = flow direction as a hue wheel (east red, north green, west cyan, south magenta), brightness
+    //       = flow strength, with stripes that MOVE along the flow so the direction reads at a glance.
+    // Opaque, so the classification is all you see; lit faintly by the normal so the waves still read.
+    {
+        const float bodyView = transpose(gBatch.worlds[17])[2].x;
+        if (bodyView > 0.5f)
+        {
+            float3 dbg;
+            if (bodyView < 1.5f)
+            {
+                dbg = bodyW.r * float3(0.10f, 0.25f, 1.0f) + bodyW.g * float3(0.10f, 0.90f, 0.15f)
+                    + bodyW.b * float3(1.0f, 0.12f, 0.10f) + bodyW.a * float3(1.0f, 0.90f, 0.10f);
+                if (dot(bodyW, float4(1.0f, 1.0f, 1.0f, 1.0f)) < 0.5f) { dbg = float3(0.3f, 0.3f, 0.3f); }   // no map
+            }
+            else
+            {
+                const float h  = atan2(flowDir.y, flowDir.x) * 0.1591549f + 0.5f;
+                const float3 hue = saturate(float3(abs(h * 6.0f - 3.0f) - 1.0f, 2.0f - abs(h * 6.0f - 2.0f),
+                                                   2.0f - abs(h * 6.0f - 4.0f)));
+                const float str = saturate(flowStr * 2.0f);
+                const float2 wxy = In.RestXY + gFrameData.lodEye.xy;
+                const float stripe = smoothstep(0.35f, 0.5f, abs(frac(dot(wxy, flowDir) / 256.0f - time * 0.5f) - 0.5f) * 2.0f);
+                dbg = (dot(flowDir, flowDir) > 1.0e-4f) ? hue * (0.25f + 0.75f * str) * (0.6f + 0.4f * stripe)
+                                                        : float3(0.25f, 0.25f, 0.25f);
+            }
+            result = dbg * (0.75f + 0.25f * saturate(normal.z * 8.0f - 7.0f));
+            kDst   = 0.0f;
+        }
     }
 
 	// ─── THE AIR SEGMENT: THE ONE FOGGING ────────────────────────────────────────────────────────

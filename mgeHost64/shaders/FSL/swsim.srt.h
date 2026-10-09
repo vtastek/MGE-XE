@@ -52,7 +52,7 @@ STRUCT(SwSimParams)
     DATA(float4, skyMap,  None);
     // gWaterBodies / gWaterFlow addressing: xy = world origin, zw = 1/extent (0 = no map: open sea)
     DATA(float4, bodyMap, None);
-    // x,y = wind heading (unit)   z = swell amplitude (u) at the sponge   w = swell wavelength (u)
+    // x,y = wind heading (unit)   z = swell amplitude (u) at the sponge   w = swell PERIOD (s, longest)
     DATA(float4, wind,    None);
     // x = gust pressure amplitude (u of head)  y = gust scale (u)  z = river chop amp (u)
     // w = river loop period (s; divides the 20 s water clock)
@@ -73,7 +73,8 @@ STRUCT(SwSimParams)
     //       run on as a bore instead of sloshing in place)
     //   y = breaking ratio: a crest higher than y * still depth breaks
     //   z = whitewater produced per second by a fully breaking cell
-    //   w = spare
+    //   w = SHELTER damping (1/s) added where the water is enclosed (exposure 0): what enters an inner
+    //       bay reflects off its shores and dies there instead of keeping a heading
     DATA(float4, brk,     None);
     // per impulse: xy = position in TEXELS of this frame's grid, z = radius (texels),
     // w = pressure head (u; a moving swimmer is a moving dip in the surface pressure)

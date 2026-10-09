@@ -6,12 +6,14 @@
 //
 // Shallow-water plane waves, three components around the wind heading: phase speed c (the sim's open-
 // water speed sqrt(g Hmax)), particle velocity g*eta/c along each heading. World XY is ABSOLUTE.
+// DEFINED BY PERIOD (user, 2026-10-09: "open sea should have low frequency waves, 4 to 10 waves per
+// minute"): component k has period per * swSwellPer(k) and wavelength c * that period.
 #pragma once
 
 #define SW_GRAVITY 689.69f   // 9.81 m/s^2 in MW units (64 u = 1 yard)
 
-// Component k: relative wavelength, heading rotation (rad), relative amplitude, phase offset.
-float swSwellLam(int k) { return (k == 0) ? 1.0f  : (k == 1) ? 0.71f : 0.53f; }
+// Component k: relative period, heading rotation (rad), relative amplitude, phase offset.
+float swSwellPer(int k) { return (k == 0) ? 1.0f  : (k == 1) ? 0.75f : 0.58f; }   // 12/9/7 s at per = 12
 float swSwellAng(int k) { return (k == 0) ? 0.0f  : (k == 1) ? 0.42f : -0.35f; }
 float swSwellAmp(int k) { return (k == 0) ? 1.0f  : (k == 1) ? 0.6f  : 0.4f; }
 
@@ -22,15 +24,15 @@ float2 swSwellDir(float2 wind, int k)
     return float2(wind.x * ca - wind.y * sa, wind.x * sa + wind.y * ca);
 }
 
-// (eta, d eta/dx, d eta/dy) at absolute world XY. A = amplitude, lam = longest wavelength, c = phase
+// (eta, d eta/dx, d eta/dy) at absolute world XY. A = amplitude, per = longest period (s), c = phase
 // speed, t = forcing time (s). `footprint` (world units per pixel; 0 = none) fades each component out
 // once a pixel spans a quarter of its wavelength, so the far field never sparkles.
-float3 swSwellEval(float2 w, float2 wind, float A, float lam, float c, float t, float footprint)
+float3 swSwellEval(float2 w, float2 wind, float A, float per, float c, float t, float footprint)
 {
     float3 r = float3(0.0f, 0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float  lk = lam * swSwellLam(k);
+        const float  lk = max(c, 1.0f) * per * swSwellPer(k);
         const float  fp = (footprint > 0.0f) ? (1.0f - smoothstep(0.125f * lk, 0.25f * lk, footprint)) : 1.0f;
         const float2 d  = swSwellDir(wind, k);
         const float  kk = 6.28318531f / lk;
@@ -42,29 +44,33 @@ float3 swSwellEval(float2 w, float2 wind, float A, float lam, float c, float t, 
     return r;
 }
 
-// The horizontal parcel displacement the sim's integrated velocity settles to for the same train:
-// integral of g*eta/c dt = -(g / (c^2 k)) A sin(phase), along each heading.
-float2 swSwellDisp(float2 w, float2 wind, float A, float lam, float c, float t)
+// The horizontal parcel displacement the sim's D field settles to for the same train: D' = u - r D with
+// u = U cos(theta), U = g A / c, theta = k x - w t  =>  D = U (r cos(theta) - w sin(theta)) / (w^2 + r^2)
+// along each heading (r = the sim's displacement relax rate, swsim disp.x). Same response, no seam.
+float2 swSwellDisp(float2 w, float2 wind, float A, float per, float c, float t, float r)
 {
-    float2 r = float2(0.0f, 0.0f);
+    float2 res = float2(0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float  lk = lam * swSwellLam(k);
+        const float  Tk = max(per * swSwellPer(k), 0.1f);
+        const float  lk = max(c, 1.0f) * Tk;
         const float2 d  = swSwellDir(wind, k);
         const float  kk = 6.28318531f / lk;
+        const float  om = 6.28318531f / Tk;
         const float  ph = kk * (dot(w, d) - c * t) + 1.7f * float(k);
-        r -= d * (SW_GRAVITY / max(c * c * kk, 1.0f)) * A * swSwellAmp(k) * sin(ph);
+        const float  U  = SW_GRAVITY * A * swSwellAmp(k) / max(c, 1.0f);
+        res += d * (U * (r * cos(ph) - om * sin(ph)) / (om * om + r * r));
     }
-    return r;
+    return res;
 }
 
 // Sim-side: (eta, u, v) of the train — the hold target.
-float3 swSwellState(float2 w, float2 wind, float A, float lam, float c, float t)
+float3 swSwellState(float2 w, float2 wind, float A, float per, float c, float t)
 {
     float3 r = float3(0.0f, 0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float  lk = lam * swSwellLam(k);
+        const float  lk = max(c, 1.0f) * per * swSwellPer(k);
         const float2 d  = swSwellDir(wind, k);
         const float  kk = 6.28318531f / lk;
         const float  e  = A * swSwellAmp(k) * cos(kk * (dot(w, d) - c * t) + 1.7f * float(k));

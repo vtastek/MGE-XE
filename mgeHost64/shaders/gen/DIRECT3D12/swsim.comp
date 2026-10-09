@@ -1016,11 +1016,12 @@ STRUCT(SwSimParams)
 
 
 
+
     float4 brk;
 
 
     float4 impulses[ 16 ];
-#line 81
+#line 82
 };
 
         CBUFFER(SwSimParams) gSwParams :  register(b0,space0);
@@ -1033,8 +1034,8 @@ STRUCT(SwSimParams)
         Tex2D(float4) gSwFlow :  register(t7,space0);
 #line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swsim.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"
-#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"
-float swSwellLam(int k) { return (k == 0) ? 1.0f : (k == 1) ? 0.71f : 0.53f; }
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"
+float swSwellPer(int k) { return (k == 0) ? 1.0f : (k == 1) ? 0.75f : 0.58f; }
 float swSwellAng(int k) { return (k == 0) ? 0.0f : (k == 1) ? 0.42f : -0.35f; }
 float swSwellAmp(int k) { return (k == 0) ? 1.0f : (k == 1) ? 0.6f : 0.4f; }
 
@@ -1048,12 +1049,12 @@ float2 swSwellDir(float2 wind, int k)
 
 
 
-float3 swSwellEval(float2 w, float2 wind, float A, float lam, float c, float t, float footprint)
+float3 swSwellEval(float2 w, float2 wind, float A, float per, float c, float t, float footprint)
 {
     float3 r = float3(0.0f, 0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float lk = lam * swSwellLam(k);
+        const float lk = max(c, 1.0f) * per * swSwellPer(k);
         const float fp = (footprint > 0.0f) ? (1.0f - smoothstep(0.125f * lk, 0.25f * lk, footprint)) : 1.0f;
         const float2 d = swSwellDir(wind, k);
         const float kk = 6.28318531f / lk;
@@ -1067,27 +1068,31 @@ float3 swSwellEval(float2 w, float2 wind, float A, float lam, float c, float t, 
 
 
 
-float2 swSwellDisp(float2 w, float2 wind, float A, float lam, float c, float t)
+
+float2 swSwellDisp(float2 w, float2 wind, float A, float per, float c, float t, float r)
 {
-    float2 r = float2(0.0f, 0.0f);
+    float2 res = float2(0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float lk = lam * swSwellLam(k);
+        const float Tk = max(per * swSwellPer(k), 0.1f);
+        const float lk = max(c, 1.0f) * Tk;
         const float2 d = swSwellDir(wind, k);
         const float kk = 6.28318531f / lk;
+        const float om = 6.28318531f / Tk;
         const float ph = kk * (dot(w, d) - c * t) + 1.7f * float(k);
-        r -= d * ( 689.69f  / max(c * c * kk, 1.0f)) * A * swSwellAmp(k) * sin(ph);
+        const float U =  689.69f  * A * swSwellAmp(k) / max(c, 1.0f);
+        res += d * (U * (r * cos(ph) - om * sin(ph)) / (om * om + r * r));
     }
-    return r;
+    return res;
 }
 
 
-float3 swSwellState(float2 w, float2 wind, float A, float lam, float c, float t)
+float3 swSwellState(float2 w, float2 wind, float A, float per, float c, float t)
 {
     float3 r = float3(0.0f, 0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float lk = lam * swSwellLam(k);
+        const float lk = max(c, 1.0f) * per * swSwellPer(k);
         const float2 d = swSwellDir(wind, k);
         const float kk = 6.28318531f / lk;
         const float e = A * swSwellAmp(k) * cos(kk * (dot(w, d) - c * t) + 1.7f * float(k));
@@ -1189,6 +1194,22 @@ float2 swFlow(float2 w)
 
 
 
+float swExposure(float2 w)
+{
+    const float4 m = gSwParams.bodyMap;
+    if (m.z <= 0.0f) { return 1.0f; }
+    const int2 dim = GetDimensions(gSwFlow, NO_SAMPLER);
+    const float2 t = (w - m.xy) * m.zw * float2(dim) - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f = t - fl;
+    const int2 i = int2(fl);
+    const int2 n = dim - int2(1, 1);
+    return lerp(lerp(swFlowTap(i, n).a, swFlowTap(i + int2(1, 0), n).a, f.x),
+                lerp(swFlowTap(i + int2(0, 1), n).a, swFlowTap(i + int2(1, 1), n).a, f.x), f.y);
+}
+
+
+
 float swGust(float2 w, float c)
 {
     const float2 d = gSwParams.wind.xy;
@@ -1204,7 +1225,7 @@ float swGust(float2 w, float c)
 
 float3 swSwell(float2 w, float c)
 {
-    return swSwellState(w, gSwParams.wind.xy, gSwParams.wind.z, max(gSwParams.wind.w, 32.0f), c,
+    return swSwellState(w, gSwParams.wind.xy, gSwParams.wind.z, max(gSwParams.wind.w, 0.5f), c,
                         gSwParams.origin.z);
 }
 
@@ -1302,11 +1323,15 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
         const float4 bw = swBodies(wC);
         const float bAmp = dot(bw, gSwParams.bodyAmp);
+
+
+        const float expo = swExposure(wC);
+        const float sAmp = (bw.r * gSwParams.bodyAmp.x + bw.a * gSwParams.bodyAmp.w) * expo;
         const float pC = swGust(wC, cM) * bAmp + swImpulses(float2(id) + 0.5f);
         const float pX = swGust(wX, cM) * bAmp + swImpulses(float2(id) + float2(1.5f, 0.5f));
         const float pY = swGust(wY, cM) * bAmp + swImpulses(float2(id) + float2(0.5f, 1.5f));
 
-        const float keep = exp(-max(gSwParams.phys.y, 0.0f) * dt);
+        const float keep = exp(-(max(gSwParams.phys.y, 0.0f) + max(gSwParams.brk.w, 0.0f) * (1.0f - expo)) * dt);
         const float vMax = 0.25f * dx / max(dt, 1.0e-4f);
         const float sp = swSponge(id, d0C);
         const float cf = max(gSwParams.disp.w, 0.0f);
@@ -1338,7 +1363,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
             u /= 1.0f + dt * cf * abs(u) / max(hX,  0.25f );
             if (sp > 0.0f)
             {
-                u = lerp(u, swSwell(0.5f * (wC + wX), cM).y * bAmp, relax);
+                u = lerp(u, swSwell(0.5f * (wC + wX), cM).y * sAmp, relax);
             }
             u = clamp(u, -vMax, vMax);
         }
@@ -1353,7 +1378,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
             v /= 1.0f + dt * cf * abs(v) / max(hY,  0.25f );
             if (sp > 0.0f)
             {
-                v = lerp(v, swSwell(0.5f * (wC + wY), cM).z * bAmp, relax);
+                v = lerp(v, swSwell(0.5f * (wC + wY), cM).z * sAmp, relax);
             }
             v = clamp(v, -vMax, vMax);
         }
@@ -1399,7 +1424,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
     const float2 wC = swWorld(id);
     const float4 bw = swBodies(wC);
-    const float bAmp = dot(bw, gSwParams.bodyAmp);
+    const float sAmp = (bw.r * gSwParams.bodyAmp.x + bw.a * gSwParams.bodyAmp.w) * swExposure(wC);
     const float sp = swSponge(id, d0);
 
 
@@ -1407,7 +1432,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     if (sp > 0.0f && eta + d0 >  0.25f )
     {
         const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
-        eta = lerp(eta, swSwell(wC, cM).x * bAmp, relax);
+        eta = lerp(eta, swSwell(wC, cM).x * sAmp, relax);
     }
 
 

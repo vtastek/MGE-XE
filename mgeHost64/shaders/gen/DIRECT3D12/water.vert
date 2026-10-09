@@ -1733,8 +1733,8 @@ STRUCT(LightData)
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"
-#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"
-float swSwellLam(int k) { return (k == 0) ? 1.0f : (k == 1) ? 0.71f : 0.53f; }
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"
+float swSwellPer(int k) { return (k == 0) ? 1.0f : (k == 1) ? 0.75f : 0.58f; }
 float swSwellAng(int k) { return (k == 0) ? 0.0f : (k == 1) ? 0.42f : -0.35f; }
 float swSwellAmp(int k) { return (k == 0) ? 1.0f : (k == 1) ? 0.6f : 0.4f; }
 
@@ -1748,12 +1748,12 @@ float2 swSwellDir(float2 wind, int k)
 
 
 
-float3 swSwellEval(float2 w, float2 wind, float A, float lam, float c, float t, float footprint)
+float3 swSwellEval(float2 w, float2 wind, float A, float per, float c, float t, float footprint)
 {
     float3 r = float3(0.0f, 0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float lk = lam * swSwellLam(k);
+        const float lk = max(c, 1.0f) * per * swSwellPer(k);
         const float fp = (footprint > 0.0f) ? (1.0f - smoothstep(0.125f * lk, 0.25f * lk, footprint)) : 1.0f;
         const float2 d = swSwellDir(wind, k);
         const float kk = 6.28318531f / lk;
@@ -1767,27 +1767,31 @@ float3 swSwellEval(float2 w, float2 wind, float A, float lam, float c, float t, 
 
 
 
-float2 swSwellDisp(float2 w, float2 wind, float A, float lam, float c, float t)
+
+float2 swSwellDisp(float2 w, float2 wind, float A, float per, float c, float t, float r)
 {
-    float2 r = float2(0.0f, 0.0f);
+    float2 res = float2(0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float lk = lam * swSwellLam(k);
+        const float Tk = max(per * swSwellPer(k), 0.1f);
+        const float lk = max(c, 1.0f) * Tk;
         const float2 d = swSwellDir(wind, k);
         const float kk = 6.28318531f / lk;
+        const float om = 6.28318531f / Tk;
         const float ph = kk * (dot(w, d) - c * t) + 1.7f * float(k);
-        r -= d * ( 689.69f  / max(c * c * kk, 1.0f)) * A * swSwellAmp(k) * sin(ph);
+        const float U =  689.69f  * A * swSwellAmp(k) / max(c, 1.0f);
+        res += d * (U * (r * cos(ph) - om * sin(ph)) / (om * om + r * r));
     }
-    return r;
+    return res;
 }
 
 
-float3 swSwellState(float2 w, float2 wind, float A, float lam, float c, float t)
+float3 swSwellState(float2 w, float2 wind, float A, float per, float c, float t)
 {
     float3 r = float3(0.0f, 0.0f, 0.0f);
     UNROLL for (int k = 0; k < 3; ++k)
     {
-        const float lk = lam * swSwellLam(k);
+        const float lk = max(c, 1.0f) * per * swSwellPer(k);
         const float2 d = swSwellDir(wind, k);
         const float kk = 6.28318531f / lk;
         const float e = A * swSwellAmp(k) * cos(kk * (dot(w, d) - c * t) + 1.7f * float(k));
@@ -1812,7 +1816,7 @@ STRUCT(VSOutput)
     DATA(float2, RestXY, TEXCOORD1);
 #line 28
 };
-#line 49 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.vert.fsl"
+#line 50 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.vert.fsl"
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 VSOutput VS_MAIN( VSInput In )
 {
@@ -1860,7 +1864,8 @@ VSOutput VS_MAIN( VSInput In )
                 {
                     const float4 bw = SampleLvlTex2D(gWaterBodies, gSamplerBilinearClamp, (wAbs - xf.xy) * xf.zw, 0.0f);
                     const float ws = bw.r + bw.g + bw.b + bw.a;
-                    if (ws > 1.0e-3f) { bAmp = dot(bw, gShadowParams.waterBodyAmp) / ws; }
+                    if (ws > 1.0e-3f) { bAmp = (bw.r * gShadowParams.waterBodyAmp.x + bw.a * gShadowParams.waterBodyAmp.w) / ws; }
+                    bAmp *= SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, (wAbs - xf.xy) * xf.zw, 0.0f).a;
                 }
 
 
@@ -1874,7 +1879,7 @@ VSOutput VS_MAIN( VSInput In )
                 }
                 const float A = s3.z * bAmp;
                 dsp.z = swSwellEval(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z, 0.0f).x;
-                dsp.xy = swSwellDisp(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z);
+                dsp.xy = swSwellDisp(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z, SWQ[1].z);
                 dsp *= 1.0f - wSim;
             }
             if (wSim > 0.0f)

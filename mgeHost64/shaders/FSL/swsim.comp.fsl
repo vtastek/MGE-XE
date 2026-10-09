@@ -95,6 +95,22 @@ float2 swFlow(float2 w)
     return dir * fv.b * gSwParams.disp.y;
 }
 
+// EXPOSURE (gWaterFlow alpha, baked): 1 = open water, 0 = enclosed (inner bays, lagoons, inlets).
+// The directional swell lives only where water is exposed; enclosed water damps what reaches it.
+float swExposure(float2 w)
+{
+    const float4 m = gSwParams.bodyMap;
+    if (m.z <= 0.0f) { return 1.0f; }
+    const int2   dim = GetDimensions(gSwFlow, NO_SAMPLER);
+    const float2 t  = (w - m.xy) * m.zw * float2(dim) - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f  = t - fl;
+    const int2   i  = int2(fl);
+    const int2   n  = dim - int2(1, 1);
+    return lerp(lerp(swFlowTap(i, n).a, swFlowTap(i + int2(1, 0), n).a, f.x),
+                lerp(swFlowTap(i + int2(0, 1), n).a, swFlowTap(i + int2(1, 1), n).a, f.x), f.y);
+}
+
 // Wind GUSTS as a surface pressure head (u), travelling downwind at the open-water wave speed — the
 // resonant forcing that grows chop. Two octaves of value noise, zero-mean.
 float swGust(float2 w, float c)
@@ -112,7 +128,7 @@ float swGust(float2 w, float c)
 // window, so the deep water here and the far field are one set of waves in one phase).
 float3 swSwell(float2 w, float c)
 {
-    return swSwellState(w, gSwParams.wind.xy, gSwParams.wind.z, max(gSwParams.wind.w, 32.0f), c,
+    return swSwellState(w, gSwParams.wind.xy, gSwParams.wind.z, max(gSwParams.wind.w, 0.5f), c,
                         gSwParams.origin.z);
 }
 
@@ -210,11 +226,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
         // Forcing pressure (head, u): wind gusts scaled by the body, swimmers.
         const float4 bw   = swBodies(wC);
         const float  bAmp = dot(bw, gSwParams.bodyAmp);
+        // The SWELL is open water's: sea and beach only. Rivers carry their own looping chop and
+        // ponds a wind chop; feeding them the swell pushed the sea up the rivers (user, 2026-10-09).
+        const float  expo = swExposure(wC);
+        const float  sAmp = (bw.r * gSwParams.bodyAmp.x + bw.a * gSwParams.bodyAmp.w) * expo;
         const float  pC = swGust(wC, cM) * bAmp + swImpulses(float2(id) + 0.5f);
         const float  pX = swGust(wX, cM) * bAmp + swImpulses(float2(id) + float2(1.5f, 0.5f));
         const float  pY = swGust(wY, cM) * bAmp + swImpulses(float2(id) + float2(0.5f, 1.5f));
 
-        const float keep  = exp(-max(gSwParams.phys.y, 0.0f) * dt);
+        const float keep  = exp(-(max(gSwParams.phys.y, 0.0f) + max(gSwParams.brk.w, 0.0f) * (1.0f - expo)) * dt);
         const float vMax  = 0.25f * dx / max(dt, 1.0e-4f);
         const float sp    = swSponge(id, d0C);
         const float cf    = max(gSwParams.disp.w, 0.0f);
@@ -246,7 +266,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
             u /= 1.0f + dt * cf * abs(u) / max(hX, SW_DRY);   // bottom friction: thin sheets slow
             if (sp > 0.0f)
             {
-                u = lerp(u, swSwell(0.5f * (wC + wX), cM).y * bAmp, relax);
+                u = lerp(u, swSwell(0.5f * (wC + wX), cM).y * sAmp, relax);
             }
             u = clamp(u, -vMax, vMax);
         }
@@ -261,7 +281,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
             v /= 1.0f + dt * cf * abs(v) / max(hY, SW_DRY);
             if (sp > 0.0f)
             {
-                v = lerp(v, swSwell(0.5f * (wC + wY), cM).z * bAmp, relax);
+                v = lerp(v, swSwell(0.5f * (wC + wY), cM).z * sAmp, relax);
             }
             v = clamp(v, -vMax, vMax);
         }
@@ -307,7 +327,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
 
     const float2 wC  = swWorld(id);
     const float4 bw  = swBodies(wC);
-    const float  bAmp = dot(bw, gSwParams.bodyAmp);
+    const float  sAmp = (bw.r * gSwParams.bodyAmp.x + bw.a * gSwParams.bodyAmp.w) * swExposure(wC);   // swell: exposed sea + beach
     const float  sp  = swSponge(id, d0);
 
     // SPONGE: the edges are held to the far-field swell, so waves enter from upwind and leave
@@ -315,7 +335,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     if (sp > 0.0f && eta + d0 > SW_DRY)
     {
         const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
-        eta = lerp(eta, swSwell(wC, cM).x * bAmp, relax);
+        eta = lerp(eta, swSwell(wC, cM).x * sAmp, relax);
     }
     // RIVERS: a LOOPING chop the surface relaxes toward — two half-period-offset phases of a
     // flow-advected noise, cross-faded (the water.frag flow-map trick, here in height).

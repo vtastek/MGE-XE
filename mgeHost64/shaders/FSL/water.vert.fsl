@@ -33,11 +33,12 @@ STRUCT(VSOutput)
 //   [2] = (edge fade as a fraction of the domain, eye-guard height, eye-guard radius, eye height
 //          above the plane)
 //   [3] = (eye height where the SIM display starts fading, eye height where it is gone, swell
-//          amplitude (0 = feature off), swell wavelength) — a 44 m detail field around the eye means
+//          amplitude (0 = feature off), swell PERIOD (s)) — a 44 m detail field around the eye means
 //          nothing seen from a hilltop
 // gBatch.worlds[17]:
 //   [0] = (wind heading XY, swell time (s), swell phase speed)
-//   [1] = (analytic GEOMETRY fade start, end — Chebyshev distance from the eye, inside the 64 u ring)
+//   [1] = (analytic GEOMETRY fade start, end — Chebyshev distance from the eye, the sim's displacement
+//          relax rate)   [2].x = body debug view (water.frag)
 //
 // SEAMLESS NEAR/FAR (user, 2026-10-09: "normal version should seamlessly merge to far"): outside the
 // sim window — and from above its eye-height fade — the surface carries the SAME swell train the sim's
@@ -93,7 +94,8 @@ VSOutput VS_MAIN( VSInput In )
                 {
                     const float4 bw = SampleLvlTex2D(gWaterBodies, gSamplerBilinearClamp, (wAbs - xf.xy) * xf.zw, 0.0f);
                     const float  ws = bw.r + bw.g + bw.b + bw.a;
-                    if (ws > 1.0e-3f) { bAmp = dot(bw, gShadowParams.waterBodyAmp) / ws; }
+                    if (ws > 1.0e-3f) { bAmp = (bw.r * gShadowParams.waterBodyAmp.x + bw.a * gShadowParams.waterBodyAmp.w) / ws; }   // swell: sea + beach
+                    bAmp *= SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, (wAbs - xf.xy) * xf.zw, 0.0f).a;   // exposed only
                 }
                 // DEPTH DAMPING: the analytic train knows no shore, so it fades where the water is
                 // shallower than ~4x its amplitude (bed = gSkyHeight, piers and rocks included) —
@@ -107,7 +109,7 @@ VSOutput VS_MAIN( VSInput In )
                 }
                 const float A = s3.z * bAmp;
                 dsp.z  = swSwellEval(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z, 0.0f).x;
-                dsp.xy = swSwellDisp(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z);
+                dsp.xy = swSwellDisp(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z, SWQ[1].z);
                 dsp   *= 1.0f - wSim;
             }
             if (wSim > 0.0f)
