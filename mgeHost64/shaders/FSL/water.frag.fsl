@@ -1238,6 +1238,41 @@ float4 PS_MAIN( VSOutput In )
         normal = normalize(float3(-waveHG.yz, 1.0f));
     }
 
+    // OPEN-SEA SWELL (water bodies step 4; waterFlowParams.w = amplitude, 0 = off). Four long
+    // directional waves, 1600-6000 units (23-86 m), heights 20-90 units, travelling on a
+    // fixed wind heading in open water and turning ONSHORE near coasts (the baked coastal heading,
+    // i.e. refraction), weighted by the SEA body so rivers, ponds and beaches never carry it. Slopes
+    // only — the mesh stays flat (the true-plane, depth and shore logic all assume the plane); the
+    // near geometric swell is a separate step. Each period is a whole fraction of the 20 s water
+    // clock (2, 3, 4, 5 cycles), so the wrap is seamless; that is within ~15% of deep-water
+    // dispersion (omega = sqrt(g k), g = 687 u/s^2) for every wavelength used. A wave fades out once
+    // the pixel footprint reaches a quarter of its length: resolved geometry, never aliasing.
+    {
+        const float swellAmp = gShadowParams.waterFlowParams.w * bodyW.r;
+        if (swellAmp > 0.01f)
+        {
+            float2 wd = float2(0.8f, 0.6f);
+            if (flowStr > 0.01f) { wd = normalize(lerp(wd, flowDir, saturate(flowStr * 6.0f))); }
+            const float  sMaxW = sqrt(max(fpEll.y, 0.0f));
+            const float4 lam = float4(6000.0f, 4000.0f, 2500.0f, 1600.0f);
+            const float4 cyc = float4(2.0f, 3.0f, 4.0f, 5.0f);
+            const float4 amp = float4(90.0f, 70.0f, 40.0f, 20.0f);
+            const float4 ang = float4(0.0f, 0.35f, -0.3f, 0.6f);
+            float2 sl = float2(0.0f, 0.0f);
+            for (int i = 0; i < 4; ++i)
+            {
+                const float  ca = cos(ang[i]), sa = sin(ang[i]);
+                const float2 d  = float2(wd.x * ca - wd.y * sa, wd.x * sa + wd.y * ca);
+                const float  k  = 6.2831853f / lam[i];
+                const float  ph = k * dot(d, worldXY) - 6.2831853f * cyc[i] * time / 20.0f;
+                const float  fd = saturate(1.0f - 4.0f * sMaxW / lam[i]);
+                sl -= d * (amp[i] * k * cos(ph) * fd);   // normal slope = -grad(A sin ph)
+            }
+            const float2 base = normal.xy / max(normal.z, 1e-4f);
+            normal = normalize(float3(base + sl * swellAmp, 1.0f));
+        }
+    }
+
     // --- ROUGHNESS FROM SLOPE VARIANCE (Olano-Baker LEAN/CLEAN) ----------------------------------
     // The normal above is FILTERED, which is what stops it aliasing — but filtering does not remove
     // sub-pixel detail, it MOVES it: what was a wobbling normal becomes a flat normal plus a

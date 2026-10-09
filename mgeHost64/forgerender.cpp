@@ -8593,6 +8593,7 @@ namespace {
     Texture* g_pWaterFlowTex = nullptr;
     float    g_waterFlowSpeed  = 60.0f;     // world units / s at strength 1 (rivers)
     float    g_waterFlowPeriod = 2.5f;      // must divide the 20 s water clock
+    float    g_waterSwell      = 0.0f;      // open-sea swell amplitude (0 = off; OFF until the user's eye check)
     float    g_waterFoam       = 0.0f;      // river + shore foam amount (0 = off; OFF until the user's eye check)
     uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
     float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
@@ -24132,6 +24133,7 @@ namespace {
             { "waterAmpBeach",       &g_waterAmpBeach       },
             { "waterFlowSpeed",      &g_waterFlowSpeed      },
             { "waterFoam",           &g_waterFoam           },
+            { "waterSwell",          &g_waterSwell          },
             { "giBlend",             &g_giBlend             },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
@@ -27114,6 +27116,7 @@ namespace {
           t.sliderF("Water amp: pond / lake", &g_waterAmpPond, 0.0f, 3.0f, 0.05f);
           t.sliderF("Water flow speed (rivers downstream, beach onshore; 0 = off)", &g_waterFlowSpeed, 0.0f, 300.0f, 5.0f);
           t.sliderF("Water foam (rivers + shore; 0 = off)", &g_waterFoam, 0.0f, 2.0f, 0.05f);
+          t.sliderF("Water open-sea swell (0 = off)", &g_waterSwell, 0.0f, 3.0f, 0.05f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -61601,7 +61604,7 @@ void destroyHostWindow(Renderer* R);
             mp[kWaterFlowParamsFloat + 0] = std::max(0.0f, g_waterFlowSpeed);
             mp[kWaterFlowParamsFloat + 1] = g_waterFlowPeriod;
             mp[kWaterFlowParamsFloat + 2] = std::max(0.0f, g_waterFoam);
-            mp[kWaterFlowParamsFloat + 3] = 0.0f;
+            mp[kWaterFlowParamsFloat + 3] = std::max(0.0f, g_waterSwell);
         }
     }
 
