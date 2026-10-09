@@ -3533,6 +3533,8 @@ namespace {
         Pipeline*      pSkinnedSunPipeline = nullptr;
         Shader*        pMultiMapSunShader = nullptr;     // ...and multimap parts (heads): multimap.vert + sunshadow_mm.frag
         Pipeline*      pMultiMapSunPipeline = nullptr;
+        Shader*        pRigidSunShader = nullptr;        // ...and LIVE rigid movers (held items, doors): opaque.vert + sunshadow.frag
+        Pipeline*      pRigidSunPipeline = nullptr;
         // Blended skinned parts (ghosts, mane/hair cards): skinned.vert + alpha.frag, composited in
         // the alpha stage with REAL alpha instead of opaque.frag's forced 1.0. Depth GEQUAL test /
         // never write, same rule the AT1 colour PSOs follow. Cull honours the part's DRAW_BOTH flag.
@@ -10779,6 +10781,36 @@ namespace {
             addPipeline(R, &spd, &g_live.pShadowPipeline);
             sg.pRasterizerState = &shRasterMirror;
             addPipeline(R, &spd, &g_live.pShadowPipelineMirror);
+
+            // SUN Phase C: LIVE rigid movers into the sun moments atlas (same vertex layout and the
+            // mover pool's instance stream; moments target; CULL_NONE). Non-fatal.
+            {
+                ShaderLoadDesc rsDesc = {};
+                rsDesc.mVert.pFileName = "opaque.vert";
+                rsDesc.mFrag.pFileName = "sunshadow.frag";
+                addShader(R, &rsDesc, &g_live.pRigidSunShader);
+                if (g_live.pRigidSunShader) {
+                    TinyImageFormat sunFmt = TinyImageFormat_R16G16B16A16_UNORM;
+                    RasterizerStateDesc rsRs = shRaster; rsRs.mCullMode = CULL_MODE_NONE;
+                    PipelineDesc rsPd = {};
+                    rsPd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& rsg = rsPd.mGraphicsDesc;
+                    rsg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    rsg.mRenderTargetCount = 1;
+                    rsg.pColorFormats = &sunFmt;
+                    rsg.mSampleCount = SAMPLE_COUNT_1;
+                    rsg.mSampleQuality = 0;
+                    rsg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    rsg.pDepthState = &shDepth;
+                    rsg.pVertexLayout = &vl;
+                    rsg.pRasterizerState = &rsRs;
+                    rsg.pShaderProgram = g_live.pRigidSunShader;
+                    addPipeline(R, &rsPd, &g_live.pRigidSunPipeline);
+                }
+                if (!g_live.pRigidSunPipeline) {
+                    LOG::logline("!! [forge][sun-shadow] rigid-mover sun caster unavailable");
+                }
+            }
 
             // Live caster-cull A/B variants (g_shadowCasterCull): CULL_NONE writes BOTH faces so the
             // object's far-side / underside faces reach the atlas — closes the thin unshadowed line
@@ -40537,6 +40569,14 @@ void destroyHostWindow(Renderer* R);
                         const float rr = 2.0f * sl3.radius + wr;
                         inReach = (dx*dx + dy*dy + dz*dz <= rr*rr);
                     }
+                    // SUN Phase C: a mover inside the sun's outer cascade is kept too — the sun pass
+                    // draws it from the same packed pool entry. The point pass re-tests reach per slot,
+                    // so a sun-only mover never lands in a point-light tile.
+                    if (!inReach && g_sunActorCasters && g_drawSunShadow && g_live.pRigidSunPipeline) {
+                        const float sx = cx - g_eyeAbsShadow[0], sy = cy - g_eyeAbsShadow[1], sz = cz - g_eyeAbsShadow[2];
+                        const float sr = 1.42f * sunCascadeExtent(kSunCascades - 1) + wr;
+                        inReach = (sx*sx + sy*sy + sz*sz <= sr*sr);
+                    }
                     if (!inReach) { continue; }
                     g_dynMoverCasters.push_back({ slot, 0,
                                                   hm.lastMirror,
@@ -63106,6 +63146,36 @@ void destroyHostWindow(Renderer* R);
                     cmdBindVertexBuffer(g_live.pCmd, 2, mvbs2, mstrides2, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
                     cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, mc.index);
+                    ++g_lastSunActorDraws;
+                }
+            }
+            // ...and the LIVE rigid movers (held items, doors, activators), from the mover pool the
+            // point pass packed (one camera-relative matrix per caster at matIdx; the gather keeps
+            // movers in sun reach as well as point reach).
+            if (g_sunActorCasters && g_live.pRigidSunPipeline && !g_dynMoverCasters.empty()) {
+                cmdBindPipeline(g_live.pCmd, g_live.pRigidSunPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, c, g_live.pPerFrameSetSun);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
+                const uint32_t vS = (uint32_t)sizeof(IPC::GeomVertexWire);
+                const uint32_t iS = (uint32_t)(kStaticInstU32 * sizeof(uint32_t));
+                for (const DynMoverCaster& dm : g_dynMoverCasters) {
+                    HostMesh& hm = g_meshes[dm.slot];
+                    if (hm.inArena) {
+                        Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
+                        uint32_t strides[2] = { vS, iS };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                        cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount,
+                                                (uint32_t)(hm.ibOff / sizeof(uint16_t)), 1,
+                                                (uint32_t)(hm.vbOff / sizeof(IPC::GeomVertexWire)), dm.matIdx);
+                    } else {
+                        Buffer*  vbs[2]     = { hm.vb, g_live.pShadowInstanceBuf };
+                        uint32_t strides[2] = { vS, iS };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
+                        cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, dm.matIdx);
+                    }
                     ++g_lastSunActorDraws;
                 }
             }
