@@ -8580,10 +8580,12 @@ namespace {
     Texture* g_pWaterFlowTex = nullptr;
     float    g_waterFlowSpeed  = 60.0f;     // world units / s at strength 1 (rivers)
     float    g_waterFlowPeriod = 2.5f;      // must divide the 20 s water clock
+    float    g_waterFoam       = 0.0f;      // river + shore foam amount (0 = off; OFF until the user's eye check)
     uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
     float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
     Texture* g_pWaterBodyTex = nullptr;
     bool     g_waterBodyBound = false, g_waterBodyFailed = false;
+    std::atomic<bool> g_waterBodyReady{false};   // worker bake finished (bytes + Xf published)
     float    g_weatherDebugSnow = -1.0f;   // >= 0 overrides the integrated snow cover
     // GI field (tasks/forge-gi.md v2): giGain > 0 replaces the occluded share's constant floor with the
     // field's bounce, at that gain. 0 = off (default until the user has seen it). giBlend = the per-frame
@@ -24112,6 +24114,7 @@ namespace {
             { "waterAmpPond",        &g_waterAmpPond        },
             { "waterAmpBeach",       &g_waterAmpBeach       },
             { "waterFlowSpeed",      &g_waterFlowSpeed      },
+            { "waterFoam",           &g_waterFoam           },
             { "giBlend",             &g_giBlend             },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
@@ -27091,6 +27094,7 @@ namespace {
           t.sliderF("Water amp: river", &g_waterAmpRiver, 0.0f, 3.0f, 0.05f);
           t.sliderF("Water amp: pond / lake", &g_waterAmpPond, 0.0f, 3.0f, 0.05f);
           t.sliderF("Water flow speed (rivers downstream, beach onshore; 0 = off)", &g_waterFlowSpeed, 0.0f, 300.0f, 5.0f);
+          t.sliderF("Water foam (rivers + shore; 0 = off)", &g_waterFoam, 0.0f, 2.0f, 0.05f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -52914,7 +52918,12 @@ void destroyHostWindow(Renderer* R);
                      (unsigned long long)(gBytes >> 20));
         LOG::flush();
         g_terrainReady = true;
-        bakeWaterBodies();
+        // ~0.6 s of CPU: on a worker, never the render thread (LAND is read-only once loaded);
+        // waterBodiesEnsure uploads when g_waterBodyReady flips.
+        static std::atomic<bool> s_waterBakeStarted{false};   // once per process: LAND never changes
+        if (!s_waterBakeStarted.exchange(true)) {
+            std::thread([] { bakeWaterBodies(); g_waterBodyReady.store(true, std::memory_order_release); }).detach();
+        }
         return true;
     }
 
@@ -53148,7 +53157,8 @@ void destroyHostWindow(Renderer* R);
     // Upload + bind the baked water-body map the first time water draws (the PerFrame set exists by
     // then). Non-fatal: without it every body is 1x, the look before this.
     void waterBodiesEnsure() {
-        if (g_waterBodyBound || g_waterBodyFailed || !g_waterBodies || g_waterBodyBytes.empty()) { return; }
+        if (g_waterBodyBound || g_waterBodyFailed || !g_waterBodies
+            || !g_waterBodyReady.load(std::memory_order_acquire) || g_waterBodyBytes.empty()) { return; }
         Renderer* R = g_live.pRenderer;
         TextureDesc td = {};
         td.mWidth = g_waterBodyW; td.mHeight = g_waterBodyH; td.mDepth = 1; td.mArraySize = 1; td.mMipLevels = 1;
@@ -61563,7 +61573,7 @@ void destroyHostWindow(Renderer* R);
             mp[kWaterBodyAmpFloat + 3] = std::max(0.0f, g_waterAmpBeach);
             mp[kWaterFlowParamsFloat + 0] = std::max(0.0f, g_waterFlowSpeed);
             mp[kWaterFlowParamsFloat + 1] = g_waterFlowPeriod;
-            mp[kWaterFlowParamsFloat + 2] = 0.0f;
+            mp[kWaterFlowParamsFloat + 2] = std::max(0.0f, g_waterFoam);
             mp[kWaterFlowParamsFloat + 3] = 0.0f;
         }
     }

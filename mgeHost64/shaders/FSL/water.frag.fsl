@@ -428,6 +428,35 @@ float4 sampleReflectSmear(float2 uv, float lod, float2 stepUV, uint taps)
 }
 
 ROOT_SIGNATURE(DefaultRootSignature)
+// FOAM noise (scene-walk-v2 XE Mod Water.fx, verbatim maths): value noise and a RIDGED 4-octave fbm
+// (1 - |2v-1| folds the rounded noise into filaments; lacunarity 2.07 breaks axis tiling; ~[0,0.94]).
+float foamHash(float2 p)
+{
+    p = frac(p * float2(127.1f, 311.7f));
+    p += dot(p, p + 34.23f);
+    return frac(p.x * p.y);
+}
+float foamVnoise(float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = frac(p);
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    const float a = foamHash(i), b = foamHash(i + float2(1.0f, 0.0f));
+    const float c = foamHash(i + float2(0.0f, 1.0f)), d = foamHash(i + float2(1.0f, 1.0f));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+float foamFbm2(float2 p)
+{
+    float v = 0.0f, a = 0.5f, fr = 1.0f;
+    for (int i = 0; i < 4; ++i)
+    {
+        v += a * (1.0f - abs(2.0f * foamVnoise(p * fr) - 1.0f));
+        fr *= 2.07f;
+        a  *= 0.5f;
+    }
+    return v;
+}
+
 float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
@@ -538,6 +567,8 @@ float4 PS_MAIN( VSOutput In )
     float  waveAmp       = waveG1.y;
     float2 flowDir = float2(0.0f, 0.0f);
     float  flowStr = 0.0f;
+    float4 bodyW   = float4(0.0f, 0.0f, 0.0f, 0.0f);   // (sea, river, pond, beach), normalised; 0 = no map
+    float2 bodyUV  = float2(0.0f, 0.0f);
     // WATER BODIES (scene-walk-v2 port): this point's body (sea / river / pond / beach), from the map
     // baked once off LAND, scales the amplitude — ponds calm, rivers gentler, open sea as tuned. The
     // weights are blurred one-hot, so a bilinear tap blends across a river mouth instead of stepping.
@@ -548,8 +579,10 @@ float4 PS_MAIN( VSOutput In )
             const float2 buv = (In.WorldPos.xy + gFrameData.lodEye.xy - xf.xy) * xf.zw;
             const float4 bw  = SampleLvlTex2D(gWaterBodies, gSamplerBilinearClamp, buv, 0.0f);
             const float  ws  = bw.r + bw.g + bw.b + bw.a;
+            bodyUV = buv;
             if (ws > 1.0e-3f)
             {
+                bodyW = bw / ws;
                 const float amp = dot(bw, gShadowParams.waterBodyAmp) / ws;
                 waveAmp *= lerp(1.0f, amp, saturate(ws * 4.0f));
             }
@@ -2622,6 +2655,83 @@ float4 PS_MAIN( VSOutput In )
 	// the second place weight crosses from `result` to `kDst`.
     result = result * (1.0f - shorefactor);
     kDst   = kDst   * (1.0f - shorefactor) + shorefactor;
+
+    // ─── FOAM (water bodies step 3; scene-walk-v2's FAR layer, ported) ───────────────────────────
+    // Two sources, both deterministic (no sim yet, no per-frame noise beyond the advection):
+    //   RIVER foam — the prototype's: a ridged 4-octave value fbm, advected along the baked heading with
+    //     the SAME two-phase scheme as the normals (so it moves at the water's speed), eroded into
+    //     streaks at a hard threshold, concentrated by the flow's static vorticity (bends, mouths),
+    //     clumped by a coarser octave and perforated by a finer one.
+    //   SHORE foam — where sea/beach water meets land: a band a few tens of units deep (vertical depth
+    //     from the undistorted scene depth) eroded by the same fbm so it breaks up instead of drawing
+    //     a line; it breathes with the wave normal like the shore fade does.
+    // Opaque on the surface: lerps `result` and takes the same share off kDst. Lit by sun x the
+    // long-range sun occlusion (gSunOcc) + ambient — foam in a cliff's shadow does not glow.
+    // waterFlowParams.z = amount (0 = off, the A/B); everything below is skipped where no body foams.
+    {
+        const float foamAmt = gShadowParams.waterFlowParams.z;
+        const float riverC  = bodyW.g;
+        const float shoreC  = bodyW.r + bodyW.a;
+        if (foamAmt > 0.0f && (riverC + shoreC) > 0.01f && dist < 12000.0f)
+        {
+            const float per = max(gShadowParams.waterFlowParams.y, 0.1f);
+            const float ph0 = frac(time / per);
+            const float ph1 = frac(time / per + 0.5f);
+            const float fbl = abs(1.0f - 2.0f * ph0);
+            const float spd = gShadowParams.waterFlowParams.x * max(flowStr, 0.25f);
+            const float kTile = 160.0f;                                 // prototype DetTile
+            // Eye-relative + eye split, like the wave lattice: keep the big term out of the fraction.
+            const float2 eyeT  = frac(gFrameData.lodEye.xy / (kTile * 64.0f)) * 64.0f;
+            const float2 fP    = surfPos.xy / kTile + eyeT;
+            const float2 fdisp = flowDir * (spd * per / kTile);
+            float nf  = lerp(foamFbm2(fP - fdisp * ph0), foamFbm2(fP - fdisp * ph1 + 7.3f), fbl);
+            float ncr = lerp(foamFbm2(fP / 3.0f - fdisp / 3.0f * ph0), foamFbm2(fP / 3.0f - fdisp / 3.0f * ph1 + 7.3f), fbl);
+            float nfi = lerp(foamFbm2(fP * 5.0f - fdisp * 5.0f * ph0), foamFbm2(fP * 5.0f - fdisp * 5.0f * ph1 + 7.3f), fbl);
+
+            // Static vorticity: curl of the baked heading, one 512-unit cell apart.
+            const float4 xf = gShadowParams.waterFlowMap;
+            const float2 cs = float2(512.0f * xf.z, 512.0f * xf.w);
+            const float gR = SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, bodyUV + float2(cs.x, 0.0f), 0.0f).g;
+            const float gL = SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, bodyUV - float2(cs.x, 0.0f), 0.0f).g;
+            const float rU = SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, bodyUV + float2(0.0f, cs.y), 0.0f).r;
+            const float rD = SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, bodyUV - float2(0.0f, cs.y), 0.0f).r;
+            const float vort = abs((gR - gL) - (rU - rD)) * 4.0f;       // prototype VortGain
+
+            // Shore band from the vertical water depth under this pixel (undistorted), muted at
+            // silhouettes the way shorePre is.
+            const float  fDevZ  = waterSceneDevZ(baseUV);
+            const float  fDist  = length(reconstructWorld(invVP, baseUV * texToVp, fDevZ));
+            const float  vDepth = max(fDist - dist, 0.0f) * abs(EyeVec.z) + 40.0f * (0.95f - normal.z);
+            // A GRADIENT, not a strip: full at the waterline, gone by ~1.7 m of depth. The cover stays
+            // <= 1 so the erosion below always has noise left to carve — at 1.6 it saturated into a
+            // solid white outline of every shore (the first cut, Ascadian).
+            float band = 1.0f - saturate(vDepth / 120.0f);
+            band = band * band * (1.0f - occlusionFrom(dist, fDist, gFrameData.lodParams.w));
+
+            float cover = saturate(riverC * (1.0f + vort) + shoreC * band);
+            cover *= lerp(1.0f, saturate(0.4f + ncr), 0.5f);           // clump (CoarseAmt)
+            float foam = saturate((cover * (0.5f + nf) - 0.98f) * 3.0f); // erode (ErodeThr, sharp 3)
+            foam *= lerp(1.0f, saturate(0.5f + nfi), 0.6f);             // perforate (FineAmt)
+            foam *= foamAmt * (1.0f - smoothstep(6000.0f, 12000.0f, dist));
+
+            float sunVis = 1.0f;
+            const float4 so = gShadowParams.sunOcc;
+            const float4 sm = gShadowParams.skyAOMap;
+            if (so.x > 0.0f && sm.z > 0.0f)
+            {
+                const float2 ouv    = (surfPos.xy + gFrameData.lodEye.xy - sm.xy) * sm.z;
+                const float  blockZ = SampleLvlTex2D(gSunOcc, gSamplerBilinearClamp, ouv, 0.0f).r;
+                float t = saturate(((blockZ - so.z) - (surfPos.z + gFrameData.lodEye.z + 8.0f)) / max(so.y, 1.0e-3f));
+                t = t * t * (3.0f - 2.0f * t);
+                sunVis = 1.0f - t * so.x;
+            }
+            const float3 Lf = -normalize(gFrameData.sunDir.xyz);
+            const float3 foamCol = 0.6f * (gFrameData.sunCol.rgb * saturate(Lf.z) * sunVis + gFrameData.ambCol.rgb);
+            foam *= 0.85f;                                              // thin foam never fully hides the water
+            result = lerp(result, foamCol, foam);
+            kDst   = kDst * (1.0f - foam);
+        }
+    }
 
 	// ─── THE AIR SEGMENT: THE ONE FOGGING ────────────────────────────────────────────────────────
 	// THE ONLY PLACE THIS SHADER FOGS ANYTHING, and the last thing that happens to the surface.
