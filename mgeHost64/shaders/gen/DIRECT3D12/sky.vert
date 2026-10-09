@@ -1280,7 +1280,9 @@ STRUCT(ShadowMaskParams)
 
     float4 waterFlowMap;
     float4 waterBodyAmp;
-#line 1071
+
+    float4 waterFlowParams;
+#line 1073
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1690,6 +1692,8 @@ STRUCT(LightData)
 
         Tex2D(float4) gWaterBodies :  register(t155,space1);
 
+        Tex2D(float4) gWaterFlow :  register(t156,space1);
+
 
 
 
@@ -1705,7 +1709,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 733 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 735 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1716,7 +1720,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 757 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 759 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
