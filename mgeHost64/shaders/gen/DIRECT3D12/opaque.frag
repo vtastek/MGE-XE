@@ -3184,16 +3184,32 @@ float weatherCover(float3 worldPosRel)
 }
 
 
-void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel)
+float weatherWetness(float3 N, float3 worldPosRel)
+{
+    float w = gShadowParams.weatherState.x;
+    if (w <= 0.0f) { return 0.0f; }
+    return w * (1.0f - weatherCover(worldPosRel)) * saturate(0.35f + 0.65f * N.z);
+}
+
+
+
+void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel, float snowScale)
 {
     float4 w = gShadowParams.weatherState;
     if (w.x <= 0.0f && w.y <= 0.0f) { return; }
     float open = 1.0f - weatherCover(worldPosRel);
-
     float wetE = w.x * open * saturate(0.35f + 0.65f * N.z);
-    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f);
+    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f) * snowScale;
     albedo *= (1.0f - w.z * wetE);
     albedo = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
+}
+
+
+
+float weatherRoughness(float rough, float3 N, float3 worldPosRel)
+{
+    float wetE = weatherWetness(N, worldPosRel);
+    return lerp(rough, min(rough, 0.12f), wetE * 0.85f);
 }
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -5233,7 +5249,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         }
         albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
     }
-    weatherApply(albedo.rgb, normalize(In.Normal), In.WorldPos);
+    weatherApply(albedo.rgb, normalize(In.Normal), In.WorldPos,
+                 (In.AlphaRef > 0.0f) ? 0.3f : 1.0f);
 
 
 
@@ -5270,7 +5287,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 626 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 627 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;

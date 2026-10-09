@@ -186,7 +186,8 @@ PSOut PS_MAIN( VSOutput In )
     uint cov = a2cCoverageMask(tex.a, ((In.Flags & 0x2u) != 0u) ? (133.0f / 255.0f) : 0.0f);
     if (cov == 0u) { discard; }
 #endif
-    weatherApply(tex.rgb, normalize(In.WorldNormal), In.WorldPos);   // wetness + snow (identity when dry)
+    weatherApply(tex.rgb, normalize(In.WorldNormal), In.WorldPos,
+                 ((In.Flags & 0x2u) != 0u) ? 0.3f : 1.0f);   // wetness + snow (identity when dry); cutout = foliage
 
     // Sun shadows (Phase B): statics.vert split its per-vertex lighting into Color (ambient +
     // emissive, never shadowed) and SunLight (the sun N.L term). Attenuating only the latter by the

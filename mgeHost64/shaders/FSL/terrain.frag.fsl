@@ -789,7 +789,7 @@ float4 PS_MAIN( VSOutput In )
         // multiply and the three sliders mean the same thing to the eye.
         albedo *= max(0.0f, 1.0f + macro);
     }
-    weatherApply(albedo, normal, In.WorldPos);   // wetness + snow (identity when dry)
+    weatherApply(albedo, normal, In.WorldPos, 1.0f);   // wetness + snow (identity when dry)
 
     // (`normal` is declared up with the uv gradients now — the tangent frame the parallax block
     //  builds needs it before the albedo blend.)
@@ -934,7 +934,7 @@ float4 PS_MAIN( VSOutput In )
             // so the ground and the meshes standing on it resolve their relief the same way.
             nShade    = pbrPerturb((uint)gShadowParams.pbrParams.y, normal, pbrDPdx, pbrDPdy,
                                    pbrDUVdx, pbrDUVdy, dh, gShadowParams.pbrTerrain.y);
-            pbrRough  = pbrRoughness(pbrMat);
+            pbrRough  = weatherRoughness(pbrRoughness(pbrMat), normal, In.WorldPos);   // wet sheen
             const float r2 = pbrRough * pbrRough;
             pbrAlpha2 = r2 * r2;                     // GGX alpha^2 = roughness^4 (pbr.hlsl)
             pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);

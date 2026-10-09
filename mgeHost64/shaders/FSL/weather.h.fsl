@@ -21,16 +21,32 @@ float weatherCover(float3 worldPosRel)
     return saturate((h - z - 48.0f) / 64.0f);
 }
 
-// Wet darkening + snow on the albedo. N = the surface's geometric world normal.
-void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel)
+// How wet this exposed surface is, 0..1. Rain wets walls too (wind, splash), roofs and ground most.
+float weatherWetness(float3 N, float3 worldPosRel)
+{
+    float w = gShadowParams.weatherState.x;
+    if (w <= 0.0f) { return 0.0f; }
+    return w * (1.0f - weatherCover(worldPosRel)) * saturate(0.35f + 0.65f * N.z);
+}
+
+// Wet darkening + snow on the albedo. N = the surface's geometric world normal. snowScale < 1 for
+// alpha-tested foliage cards: a flat leaf card facing up would otherwise turn into a white silhouette.
+void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel, float snowScale)
 {
     float4 w = gShadowParams.weatherState;
     if (w.x <= 0.0f && w.y <= 0.0f) { return; }
-    float open = 1.0f - weatherCover(worldPosRel);
-    // Rain wets walls too (wind, splash), roofs and ground most; snow only settles on what faces up.
+    float open  = 1.0f - weatherCover(worldPosRel);
     float wetE  = w.x * open * saturate(0.35f + 0.65f * N.z);
-    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f);
+    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f) * snowScale;
     albedo *= (1.0f - w.z * wetE);
     albedo  = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
+}
+
+// A wet surface's specular: water fills the micro-relief, so roughness falls toward a thin film's.
+// Only where a PBR material exists to carry the lobe (terrain/statics/meshes with a _paramh).
+float weatherRoughness(float rough, float3 N, float3 worldPosRel)
+{
+    float wetE = weatherWetness(N, worldPosRel);
+    return lerp(rough, min(rough, 0.12f), wetE * 0.85f);
 }
 #endif // WEATHER_H

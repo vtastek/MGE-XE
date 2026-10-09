@@ -2926,16 +2926,32 @@ float weatherCover(float3 worldPosRel)
 }
 
 
-void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel)
+float weatherWetness(float3 N, float3 worldPosRel)
+{
+    float w = gShadowParams.weatherState.x;
+    if (w <= 0.0f) { return 0.0f; }
+    return w * (1.0f - weatherCover(worldPosRel)) * saturate(0.35f + 0.65f * N.z);
+}
+
+
+
+void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel, float snowScale)
 {
     float4 w = gShadowParams.weatherState;
     if (w.x <= 0.0f && w.y <= 0.0f) { return; }
     float open = 1.0f - weatherCover(worldPosRel);
-
     float wetE = w.x * open * saturate(0.35f + 0.65f * N.z);
-    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f);
+    float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f) * snowScale;
     albedo *= (1.0f - w.z * wetE);
     albedo = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
+}
+
+
+
+float weatherRoughness(float rough, float3 N, float3 worldPosRel)
+{
+    float wetE = weatherWetness(N, worldPosRel);
+    return lerp(rough, min(rough, 0.12f), wetE * 0.85f);
 }
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -5120,7 +5136,7 @@ rgb * w11;
 
         albedo *= max(0.0f, 1.0f + macro);
     }
-    weatherApply(albedo, normal, In.WorldPos);
+    weatherApply(albedo, normal, In.WorldPos, 1.0f);
 
 
 
@@ -5211,7 +5227,7 @@ rgb * w11;
 
             nShade = pbrPerturb((uint)gShadowParams.pbrParams.y, normal, pbrDPdx, pbrDPdy,
                                    pbrDUVdx, pbrDUVdy, dh, gShadowParams.pbrTerrain.y);
-            pbrRough = pbrRoughness(pbrMat);
+            pbrRough = weatherRoughness(pbrRoughness(pbrMat), normal, In.WorldPos);
             const float r2 = pbrRough * pbrRough;
             pbrAlpha2 = r2 * r2;
             pbrV = normalize(gFrameData.eyePos.xyz - In.WorldPos);
