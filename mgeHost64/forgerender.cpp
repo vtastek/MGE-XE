@@ -3531,6 +3531,8 @@ namespace {
         // winding). Optional: null = actors cast no sun shadow, exactly as before.
         Shader*        pSkinnedSunShader = nullptr;
         Pipeline*      pSkinnedSunPipeline = nullptr;
+        Shader*        pMultiMapSunShader = nullptr;     // ...and multimap parts (heads): multimap.vert + sunshadow_mm.frag
+        Pipeline*      pMultiMapSunPipeline = nullptr;
         // Blended skinned parts (ghosts, mane/hair cards): skinned.vert + alpha.frag, composited in
         // the alpha stage with REAL alpha instead of opaque.frag's forced 1.0. Depth GEQUAL test /
         // never write, same rule the AT1 colour PSOs follow. Cull honours the part's DRAW_BOTH flag.
@@ -12000,6 +12002,35 @@ namespace {
                     !g_live.pMultiMapShadowPipelineFrontMirror) {
                     std::printf("[forge] addPipeline(multimap shadow) FAILED\n");
                     return false;
+                }
+
+                // SUN Phase C: multimap parts (NPC heads) into the sun moments atlas. Non-fatal.
+                {
+                    ShaderLoadDesc msDesc = {};
+                    msDesc.mVert.pFileName = "multimap.vert";
+                    msDesc.mFrag.pFileName = "sunshadow_mm.frag";
+                    addShader(R, &msDesc, &g_live.pMultiMapSunShader);
+                    if (g_live.pMultiMapSunShader) {
+                        TinyImageFormat sunFmt = TinyImageFormat_R16G16B16A16_UNORM;
+                        RasterizerStateDesc sunRs = mmRaster; sunRs.mCullMode = CULL_MODE_NONE;
+                        PipelineDesc msPd = {};
+                        msPd.mType = PIPELINE_TYPE_GRAPHICS;
+                        GraphicsPipelineDesc& msg = msPd.mGraphicsDesc;
+                        msg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                        msg.mRenderTargetCount = 1;
+                        msg.pColorFormats = &sunFmt;
+                        msg.mSampleCount = SAMPLE_COUNT_1;
+                        msg.mSampleQuality = 0;
+                        msg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                        msg.pDepthState = &mmPreDepth;
+                        msg.pVertexLayout = &mvl;
+                        msg.pRasterizerState = &sunRs;
+                        msg.pShaderProgram = g_live.pMultiMapSunShader;
+                        addPipeline(R, &msPd, &g_live.pMultiMapSunPipeline);
+                    }
+                    if (!g_live.pMultiMapSunPipeline) {
+                        LOG::logline("!! [forge][sun-shadow] multimap sun caster unavailable — heads cast no sun shadow");
+                    }
                 }
             }
 
@@ -63058,6 +63089,23 @@ void destroyHostWindow(Renderer* R);
                     cmdBindVertexBuffer(g_live.pCmd, 2, svbs2, sstrides2, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                     cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
+                    ++g_lastSunActorDraws;
+                }
+            }
+            // ...and the multimap parts (heads, opaque glow layers), from the point-light pass's MM
+            // caster list (same prepass order -> firstInstance = its resident MM window slot).
+            if (g_sunActorCasters && g_live.pMultiMapSunPipeline && !g_mmCasters.empty()) {
+                cmdBindPipeline(g_live.pCmd, g_live.pMultiMapSunPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, c, g_live.pPerFrameSetSun);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                for (const MMCaster& mc : g_mmCasters) {
+                    HostMesh& mm = g_meshes[mc.slot];
+                    Buffer*  mvbs2[2]     = { mm.vb, g_live.pInstanceBufMM };
+                    uint32_t mstrides2[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, mvbs2, mstrides2, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, mc.index);
                     ++g_lastSunActorDraws;
                 }
             }

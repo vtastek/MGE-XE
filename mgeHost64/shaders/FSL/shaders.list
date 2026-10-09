@@ -79,6 +79,11 @@
 #include "sunshadow.frag.fsl"
 #end
 
+// ...and its MULTIMAP twin (heads, glow layers): multimap.vert VSOutput, same moments. Sun Phase C.
+#frag sunshadow_mm.frag
+#include "sunshadow_mm.frag.fsl"
+#end
+
 // SUN shadow moments for DL STATICS (the PRIMARY caster proxy — casts off-screen into the near
 // scene). Pairs with statics.vert's VSOutput; statics bindless sample + 133/255 cutout.
 #frag sunshadow_statics.frag
