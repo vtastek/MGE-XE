@@ -22001,6 +22001,10 @@ namespace {
     // shader (PBR, parallax, displacement); the coarser rungs — mid and far — with terrain_mirror
     // (no PBR / parallax / macro / displacement; sun shadows and sky AO kept).
     float g_reflTerrainFullRungs = 1.0f;
+    // Half-rate mirror (see the gate at the reflect pass). Off by default until the user has seen it.
+    bool     g_reflHalfRate    = false;
+    float    g_reflHalfRateEps = 1e-4f;     // max |dVP| / max |VP| that still counts as "not moved"
+    uint32_t g_reflHalfRateSkips = 0;
 
     // The scalar. 1.0 = today's picture, exactly.
     inline float reflFidelity() {
@@ -23990,6 +23994,7 @@ namespace {
             { "reflFidelity",        &g_reflFidelity        },
             { "reflDistScale",       &g_reflDistScale       },
             { "reflectSize",         &g_reflectSizeKnob     },
+            { "reflHalfRateEps",     &g_reflHalfRateEps     },
             { "reflTerrainFullRungs", &g_reflTerrainFullRungs },
             { "reflLodBias",         &g_reflLodBias         },
             { "mbShutter",           &g_mbShutter           },
@@ -24089,6 +24094,7 @@ namespace {
             { "waterDepthDirect",    &g_waterDepthDirect    },
             { "terrainPatchCull",    &g_terrainPatchCull    },
             { "terrainVcacheOpt",    &g_terrainVcacheOpt    },
+            { "reflHalfRate",        &g_reflHalfRate        },
             { "sunBlurFused",        &g_sunBlurFused        },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
@@ -42552,8 +42558,35 @@ void destroyHostWindow(Renderer* R);
         // the mip pyramid, which is the point — nothing samples pReflectColor in a view with no water
         // surface in it. When it skips, the mirror keeps its last contents exactly as it does under
         // drawReflect=0 (the pre-existing, documented stale-RT condition noted at the pyramid build).
-        const bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled && waterParams
-                            && !g_reflWaterGateOff;
+        bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled && waterParams
+                      && !g_reflWaterGateOff;
+        // HALF-RATE MIRROR (knob reflHalfRate): when the camera has not moved since the mirror was last
+        // rendered — the main viewProj within reflHalfRateEps, the same water plane, the same side of
+        // it — and that render was the PREVIOUS frame, keep its contents for one frame. At most every
+        // other frame is skipped, so moving content in the reflection (NPCs, clouds) updates at half
+        // rate while the camera is still; any camera motion re-renders every frame.
+        {
+            static float    s_reflVP[16] = {};
+            static float    s_reflWater = 0.0f;
+            static bool     s_reflUnder = false, s_reflHave = false;
+            static uint32_t s_reflFrame = 0;
+            if (reflectOn && g_reflHalfRate && s_reflHave && g_renderFrame == s_reflFrame + 1u
+                && waterParams[0] == s_reflWater && (waterParams[7] > 0.5f) == s_reflUnder) {
+                float d = 0.0f, m = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    d = std::max(d, std::fabs(rzViewProj[i] - s_reflVP[i]));
+                    m = std::max(m, std::fabs(rzViewProj[i]));
+                }
+                if (d <= g_reflHalfRateEps * std::max(m, 1e-6f)) { reflectOn = false; ++g_reflHalfRateSkips; }
+            }
+            if (reflectOn) {
+                std::memcpy(s_reflVP, rzViewProj, sizeof(s_reflVP));
+                s_reflWater = waterParams[0];
+                s_reflUnder = waterParams[7] > 0.5f;
+                s_reflFrame = g_renderFrame;
+                s_reflHave  = true;
+            }
+        }
         // Gated-off frames still write the ReflGeo pair (adjacent = ~0) — an index the
         // frame never begins/ends reads back stale garbage at resolve.
         if (!reflectOn) {
