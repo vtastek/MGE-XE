@@ -12,6 +12,7 @@
 // The frag reads them; the VS only needs the per-level world (worlds[DrawIndex]).
 
 #include "opaque.srt.h"
+#include "swswell.h.fsl"
 
 STRUCT(VSInput)
 {
@@ -27,14 +28,24 @@ STRUCT(VSOutput)
 };
 
 // S — the local water sim (swsim.srt.h). gBatch.worlds[15], host-written rows:
-//   [0] = (domain origin XY eye-relative, 1/extent, on)
+//   [0] = (domain origin XY eye-relative, 1/extent, sim field valid)
 //   [1] = (vertical gain, horizontal gain, normal gain, whitewater gain)
 //   [2] = (edge fade as a fraction of the domain, eye-guard height, eye-guard radius, eye height
 //          above the plane)
-//   [3] = (eye height where the display starts fading, eye height where it is gone, 0, 0) — a 44 m
-//          detail field around the eye means nothing seen from a hilltop or the sky
-// Only the 32 u and 64 u rings reach into the window; the edge fade lands before the 64 u ring ends,
-// so the stitch to the flat 128 u ring is exact.
+//   [3] = (eye height where the SIM display starts fading, eye height where it is gone, swell
+//          amplitude (0 = feature off), swell wavelength) — a 44 m detail field around the eye means
+//          nothing seen from a hilltop
+// gBatch.worlds[17]:
+//   [0] = (wind heading XY, swell time (s), swell phase speed)
+//   [1] = (analytic GEOMETRY fade start, end — Chebyshev distance from the eye, inside the 64 u ring)
+//
+// SEAMLESS NEAR/FAR (user, 2026-10-09: "normal version should seamlessly merge to far"): outside the
+// sim window — and from above its eye-height fade — the surface carries the SAME swell train the sim's
+// deep water is held to (swswell.h.fsl), so the window's edge is a crossfade between two agreeing
+// descriptions, not a boundary. Geometry ends inside the 64 u ring (128 u cells cannot carry the
+// shorter components); the normals carry the train on to the fog (water.frag).
+// The SAME function of world position on every ring: shared edge vertices must agree (a per-ring
+// filter cracked every crest at the ring seam).
 ROOT_SIGNATURE(DefaultRootSignature)
 VSOutput VS_MAIN( VSInput In )
 {
@@ -46,28 +57,67 @@ VSOutput VS_MAIN( VSInput In )
     Out.RestXY = worldPos.xy;
 
     const float4x4 SWP = transpose(gBatch.worlds[15]);
+    const float4x4 SWQ = transpose(gBatch.worlds[17]);
     const float4 s0 = SWP[0];
     const float4 s1 = SWP[1];
     const float4 s2 = SWP[2];
-    if (s0.w > 0.5f)
+    const float4 s3 = SWP[3];
+    if (s3.z > 0.0f)
     {
+        const float eyeH = abs(s2.w);
+        // Sim weight: inside the window, faded at its edge and with eye height.
+        float wSim = 0.0f;
         const float2 uv = (worldPos.xy - s0.xy) * s0.z;
-        const float2 e  = min(uv, 1.0f - uv);
-        float w = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(e.x, e.y));
+        if (s0.w > 0.5f)
+        {
+            const float2 e = min(uv, 1.0f - uv);
+            wSim = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(e.x, e.y))
+                 * (1.0f - smoothstep(s3.x, max(s3.y, s3.x + 1.0f), eyeH));
+        }
+        // Geometry reach of the analytic train (the sim window lies inside it).
+        const float cheb = max(abs(worldPos.x), abs(worldPos.y));
+        const float wGeo = 1.0f - smoothstep(SWQ[1].x, max(SWQ[1].y, SWQ[1].x + 1.0f), cheb);
         // EYE GUARD: with the eye near the waterline, flatten a disc around it so the camera never
         // sits inside a crest; full displacement again once the eye is s2.y above the plane.
-        const float guardR = max(s2.z, 1.0f);
-        w *= lerp(saturate(length(worldPos.xy) / guardR), 1.0f, saturate(abs(s2.w) / max(s2.y, 1.0f)));
-        w *= 1.0f - smoothstep(SWP[3].x, max(SWP[3].y, SWP[3].x + 1.0f), abs(s2.w));
-        if (w > 0.0f)
+        const float guard = lerp(saturate(length(worldPos.xy) / max(s2.z, 1.0f)), 1.0f,
+                                 saturate(eyeH / max(s2.y, 1.0f)));
+        if (wGeo * guard > 0.0f)
         {
-            // ⚠ THE SAME FUNCTION OF WORLD POSITION ON EVERY RING. The 32 u ring's outer edge and the
-            // 64 u ring's inner edge share vertices; a per-ring filter (a box on the coarse ring
-            // only, the first cut) gave those shared vertices two different heights — a crack along
-            // every crest at the ring boundary.
-            const float4 f = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, uv, 0.0f);
-            worldPos.z  += f.z  * s1.x * w;
-            worldPos.xy += f.xy * s1.y * w;
+            float3 dsp = float3(0.0f, 0.0f, 0.0f);
+            if (wSim < 1.0f)
+            {
+                const float2 wAbs = worldPos.xy + gFrameData.lodEye.xy;
+                float bAmp = 1.0f;
+                const float4 xf = gShadowParams.waterFlowMap;
+                if (xf.z > 0.0f)
+                {
+                    const float4 bw = SampleLvlTex2D(gWaterBodies, gSamplerBilinearClamp, (wAbs - xf.xy) * xf.zw, 0.0f);
+                    const float  ws = bw.r + bw.g + bw.b + bw.a;
+                    if (ws > 1.0e-3f) { bAmp = dot(bw, gShadowParams.waterBodyAmp) / ws; }
+                }
+                // DEPTH DAMPING: the analytic train knows no shore, so it fades where the water is
+                // shallower than ~4x its amplitude (bed = gSkyHeight, piers and rocks included) —
+                // crests never climb a beach or bare the seabed outside the sim window.
+                const float4 sm = gShadowParams.skyAOMap;
+                if (sm.z > 0.0f)
+                {
+                    const float bed = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, (wAbs - sm.xy) * sm.z, 0.0f).r;
+                    const float dep = (worldPos.z + gFrameData.lodEye.z) - bed;
+                    bAmp *= saturate(dep / max(4.0f * s3.z * bAmp, 1.0f));
+                }
+                const float A = s3.z * bAmp;
+                dsp.z  = swSwellEval(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z, 0.0f).x;
+                dsp.xy = swSwellDisp(wAbs, SWQ[0].xy, A, s3.w, SWQ[0].w, SWQ[0].z);
+                dsp   *= 1.0f - wSim;
+            }
+            if (wSim > 0.0f)
+            {
+                const float4 f = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, uv, 0.0f);
+                dsp += float3(f.xy, f.z) * wSim;
+            }
+            const float k = wGeo * guard;
+            worldPos.z  += dsp.z  * s1.x * k;
+            worldPos.xy += dsp.xy * s1.y * k;
         }
     }
     Out.WorldPos = worldPos.xyz;

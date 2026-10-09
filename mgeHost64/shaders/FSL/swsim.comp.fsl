@@ -4,9 +4,10 @@
 // with its OWN cbuffer and set (cmdDispatch records, it does not execute — ripplesim.srt.h's lesson).
 
 #include "swsim.srt.h"
+#include "swswell.h.fsl"
 
 #define SW_THREADS 8
-#define SW_DRY     0.5f      // film depth (u): a face shallower than this does not flow
+#define SW_DRY     0.25f     // film depth (u): a face shallower than this does not flow (thin: swash runs far)
 #define SW_NONE    -20000.0f // gSkyHeight's "no surface here" sentinel
 
 float swHash(float2 p)
@@ -107,30 +108,12 @@ float swGust(float2 w, float c)
     return gSwParams.chop.x * 1.33f * n;
 }
 
-// The far-field SWELL as a travelling wave train (eta, u, v): what the sponge holds the edges to.
-// Shallow-water plane waves: phase speed c, particle velocity g*eta/c along the heading.
+// The far-field SWELL train (swswell.h.fsl — the SAME function the water surface draws outside this
+// window, so the deep water here and the far field are one set of waves in one phase).
 float3 swSwell(float2 w, float c)
 {
-    const float A   = gSwParams.wind.z;
-    const float lam = max(gSwParams.wind.w, 32.0f);
-    const float t   = gSwParams.origin.z;
-    const float g   = gSwParams.scroll.z;
-    float3 r = float3(0.0f, 0.0f, 0.0f);
-    const float  lams[3] = { 1.0f, 0.71f, 0.53f };
-    const float  angs[3] = { 0.0f, 0.42f, -0.35f };
-    const float  amps[3] = { 1.0f, 0.6f, 0.4f };
-    UNROLL for (int k = 0; k < 3; ++k)
-    {
-        const float  ca = cos(angs[k]);
-        const float  sa = sin(angs[k]);
-        const float2 d  = float2(gSwParams.wind.x * ca - gSwParams.wind.y * sa,
-                                 gSwParams.wind.x * sa + gSwParams.wind.y * ca);
-        const float  kk = 6.28318531f / (lam * lams[k]);
-        const float  e  = A * amps[k] * cos(kk * (dot(w, d) - c * t) + 1.7f * float(k));
-        r.x  += e;
-        r.yz += d * (g * e / max(c, 1.0f));
-    }
-    return r;
+    return swSwellState(w, gSwParams.wind.xy, gSwParams.wind.z, max(gSwParams.wind.w, 32.0f), c,
+                        gSwParams.origin.z);
 }
 
 // Pressure head of the swimmers at a texel position (a dip that travels with each of them).
@@ -162,6 +145,26 @@ float swSponge(int2 id, float d0)
 }
 
 bool swInside(int2 c) { const int N = int(gSwParams.grid.x); return c.x >= 0 && c.y >= 0 && c.x < N && c.y < N; }
+
+// PREV grid velocity (u on the +x face, v on the +y face); outside the grid = still water.
+float2 swPrevVel(int2 c)
+{
+    if (!swInside(c)) { return float2(0.0f, 0.0f); }
+    return LoadRWTex2D(gSwPrevS, c).yz;
+}
+// Bilinear velocity component of the PREV grid at a fractional texel index (comp 0 = u, 1 = v).
+float swPrevVelAt(float2 q, int comp)
+{
+    const float2 fl = floor(q);
+    const float2 f  = q - fl;
+    const int2   i  = int2(fl);
+    const float2 a = swPrevVel(i);
+    const float2 b = swPrevVel(i + int2(1, 0));
+    const float2 c = swPrevVel(i + int2(0, 1));
+    const float2 d = swPrevVel(i + int2(1, 1));
+    const float2 r = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    return (comp == 0) ? r.x : r.y;
+}
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(SW_THREADS, SW_THREADS, 1)
@@ -217,7 +220,24 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
         const float cf    = max(gSwParams.disp.w, 0.0f);
         const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
 
-        float u = SC.y;
+        // MOMENTUM ADVECTION (semi-Lagrangian, on the staggered faces): each face's velocity is the one
+        // that arrives from upstream. Without it a wave entering the shallows can only slow and slosh;
+        // with it the broken crest carries its momentum up the beach as a bore and drains back.
+        const float adv = saturate(gSwParams.brk.x);
+        float uBase = SC.y;
+        float vBase = SC.z;
+        if (adv > 0.0f)
+        {
+            const float vAtU = 0.25f * (SC.z + swPrevVel(src + int2(0, -1)).y
+                                      + SX.z + swPrevVel(src + int2(1, -1)).y);
+            const float uAtV = 0.25f * (SC.y + swPrevVel(src + int2(-1, 0)).x
+                                      + SY.y + swPrevVel(src + int2(-1, 1)).x);
+            const float k = dt / dx;
+            uBase = lerp(SC.y, swPrevVelAt(float2(src) - float2(SC.y, vAtU) * k, 0), adv);
+            vBase = lerp(SC.z, swPrevVelAt(float2(src) - float2(uAtV, SC.z) * k, 1), adv);
+        }
+
+        float u = uBase;
         const float hX = max(SC.x, SX.x) - max(-SC.w, -SX.w);
         if (hX > SW_DRY)
         {
@@ -226,14 +246,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
             u /= 1.0f + dt * cf * abs(u) / max(hX, SW_DRY);   // bottom friction: thin sheets slow
             if (sp > 0.0f)
             {
-                const float c = sqrt(g * clamp(min(SC.w, SX.w), 1.0f, Hm));
-                u = lerp(u, swSwell(0.5f * (wC + wX), c).y * bAmp, relax);
+                u = lerp(u, swSwell(0.5f * (wC + wX), cM).y * bAmp, relax);
             }
             u = clamp(u, -vMax, vMax);
         }
         else { u = 0.0f; }
 
-        float v = SC.z;
+        float v = vBase;
         const float hY = max(SC.x, SY.x) - max(-SC.w, -SY.w);
         if (hY > SW_DRY)
         {
@@ -242,8 +261,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
             v /= 1.0f + dt * cf * abs(v) / max(hY, SW_DRY);
             if (sp > 0.0f)
             {
-                const float c = sqrt(g * clamp(min(SC.w, SY.w), 1.0f, Hm));
-                v = lerp(v, swSwell(0.5f * (wC + wY), c).z * bAmp, relax);
+                v = lerp(v, swSwell(0.5f * (wC + wY), cM).z * bAmp, relax);
             }
             v = clamp(v, -vMax, vMax);
         }
@@ -275,10 +293,16 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     const float hN = max(SC.x, SN_.x) - max(-d0, -SN_.w);
     const float hS = max(SC.x, SS_.x) - max(-d0, -SS_.w);
     const float Hm2 = Hm;
-    const float fE = (hE > SW_DRY) ? SC.y  * min(hE, Hm2) : 0.0f;
-    const float fW = (hW > SW_DRY) ? SW_.y * min(hW, Hm2) : 0.0f;
-    const float fN = (hN > SW_DRY) ? SC.z  * min(hN, Hm2) : 0.0f;
-    const float fS = (hS > SW_DRY) ? SS_.z * min(hS, Hm2) : 0.0f;
+    // UPWIND flow depth for the flux (the surface the water comes FROM, over the higher bed): a bore
+    // is a shock, and a centred depth lets it ring instead of run.
+    const float uE = (SC.y  > 0.0f ? SC.x  : SE_.x) - max(-d0, -SE_.w);
+    const float uW = (SW_.y > 0.0f ? SW_.x : SC.x)  - max(-d0, -SW_.w);
+    const float uN = (SC.z  > 0.0f ? SC.x  : SN_.x) - max(-d0, -SN_.w);
+    const float uS = (SS_.z > 0.0f ? SS_.x : SC.x)  - max(-d0, -SS_.w);
+    const float fE = (hE > SW_DRY) ? SC.y  * clamp(uE, 0.0f, Hm2) : 0.0f;
+    const float fW = (hW > SW_DRY) ? SW_.y * clamp(uW, 0.0f, Hm2) : 0.0f;
+    const float fN = (hN > SW_DRY) ? SC.z  * clamp(uN, 0.0f, Hm2) : 0.0f;
+    const float fS = (hS > SW_DRY) ? SS_.z * clamp(uS, 0.0f, Hm2) : 0.0f;
     float eta = SC.x - dt * (fE - fW + fN - fS) / dx;
 
     const float2 wC  = swWorld(id);
@@ -290,9 +314,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     // downwind without reflecting off the window.
     if (sp > 0.0f && eta + d0 > SW_DRY)
     {
-        const float c = sqrt(g * clamp(d0, 1.0f, Hm));
         const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
-        eta = lerp(eta, swSwell(wC, c).x * bAmp, relax);
+        eta = lerp(eta, swSwell(wC, cM).x * bAmp, relax);
     }
     // RIVERS: a LOOPING chop the surface relaxes toward — two half-period-offset phases of a
     // flow-advected noise, cross-faded (the water.frag flow-map trick, here in height).
@@ -340,7 +363,17 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     const float thr = max(gSwParams.ww.x, 1.0f);
     float ww = wwAdv * exp(-max(gSwParams.ww.z, 0.0f) * dt)
              + dt * (gSwParams.ww.y * max(spd - thr, 0.0f) / thr + gSwParams.ww.w * max(conv, 0.0f));
-    ww = wet ? saturate(ww) : saturate(ww) * exp(-4.0f * dt);
+    // BREAKING: a crest higher than brk.y x its still depth is a broken wave; it produces whitewater, which then rides the bore up the beach and back.
+    // Only where there IS still depth: over land (the swash) every wet cell is "above its still depth"
+    // by definition — counting it painted a solid white band along the shore. The swash makes its
+    // whitewater from its SPEED (above), like everything else.
+    if (wet && eta > 0.5f && d0 > 2.0f)
+    {
+        const float brkH = gSwParams.brk.y * d0;
+        const float br   = saturate((eta - brkH) / max(0.5f * brkH, 1.0f));
+        ww += dt * gSwParams.brk.z * br;
+    }
+    ww = wet ? saturate(ww) : saturate(ww) * exp(-1.5f * dt);
 
     // DISPLAY height: eta where wet; where dry the mesh sinks under the bed so it never z-fights it.
     const float hDisp = wet ? eta : (min(eta, 0.0f) - 4.0f);

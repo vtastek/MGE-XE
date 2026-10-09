@@ -58,6 +58,7 @@
 // made the specular term's own tonemapInPass() call below collapse to a no-op (see it).
 
 #include "opaque.srt.h"
+#include "swswell.h.fsl"
 #include "tonemap.h.fsl"   // tonemap() — the curve itself; scenecolor.h.fsl below decides who applies it
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
@@ -1407,15 +1408,34 @@ float4 PS_MAIN( VSOutput In )
     float swWW = 0.0f;
     {
         const float4x4 SWP = transpose(gBatch.worlds[15]);
+        const float4x4 SWQ = transpose(gBatch.worlds[17]);
         const float4 s0 = SWP[0];
         const float4 s1 = SWP[1];
         const float4 s2 = SWP[2];
-        if (s0.w > 0.5f && !flatWater)
+        const float4 s3 = SWP[3];
+        if (s3.z > 0.0f && !flatWater)
         {
+            // Sim weight (water.vert's, evaluated at the parcel's rest XY).
+            float sw = 0.0f;
             const float2 suv = (In.RestXY - s0.xy) * s0.z;
-            const float2 se  = min(suv, 1.0f - suv);
-            const float  sw  = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(se.x, se.y))
-                             * (1.0f - smoothstep(SWP[3].x, max(SWP[3].y, SWP[3].x + 1.0f), abs(s2.w)));
+            if (s0.w > 0.5f)
+            {
+                const float2 se = min(suv, 1.0f - suv);
+                sw = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(se.x, se.y))
+                   * (1.0f - smoothstep(s3.x, max(s3.y, s3.x + 1.0f), abs(s2.w)));
+            }
+            float2 sslope = float2(0.0f, 0.0f);
+            if (sw < 1.0f)
+            {
+                // The FAR FIELD: the same swell train the sim's deep water is held to, so the window
+                // edge is a crossfade, not a boundary. Footprint-faded per component (no far sparkle).
+                const float bAmp = (dot(bodyW, float4(1.0f, 1.0f, 1.0f, 1.0f)) > 0.5f)
+                                 ? dot(bodyW, gShadowParams.waterBodyAmp) : 1.0f;
+                const float fpW  = dist / (focalPx * max(abs(EyeVec.z), 0.1f));
+                const float3 an  = swSwellEval(In.RestXY + gFrameData.lodEye.xy, SWQ[0].xy, s3.z * bAmp,
+                                               s3.w, SWQ[0].w, SWQ[0].z, fpW);
+                sslope = -an.yz * (1.0f - sw);
+            }
             if (sw > 0.0f)
             {
                 const float tx = 16.0f * s0.z;       // one sim texel (16 u) in uv
@@ -1424,11 +1444,12 @@ float4 PS_MAIN( VSOutput In )
                 const float hU = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv + float2(0.0f, tx), 0.0f).z;
                 const float hD = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv - float2(0.0f, tx), 0.0f).z;
                 // -dh/dx: the convention every slope above adds (a rising surface tilts the normal back).
-                const float2 sslope = -float2(hR - hL, hU - hD) / 32.0f * s1.x * s1.z * sw;
-                const float2 base5  = normal.xy / max(normal.z, 1e-4f);
-                normal = normalize(float3(base5 + sslope, 1.0f));
+                sslope += -float2(hR - hL, hU - hD) / 32.0f * sw;
                 swWW = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv, 0.0f).w * s1.w * sw;
             }
+            sslope *= s1.x * s1.z;
+            const float2 base5 = normal.xy / max(normal.z, 1e-4f);
+            normal = normalize(float3(base5 + sslope, 1.0f));
         }
     }
 
@@ -2807,13 +2828,15 @@ float4 PS_MAIN( VSOutput In )
     // displaced surface rather than sliding under it.
     if (swWW > 0.002f)
     {
-        const float  kT   = 160.0f;
+        const float  kT   = 48.0f;                // foam cells ~0.7 m: lace, not blobs (160 read as clouds)
         const float2 eyeT = frac(gFrameData.lodEye.xy / (kT * 64.0f)) * 64.0f;
         const float2 fP   = In.RestXY / kT + eyeT;
         const float  nf   = foamFbm2(fP);
-        const float  nfi  = foamFbm2(fP * 5.0f + 3.1f);
-        float wf = saturate((saturate(swWW) * (0.6f + nf) - 0.35f) * 2.5f);
-        wf *= lerp(1.0f, saturate(0.5f + nfi), 0.5f);
+        const float  nfi  = foamFbm2(fP * 4.0f + 3.1f);
+        // LACE, never a sheet: the mass sets how much of the noise survives the erosion, and the fine
+        // octave perforates what does — a saturated mass is dense foam with holes, not flat white.
+        float wf = saturate((saturate(swWW) * nf - 0.25f) * 6.0f);
+        wf *= saturate(nfi * 1.6f - 0.2f);
         float sunVisW = 1.0f;
         const float4 so = gShadowParams.sunOcc;
         const float4 sm = gShadowParams.skyAOMap;

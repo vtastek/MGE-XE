@@ -67,6 +67,14 @@ STRUCT(SwSimParams)
     DATA(float4, disp,    None);
     // per-body amplitude (sea, river, pond, beach) — gShadowParams.waterBodyAmp's values
     DATA(float4, bodyAmp, None);
+    // BREAKING (user 2026-10-09: "when break happens, it swings in place ... breaking wave speed is
+    // enough to travel more there, then swings back as it dissipates. it is okay to penetrate more land")
+    //   x = momentum ADVECTION share (0 = the linear v1; 1 = full u.grad u — what lets a broken wave
+    //       run on as a bore instead of sloshing in place)
+    //   y = breaking ratio: a crest higher than y * still depth breaks
+    //   z = whitewater produced per second by a fully breaking cell
+    //   w = spare
+    DATA(float4, brk,     None);
     // per impulse: xy = position in TEXELS of this frame's grid, z = radius (texels),
     // w = pressure head (u; a moving swimmer is a moving dip in the surface pressure)
     DATA(float4, impulses[SW_MAX_IMPULSES], None);

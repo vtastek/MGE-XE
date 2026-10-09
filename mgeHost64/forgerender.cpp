@@ -4726,9 +4726,12 @@ namespace {
     // the local sim's displacement (swsim) has vertices to move. Their world matrices live in
     // gBatch.worlds[13..14] because [6..12] are the water params — see waterLevelSlot(). The instance
     // VB carries the SLOT, so water.vert still reads worlds[DrawIndex] unchanged.
-    constexpr uint32_t kMaxWaterLevels = 8;
-    constexpr uint32_t kWaterLevels    = 8;
-    inline uint32_t waterLevelSlot(uint32_t k) { return (k < 2u) ? 13u + k : k - 2u; }
+    // 2026-10-09: + a 16 u ring (the sim's own cell) in front — "breaking waves need more triangles".
+    // Slots: level 0 -> 16 (15 is the sim's lanes), levels 1-2 -> 13-14, levels 3.. -> 0..5.
+    constexpr uint32_t kMaxWaterLevels = 9;
+    constexpr uint32_t kWaterLevels    = 9;
+    constexpr uint32_t kWaterNearLevels = 3;   // the rings the local sim displaces (16/32/64 u)
+    inline uint32_t waterLevelSlot(uint32_t k) { return (k == 0u) ? 16u : (k < 3u) ? 12u + k : k - 3u; }
     // WT2 reflection RT side (matches MGE texReflection's 1024² budget; sampled with normalized UV).
     // A STARTUP knob (reflectSize, applied before init like every knob): the RTs, the pyramid and every
     // pass that addresses them read reflectSize(), never a literal. Clamped to [256, 2048] and to a
@@ -4790,7 +4793,7 @@ namespace {
     inline float waterTrueLevel(float waterLevelAbs) { return waterLevelAbs - 1.0f; }
     // ...and the plane it MIRRORS about, which is a separate, TUNED question (g_reflWaterLevelOffset).
     inline float waterMirrorZ(float waterLevelAbs);
-    constexpr float    kWaterCell0     = 32.0f;    // Phase A: was 128 with 6 levels; same outer extent
+    constexpr float    kWaterCell0     = 16.0f;    // was 128 with 6 levels, 32 with 8; same outer extent
     constexpr int      kWaterGrid      = 64;     // cells per side per level (even)
     // One per-level draw record: which IB sub-range each of the 4 trim variants occupies.
     struct WaterLodLevelHost {
@@ -8638,9 +8641,14 @@ namespace {
     float    g_swGuardHeight   = 60.0f;     // u: eye above the plane at which the eye guard is gone
     float    g_swGuardRadius   = 300.0f;    // u: radius the eye guard flattens at the waterline
     float    g_swDeepHold      = 0.15f;     // share of the sponge rate holding deep water to the swell
-    float    g_swFriction      = 0.05f;     // bottom friction coefficient (thin run-up sheets)
+    float    g_swFriction      = 0.01f;     // bottom friction coefficient (thin run-up sheets; 0.05 froze the shallows)
+    float    g_swAdvect        = 1.0f;      // momentum advection share (broken waves run on as bores)
+    float    g_swBreakRatio    = 0.6f;      // crest above this x still depth breaks
+    float    g_swBreakWW       = 3.0f;      // whitewater per second of a fully breaking cell
     float    g_swEyeFadeLo     = 900.0f;    // u above the water: display starts fading
     float    g_swEyeFadeHi     = 2200.0f;   // u above the water: display gone (the sim parks)
+    float    g_swGeoFadeLo     = 1500.0f;   // u from the eye (Chebyshev): far-field GEOMETRY starts fading
+    float    g_swGeoFadeHi     = 1850.0f;   // ...and is gone (inside the 64 u ring's reach); normals go on
     uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
     float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
     Texture* g_pWaterBodyTex = nullptr;
@@ -8870,7 +8878,7 @@ namespace {
         // last edge polygons of water surface towards horizon. no additional polygons, gets fogged
         // fully there so shape is no more important."
         //
-        // The clipmap's outer half-extent is exactly kWaterCell0 * 2^(L-1) * (m/2) = 32*128*32 (was 128*32*32) =
+        // The clipmap's outer half-extent is exactly kWaterCell0 * 2^(L-1) * (m/2) = 16*256*32 (was 128*32*32) =
         // 131072 units = 16 cells, which is ALSO the fog end and the draw distance. So the mesh
         // stopped precisely where the fog finished, and the last ring of quads spanned the stretch
         // where fog is not yet opaque. Past that edge there is no water surface at all, and what
@@ -24208,6 +24216,9 @@ namespace {
             { "swEdgeFade",          &g_swEdgeFade          },
             { "swDeepHold",          &g_swDeepHold          },
             { "swFriction",          &g_swFriction          },
+            { "swAdvect",            &g_swAdvect            },
+            { "swBreakRatio",        &g_swBreakRatio        },
+            { "swBreakWW",           &g_swBreakWW           },
             { "swEyeFadeLo",         &g_swEyeFadeLo         },
             { "swEyeFadeHi",         &g_swEyeFadeHi         },
             { "giBlend",             &g_giBlend             },
@@ -27212,6 +27223,10 @@ namespace {
           t.sliderF("Water sim: whitewater decay (1/s)", &g_swWWDecay, 0.0f, 5.0f, 0.05f);
           t.sliderF("Water sim: swimmer push (u)", &g_swImpHead, 0.0f, 40.0f, 0.5f);
           t.sliderF("Water sim: deep-water hold (0 = edge sponge only)", &g_swDeepHold, 0.0f, 1.0f, 0.01f);
+          t.sliderF("Water sim: momentum advection (bores)", &g_swAdvect, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Water sim: friction", &g_swFriction, 0.0f, 0.2f, 0.005f);
+          t.sliderF("Water sim: breaking ratio (crest / depth)", &g_swBreakRatio, 0.1f, 1.5f, 0.05f);
+          t.sliderF("Water sim: breaking whitewater", &g_swBreakWW, 0.0f, 20.0f, 0.1f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -29637,6 +29652,14 @@ namespace {
         removeResource(rbS); removeResource(rbD);
     }
 
+    // Wind heading: MW's wind vector for the DIRECTION only (its speeds are not trusted — the W field
+    // replaces this). Calm or missing: a fixed heading. Shared by the sim and the far-field lanes.
+    void swWindDir(float& wx, float& wy) {
+        wx = g_grassWind[0]; wy = g_grassWind[1];
+        const float wl = std::sqrt(wx * wx + wy * wy);
+        if (wl > 1.0e-4f) { wx /= wl; wy /= wl; } else { wx = 0.8f; wy = 0.6f; }
+    }
+
     // One frame of the sim. `on` false parks it (D[0] readable, field frozen) and forgets the field so
     // switching back on starts from rest.
     void swAdvance(bool on, float eyeAbsX, float eyeAbsY, float waterZ, float dtFrame) {
@@ -29654,6 +29677,23 @@ namespace {
         }
         if (!g_sw.cleared) { steps = std::max(steps, 1); }
         g_sw.lastSteps = steps;
+        // Heartbeat: which water BODY is under the eye (bake weights), so a recording/save can be
+        // classified sea / river / pond / beach without guessing.
+        {
+            static double s_lastBodyLog = -1.0e9;
+            if (g_simClock - s_lastBodyLog > 5.0 && g_sw.bodies && !g_waterBodyBytes.empty()
+                && g_waterBodyXf[2] > 0.0f) {
+                s_lastBodyLog = g_simClock;
+                const int bx = (int)((eyeAbsX - g_waterBodyXf[0]) * g_waterBodyXf[2] * (float)g_waterBodyW);
+                const int by = (int)((eyeAbsY - g_waterBodyXf[1]) * g_waterBodyXf[3] * (float)g_waterBodyH);
+                if (bx >= 0 && by >= 0 && bx < (int)g_waterBodyW && by < (int)g_waterBodyH) {
+                    const uint32_t c = g_waterBodyBytes[(size_t)by * g_waterBodyW + (size_t)bx];
+                    LOG::logline(">> [swsim] eye (%.0f, %.0f) body sea=%u river=%u pond=%u beach=%u (/255)",
+                                 (double)eyeAbsX, (double)eyeAbsY, c & 255u, (c >> 8) & 255u,
+                                 (c >> 16) & 255u, (c >> 24) & 255u);
+                }
+            }
+        }
         // No step = no scroll: the origin must stay with the stored field (advanceRippleGrid's lesson).
         if (steps <= 0) { swPark(); return; }
 
@@ -29671,9 +29711,8 @@ namespace {
 
         // Wind heading: MW's wind vector for the DIRECTION only (its speeds are not trusted — the W
         // field replaces this). Calm or missing: a fixed heading.
-        float wx = g_grassWind[0], wy = g_grassWind[1];
-        const float wl = std::sqrt(wx * wx + wy * wy);
-        if (wl > 1.0e-4f) { wx /= wl; wy /= wl; } else { wx = 0.8f; wy = 0.6f; }
+        float wx = 0.0f, wy = 0.0f;
+        swWindDir(wx, wy);
 
         SwSimParams base = {};
         base.grid[0] = (float)kSwGrid; base.grid[1] = kSwCell; base.grid[2] = kSwStep;
@@ -29702,6 +29741,9 @@ namespace {
         base.disp[1] = g_waterFlowSpeed;
         base.disp[2] = std::clamp(g_swDeepHold, 0.0f, 1.0f);
         base.disp[3] = std::max(g_swFriction, 0.0f);
+        base.brk[0] = std::clamp(g_swAdvect, 0.0f, 1.0f);
+        base.brk[1] = std::max(g_swBreakRatio, 0.05f);
+        base.brk[2] = std::max(g_swBreakWW, 0.0f);
         base.bodyAmp[0] = g_waterAmpSea; base.bodyAmp[1] = g_waterAmpRiver;
         base.bodyAmp[2] = g_waterAmpPond; base.bodyAmp[3] = g_waterAmpBeach;
         // Swimmers: the wake tracks (moving, extrapolated), as moving pressure dips.
@@ -29766,7 +29808,7 @@ namespace {
     }
 
     // gBatch.worlds[15] for the water pass (water.vert/water.frag read it; layout in water.vert.fsl).
-    void swWriteWaterLanes(uint8_t* wbuf, float eyeAbsX, float eyeAbsY, float eyeAbove) {
+    void swWriteWaterLanes(uint8_t* wbuf, float eyeAbsX, float eyeAbsY, float eyeAbove, bool exterior) {
         float w[16] = {};
         const bool on = g_waterSim && g_sw.ready && g_sw.cleared;
         w[0] = g_sw.originX - eyeAbsX;
@@ -29783,7 +29825,19 @@ namespace {
         w[11] = eyeAbove;
         w[12] = g_swEyeFadeLo;
         w[13] = std::max(g_swEyeFadeHi, g_swEyeFadeLo + 1.0f);
+        // The FAR-FIELD swell train (swswell.h.fsl): on with the feature in exteriors, whether or not
+        // the sim itself is running (from above its eye-height fade the train is all there is).
+        const bool farOn = g_waterSim && exterior;
+        w[14] = farOn ? std::max(g_swSwellAmp, 0.0f) : 0.0f;
+        w[15] = std::max(g_swSwellLam, 32.0f);
         std::memcpy(wbuf + 15 * 64, w, 64);
+        float q[16] = {};
+        swWindDir(q[0], q[1]);
+        q[2] = (float)std::fmod(g_simClock, 1200.0);                         // the sim's forcing time
+        q[3] = std::sqrt((9.81f / kMwUnitMetres) * std::max(g_swHmax, 1.0f)); // its open-water speed
+        q[4] = g_swGeoFadeLo;
+        q[5] = std::max(g_swGeoFadeHi, g_swGeoFadeLo + 1.0f);
+        std::memcpy(wbuf + 17 * 64, q, 64);
     }
 
     // ═══ G7: THE GRASS CRUSH FIELD ═══════════════════════════════════════════════════════════════
@@ -34840,7 +34894,7 @@ void destroyHostWindow(Renderer* R);
                 std::memcpy(wbuf + 6 * 64, p, 64);
                 // eyeAbs so the R2 block can make MW's absolute ripple centres eye-relative.
                 writeWaveScales(wbuf, eyeAbsX, eyeAbsY);
-                swWriteWaterLanes(wbuf, eyeAbsX, eyeAbsY, eyeAbsZ - waterLevelAbs);
+                swWriteWaterLanes(wbuf, eyeAbsX, eyeAbsY, eyeAbsZ - waterLevelAbs, g_dlExterior);
             }
             // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
             // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
@@ -34895,14 +34949,14 @@ void destroyHostWindow(Renderer* R);
             // BEHIND flat water, so a crest raised over a far rock was shaded at the far rate — dark
             // 2x2-rate tiles along every silhouette the waves crossed (swsim, 3x amplitude A/B).
             // Only the two rings the sim displaces (levels 0-1) lose it; the far rings keep their 2x2.
-            const bool swShown = g_waterSim && g_sw.ready && g_sw.cleared;
+            const bool swShown = g_waterSim && g_dlExterior;   // sim or its far-field train displaces
             const bool vrsW = g_vrsWater && g_live.vrsBuilt && !underwater && !waterDebugBitsSet();
             g_vrsMaskCur |= 16u | (underwater ? 32u : 0u) | (waterDebugBitsSet() ? 64u : 0u);
             bool vrsOn = false;
             if (vrsW) { g_vrsMaskCur |= 8u; }
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const WaterLodLevelHost& lvl = g_waterLevels[k];
-                const bool wantVrs = vrsW && !(swShown && k < 2u);
+                const bool wantVrs = vrsW && !(swShown && k < kWaterNearLevels);
                 if (wantVrs != vrsOn) { vrsBind(wantVrs); vrsOn = wantVrs; }
                 uint32_t variant = 0;
                 if (lvl.numVariants > 1) {
@@ -55797,6 +55851,7 @@ void destroyHostWindow(Renderer* R);
             // Viewer path: no client, so no actor ripples — the default 0,0 eye is unused.
             writeWaveScales(wbuf);             // worlds[8] = wave scales, worlds[9] = field extras
             std::memset(wbuf + 15 * 64, 0, 64);   // no water sim in the viewer
+            std::memset(wbuf + 17 * 64, 0, 64);
         }
         {
             float invVP[16];
