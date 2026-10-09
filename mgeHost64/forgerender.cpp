@@ -6789,6 +6789,11 @@ namespace {
     // WEATHER SURFACE STATE (weather.h.fsl): x = wetness 0..1, y = snow cover 0..1, z = wet darkening
     // depth, w = snow albedo. Appended last.
     constexpr uint32_t kWeatherFloat          = kSunNoiseFloat + 4;
+    // WATER BODIES (scene-walk-v2 port; bakeWaterBodies): waterFlowMap = (origin XY, 1/extent XY) of
+    // gWaterFlow over the exterior world (zw = 0 = no map: indoors / not baked); waterBodyAmp = the
+    // wave amplitude per body, in gWaterFlow's channel order (sea, river, pond, beach).
+    constexpr uint32_t kWaterFlowMapFloat     = kWeatherFloat + 4;
+    constexpr uint32_t kWaterBodyAmpFloat     = kWaterFlowMapFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6814,6 +6819,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, weatherState) == kWeatherFloat * sizeof(float),
                   "kWeatherFloat does not land on ShadowMaskParams::weatherState");
+    static_assert((kWaterBodyAmpFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, waterBodyAmp) == kWaterBodyAmpFloat * sizeof(float),
+                  "kWaterBodyAmpFloat does not land on ShadowMaskParams::waterBodyAmp");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8551,6 +8560,19 @@ namespace {
     float    g_weatherSnowAlbedo = 0.85f;    // snow's albedo
     float    g_weatherWet = 0.0f, g_weatherSnow = 0.0f;   // last published (heartbeat)
     float    g_weatherDebugWet  = -1.0f;   // >= 0 overrides the integrated wetness (A/B, screenshots)
+    // WATER BODIES (scene-walk-v2 port): per-body wave amplitude off a one-hot body mask baked once
+    // from LAND (bakeWaterBodies). 1 = today's tuned look; the defaults calm rivers and ponds and keep
+    // sea and beach as they were. waterBodies=0 = no map (every body 1x).
+    bool     g_waterBodies    = true;
+    float    g_waterAmpSea    = 1.0f;
+    float    g_waterAmpRiver  = 0.5f;
+    float    g_waterAmpPond   = 0.2f;
+    float    g_waterAmpBeach  = 1.0f;
+    std::vector<uint32_t> g_waterBodyBytes;     // RGBA8 W*H, (sea, river, pond, beach) weights
+    uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
+    float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
+    Texture* g_pWaterBodyTex = nullptr;
+    bool     g_waterBodyBound = false, g_waterBodyFailed = false;
     float    g_weatherDebugSnow = -1.0f;   // >= 0 overrides the integrated snow cover
     // GI field (tasks/forge-gi.md v2): giGain > 0 replaces the occluded share's constant floor with the
     // field's bounce, at that gain. 0 = off (default until the user has seen it). giBlend = the per-frame
@@ -24074,6 +24096,10 @@ namespace {
             { "weatherSnowAlbedo",   &g_weatherSnowAlbedo   },
             { "weatherDebugWet",     &g_weatherDebugWet     },
             { "weatherDebugSnow",    &g_weatherDebugSnow    },
+            { "waterAmpSea",         &g_waterAmpSea         },
+            { "waterAmpRiver",       &g_waterAmpRiver       },
+            { "waterAmpPond",        &g_waterAmpPond        },
+            { "waterAmpBeach",       &g_waterAmpBeach       },
             { "giBlend",             &g_giBlend             },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
@@ -24254,6 +24280,7 @@ namespace {
             { "reflHalfRate",        &g_reflHalfRate        },
             { "sunActorCasters",     &g_sunActorCasters     },
             { "weatherSurface",      &g_weatherSurface      },
+            { "waterBodies",         &g_waterBodies         },
             { "sunBlurFused",        &g_sunBlurFused        },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
@@ -27046,6 +27073,11 @@ namespace {
           t.sliderF("Weather DEBUG wetness (-1 = live)", &g_weatherDebugWet, -1.0f, 1.0f, 0.05f);
           t.sliderF("Weather DEBUG snow (-1 = live)", &g_weatherDebugSnow, -1.0f, 1.0f, 0.05f);
           t.sliderF("Weather wet darkening", &g_weatherWetDarken, 0.0f, 0.9f, 0.05f);
+          t.checkbox("Water bodies (per-body wave amplitude, baked from LAND)", &g_waterBodies);
+          t.sliderF("Water amp: open sea", &g_waterAmpSea, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Water amp: beach", &g_waterAmpBeach, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Water amp: river", &g_waterAmpRiver, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Water amp: pond / lake", &g_waterAmpPond, 0.0f, 3.0f, 0.05f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -33133,6 +33165,8 @@ void destroyHostWindow(Renderer* R);
     void terrainRecordDepth(Cmd* cmd);   // host-owned terrain, depth-only — the Z-prepass entry
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
     void giFieldUpdate();     // GI field producer (tasks/forge-gi.md v2)
+    void bakeWaterBodies();   // water body classification (scene-walk-v2 port), CPU, at terrain init
+    void waterBodiesEnsure(); // ...its upload + PerFrame bind, on first water draw
     void blurSunMoments();    // SUN shadow: separable Gaussian over the moments — what makes MSM soft
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
     bool createOccProbeResources(Renderer* R);  // H0: lazy, the first frame `occProbe` is armed
@@ -34185,6 +34219,7 @@ void destroyHostWindow(Renderer* R);
         // invVP → draw one indexed-instanced call per clipmap level (DrawIndex=level). Depth GEQUAL +
         // write so water occludes / is occluded correctly. Gated by waterReady (build) + waterEnabled (F7).
         g_lastWaterLevels = 0;   // Phase 0 panel: 0 unless the water pass runs below
+        waterBodiesEnsure();
         if (g_live.waterReady && waterEnabled && g_drawWater) {
             // (1) End the colour pass; copy colorTarget → pRefractColor. CopyResource for 1x; for MSAA
             // the colour is multisampled → ResolveSubresource into the single-sample refraction copy.
@@ -52866,7 +52901,165 @@ void destroyHostWindow(Renderer* R);
                      (unsigned long long)(gBytes >> 20));
         LOG::flush();
         g_terrainReady = true;
+        bakeWaterBodies();
         return true;
+    }
+
+    // ═══ WATER BODIES — the scene-walk-v2 flow-map classification, ported (CPU, once) ═════════════
+    // A 512-unit grid over the LAND extent (plus an open-sea fringe). Wet = no LAND data (open sea)
+    // or the cell's lowest terrain under the sea level. Then, as the prototype: distance-to-OPEN-SEA
+    // over wet cells (unreachable = an isolated POND), distance-to-SHORE (narrow vs wide), WIDE water
+    // = farther from shore than the river half-width (SEA), BEACH = narrow water within beachReach of
+    // wide water, RIVER = narrow sea-connected water away from it. Stored ONE-HOT (sea, river, pond,
+    // beach) and blurred once over wet neighbours, so a bilinear tap blends bodies smoothly instead of
+    // interpolating category codes. (Flow DIRECTION for steered crests/foam is the next step.)
+    void bakeWaterBodies() {
+        g_waterBodyBytes.clear(); g_waterBodyW = g_waterBodyH = 0;
+        int32_t cx0, cy0, cx1, cy1;
+        Terrain::extent(cx0, cy0, cx1, cy1);
+        if (cx1 < cx0 || cy1 < cy0) { return; }
+        constexpr float kG = 512.0f;
+        constexpr int   kPerCell = (int)(Terrain::kCellSize / kG);   // 16
+        constexpr int   kPadCells = 2;
+        const int W = (cx1 - cx0 + 1 + 2 * kPadCells) * kPerCell;
+        const int H = (cy1 - cy0 + 1 + 2 * kPadCells) * kPerCell;
+        if ((int64_t)W * H > 16ll * 1024 * 1024) { LOG::logline("!! [water-bodies] grid %dx%d too large — skipped", W, H); return; }
+        const size_t N = (size_t)W * H;
+        const float seaZ = 0.0f;
+        const double t0 = hostNowMs();
+        std::vector<uint8_t> wet(N, 0), openSea(N, 0);
+        for (int gy = 0; gy < H; ++gy) {
+            for (int gx = 0; gx < W; ++gx) {
+                const int cx = cx0 - kPadCells + gx / kPerCell, cy = cy0 - kPadCells + gy / kPerCell;
+                const Terrain::LandCell* c = Terrain::cellAt(cx, cy);
+                const size_t i = (size_t)gy * W + gx;
+                if (!c) { wet[i] = 1; openSea[i] = 1; continue; }
+                const int vx0 = (gx % kPerCell) * 4, vy0 = (gy % kPerCell) * 4;
+                int16_t mn = 32767;
+                for (int vy = vy0; vy <= vy0 + 4; ++vy) {
+                    for (int vx = vx0; vx <= vx0 + 4; ++vx) {
+                        mn = std::min(mn, c->height[vy * Terrain::kCellVerts + vx]);
+                    }
+                }
+                if ((float)mn * Terrain::kHeightScale < seaZ) { wet[i] = 1; }
+            }
+        }
+        static const int nb[4][2] = { {1,0},{-1,0},{0,1},{0,-1} };
+        auto bfs = [&](std::vector<int>& d, std::vector<int>& q, int cap, auto pass) {
+            for (size_t h = 0; h < q.size(); ++h) {
+                const int c = q[h];
+                if (d[c] >= cap) { continue; }
+                const int x = c % W, y = c / W;
+                for (auto& o : nb) {
+                    const int nx = x + o[0], ny = y + o[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                    const int ni = ny * W + nx;
+                    if (d[ni] == INT_MAX && pass(ni)) { d[ni] = d[c] + 1; q.push_back(ni); }
+                }
+            }
+        };
+        std::vector<int> dSea(N, INT_MAX), dShore(N, INT_MAX), dWide(N, INT_MAX), q;
+        q.reserve(N);
+        for (size_t i = 0; i < N; ++i) { if (openSea[i]) { dSea[i] = 0; q.push_back((int)i); } }
+        bfs(dSea, q, INT_MAX, [&](int ni) { return wet[ni] != 0; });
+        q.clear();
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) { continue; }
+            const int x = (int)(i % W), y = (int)(i / W);
+            for (auto& o : nb) {
+                const int nx = x + o[0], ny = y + o[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                if (!wet[(size_t)ny * W + nx]) { dShore[i] = 1; q.push_back((int)i); break; }
+            }
+        }
+        bfs(dShore, q, INT_MAX, [&](int ni) { return wet[ni] != 0; });
+        const float riverHalfWidth = 3.5f;    // cells (prototype g_flowRiverWidth)
+        const int   beachReach     = 10;      // cells (prototype g_flowBeachReach)
+        q.clear();
+        for (size_t i = 0; i < N; ++i) {
+            if (wet[i] && dShore[i] != INT_MAX && (float)dShore[i] > riverHalfWidth) { dWide[i] = 0; q.push_back((int)i); }
+        }
+        bfs(dWide, q, beachReach, [&](int ni) { return wet[ni] != 0; });
+        // One-hot weights: 0 sea, 1 river, 2 pond, 3 beach.
+        std::vector<float> w4(N * 4, 0.0f);
+        uint32_t nCat[4] = {};
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) { continue; }
+            int cat;
+            if (dSea[i] == INT_MAX)                            { cat = 2; }
+            else if (dWide[i] == 0)                            { cat = 0; }
+            else if (dWide[i] != INT_MAX && dWide[i] <= beachReach) { cat = 3; }
+            else                                               { cat = 1; }
+            w4[i * 4 + cat] = 1.0f; ++nCat[cat];
+        }
+        // One blur pass over wet neighbours; dry cells take their wet neighbours' mean (the shore line
+        // samples a valid body on both sides of the bilinear footprint).
+        std::vector<float> t4(w4);
+        for (size_t i = 0; i < N; ++i) {
+            const int x = (int)(i % W), y = (int)(i / W);
+            float acc[4] = { 0, 0, 0, 0 }; int n = 0;
+            auto add = [&](size_t j) { if (!wet[j]) { return; } for (int k = 0; k < 4; ++k) { acc[k] += t4[j * 4 + k]; } ++n; };
+            add(i);
+            for (auto& o : nb) {
+                const int nx = x + o[0], ny = y + o[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                add((size_t)ny * W + nx);
+            }
+            if (n) { for (int k = 0; k < 4; ++k) { w4[i * 4 + k] = acc[k] / (float)n; } }
+        }
+        g_waterBodyBytes.assign(N, 0);
+        for (size_t i = 0; i < N; ++i) {
+            uint32_t v = 0;
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t b = (uint32_t)std::clamp((int)(w4[i * 4 + k] * 255.0f + 0.5f), 0, 255);
+                v |= b << (8 * k);   // R8G8B8A8_UNORM little-endian: R = byte 0
+            }
+            g_waterBodyBytes[i] = v;
+        }
+        g_waterBodyW = (uint32_t)W; g_waterBodyH = (uint32_t)H;
+        g_waterBodyXf[0] = (float)(cx0 - kPadCells) * Terrain::kCellSize;
+        g_waterBodyXf[1] = (float)(cy0 - kPadCells) * Terrain::kCellSize;
+        g_waterBodyXf[2] = 1.0f / ((float)W * kG);
+        g_waterBodyXf[3] = 1.0f / ((float)H * kG);
+        LOG::logline(">> [water-bodies] baked %dx%d (512u) in %.0f ms: sea=%u river=%u pond=%u beach=%u cells",
+                     W, H, hostNowMs() - t0, nCat[0], nCat[1], nCat[2], nCat[3]);
+    }
+
+    // Upload + bind the baked water-body map the first time water draws (the PerFrame set exists by
+    // then). Non-fatal: without it every body is 1x, the look before this.
+    void waterBodiesEnsure() {
+        if (g_waterBodyBound || g_waterBodyFailed || !g_waterBodies || g_waterBodyBytes.empty()) { return; }
+        Renderer* R = g_live.pRenderer;
+        TextureDesc td = {};
+        td.mWidth = g_waterBodyW; td.mHeight = g_waterBodyH; td.mDepth = 1; td.mArraySize = 1; td.mMipLevels = 1;
+        td.mSampleCount = SAMPLE_COUNT_1;
+        td.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+        td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        td.pName = "waterBodies";
+        TextureLoadDesc tl = {}; tl.ppTexture = &g_pWaterBodyTex; tl.pDesc = &td;
+        addResource(&tl, nullptr);
+        waitForAllResourceLoads();
+        if (!g_pWaterBodyTex) { g_waterBodyFailed = true; LOG::logline("!! [water-bodies] texture alloc FAILED"); return; }
+        TextureUpdateDesc upd = {};
+        upd.pTexture = g_pWaterBodyTex;
+        upd.mBaseMipLevel = 0; upd.mMipLevels = 1; upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+        upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+        beginUpdateResource(&upd);
+        TextureSubresourceUpdate sr = upd.getSubresourceUpdateDesc(0, 0);
+        for (uint32_t row = 0; row < sr.mRowCount; ++row) {
+            std::memcpy(sr.pMappedData + (size_t)row * sr.mDstRowStride,
+                        (const uint8_t*)g_waterBodyBytes.data() + (size_t)row * g_waterBodyW * 4u,
+                        (size_t)g_waterBodyW * 4u);
+        }
+        endUpdateResource(&upd);
+        waitForAllResourceLoads();
+        DescriptorData dd = {};
+        dd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterBodies);
+        dd.mCount = 1; dd.ppTextures = &g_pWaterBodyTex;
+        if (g_live.pPerFrameSet) { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &dd); }
+        g_waterBodyBound = true;
+        LOG::logline(">> [water-bodies] map uploaded + bound (%ux%u)", g_waterBodyW, g_waterBodyH);
     }
 
     // ═══ THE W-GATE — is there any water SURFACE in the camera's view? ═══════════════════════════
@@ -61228,6 +61421,17 @@ void destroyHostWindow(Renderer* R);
             mp[kWeatherFloat + 2] = std::clamp(g_weatherWetDarken, 0.0f, 0.9f);
             mp[kWeatherFloat + 3] = std::clamp(g_weatherSnowAlbedo, 0.0f, 1.0f);
         }
+        {
+            const bool on = g_waterBodies && g_waterBodyBound && g_dlExterior;
+            mp[kWaterFlowMapFloat + 0] = g_waterBodyXf[0];
+            mp[kWaterFlowMapFloat + 1] = g_waterBodyXf[1];
+            mp[kWaterFlowMapFloat + 2] = on ? g_waterBodyXf[2] : 0.0f;
+            mp[kWaterFlowMapFloat + 3] = on ? g_waterBodyXf[3] : 0.0f;
+            mp[kWaterBodyAmpFloat + 0] = std::max(0.0f, g_waterAmpSea);
+            mp[kWaterBodyAmpFloat + 1] = std::max(0.0f, g_waterAmpRiver);
+            mp[kWaterBodyAmpFloat + 2] = std::max(0.0f, g_waterAmpPond);
+            mp[kWaterBodyAmpFloat + 3] = std::max(0.0f, g_waterAmpBeach);
+        }
     }
 
     // What the screen pass last received for the underwater Snell window — echoed in the [svm] line,
@@ -65319,6 +65523,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGiFieldPipeline)     { removePipeline(R, g_live.pGiFieldPipeline); g_live.pGiFieldPipeline = nullptr; }
         if (g_live.pGiFieldShader)       { removeShader(R, g_live.pGiFieldShader); g_live.pGiFieldShader = nullptr; }
         if (g_live.pGiField)             { removeRenderTarget(R, g_live.pGiField); g_live.pGiField = nullptr; }
+        if (g_pWaterBodyTex)             { removeResource(g_pWaterBodyTex); g_pWaterBodyTex = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
         if (g_live.pSvmDepth)            { removeRenderTarget(R, g_live.pSvmDepth); g_live.pSvmDepth = nullptr; }
         if (g_live.pSkyVisSet)           { removeDescriptorSet(R, g_live.pSkyVisSet); g_live.pSkyVisSet = nullptr; }

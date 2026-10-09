@@ -536,6 +536,23 @@ float4 PS_MAIN( VSOutput In )
     // W2 wave amplitude: one multiplier on the decoded slope, so it moves the normals AND the
     // roughness together — they are the same physical quantity and must never drift apart.
     float  waveAmp       = waveG1.y;
+    // WATER BODIES (scene-walk-v2 port): this point's body (sea / river / pond / beach), from the map
+    // baked once off LAND, scales the amplitude — ponds calm, rivers gentler, open sea as tuned. The
+    // weights are blurred one-hot, so a bilinear tap blends across a river mouth instead of stepping.
+    {
+        const float4 xf = gShadowParams.waterFlowMap;
+        if (xf.z > 0.0f)
+        {
+            const float2 buv = (In.WorldPos.xy + gFrameData.lodEye.xy - xf.xy) * xf.zw;
+            const float4 bw  = SampleLvlTex2D(gWaterBodies, gSamplerBilinearClamp, buv, 0.0f);
+            const float  ws  = bw.r + bw.g + bw.b + bw.a;
+            if (ws > 1.0e-3f)
+            {
+                const float amp = dot(bw, gShadowParams.waterBodyAmp) / ws;
+                waveAmp *= lerp(1.0f, amp, saturate(ws * 4.0f));
+            }
+        }
+    }
     // W3: the BAKE owns both of these, so the shader is told rather than told to assume. waveSlices
     // is the array's layer count (the animation is cyclic mod this) and waveTile is the bombed
     // field's world period — 4x the shipped 527 at an unchanged texel density.

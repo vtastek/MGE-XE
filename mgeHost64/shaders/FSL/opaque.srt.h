@@ -696,6 +696,10 @@ BEGIN_SRT_NO_AB(SrtData)
         // Read by skyamb.h.fsl in place of the constant occluded-share floor when skyAOFloor.z > 0.
         // Unbound reads (0,0,0,0) -> a = 0 -> the receiver keeps the floor. Appended last.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiField)
+        // WATER BODIES (scene-walk-v2 port): one-hot (sea, river, pond, beach) weights over the
+        // exterior world, mapped by gShadowParams.waterFlowMap; water.frag scales the wave amplitude by
+        // dot(weights, waterBodyAmp). Unbound or zw = 0 -> 1x. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gWaterBodies)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

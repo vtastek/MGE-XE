@@ -1064,4 +1064,8 @@ STRUCT(ShadowMaskParams)
     // WEATHER SURFACE STATE (weather.h.fsl): x = wetness, y = snow cover (0..1, host-integrated from
     // MW's precipitation counters), z = wet darkening depth, w = snow albedo. 0/0 = dry = identity.
     DATA(float4,   weatherState,     None);
+    // WATER BODIES: gWaterBodies' mapping (xy = world origin, zw = 1/extent; zw = 0 = no map) and the
+    // per-body wave amplitude in its channel order (sea, river, pond, beach).
+    DATA(float4,   waterFlowMap,     None);
+    DATA(float4,   waterBodyAmp,     None);
 };
