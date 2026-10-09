@@ -700,6 +700,8 @@ BEGIN_SRT_NO_AB(SrtData)
         // exterior world, mapped by gShadowParams.waterFlowMap; water.frag scales the wave amplitude by
         // dot(weights, waterBodyAmp). Unbound or zw = 0 -> 1x. Appended last.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gWaterBodies)
+        // ...and the baked flow: rg = heading * 0.5 + 0.5 (river downstream, beach onshore), b = strength.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gWaterFlow)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

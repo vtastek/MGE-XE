@@ -536,6 +536,8 @@ float4 PS_MAIN( VSOutput In )
     // W2 wave amplitude: one multiplier on the decoded slope, so it moves the normals AND the
     // roughness together — they are the same physical quantity and must never drift apart.
     float  waveAmp       = waveG1.y;
+    float2 flowDir = float2(0.0f, 0.0f);
+    float  flowStr = 0.0f;
     // WATER BODIES (scene-walk-v2 port): this point's body (sea / river / pond / beach), from the map
     // baked once off LAND, scales the amplitude — ponds calm, rivers gentler, open sea as tuned. The
     // weights are blurred one-hot, so a bilinear tap blends across a river mouth instead of stepping.
@@ -551,6 +553,10 @@ float4 PS_MAIN( VSOutput In )
                 const float amp = dot(bw, gShadowParams.waterBodyAmp) / ws;
                 waveAmp *= lerp(1.0f, amp, saturate(ws * 4.0f));
             }
+            const float3 fl = SampleLvlTex2D(gWaterFlow, gSamplerBilinearClamp, buv, 0.0f).rgb;
+            flowDir = fl.rg * 2.0f - 1.0f;
+            flowStr = fl.b * saturate(length(flowDir) * 2.0f);
+            flowDir = (dot(flowDir, flowDir) > 1.0e-6f) ? normalize(flowDir) : float2(0.0f, 0.0f);
         }
     }
     // W3: the BAKE owns both of these, so the shader is told rather than told to assume. waveSlices
@@ -1091,6 +1097,26 @@ float4 PS_MAIN( VSOutput In )
                                            float3(tc2, z0), dTdx, dTdy).rg - 1.0f;
         float2 s1 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic,
                                            float3(tc2, z1), dTdx, dTdy).rg - 1.0f;
+        // FLOW (water bodies step 2): rivers carry the wave field DOWNSTREAM, beach water drifts
+        // onshore. Classic two-phase flow-map advection: two copies of the field, each slid along the
+        // baked heading for one period and reset, half a period apart, cross-faded so neither reset
+        // shows. Explicit gradients, so the branch is legal; still water (strength 0) pays nothing.
+        const float flowSpeed = gShadowParams.waterFlowParams.x * flowStr;
+        if (flowSpeed > 0.5f)
+        {
+            const float  per = max(gShadowParams.waterFlowParams.y, 0.1f);
+            const float  ph0 = frac(time / per);
+            const float  ph1 = frac(time / per + 0.5f);
+            const float2 d0  = flowDir * (flowSpeed * per * (ph0 - 0.5f) / waveTile);
+            const float2 d1  = flowDir * (flowSpeed * per * (ph1 - 0.5f) / waveTile);
+            const float  wB  = abs(2.0f * ph0 - 1.0f);   // weight of copy 1: 1 when copy 0 resets
+            float2 a0 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic, float3(tc2 - d0, z0), dTdx, dTdy).rg - 1.0f;
+            float2 a1 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic, float3(tc2 - d0, z1), dTdx, dTdy).rg - 1.0f;
+            float2 b0 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic, float3(tc2 - d1 + 0.37f, z0), dTdx, dTdy).rg - 1.0f;
+            float2 b1 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic, float3(tc2 - d1 + 0.37f, z1), dTdx, dTdy).rg - 1.0f;
+            s0 = lerp(a0, b0, wB);
+            s1 = lerp(a1, b1, wB);
+        }
         normal = normalize(float3(lerp(s0, s1, fz) * waveAmp, 1.0f));
 
         // --- ROUGHNESS: FROM THE BAKED ARRAY, NOT FROM THE TAPS -----------------------------------

@@ -6794,6 +6794,9 @@ namespace {
     // wave amplitude per body, in gWaterFlow's channel order (sea, river, pond, beach).
     constexpr uint32_t kWaterFlowMapFloat     = kWeatherFloat + 4;
     constexpr uint32_t kWaterBodyAmpFloat     = kWaterFlowMapFloat + 4;
+    // ...and the flow: x = speed (world units / s at strength 1), y = advection period (s, must divide
+    // the 20 s water clock), zw spare.
+    constexpr uint32_t kWaterFlowParamsFloat  = kWaterBodyAmpFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6823,6 +6826,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, waterBodyAmp) == kWaterBodyAmpFloat * sizeof(float),
                   "kWaterBodyAmpFloat does not land on ShadowMaskParams::waterBodyAmp");
+    static_assert((kWaterFlowParamsFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, waterFlowParams) == kWaterFlowParamsFloat * sizeof(float),
+                  "kWaterFlowParamsFloat does not land on ShadowMaskParams::waterFlowParams");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8569,6 +8576,10 @@ namespace {
     float    g_waterAmpPond   = 0.2f;
     float    g_waterAmpBeach  = 1.0f;
     std::vector<uint32_t> g_waterBodyBytes;     // RGBA8 W*H, (sea, river, pond, beach) weights
+    std::vector<uint32_t> g_waterFlowBytes;     // RGBA8 W*H, (dir x, dir y) * 0.5 + 0.5, strength, 0
+    Texture* g_pWaterFlowTex = nullptr;
+    float    g_waterFlowSpeed  = 60.0f;     // world units / s at strength 1 (rivers)
+    float    g_waterFlowPeriod = 2.5f;      // must divide the 20 s water clock
     uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
     float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
     Texture* g_pWaterBodyTex = nullptr;
@@ -24100,6 +24111,7 @@ namespace {
             { "waterAmpRiver",       &g_waterAmpRiver       },
             { "waterAmpPond",        &g_waterAmpPond        },
             { "waterAmpBeach",       &g_waterAmpBeach       },
+            { "waterFlowSpeed",      &g_waterFlowSpeed      },
             { "giBlend",             &g_giBlend             },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
@@ -27078,6 +27090,7 @@ namespace {
           t.sliderF("Water amp: beach", &g_waterAmpBeach, 0.0f, 3.0f, 0.05f);
           t.sliderF("Water amp: river", &g_waterAmpRiver, 0.0f, 3.0f, 0.05f);
           t.sliderF("Water amp: pond / lake", &g_waterAmpPond, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Water flow speed (rivers downstream, beach onshore; 0 = off)", &g_waterFlowSpeed, 0.0f, 300.0f, 5.0f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -52992,6 +53005,76 @@ void destroyHostWindow(Renderer* R);
             else                                               { cat = 1; }
             w4[i * 4 + cat] = 1.0f; ++nCat[cat];
         }
+        // FLOW (step 2). RIVERS run DOWNSTREAM = -grad(distance to open sea), off a box-blurred copy of
+        // that integer field so the heading is continuous (the prototype's de-blocking): the river
+        // flows OUT to the sea, never the sea in. BEACH and coastal SEA move ONSHORE = grad of a heavily
+        // blurred land(1)/water(0) field, i.e. the coast's broad orientation, not every wiggle.
+        std::vector<float> fdx(N, 0.0f), fdy(N, 0.0f), fst(N, 0.0f);
+        {
+            auto boxBlur = [&](std::vector<float>& f, int R, int iters) {
+                std::vector<float> tmp(N), pre((size_t)std::max(W, H) + 1);
+                for (int it = 0; it < iters; ++it) {
+                    for (int y = 0; y < H; ++y) {
+                        pre[0] = 0.0f;
+                        for (int x = 0; x < W; ++x) { pre[x + 1] = pre[x] + f[(size_t)y * W + x]; }
+                        for (int x = 0; x < W; ++x) {
+                            const int lo = std::max(0, x - R), hi = std::min(W - 1, x + R);
+                            tmp[(size_t)y * W + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                        }
+                    }
+                    for (int x = 0; x < W; ++x) {
+                        pre[0] = 0.0f;
+                        for (int y = 0; y < H; ++y) { pre[y + 1] = pre[y] + tmp[(size_t)y * W + x]; }
+                        for (int y = 0; y < H; ++y) {
+                            const int lo = std::max(0, y - R), hi = std::min(H - 1, y + R);
+                            f[(size_t)y * W + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                        }
+                    }
+                }
+            };
+            // River heading off the blurred distance-to-sea, blurred over SEA-CONNECTED WATER ONLY
+            // (normalised convolution: blur value*mask and mask, divide). A plain blur pulled the dry
+            // banks' placeholder into a 3-4 cell river, so the gradient pointed ACROSS the channel at
+            // the nearer bank; masked, the field only falls along the channel, toward the mouth.
+            std::vector<float> ds(N), dm(N);
+            for (size_t i = 0; i < N; ++i) {
+                const bool ok = wet[i] && dSea[i] != INT_MAX;
+                ds[i] = ok ? (float)dSea[i] : 0.0f; dm[i] = ok ? 1.0f : 0.0f;
+            }
+            boxBlur(ds, 3, 2);
+            boxBlur(dm, 3, 2);
+            for (size_t i = 0; i < N; ++i) { ds[i] = (dm[i] > 1e-4f) ? ds[i] / dm[i] : 0.0f; }
+            std::vector<float> lf(N);
+            for (size_t i = 0; i < N; ++i) { lf[i] = wet[i] ? 0.0f : 1.0f; }
+            const int Rc = 40;
+            boxBlur(lf, Rc, 3);
+            for (size_t i = 0; i < N; ++i) {
+                if (!wet[i]) { continue; }
+                const int x = (int)(i % W), y = (int)(i / W);
+                const int xl = std::max(0, x - 1), xr = std::min(W - 1, x + 1);
+                const int yd = std::max(0, y - 1), yu = std::min(H - 1, y + 1);
+                const float* w = &w4[i * 4];
+                if (w[1] > 0.5f) {                       // river: downstream
+                    // One-sided where a neighbour carries no field (dm 0 = nothing water-borne in reach).
+                    auto at = [&](int xx, int yy) { const size_t j = (size_t)yy * W + xx; return dm[j] > 1e-4f; };
+                    const int ax = at(xl, y) ? xl : x, bx = at(xr, y) ? xr : x;
+                    const int ay = at(x, yd) ? yd : y, by = at(x, yu) ? yu : y;
+                    float gx = (bx != ax) ? -(ds[(size_t)y * W + bx] - ds[(size_t)y * W + ax]) / (float)(bx - ax) : 0.0f;
+                    float gy = (by != ay) ? -(ds[(size_t)by * W + x] - ds[(size_t)ay * W + x]) / (float)(by - ay) : 0.0f;
+                    const float l = std::sqrt(gx * gx + gy * gy);
+                    if (l > 1e-4f) { fdx[i] = gx / l; fdy[i] = gy / l; fst[i] = 1.0f; }
+                } else if (w[3] > 0.5f || w[0] > 0.5f) { // beach / sea: onshore
+                    const float gx = lf[(size_t)y * W + xr] - lf[(size_t)y * W + xl];
+                    const float gy = lf[(size_t)yu * W + x] - lf[(size_t)yd * W + x];
+                    const float l = std::sqrt(gx * gx + gy * gy);
+                    if (l > 1e-6f) {
+                        fdx[i] = gx / l; fdy[i] = gy / l;
+                        // beach drifts onshore gently; open sea only near a coast (gradient ~ 1/Rc).
+                        fst[i] = (w[3] > 0.5f) ? 0.35f : std::min(1.0f, l * (float)Rc * 1.5f) * 0.15f;
+                    }
+                }
+            }
+        }
         // One blur pass over wet neighbours; dry cells take their wet neighbours' mean (the shore line
         // samples a valid body on both sides of the bilinear footprint).
         std::vector<float> t4(w4);
@@ -53007,6 +53090,33 @@ void destroyHostWindow(Renderer* R);
             }
             if (n) { for (int k = 0; k < 4; ++k) { w4[i * 4 + k] = acc[k] / (float)n; } }
         }
+        // Flow: the same wet-neighbour mean, so the heading turns smoothly and reaches over the shore.
+        {
+            std::vector<float> tx(fdx), ty(fdy), ts(fst);
+            for (size_t i = 0; i < N; ++i) {
+                const int x = (int)(i % W), y = (int)(i / W);
+                float ax = 0, ay = 0, as = 0; int n = 0;
+                auto add = [&](size_t j) { if (!wet[j]) { return; } ax += tx[j] * ts[j]; ay += ty[j] * ts[j]; as += ts[j]; ++n; };
+                add(i);
+                for (auto& o : nb) {
+                    const int nx = x + o[0], ny = y + o[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                    add((size_t)ny * W + nx);
+                }
+                if (n && as > 1e-4f) {
+                    const float l = std::sqrt(ax * ax + ay * ay);
+                    fdx[i] = (l > 1e-6f) ? ax / l : 0.0f; fdy[i] = (l > 1e-6f) ? ay / l : 0.0f;
+                    fst[i] = as / (float)n;
+                }
+            }
+        }
+        g_waterFlowBytes.assign(N, 0);
+        for (size_t i = 0; i < N; ++i) {
+            const uint32_t r = (uint32_t)std::clamp((int)((fdx[i] * 0.5f + 0.5f) * 255.0f + 0.5f), 0, 255);
+            const uint32_t g = (uint32_t)std::clamp((int)((fdy[i] * 0.5f + 0.5f) * 255.0f + 0.5f), 0, 255);
+            const uint32_t b = (uint32_t)std::clamp((int)(fst[i] * 255.0f + 0.5f), 0, 255);
+            g_waterFlowBytes[i] = r | (g << 8) | (b << 16);
+        }
         g_waterBodyBytes.assign(N, 0);
         for (size_t i = 0; i < N; ++i) {
             uint32_t v = 0;
@@ -53021,6 +53131,16 @@ void destroyHostWindow(Renderer* R);
         g_waterBodyXf[1] = (float)(cy0 - kPadCells) * Terrain::kCellSize;
         g_waterBodyXf[2] = 1.0f / ((float)W * kG);
         g_waterBodyXf[3] = 1.0f / ((float)H * kG);
+        // Dev: MGE_WATER_DUMP=<dir> writes both maps raw (RGBA8, W x H, row 0 = south) for inspection.
+        if (const char* dumpDir = std::getenv("MGE_WATER_DUMP")) {
+            const std::string base = std::string(dumpDir) + "\\water_";
+            for (int k = 0; k < 2; ++k) {
+                const std::vector<uint32_t>& v = k ? g_waterFlowBytes : g_waterBodyBytes;
+                if (FILE* f = std::fopen((base + (k ? "flow" : "bodies") + ".rgba").c_str(), "wb")) {
+                    std::fwrite(v.data(), 4, v.size(), f); std::fclose(f);
+                }
+            }
+        }
         LOG::logline(">> [water-bodies] baked %dx%d (512u) in %.0f ms: sea=%u river=%u pond=%u beach=%u cells",
                      W, H, hostNowMs() - t0, nCat[0], nCat[1], nCat[2], nCat[3]);
     }
@@ -53037,27 +53157,37 @@ void destroyHostWindow(Renderer* R);
         td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
         td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         td.pName = "waterBodies";
-        TextureLoadDesc tl = {}; tl.ppTexture = &g_pWaterBodyTex; tl.pDesc = &td;
-        addResource(&tl, nullptr);
-        waitForAllResourceLoads();
-        if (!g_pWaterBodyTex) { g_waterBodyFailed = true; LOG::logline("!! [water-bodies] texture alloc FAILED"); return; }
-        TextureUpdateDesc upd = {};
-        upd.pTexture = g_pWaterBodyTex;
-        upd.mBaseMipLevel = 0; upd.mMipLevels = 1; upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
-        upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-        beginUpdateResource(&upd);
-        TextureSubresourceUpdate sr = upd.getSubresourceUpdateDesc(0, 0);
-        for (uint32_t row = 0; row < sr.mRowCount; ++row) {
-            std::memcpy(sr.pMappedData + (size_t)row * sr.mDstRowStride,
-                        (const uint8_t*)g_waterBodyBytes.data() + (size_t)row * g_waterBodyW * 4u,
-                        (size_t)g_waterBodyW * 4u);
+        auto upload = [&](Texture** ppTex, const std::vector<uint32_t>& bytes, const char* name) -> bool {
+            td.pName = name;
+            TextureLoadDesc tl = {}; tl.ppTexture = ppTex; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+            waitForAllResourceLoads();
+            if (!*ppTex) { return false; }
+            TextureUpdateDesc upd = {};
+            upd.pTexture = *ppTex;
+            upd.mBaseMipLevel = 0; upd.mMipLevels = 1; upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+            upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            beginUpdateResource(&upd);
+            TextureSubresourceUpdate sr = upd.getSubresourceUpdateDesc(0, 0);
+            for (uint32_t row = 0; row < sr.mRowCount; ++row) {
+                std::memcpy(sr.pMappedData + (size_t)row * sr.mDstRowStride,
+                            (const uint8_t*)bytes.data() + (size_t)row * g_waterBodyW * 4u,
+                            (size_t)g_waterBodyW * 4u);
+            }
+            endUpdateResource(&upd);
+            waitForAllResourceLoads();
+            return true;
+        };
+        if (!upload(&g_pWaterBodyTex, g_waterBodyBytes, "waterBodies")
+            || !upload(&g_pWaterFlowTex, g_waterFlowBytes, "waterFlow")) {
+            g_waterBodyFailed = true; LOG::logline("!! [water-bodies] texture alloc/upload FAILED"); return;
         }
-        endUpdateResource(&upd);
-        waitForAllResourceLoads();
-        DescriptorData dd = {};
-        dd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterBodies);
-        dd.mCount = 1; dd.ppTextures = &g_pWaterBodyTex;
-        if (g_live.pPerFrameSet) { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &dd); }
+        DescriptorData dd[2] = {};
+        dd[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterBodies);
+        dd[0].mCount = 1; dd[0].ppTextures = &g_pWaterBodyTex;
+        dd[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterFlow);
+        dd[1].mCount = 1; dd[1].ppTextures = &g_pWaterFlowTex;
+        if (g_live.pPerFrameSet) { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 2, dd); }
         g_waterBodyBound = true;
         LOG::logline(">> [water-bodies] map uploaded + bound (%ux%u)", g_waterBodyW, g_waterBodyH);
     }
@@ -61431,6 +61561,10 @@ void destroyHostWindow(Renderer* R);
             mp[kWaterBodyAmpFloat + 1] = std::max(0.0f, g_waterAmpRiver);
             mp[kWaterBodyAmpFloat + 2] = std::max(0.0f, g_waterAmpPond);
             mp[kWaterBodyAmpFloat + 3] = std::max(0.0f, g_waterAmpBeach);
+            mp[kWaterFlowParamsFloat + 0] = std::max(0.0f, g_waterFlowSpeed);
+            mp[kWaterFlowParamsFloat + 1] = g_waterFlowPeriod;
+            mp[kWaterFlowParamsFloat + 2] = 0.0f;
+            mp[kWaterFlowParamsFloat + 3] = 0.0f;
         }
     }
 
@@ -65524,6 +65658,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGiFieldShader)       { removeShader(R, g_live.pGiFieldShader); g_live.pGiFieldShader = nullptr; }
         if (g_live.pGiField)             { removeRenderTarget(R, g_live.pGiField); g_live.pGiField = nullptr; }
         if (g_pWaterBodyTex)             { removeResource(g_pWaterBodyTex); g_pWaterBodyTex = nullptr; }
+        if (g_pWaterFlowTex)             { removeResource(g_pWaterFlowTex); g_pWaterFlowTex = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
         if (g_live.pSvmDepth)            { removeRenderTarget(R, g_live.pSvmDepth); g_live.pSvmDepth = nullptr; }
         if (g_live.pSkyVisSet)           { removeDescriptorSet(R, g_live.pSkyVisSet); g_live.pSkyVisSet = nullptr; }

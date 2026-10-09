@@ -1068,4 +1068,6 @@ STRUCT(ShadowMaskParams)
     // per-body wave amplitude in its channel order (sea, river, pond, beach).
     DATA(float4,   waterFlowMap,     None);
     DATA(float4,   waterBodyAmp,     None);
+    // x = flow speed (world units / s at strength 1), y = advection period (s; divides the 20 s clock).
+    DATA(float4,   waterFlowParams,  None);
 };
