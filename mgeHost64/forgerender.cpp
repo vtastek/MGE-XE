@@ -8515,6 +8515,7 @@ namespace {
     // terraindisp.h.fsl). Only with the near rung at 0 (it adds exactly one step) and only while D1 is
     // inside the fade end (past it there is nothing displaced to step). 0 = off.
     float    g_terrainPatchStep  = 800.0f;
+    float    g_terrainFarNoPbrRung = 0.0f;   // cost probe (terrainRecord): cell rungs >= this draw no-PBR
     // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
     // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
     // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
@@ -23918,6 +23919,7 @@ namespace {
             { "terrainDispLod",      &g_terrainDispLod      },
             { "terrainPatchRung",    &g_terrainPatchRung    },
             { "terrainPatchStep",    &g_terrainPatchStep    },
+            { "terrainFarNoPbrRung", &g_terrainFarNoPbrRung },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -53241,6 +53243,15 @@ void destroyHostWindow(Renderer* R);
                 if (pso == g_pTerrainPipelineMirror && g_pTerrainPipelineMirrorFull) {
                     Pipeline* want = ((float)l < g_reflTerrainFullRungs) ? g_pTerrainPipelineMirrorFull
                                                                          : g_pTerrainPipelineMirror;
+                    if (want != boundMirror) { cmdBindPipeline(cmd, want); boundMirror = want; }
+                }
+                // terrainFarNoPbrRung (cost probe, 0 = off): whole cells at or past this rung draw the
+                // main view with the PBR-compiled-out variant — a different PROGRAM, so its register
+                // budget, unlike a per-pixel branch, which keeps the worst path's registers.
+                if (pso == mainPso && !dbgVar && g_terrainFarNoPbrRung >= 1.0f && f == kTerrainFamCell
+                    && g_pTerrainPipelineNoPbr && g_pTerrainPipelineEQNoPbr) {
+                    Pipeline* farPso = (mainPso == eqPso) ? g_pTerrainPipelineEQNoPbr : g_pTerrainPipelineNoPbr;
+                    Pipeline* want = ((float)l >= g_terrainFarNoPbrRung) ? farPso : mainPso;
                     if (want != boundMirror) { cmdBindPipeline(cmd, want); boundMirror = want; }
                 }
                 cmdDrawIndexedInstanced(cmd, rg.indexCount, rg.firstIndex, n, rg.firstVertex, firstInstance);
