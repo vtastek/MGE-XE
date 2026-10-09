@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 169 "FSL/shaders.list"
+#line 179 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1264,6 +1264,7 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 skyAOFloor;
 
 
@@ -1272,7 +1273,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 sunNoise;
-#line 1063
+#line 1064
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1676,6 +1677,11 @@ STRUCT(LightData)
 
 
 
+        Tex2D(float4) gGiField :  register(t154,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1688,7 +1694,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 724 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 729 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1699,7 +1705,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 748 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 753 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobosample.h.fsl"
@@ -2155,15 +2161,40 @@ float3 skyAmbFactorAO(float3 N, float ao)
 }
 
 
+
+
+
+
+
+float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+{
+    float3 f = skyAmbFactorAO(N, ao);
+    float g = gShadowParams.skyAOFloor.z;
+    if (g <= 0.0f || ao >= 1.0f) { return f; }
+    float4 m = gShadowParams.skyAOMap;
+    float2 uv = (worldPosRel.xy + gFrameData.lodEye.xy - m.xy) * m.z;
+    float2 e = abs(uv - 0.5f) * 2.0f;
+    float edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    float4 fld = SampleLvlTex2D(gGiField, gSamplerBilinearClamp, uv, 0.0f);
+    float w = saturate(fld.a) * edge;
+    if (w <= 0.0f) { return f; }
+
+    float ambL = dot(gFrameData.ambCol.rgb, float3(0.299f, 0.587f, 0.114f));
+    float fl = (ambL > 1.0e-6f) ? min(gShadowParams.skyAOFloor.x / ambL, gShadowParams.skyAOFloor.y) : 0.0f;
+    float3 amb = max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+    float3 bounce = (fld.rgb / max(fld.a, 1.0e-3f)) * g / amb;
+    return f + (bounce - f3(fl)) * (1.0f - ao) * w;
+}
+
 float3 skyAmbFactor(float3 N, float3 worldPosRel)
 {
-    return skyAmbFactorAO(N, skyAOTerm(N, worldPosRel));
+    return skyAmbFactorAOp(N, skyAOTerm(N, worldPosRel), worldPosRel);
 }
 
 
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
-    return skyAmbFactorAO(N, skyAOTermPx(N, worldPosRel, svPos));
+    return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 #line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -4001,4 +4032,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }
-#line 170 "FSL/shaders.list"
+#line 180 "FSL/shaders.list"

@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 696 "FSL/shaders.list"
+#line 706 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur2d.comp.fsl"
 #line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur2d.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
@@ -1033,8 +1033,10 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     const int2 px = int2(GroupID.xy) *  16  + int2(GroupThreadID.xy);
     const bool copy = !(sigma > 0.0f);
     const float inv2 = copy ? 0.0f : 1.0f / (2.0f * sigma * sigma);
+
+    float w[2 *  4  + 1];
     float wsum = 0.0f;
-    UNROLL for (int k = - 4 ; k <=  4 ; ++k) { wsum += exp(-float(k * k) * inv2); }
+    UNROLL for (int k = - 4 ; k <=  4 ; ++k) { w[k +  4 ] = exp(-float(k * k) * inv2); wsum += w[k +  4 ]; }
     const float invW = (wsum > 0.0f) ? (1.0f / wsum) : 0.0f;
 
 
@@ -1045,7 +1047,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
         float4 s = float4(0.0f, 0.0f, 0.0f, 0.0f);
         UNROLL for (int k = - 4 ; k <=  4 ; ++k)
         {
-            s += g_sbSrc[row *  ( 16 + 2 * 4 )  + col +  4  + k] * exp(-float(k * k) * inv2);
+            s += g_sbSrc[row *  ( 16 + 2 * 4 )  + col +  4  + k] * w[k +  4 ];
         }
         g_sbH[j] = s * invW;
     }
@@ -1065,7 +1067,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
             float4 s = float4(0.0f, 0.0f, 0.0f, 0.0f);
             UNROLL for (int k = - 4 ; k <=  4 ; ++k)
             {
-                s += g_sbH[((int)GroupThreadID.y +  4  + k) *  16  + (int)GroupThreadID.x] * exp(-float(k * k) * inv2);
+                s += g_sbH[((int)GroupThreadID.y +  4  + k) *  16  + (int)GroupThreadID.x] * w[k +  4 ];
             }
             o = s * invW;
         }
@@ -1073,4 +1075,4 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     }
     return;
 }
-#line 697 "FSL/shaders.list"
+#line 707 "FSL/shaders.list"

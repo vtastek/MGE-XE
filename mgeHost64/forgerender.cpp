@@ -3535,6 +3535,13 @@ namespace {
         Pipeline*      pMultiMapSunPipeline = nullptr;
         Shader*        pRigidSunShader = nullptr;        // ...and LIVE rigid movers (held items, doors): opaque.vert + sunshadow.frag
         Pipeline*      pRigidSunPipeline = nullptr;
+        // GI field (tasks/forge-gi.md v2): 128^2 RGBA16F premultiplied radiance over gSkyHeight's
+        // window, blended into each frame by gifield.frag. Built lazily by giFieldUpdate.
+        RenderTarget*  pGiField = nullptr;
+        Shader*        pGiFieldShader = nullptr;
+        Pipeline*      pGiFieldPipeline = nullptr;
+        bool           giReady = false;
+        bool           giFailed = false;
         // Blended skinned parts (ghosts, mane/hair cards): skinned.vert + alpha.frag, composited in
         // the alpha stage with REAL alpha instead of opaque.frag's forced 1.0. Depth GEQUAL test /
         // never write, same rule the AT1 colour PSOs follow. Cull honours the part's DRAW_BOTH flag.
@@ -8525,7 +8532,12 @@ namespace {
     // terraindisp.h.fsl). Only with the near rung at 0 (it adds exactly one step) and only while D1 is
     // inside the fade end (past it there is nothing displaced to step). 0 = off.
     float    g_terrainPatchStep  = 800.0f;
-    float    g_terrainFarNoPbrRung = 0.0f;   // cost probe (terrainRecord): cell rungs >= this draw no-PBR
+    float    g_terrainFarNoPbrRung = 0.0f;
+    // GI field (tasks/forge-gi.md v2): giGain > 0 replaces the occluded share's constant floor with the
+    // field's bounce, at that gain. 0 = off (default until the user has seen it). giBlend = the per-frame
+    // blend weight of each new field (~1 s to settle at 0.05 / 60 fps).
+    float    g_giGain  = 0.0f;
+    float    g_giBlend = 0.05f;   // cost probe (terrainRecord): cell rungs >= this draw no-PBR
     // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
     // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
     // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
@@ -24034,6 +24046,8 @@ namespace {
             { "terrainPatchRung",    &g_terrainPatchRung    },
             { "terrainPatchStep",    &g_terrainPatchStep    },
             { "terrainFarNoPbrRung", &g_terrainFarNoPbrRung },
+            { "giGain",              &g_giGain              },
+            { "giBlend",             &g_giBlend             },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -33084,6 +33098,7 @@ void destroyHostWindow(Renderer* R);
     void dlLiveRecord();
     void terrainRecordDepth(Cmd* cmd);   // host-owned terrain, depth-only — the Z-prepass entry
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
+    void giFieldUpdate();     // GI field producer (tasks/forge-gi.md v2)
     void blurSunMoments();    // SUN shadow: separable Gaussian over the moments — what makes MSM soft
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
     bool createOccProbeResources(Renderer* R);  // H0: lazy, the first frame `occProbe` is armed
@@ -35297,6 +35312,7 @@ void destroyHostWindow(Renderer* R);
         }
         gpuPhaseBegin(kGpuPhaseShadowSun);
         renderSunShadow();
+        giFieldUpdate();   // GI field: after the sun pass (it reads gSunOcc/gSkyHeight, not the moments)
         gpuPhaseEnd(kGpuPhaseShadowSun);
 
         // --- W8d DIAGNOSTIC: every uniform the in-scatter reads, one CSV row per frame ----------
@@ -61129,8 +61145,10 @@ void destroyHostWindow(Renderer* R);
         decodeAuthoredRGB(g);
         mp[kSkyAOFloorFloat + 0] = g[0] * g_calAmbGain * sunnyM();
         mp[kSkyAOFloorFloat + 1] = std::max(0.0f, std::min(g_skyAOFloorMax, 1.0f));
-        mp[kSkyAOFloorFloat + 2] = 0.0f;
-        mp[kSkyAOFloorFloat + 3] = 0.0f;
+        // GI field (tasks/forge-gi.md v2): z = gain on the field's bounce in place of the floor
+        // (0 = off, the floor exactly as before), w = the producer's per-frame blend weight.
+        mp[kSkyAOFloorFloat + 2] = (g_live.giReady && g_dlExterior) ? std::max(0.0f, g_giGain) : 0.0f;
+        mp[kSkyAOFloorFloat + 3] = std::clamp(g_giBlend, 0.001f, 1.0f);
         // Sun PCSS disc noise. Auto (3) takes the per-frame sequence only while a TEMPORAL upscaler
         // runs — it is what integrates it; without one, the static pixel pattern.
         static uint32_t s_sunNoiseFrame = 0;
@@ -62967,6 +62985,94 @@ void destroyHostWindow(Renderer* R);
             texBarrier(g_live.pSunMoments->pTexture, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
             texBarrier(g_live.pSunMomentsScratch, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // GI field producer (tasks/forge-gi.md v2). Lazily builds its RT + pipeline + bindings the first
+    // time giGain > 0, then draws gifield.frag over the 128^2 field each exterior frame, blending into
+    // what is there (SRC_ALPHA / INV_SRC_ALPHA colour, ONE / INV_SRC_ALPHA alpha => premultiplied
+    // radiance whose alpha climbs to 1). A window move clears it first: the receiver divides by alpha,
+    // so the field is right from the first frame and only its WEIGHT eases in.
+    void giFieldUpdate() {
+        if (g_giGain <= 0.0f || !g_dlExterior || !g_live.pSkyHeight || g_live.giFailed) { return; }
+        Renderer* R = g_live.pRenderer;
+        if (!g_live.giReady) {
+            RenderTargetDesc d = {};
+            d.mWidth = 128; d.mHeight = 128; d.mDepth = 1; d.mArraySize = 1; d.mMipLevels = 1;
+            d.mSampleCount = SAMPLE_COUNT_1; d.mSampleQuality = 0;
+            d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            d.pName = "giField";
+            addRenderTarget(R, &d, &g_live.pGiField);
+            ShaderLoadDesc sd = {};
+            sd.mVert.pFileName = "shadowatlasview.vert";
+            sd.mFrag.pFileName = "gifield.frag";
+            addShader(R, &sd, &g_live.pGiFieldShader);
+            if (g_live.pGiField && g_live.pGiFieldShader) {
+                TinyImageFormat fmt = TinyImageFormat_R16G16B16A16_SFLOAT;
+                BlendStateDesc b = {};
+                b.mSrcFactors[0] = BC_SRC_ALPHA;      b.mDstFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+                b.mSrcAlphaFactors[0] = BC_ONE;       b.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+                b.mBlendModes[0] = BM_ADD;            b.mBlendAlphaModes[0] = BM_ADD;
+                b.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                b.mRenderTargetMask = BLEND_STATE_TARGET_0;
+                RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE;
+                DepthStateDesc ds = {};
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+                g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                g.mRenderTargetCount = 1;
+                g.pColorFormats = &fmt;
+                g.mSampleCount = SAMPLE_COUNT_1;
+                g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+                g.pDepthState = &ds;
+                g.pRasterizerState = &rs;
+                g.pBlendState = &b;
+                g.pVertexLayout = nullptr;
+                g.pShaderProgram = g_live.pGiFieldShader;
+                addPipeline(R, &pd, &g_live.pGiFieldPipeline);
+            }
+            if (!g_live.pGiFieldPipeline) {
+                LOG::logline("!! [forge][gi] field pipeline FAILED — GI off");
+                g_live.giFailed = true;
+                return;
+            }
+            // Bind into the sets whose receivers take skyAmbFactor: main, mirror geometry, FP arms.
+            DescriptorData dd = {};
+            dd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gGiField);
+            dd.mCount = 1; dd.ppTextures = &g_live.pGiField->pTexture;
+            if (g_live.pPerFrameSet)            { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &dd); }
+            if (g_live.pPerFrameSetReflectGeo)  { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &dd); }
+            if (g_live.pPerFrameSetFP)          { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &dd); }
+            g_live.giReady = true;
+            LOG::logline(">> [forge][gi] field ready (128^2 RGBA16F over the sky-height window)");
+        }
+        static float s_giOrigin[2] = { 1e30f, 1e30f };
+        const bool reset = (s_giOrigin[0] != g_skyHeightOrigin[0] || s_giOrigin[1] != g_skyHeightOrigin[1]);
+        s_giOrigin[0] = g_skyHeightOrigin[0]; s_giOrigin[1] = g_skyHeightOrigin[1];
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.4f, "GI FIELD");
+        RenderTargetBarrier rb = {};
+        rb.pRenderTarget = g_live.pGiField;
+        rb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE; rb.mNewState = RESOURCE_STATE_RENDER_TARGET;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+        BindRenderTargetsDesc bd = {};
+        bd.mRenderTargetCount = 1;
+        bd.mRenderTargets[0] = { g_live.pGiField, reset ? LOAD_ACTION_CLEAR : LOAD_ACTION_LOAD };
+        cmdBindRenderTargets(g_live.pCmd, &bd);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, 128.0f, 128.0f, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, 128, 128);
+        cmdBindPipeline(g_live.pCmd, g_live.pGiFieldPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdDraw(g_live.pCmd, 3, 0);
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+        rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET; rb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -65141,6 +65247,9 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSunMomentsScratch)   { removeResource(g_live.pSunMomentsScratch); g_live.pSunMomentsScratch = nullptr; }
         if (g_live.pSunMoments)          { removeRenderTarget(R, g_live.pSunMoments); g_live.pSunMoments = nullptr; }
         if (g_live.pSunMomentsRaw)       { removeRenderTarget(R, g_live.pSunMomentsRaw); g_live.pSunMomentsRaw = nullptr; }
+        if (g_live.pGiFieldPipeline)     { removePipeline(R, g_live.pGiFieldPipeline); g_live.pGiFieldPipeline = nullptr; }
+        if (g_live.pGiFieldShader)       { removeShader(R, g_live.pGiFieldShader); g_live.pGiFieldShader = nullptr; }
+        if (g_live.pGiField)             { removeRenderTarget(R, g_live.pGiField); g_live.pGiField = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
         if (g_live.pSvmDepth)            { removeRenderTarget(R, g_live.pSvmDepth); g_live.pSvmDepth = nullptr; }
         if (g_live.pSkyVisSet)           { removeDescriptorSet(R, g_live.pSkyVisSet); g_live.pSkyVisSet = nullptr; }

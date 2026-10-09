@@ -691,6 +691,11 @@ BEGIN_SRT_NO_AB(SrtData)
 #else
         DECL_TEXTURE(PerFrame, Depth2D(float), gSceneDepthMS)
 #endif
+        // GI field (gifield.frag.fsl, tasks/forge-gi.md v2): low-frequency RGB surface radiance over
+        // gSkyHeight's window (same mapping, gShadowParams.skyAOMap); a = settled-ness (0 = no data).
+        // Read by skyamb.h.fsl in place of the constant occluded-share floor when skyAOFloor.z > 0.
+        // Unbound reads (0,0,0,0) -> a = 0 -> the receiver keeps the floor. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gGiField)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

@@ -84,6 +84,11 @@
 #include "sunshadow_mm.frag.fsl"
 #end
 
+// GI field producer (tasks/forge-gi.md v2): fullscreen over the field RT, paired with shadowatlasview.vert.
+#frag gifield.frag
+#include "gifield.frag.fsl"
+#end
+
 // SUN shadow moments for DL STATICS (the PRIMARY caster proxy — casts off-screen into the near
 // scene). Pairs with statics.vert's VSOutput; statics bindless sample + 133/255 cutout.
 #frag sunshadow_statics.frag

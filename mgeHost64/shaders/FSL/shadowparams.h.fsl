@@ -1051,7 +1051,8 @@ STRUCT(ShadowMaskParams)
     //       MW-family path an interior's own ambCol takes); 0 = no floor.
     //   y = the cap on floor / (this frame's ambCol luma): at night the open sky is dimmer than an
     //       interior, and an uncapped floor would light the tunnel brighter than the ground outside.
-    //   zw = spare
+    //   z = GI field gain (tasks/forge-gi.md; 0 = off: the constant floor above, exactly as before),
+    //   w = the GI field producer's per-frame blend weight (gifield.frag writes it as alpha).
     DATA(float4,   skyAOFloor,       None);
     // SUN PCSS DISC ROTATION NOISE (msmrecv.h.fsl sunDiscRotation):
     //   x = 0 the legacy white hash of worldPosRel | 1 interleaved gradient noise on the PIXEL

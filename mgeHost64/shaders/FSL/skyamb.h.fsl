@@ -328,15 +328,40 @@ float3 skyAmbFactorAO(float3 N, float ao)
 }
 
 
+// GI (tasks/forge-gi.md v2): the occluded share's fill from the GI FIELD — what the surroundings
+// actually reflect (sunlit sand, shadowed rock, water) — instead of the constant floor. The field is
+// low-frequency RGB radiance in the same units the lit surfaces carry, so dividing by ambCol turns it
+// into this function's factor. Falls back to the floor wherever the field has no data (alpha 0:
+// unbound in this set, outside the window, not yet settled) so a missing field reads as today.
+float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+{
+    float3 f = skyAmbFactorAO(N, ao);
+    float  g = gShadowParams.skyAOFloor.z;
+    if (g <= 0.0f || ao >= 1.0f) { return f; }
+    float4 m  = gShadowParams.skyAOMap;
+    float2 uv = (worldPosRel.xy + gFrameData.lodEye.xy - m.xy) * m.z;
+    float2 e  = abs(uv - 0.5f) * 2.0f;
+    float  edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    float4 fld = SampleLvlTex2D(gGiField, gSamplerBilinearClamp, uv, 0.0f);
+    float  w   = saturate(fld.a) * edge;
+    if (w <= 0.0f) { return f; }
+    // Undo the constant floor skyAmbFactorAO added, then add the field's bounce in its place.
+    float ambL = dot(gFrameData.ambCol.rgb, float3(0.299f, 0.587f, 0.114f));
+    float fl   = (ambL > 1.0e-6f) ? min(gShadowParams.skyAOFloor.x / ambL, gShadowParams.skyAOFloor.y) : 0.0f;
+    float3 amb = max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+    float3 bounce = (fld.rgb / max(fld.a, 1.0e-3f)) * g / amb;
+    return f + (bounce - f3(fl)) * (1.0f - ao) * w;
+}
+
 float3 skyAmbFactor(float3 N, float3 worldPosRel)
 {
-    return skyAmbFactorAO(N, skyAOTerm(N, worldPosRel));
+    return skyAmbFactorAOp(N, skyAOTerm(N, worldPosRel), worldPosRel);
 }
 
 // The MAIN camera's lit fragments: the same factor with the sky-visibility screen term.
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
-    return skyAmbFactorAO(N, skyAOTermPx(N, worldPosRel, svPos));
+    return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 
 #endif // SKY_AMB_H
