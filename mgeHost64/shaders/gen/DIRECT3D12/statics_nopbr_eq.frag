@@ -2382,7 +2382,11 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
     float2 e = abs(uv - 0.5f) * 2.0f;
     float edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
     float4 fld = SampleLvlTex2D(gGiField, gSamplerBilinearClamp, uv, 0.0f);
-    float w = saturate(fld.a) * edge;
+
+
+
+
+    float w = saturate(fld.a * 1.0e4f) * edge;
     if (w <= 0.0f) { return f; }
 
     float ambL = dot(gFrameData.ambCol.rgb, float3(0.299f, 0.587f, 0.114f));
