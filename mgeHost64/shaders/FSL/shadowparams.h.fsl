@@ -1070,4 +1070,6 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   waterBodyAmp,     None);
     // x = flow speed (world units / s at strength 1), y = advection period (s; divides the 20 s clock).
     DATA(float4,   waterFlowParams,  None);
+    // PUDDLES (weather.h.fsl): x = standing-water level 0..1, y = max share of flat open ground covered.
+    DATA(float4,   weatherState2,    None);
 };

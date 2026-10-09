@@ -1282,7 +1282,9 @@ STRUCT(ShadowMaskParams)
     float4 waterBodyAmp;
 
     float4 waterFlowParams;
-#line 1073
+
+    float4 weatherState2;
+#line 1075
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

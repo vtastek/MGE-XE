@@ -1282,7 +1282,9 @@ STRUCT(ShadowMaskParams)
     float4 waterBodyAmp;
 
     float4 waterFlowParams;
-#line 1073
+
+    float4 weatherState2;
+#line 1075
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2433,6 +2435,41 @@ void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel, float snowS
     float snowE = w.y * open * saturate((N.z - 0.35f) * 2.5f) * snowScale;
     albedo *= (1.0f - w.z * wetE);
     albedo = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
+}
+
+
+
+
+
+float weatherHash(float2 p)
+{
+    p = frac(p * float2(127.1f, 311.7f));
+    p += dot(p, p + 34.23f);
+    return frac(p.x * p.y);
+}
+float weatherVnoise(float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = frac(p);
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    return lerp(lerp(weatherHash(i), weatherHash(i + float2(1.0f, 0.0f)), u.x),
+                lerp(weatherHash(i + float2(0.0f, 1.0f)), weatherHash(i + float2(1.0f, 1.0f)), u.x), u.y);
+}
+float weatherPuddle(float3 N, float3 worldPosRel)
+{
+    const float lvl = gShadowParams.weatherState2.x;
+    if (lvl <= 0.0f) { return 0.0f; }
+
+    const float kScale = 1.0f / 420.0f;
+    const float2 eyeT = frac(gFrameData.lodEye.xy * (kScale / 64.0f)) * 64.0f;
+    const float2 p = worldPosRel.xy * kScale + eyeT;
+    const float n = 0.65f * weatherVnoise(p) + 0.35f * weatherVnoise(p * 2.3f + 17.1f);
+
+    const float thr = 1.0f - lvl * gShadowParams.weatherState2.y * 1.6f;
+    const float edge = 0.035f;
+    float pud = smoothstep(thr - edge, thr + edge, n);
+    pud *= smoothstep(0.94f, 0.985f, N.z) * (1.0f - weatherCover(worldPosRel));
+    return pud;
 }
 
 

@@ -42,6 +42,41 @@ void weatherApply(inout float3 albedo, float3 N, float3 worldPosRel, float snowS
     albedo  = lerp(albedo, float3(w.w, w.w, w.w * 1.04f), snowE);
 }
 
+// PUDDLES — standing water on flat, open ground, 0..1. Where it pools is a fixed world pattern (two
+// octaves of value noise, ~3-6 m blobs) thresholded by the level: as rain goes on the blobs grow from
+// their centres and merge, and they shrink back the same way as it drains. Flat only (N.z), so slopes
+// shed the water. LOW-frequency by design: an edge every few metres, never per-pixel speckle.
+float weatherHash(float2 p)
+{
+    p = frac(p * float2(127.1f, 311.7f));
+    p += dot(p, p + 34.23f);
+    return frac(p.x * p.y);
+}
+float weatherVnoise(float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = frac(p);
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    return lerp(lerp(weatherHash(i), weatherHash(i + float2(1.0f, 0.0f)), u.x),
+                lerp(weatherHash(i + float2(0.0f, 1.0f)), weatherHash(i + float2(1.0f, 1.0f)), u.x), u.y);
+}
+float weatherPuddle(float3 N, float3 worldPosRel)
+{
+    const float lvl = gShadowParams.weatherState2.x;
+    if (lvl <= 0.0f) { return 0.0f; }
+    // Eye-relative + eye split (the eye folded mod the noise period first) so float32 keeps the fraction.
+    const float  kScale = 1.0f / 420.0f;
+    const float2 eyeT = frac(gFrameData.lodEye.xy * (kScale / 64.0f)) * 64.0f;
+    const float2 p = worldPosRel.xy * kScale + eyeT;
+    const float  n = 0.65f * weatherVnoise(p) + 0.35f * weatherVnoise(p * 2.3f + 17.1f);
+    // Threshold falls as the level rises; max cover = the share of the noise range let under water.
+    const float  thr = 1.0f - lvl * gShadowParams.weatherState2.y * 1.6f;
+    const float  edge = 0.035f;
+    float pud = smoothstep(thr - edge, thr + edge, n);
+    pud *= smoothstep(0.94f, 0.985f, N.z) * (1.0f - weatherCover(worldPosRel));
+    return pud;
+}
+
 // A wet surface's specular: water fills the micro-relief, so roughness falls toward a thin film's.
 // Only where a PBR material exists to carry the lobe (terrain/statics/meshes with a _paramh).
 float weatherRoughness(float rough, float3 N, float3 worldPosRel)

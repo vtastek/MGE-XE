@@ -6797,6 +6797,9 @@ namespace {
     // ...and the flow: x = speed (world units / s at strength 1), y = advection period (s, must divide
     // the 20 s water clock), zw spare.
     constexpr uint32_t kWaterFlowParamsFloat  = kWaterBodyAmpFloat + 4;
+    // PUDDLES: x = standing-water level 0..1 (integrated slower than wetness), y = max ground share
+    // they may cover, zw spare.
+    constexpr uint32_t kWeather2Float         = kWaterFlowParamsFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6830,6 +6833,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, waterFlowParams) == kWaterFlowParamsFloat * sizeof(float),
                   "kWaterFlowParamsFloat does not land on ShadowMaskParams::waterFlowParams");
+    static_assert((kWeather2Float + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, weatherState2) == kWeather2Float * sizeof(float),
+                  "kWeather2Float does not land on ShadowMaskParams::weatherState2");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8567,6 +8574,12 @@ namespace {
     float    g_weatherSnowAlbedo = 0.85f;    // snow's albedo
     float    g_weatherWet = 0.0f, g_weatherSnow = 0.0f;   // last published (heartbeat)
     float    g_weatherDebugWet  = -1.0f;   // >= 0 overrides the integrated wetness (A/B, screenshots)
+    // PUDDLES: standing water fills far slower than surfaces wet (minutes of rain) and outlasts them.
+    float    g_weatherPuddleSec   = 240.0f;  // time constant to fill at full rain
+    float    g_weatherPuddleDrySec = 600.0f; // ...to drain/evaporate once it stops
+    float    g_weatherPuddleCover = 0.35f;   // max share of flat open ground under water
+    float    g_weatherPuddle = 0.0f;         // last published (heartbeat)
+    float    g_weatherDebugPuddle = -1.0f;   // >= 0 overrides the integrated level
     // WATER BODIES (scene-walk-v2 port): per-body wave amplitude off a one-hot body mask baked once
     // from LAND (bakeWaterBodies). 1 = today's tuned look; the defaults calm rivers and ponds and keep
     // sea and beach as they were. waterBodies=0 = no map (every body 1x).
@@ -24102,6 +24115,10 @@ namespace {
             { "terrainFarNoPbrRung", &g_terrainFarNoPbrRung },
             { "giGain",              &g_giGain              },
             { "weatherWetSec",       &g_weatherWetSec       },
+            { "weatherPuddleSec",    &g_weatherPuddleSec    },
+            { "weatherPuddleDrySec", &g_weatherPuddleDrySec },
+            { "weatherPuddleCover",  &g_weatherPuddleCover  },
+            { "weatherDebugPuddle",  &g_weatherDebugPuddle  },
             { "weatherDrySec",       &g_weatherDrySec       },
             { "weatherSnowSec",      &g_weatherSnowSec      },
             { "weatherMeltSec",      &g_weatherMeltSec      },
@@ -27087,6 +27104,8 @@ namespace {
           t.checkbox("Weather surface state (wet / snow from MW weather)", &g_weatherSurface);
           t.sliderF("Weather DEBUG wetness (-1 = live)", &g_weatherDebugWet, -1.0f, 1.0f, 0.05f);
           t.sliderF("Weather DEBUG snow (-1 = live)", &g_weatherDebugSnow, -1.0f, 1.0f, 0.05f);
+          t.sliderF("Weather DEBUG puddles (-1 = live)", &g_weatherDebugPuddle, -1.0f, 1.0f, 0.05f);
+          t.sliderF("Weather puddle max cover", &g_weatherPuddleCover, 0.0f, 1.0f, 0.05f);
           t.sliderF("Weather wet darkening", &g_weatherWetDarken, 0.0f, 0.9f, 0.05f);
           t.checkbox("Water bodies (per-body wave amplitude, baked from LAND)", &g_waterBodies);
           t.sliderF("Water amp: open sea", &g_waterAmpSea, 0.0f, 3.0f, 0.05f);
@@ -37395,8 +37414,8 @@ void destroyHostWindow(Renderer* R);
             char wakeTilesText[48], fineTilesText[48];
             tilesText(g_live.rippleWake, wakeTilesText, sizeof(wakeTilesText));
             tilesText(g_live.rippleFine, fineTilesText, sizeof(fineTilesText));
-            LOG::logline(">> [forge-hb] weather: wet=%.2f snow=%.2f (rain=%.0f snowCount=%.0f)",
-                         g_weatherWet, g_weatherSnow, g_rainWetRain, g_rainWetSnow);
+            LOG::logline(">> [forge-hb] weather: wet=%.2f puddle=%.2f snow=%.2f (rain=%.0f snowCount=%.0f)",
+                         g_weatherWet, g_weatherPuddle, g_weatherSnow, g_rainWetRain, g_rainWetSnow);
             LOG::logline(">> [forge-hb] sun: blur=%.2f (%s) actorDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseSunBlur], g_live.sunBlurFused ? "fused" : "two-pass",
                          g_lastSunActorDraws);
@@ -61535,7 +61554,7 @@ void destroyHostWindow(Renderer* R);
         {
             static double s_wTms = 0.0;
             static bool   s_wInit = false;
-            static float  s_wet = 0.0f, s_snow = 0.0f;
+            static float  s_wet = 0.0f, s_snow = 0.0f, s_pud = 0.0f;
             const double now = hostNowMs();
             const float  dt  = s_wInit ? (float)std::min((now - s_wTms) * 0.001, 0.25) : 0.0f;
             s_wTms = now;
@@ -61543,12 +61562,14 @@ void destroyHostWindow(Renderer* R);
             const float rain = std::clamp(g_rainWetRain / ref, 0.0f, 1.0f);
             const float snow = std::clamp(g_rainWetSnow / ref, 0.0f, 1.0f);
             if (!s_wInit) {
-                s_wet = rain; s_snow = snow; s_wInit = true;   // load INTO a storm: already wet
+                s_wet = rain; s_snow = snow; s_pud = rain * 0.5f; s_wInit = true;   // load INTO a storm: already wet
             } else {
                 // Wetting toward 1 at a rate set by intensity (~10 s in a downpour); drying toward
                 // 0 over g_weatherDrySec once it stops (rain still falling holds the level).
                 s_wet  += (1.0f - s_wet) * std::min(1.0f, rain * dt / std::max(g_weatherWetSec, 0.1f));
                 s_wet  -= s_wet * std::min(1.0f, (1.0f - rain) * dt / std::max(g_weatherDrySec, 0.1f));
+                s_pud  += (1.0f - s_pud) * std::min(1.0f, rain * dt / std::max(g_weatherPuddleSec, 0.1f));
+                s_pud  -= s_pud * std::min(1.0f, (1.0f - rain) * dt / std::max(g_weatherPuddleDrySec, 0.1f));
                 s_snow += (1.0f - s_snow) * std::min(1.0f, snow * dt / std::max(g_weatherSnowSec, 0.1f));
                 s_snow -= s_snow * std::min(1.0f, (1.0f - snow) * dt / std::max(g_weatherMeltSec, 0.1f));
             }
@@ -61560,6 +61581,12 @@ void destroyHostWindow(Renderer* R);
             mp[kWeatherFloat + 1] = on ? sPub : 0.0f;
             mp[kWeatherFloat + 2] = std::clamp(g_weatherWetDarken, 0.0f, 0.9f);
             mp[kWeatherFloat + 3] = std::clamp(g_weatherSnowAlbedo, 0.0f, 1.0f);
+            g_weatherPuddle = s_pud;
+            const float pPub = (g_weatherDebugPuddle >= 0.0f) ? std::min(g_weatherDebugPuddle, 1.0f) : s_pud;
+            mp[kWeather2Float + 0] = on ? pPub : 0.0f;
+            mp[kWeather2Float + 1] = std::clamp(g_weatherPuddleCover, 0.0f, 1.0f);
+            mp[kWeather2Float + 2] = 0.0f;
+            mp[kWeather2Float + 3] = 0.0f;
         }
         {
             const bool on = g_waterBodies && g_waterBodyBound && g_dlExterior;
