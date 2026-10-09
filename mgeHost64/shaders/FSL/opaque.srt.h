@@ -702,6 +702,11 @@ BEGIN_SRT_NO_AB(SrtData)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gWaterBodies)
         // ...and the baked flow: rg = heading * 0.5 + 0.5 (river downstream, beach onshore), b = strength.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gWaterFlow)
+        // S — the LOCAL WATER SIM's display field (swsim.srt.h layout D): xy = horizontal displacement,
+        // z = display height, w = whitewater mass. Mapped by gBatch.worlds[15] in the water pass.
+        // water.vert displaces the near rings with it; water.frag takes normals + whitewater from it.
+        // Unbound reads zero = flat. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSwField)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

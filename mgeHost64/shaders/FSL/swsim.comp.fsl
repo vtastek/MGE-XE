@@ -1,0 +1,351 @@
+// mgeHost64 — S: the local shallow-water step (model, layout and lanes: swsim.srt.h).
+//
+// One shader, two passes (gSwParams.grid.w): 0 = velocity, 1 = height. The host records each pass
+// with its OWN cbuffer and set (cmdDispatch records, it does not execute — ripplesim.srt.h's lesson).
+
+#include "swsim.srt.h"
+
+#define SW_THREADS 8
+#define SW_DRY     0.5f      // film depth (u): a face shallower than this does not flow
+#define SW_NONE    -20000.0f // gSkyHeight's "no surface here" sentinel
+
+float swHash(float2 p)
+{
+    p = frac(p * float2(0.1031f, 0.1030f));
+    p += dot(p, p.yx + 33.33f);
+    return frac((p.x + p.y) * p.x);
+}
+float swNoise(float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = p - i;
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    const float a = swHash(i);
+    const float b = swHash(i + float2(1.0f, 0.0f));
+    const float c = swHash(i + float2(0.0f, 1.0f));
+    const float d = swHash(i + float2(1.0f, 1.0f));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+// World XY of texel c's centre.
+float2 swWorld(int2 c)
+{
+    return gSwParams.origin.xy + (float2(c) + 0.5f) * gSwParams.grid.y;
+}
+
+float swBedTap(int2 t, int n)
+{
+    const float z = LoadTex2D(gSwSkyHeight, NO_SAMPLER, clamp(t, int2(0, 0), int2(n, n)), 0).r;
+    // No surface in the map = open water far below anything a wave can feel.
+    return (z < SW_NONE) ? (gSwParams.scroll.w - 4000.0f) : z;
+}
+// Bed Z under a world point (bilinear over gSkyHeight's 32 u texels).
+float swBed(float2 w)
+{
+    const float4 m = gSwParams.skyMap;
+    if (m.w < 1.0f) { return gSwParams.scroll.w - 4000.0f; }
+    const float2 t  = (w - m.xy) * m.z * m.w - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f  = t - fl;
+    const int2   i  = int2(fl);
+    const int    n  = int(m.w) - 1;
+    const float a = swBedTap(i, n);
+    const float b = swBedTap(i + int2(1, 0), n);
+    const float c = swBedTap(i + int2(0, 1), n);
+    const float d = swBedTap(i + int2(1, 1), n);
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+// Rest depth: water plane minus bed. NEGATIVE on land.
+float swD0(float2 w) { return gSwParams.scroll.w - swBed(w); }
+
+float4 swBodyTap(int2 t, int2 n) { return LoadTex2D(gSwBodies, NO_SAMPLER, clamp(t, int2(0, 0), n), 0); }
+float4 swFlowTap(int2 t, int2 n) { return LoadTex2D(gSwFlow,   NO_SAMPLER, clamp(t, int2(0, 0), n), 0); }
+
+// (sea, river, pond, beach) weights, normalised; open sea where there is no map.
+float4 swBodies(float2 w)
+{
+    const float4 m = gSwParams.bodyMap;
+    if (m.z <= 0.0f) { return float4(1.0f, 0.0f, 0.0f, 0.0f); }
+    const int2   dim = GetDimensions(gSwBodies, NO_SAMPLER);
+    const float2 t  = (w - m.xy) * m.zw * float2(dim) - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f  = t - fl;
+    const int2   i  = int2(fl);
+    const int2   n  = dim - int2(1, 1);
+    const float4 bw = lerp(lerp(swBodyTap(i, n), swBodyTap(i + int2(1, 0), n), f.x),
+                           lerp(swBodyTap(i + int2(0, 1), n), swBodyTap(i + int2(1, 1), n), f.x), f.y);
+    const float ws = bw.r + bw.g + bw.b + bw.a;
+    return (ws > 1.0e-3f) ? bw / ws : float4(1.0f, 0.0f, 0.0f, 0.0f);
+}
+// River flow (world units/s) under a world point.
+float2 swFlow(float2 w)
+{
+    const float4 m = gSwParams.bodyMap;
+    if (m.z <= 0.0f) { return float2(0.0f, 0.0f); }
+    const int2   dim = GetDimensions(gSwFlow, NO_SAMPLER);
+    const float2 t  = (w - m.xy) * m.zw * float2(dim) - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f  = t - fl;
+    const int2   i  = int2(fl);
+    const int2   n  = dim - int2(1, 1);
+    const float3 fv = lerp(lerp(swFlowTap(i, n), swFlowTap(i + int2(1, 0), n), f.x),
+                           lerp(swFlowTap(i + int2(0, 1), n), swFlowTap(i + int2(1, 1), n), f.x), f.y).rgb;
+    const float2 dir = fv.rg * 2.0f - 1.0f;
+    return dir * fv.b * gSwParams.disp.y;
+}
+
+// Wind GUSTS as a surface pressure head (u), travelling downwind at the open-water wave speed — the
+// resonant forcing that grows chop. Two octaves of value noise, zero-mean.
+float swGust(float2 w, float c)
+{
+    const float2 d  = gSwParams.wind.xy;
+    const float  L  = max(gSwParams.chop.y, 1.0f);
+    const float  t  = gSwParams.origin.z;
+    float2 p = float2(dot(w, d), dot(w, float2(-d.y, d.x)));
+    p.x -= c * t;
+    const float n = (swNoise(p / L) - 0.5f) + 0.5f * (swNoise(p / (0.47f * L) + 17.3f) - 0.5f);
+    return gSwParams.chop.x * 1.33f * n;
+}
+
+// The far-field SWELL as a travelling wave train (eta, u, v): what the sponge holds the edges to.
+// Shallow-water plane waves: phase speed c, particle velocity g*eta/c along the heading.
+float3 swSwell(float2 w, float c)
+{
+    const float A   = gSwParams.wind.z;
+    const float lam = max(gSwParams.wind.w, 32.0f);
+    const float t   = gSwParams.origin.z;
+    const float g   = gSwParams.scroll.z;
+    float3 r = float3(0.0f, 0.0f, 0.0f);
+    const float  lams[3] = { 1.0f, 0.71f, 0.53f };
+    const float  angs[3] = { 0.0f, 0.42f, -0.35f };
+    const float  amps[3] = { 1.0f, 0.6f, 0.4f };
+    UNROLL for (int k = 0; k < 3; ++k)
+    {
+        const float  ca = cos(angs[k]);
+        const float  sa = sin(angs[k]);
+        const float2 d  = float2(gSwParams.wind.x * ca - gSwParams.wind.y * sa,
+                                 gSwParams.wind.x * sa + gSwParams.wind.y * ca);
+        const float  kk = 6.28318531f / (lam * lams[k]);
+        const float  e  = A * amps[k] * cos(kk * (dot(w, d) - c * t) + 1.7f * float(k));
+        r.x  += e;
+        r.yz += d * (g * e / max(c, 1.0f));
+    }
+    return r;
+}
+
+// Pressure head of the swimmers at a texel position (a dip that travels with each of them).
+float swImpulses(float2 c)
+{
+    float p = 0.0f;
+    const int n = int(gSwParams.origin.w);
+    LOOP for (int i = 0; i < n; ++i)
+    {
+        const float4 imp = gSwParams.impulses[i];
+        const float  r   = max(imp.z, 0.5f);
+        const float  d   = length(c - imp.xy) / r;
+        if (d < 1.0f) { p -= imp.w * (1.0f - d * d) * (1.0f - d * d); }
+    }
+    return p;
+}
+
+// Hold weight toward the far-field wave train: 1 at the domain edge (the sponge), and the DEEP HOLD
+// share wherever the bed is deeper than 2*Hmax — there the sim's wave speed is the target's, so the
+// two agree and the hold only replaces what damping takes. Shallower than Hmax it is 0: free physics.
+float swSponge(int2 id, float d0)
+{
+    const int   N  = int(gSwParams.grid.x);
+    const float e  = float(min(min(id.x, id.y), min(N - 1 - id.x, N - 1 - id.y)));
+    const float Hm = max(gSwParams.phys.x, 1.0f);
+    const float edge = saturate(1.0f - e / max(gSwParams.phys.z, 1.0f));
+    const float deep = saturate(gSwParams.disp.z) * saturate((d0 - Hm) / Hm);
+    return max(edge, deep);
+}
+
+bool swInside(int2 c) { const int N = int(gSwParams.grid.x); return c.x >= 0 && c.y >= 0 && c.x < N && c.y < N; }
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(SW_THREADS, SW_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+    const int2  id  = int2(did.xy);
+    if (!swInside(id))
+    {
+        RETURN();
+    }
+    const float dx  = gSwParams.grid.y;
+    const float dt  = gSwParams.grid.z;
+    const float g   = gSwParams.scroll.z;
+    const float Hm  = max(gSwParams.phys.x, 1.0f);
+    const float cM  = sqrt(g * Hm);
+
+    if (gSwParams.grid.w < 0.5f)
+    {
+        // ---- PASS 0: velocity (+ scroll/clear) ---------------------------------------------------
+        const int2   src = id + int2(gSwParams.scroll.xy);
+        const float2 wC  = swWorld(id);
+        const float2 wX  = swWorld(id + int2(1, 0));
+        const float2 wY  = swWorld(id + int2(0, 1));
+        // The bed is refreshed for THIS cell every step (the height map streams); the +x/+y
+        // neighbours' come from their stored lane where they have one.
+        const float d0C = swD0(wC);
+        float4 SC = float4(max(0.0f, -d0C), 0.0f, 0.0f, d0C);
+        float4 DC = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (swInside(src))
+        {
+            SC = LoadRWTex2D(gSwPrevS, src);
+            SC.w = d0C;
+            SC.x = max(SC.x, -d0C);
+            DC = LoadRWTex2D(gSwPrevD, src);
+        }
+        float4 SX, SY;
+        if (swInside(src + int2(1, 0))) { SX = LoadRWTex2D(gSwPrevS, src + int2(1, 0)); }
+        else { const float d = swD0(wX); SX = float4(max(0.0f, -d), 0.0f, 0.0f, d); }
+        if (swInside(src + int2(0, 1))) { SY = LoadRWTex2D(gSwPrevS, src + int2(0, 1)); }
+        else { const float d = swD0(wY); SY = float4(max(0.0f, -d), 0.0f, 0.0f, d); }
+
+        // Forcing pressure (head, u): wind gusts scaled by the body, swimmers.
+        const float4 bw   = swBodies(wC);
+        const float  bAmp = dot(bw, gSwParams.bodyAmp);
+        const float  pC = swGust(wC, cM) * bAmp + swImpulses(float2(id) + 0.5f);
+        const float  pX = swGust(wX, cM) * bAmp + swImpulses(float2(id) + float2(1.5f, 0.5f));
+        const float  pY = swGust(wY, cM) * bAmp + swImpulses(float2(id) + float2(0.5f, 1.5f));
+
+        const float keep  = exp(-max(gSwParams.phys.y, 0.0f) * dt);
+        const float vMax  = 0.25f * dx / max(dt, 1.0e-4f);
+        const float sp    = swSponge(id, d0C);
+        const float cf    = max(gSwParams.disp.w, 0.0f);
+        const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
+
+        float u = SC.y;
+        const float hX = max(SC.x, SX.x) - max(-SC.w, -SX.w);
+        if (hX > SW_DRY)
+        {
+            u -= dt * g * ((SX.x + pX) - (SC.x + pC)) / dx;
+            u *= keep;
+            u /= 1.0f + dt * cf * abs(u) / max(hX, SW_DRY);   // bottom friction: thin sheets slow
+            if (sp > 0.0f)
+            {
+                const float c = sqrt(g * clamp(min(SC.w, SX.w), 1.0f, Hm));
+                u = lerp(u, swSwell(0.5f * (wC + wX), c).y * bAmp, relax);
+            }
+            u = clamp(u, -vMax, vMax);
+        }
+        else { u = 0.0f; }
+
+        float v = SC.z;
+        const float hY = max(SC.x, SY.x) - max(-SC.w, -SY.w);
+        if (hY > SW_DRY)
+        {
+            v -= dt * g * ((SY.x + pY) - (SC.x + pC)) / dx;
+            v *= keep;
+            v /= 1.0f + dt * cf * abs(v) / max(hY, SW_DRY);
+            if (sp > 0.0f)
+            {
+                const float c = sqrt(g * clamp(min(SC.w, SY.w), 1.0f, Hm));
+                v = lerp(v, swSwell(0.5f * (wC + wY), c).z * bAmp, relax);
+            }
+            v = clamp(v, -vMax, vMax);
+        }
+        else { v = 0.0f; }
+
+        Write2D(gSwNextS, id, float4(SC.x, u, v, SC.w));
+        Write2D(gSwNextD, id, DC);
+        RETURN();
+    }
+
+    // ---- PASS 1: height, displacement, whitewater ------------------------------------------------
+    const float4 SC = LoadRWTex2D(gSwPrevS, id);
+    const float4 DC = LoadRWTex2D(gSwPrevD, id);
+    const float  d0 = SC.w;
+    // Neighbours; outside the grid a wall at rest (zero velocity, own bed).
+    float4 SW_ = float4(SC.x, 0.0f, 0.0f, d0);
+    float4 SS_ = float4(SC.x, 0.0f, 0.0f, d0);
+    float4 SE_ = float4(SC.x, 0.0f, 0.0f, d0);
+    float4 SN_ = float4(SC.x, 0.0f, 0.0f, d0);
+    if (swInside(id - int2(1, 0))) { SW_ = LoadRWTex2D(gSwPrevS, id - int2(1, 0)); }
+    if (swInside(id - int2(0, 1))) { SS_ = LoadRWTex2D(gSwPrevS, id - int2(0, 1)); }
+    if (swInside(id + int2(1, 0))) { SE_ = LoadRWTex2D(gSwPrevS, id + int2(1, 0)); }
+    if (swInside(id + int2(0, 1))) { SN_ = LoadRWTex2D(gSwPrevS, id + int2(0, 1)); }
+
+    // Face flow depths (LISFLOOD): water above the higher bed, capped at Hmax for the flux — the cap
+    // is what sets the open-water wave speed; the uncapped shallows slow the waves down.
+    const float hE = max(SC.x, SE_.x) - max(-d0, -SE_.w);
+    const float hW = max(SC.x, SW_.x) - max(-d0, -SW_.w);
+    const float hN = max(SC.x, SN_.x) - max(-d0, -SN_.w);
+    const float hS = max(SC.x, SS_.x) - max(-d0, -SS_.w);
+    const float Hm2 = Hm;
+    const float fE = (hE > SW_DRY) ? SC.y  * min(hE, Hm2) : 0.0f;
+    const float fW = (hW > SW_DRY) ? SW_.y * min(hW, Hm2) : 0.0f;
+    const float fN = (hN > SW_DRY) ? SC.z  * min(hN, Hm2) : 0.0f;
+    const float fS = (hS > SW_DRY) ? SS_.z * min(hS, Hm2) : 0.0f;
+    float eta = SC.x - dt * (fE - fW + fN - fS) / dx;
+
+    const float2 wC  = swWorld(id);
+    const float4 bw  = swBodies(wC);
+    const float  bAmp = dot(bw, gSwParams.bodyAmp);
+    const float  sp  = swSponge(id, d0);
+
+    // SPONGE: the edges are held to the far-field swell, so waves enter from upwind and leave
+    // downwind without reflecting off the window.
+    if (sp > 0.0f && eta + d0 > SW_DRY)
+    {
+        const float c = sqrt(g * clamp(d0, 1.0f, Hm));
+        const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
+        eta = lerp(eta, swSwell(wC, c).x * bAmp, relax);
+    }
+    // RIVERS: a LOOPING chop the surface relaxes toward — two half-period-offset phases of a
+    // flow-advected noise, cross-faded (the water.frag flow-map trick, here in height).
+    if (bw.g > 0.02f && eta + d0 > SW_DRY && gSwParams.chop.z > 0.0f)
+    {
+        const float  T   = max(gSwParams.chop.w, 0.1f);
+        const float  ph  = frac(gSwParams.origin.z / T);
+        const float2 fl  = swFlow(wC);
+        const float2 p1  = (wC - fl * (ph * T)) / 70.0f;
+        const float2 p2  = (wC - fl * (frac(ph + 0.5f) * T)) / 70.0f + 31.7f;
+        const float  wgt = abs(2.0f * ph - 1.0f);
+        const float  n   = lerp(swNoise(p1), swNoise(p2), wgt) - 0.5f;
+        const float  tgt = gSwParams.chop.z * 2.0f * n;
+        eta = lerp(eta, tgt, (1.0f - exp(-3.0f * dt)) * bw.g);
+    }
+    eta = max(eta, -d0);
+    const float H   = eta + d0;
+    const bool  wet = H > SW_DRY;
+
+    // Cell-centred velocity, convergence, speed.
+    const float2 vel  = float2(0.5f * (SC.y + SW_.y), 0.5f * (SC.z + SS_.z));
+    const float  spd  = length(vel);
+    const float  conv = -((SC.y - SW_.y) + (SC.z - SS_.z)) / dx;
+
+    // HORIZONTAL DISPLACEMENT: the water parcel's integrated motion, relaxing home so a steady
+    // current cannot drift it without bound. This is the "visible horizontal motion".
+    const float  dkeep = exp(-max(gSwParams.disp.x, 0.0f) * dt);
+    float2 D = DC.xy * dkeep + (wet ? vel * dt : float2(0.0f, 0.0f));
+
+    // WHITEWATER mass: advected with the water (semi-Lagrangian), decaying; produced where the
+    // water is FAST and where flows COLLIDE. The speed is the driver (user, 2026-10-09).
+    float wwAdv = DC.w;
+    {
+        const float2 p  = float2(id) - vel * dt / dx;
+        const float2 fl = floor(p);
+        const float2 f  = p - fl;
+        const int2   i  = int2(fl);
+        const int    N1 = int(gSwParams.grid.x) - 1;
+        const float a = LoadRWTex2D(gSwPrevD, clamp(i,               int2(0, 0), int2(N1, N1))).w;
+        const float b = LoadRWTex2D(gSwPrevD, clamp(i + int2(1, 0), int2(0, 0), int2(N1, N1))).w;
+        const float c = LoadRWTex2D(gSwPrevD, clamp(i + int2(0, 1), int2(0, 0), int2(N1, N1))).w;
+        const float d = LoadRWTex2D(gSwPrevD, clamp(i + int2(1, 1), int2(0, 0), int2(N1, N1))).w;
+        wwAdv = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    }
+    const float thr = max(gSwParams.ww.x, 1.0f);
+    float ww = wwAdv * exp(-max(gSwParams.ww.z, 0.0f) * dt)
+             + dt * (gSwParams.ww.y * max(spd - thr, 0.0f) / thr + gSwParams.ww.w * max(conv, 0.0f));
+    ww = wet ? saturate(ww) : saturate(ww) * exp(-4.0f * dt);
+
+    // DISPLAY height: eta where wet; where dry the mesh sinks under the bed so it never z-fights it.
+    const float hDisp = wet ? eta : (min(eta, 0.0f) - 4.0f);
+
+    Write2D(gSwNextS, id, float4(eta, SC.y, SC.z, d0));
+    Write2D(gSwNextD, id, float4(D, hDisp, ww));
+    RETURN();
+}

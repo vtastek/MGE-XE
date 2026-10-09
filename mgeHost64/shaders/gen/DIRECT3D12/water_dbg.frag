@@ -1701,6 +1701,11 @@ STRUCT(LightData)
 
 
 
+        Tex2D(float4) gSwField :  register(t157,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1713,7 +1718,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 735 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 740 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1724,7 +1729,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 759 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 764 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 61 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -3833,7 +3838,8 @@ STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float3, WorldPos, TEXCOORD0);
-#line 277
+    DATA(float2, RestXY, TEXCOORD1);
+#line 278
 };
 
 
@@ -3845,7 +3851,7 @@ float3 reconstructWorld(float4x4 invVP, float2 uv, float deviceZ)
     float4 p = mul(invVP, float4(ndcX, ndcY, deviceZ, 1.0f));
     return p.xyz / p.w;
 }
-#line 329 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 330 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 float occlusionFrom(float waterDist, float sceneDist, float nearRange)
 {
     float valid = step(sceneDist, nearRange + 64.0f);
@@ -3862,7 +3868,7 @@ float sceneOcclusionAt(float4x4 invVP, float2 uvVp, float2 texToVp, float waterD
     float sceneDist = length(reconstructWorld(invVP, uvVp, devZ));
     return occlusionFrom(waterDist, sceneDist, nearRange);
 }
-#line 380 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 381 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 float2 clampAllocUV(float2 uv)
 {
     float2 ia = gShadowParams.screenAlloc.zw;
@@ -3873,7 +3879,7 @@ float2 clampAllocUV(float2 uv)
 float4 sampleReflectSmear(float2 uv, float lod, float2 stepUV, uint taps)
 {
     if (taps < 2u) { return SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, uv, lod); }
-#line 412 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 413 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 lim = min(uv, 1.0f - uv);
     float2 sa = abs(stepUV);
     float kx = (sa.x > 1.0e-8f) ? (lim.x / sa.x) : 1.0e30f;
@@ -3936,7 +3942,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 depthBaseColor= P[1].xyz;
     bool underwater = P[1].w > 0.5f;
     float3 camFwd = P[2].xyz;
-#line 488 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 489 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float distortFar = P[2].w * max(gFrameData.lodParams.w, 4096.0f);
 
 
@@ -3980,13 +3986,13 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     bool hdrView = (waterFlags & 131072u) != 0u;
-#line 542 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 543 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     bool noReflect = (waterFlags & 262144u) != 0u;
 
     bool destProbe = (waterFlags & 524288u) != 0u;
 
     bool flatProbe = (waterFlags & 1048576u) != 0u;
-#line 560 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 561 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     uint smearTaps = (waterFlags >> 6) & 63u;
 
 
@@ -4075,12 +4081,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float alphaBase = P[3].y;
     float reflSize = P[3].z;
     float reflBlurGain = P[3].w;
-#line 662 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 663 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 invAlloc = gShadowParams.screenAlloc.zw;
     float2 invScreen = gShadowParams.screenParams.zw;
     float2 texToVp = gShadowParams.screenAlloc.xy * gShadowParams.screenParams.zw;
     float3 fogCol = gFrameData.fogColNear.rgb;
-#line 721 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 722 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float trueRel = waterLevelRel - 1.0f;
     float2 rayUv = In.Position.xy * invScreen;
     float3 rayA = reconstructWorld(invVP, rayUv, 0.25f);
@@ -4088,15 +4094,15 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 rayD = rayA - rayB;
     rayD = (dot(rayD, In.WorldPos) < 0.0f) ? -rayD : rayD;
     float3 rayDir = normalize(rayD);
-#line 745 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 746 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float invFocal = length(ddy(rayDir));
     float focalPx = (invFocal > 1e-7f) ? (1.0f / invFocal) : 1000.0f;
-#line 759 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 760 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float3 surfPos = In.WorldPos;
     float dist = length(surfPos);
     float3 EyeVec = truePlaneOn ? rayDir
                                  : ((dist > 1e-4f) ? surfPos / dist : float3(0, 0, 1));
-#line 830 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 831 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float wcutR = max(gShadowParams.waterDistort.w, 0.0f);
     float wcutH = max(gShadowParams.waterCut.x, 0.0f);
     float wcutAbove = max(-waterLevelRel, 0.0f);
@@ -4107,9 +4113,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         wcut = smoothstep(0.900f * wcutR, 1.000f * wcutR, dist);
         wcutdark = saturate(wd * (1.0f - wd) * 3.0f);
     }
-#line 882 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 883 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float fog = mwFogRamp(dist);
-#line 929 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 930 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float distortFarL =  0.5f  * distortFar;
     float distortMag = (distortFarL > 0.0f) ? min(dist, 0.5f * distortFarL) : dist;
     float distortFadeL = (distortFarL > 0.0f)
@@ -4123,7 +4129,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float distortAmpLegacy = (windFactor * distortMag + 0.1f) * distortFadeL;
-#line 981 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 982 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float angMix = saturate(gShadowParams.waterDistort.x);
     float distortGain = max(gShadowParams.waterDistort.y, 0.0f);
     float distortAmpAng =  (1.0f - 1.0f / 1.333f )  * focalPx * distortFade;
@@ -4148,7 +4154,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float t = 0.4f * time;
     float2 tc2 = worldXY / waveTile;
-#line 1040 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1041 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 dWdx = ddx(surfPos.xy);
     float2 dWdy = ddy(surfPos.xy);
 
@@ -4172,9 +4178,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 ddxEye = ddx(EyeVec);
     float3 ddyEye = ddy(EyeVec);
     float pixAngle = max(length(ddxEye), length(ddyEye));
-#line 1075 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1076 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float3 normal = float3(0.0f, 0.0f, 1.0f);
-#line 1105 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1106 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float afSigma2 = 0.0f;
     float afAniso = 1.0f;
     {
@@ -4200,10 +4206,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float2 dTdx = dWdx / waveTile;
         float2 dTdy = dWdy / waveTile;
         float2 s0 = 2.0f *  gWaterNormalVol.SampleGrad(gSamplerAnisotropic, float3(tc2, z0), dTdx, dTdy) .
-#line 1130 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1131 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 rg - 1.0f;
         float2 s1 = 2.0f *  gWaterNormalVol.SampleGrad(gSamplerAnisotropic, float3(tc2, z1), dTdx, dTdy) .
-#line 1132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1133 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 rg - 1.0f;
 
 
@@ -4226,16 +4232,16 @@ rg - 1.0f;
             s1 = lerp(a1, b1, wB);
         }
         normal = normalize(float3(lerp(s0, s1, fz) * waveAmp, 1.0f));
-#line 1192 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1193 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         float wTap = max(sMinW, sMaxW / (float) 8 );
         float lodA = log2(wTap / texelWorld);
         float lodV = 0.5f * (lodA + log2(sMaxW / texelWorld));
-#line 1206 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1207 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         float lodS = max(lodV - 1.0f, 0.0f);
         float vr =  gWaterSlopeVar.SampleLevel(gSamplerTrilinearWrap, float3(tc2, z0), lodS) .r;
         afSigma2 = max(0.0f, vr) * min(lodV, 1.0f) * (waveAmp * waveAmp);
     }
-#line 1223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float waveSigma2 = 0.0f;
     float3 waveHG = float3(0.0f, 0.0f, 0.0f);
     if (proceduralWaves || heightView) {
@@ -4288,9 +4294,9 @@ rg - 1.0f;
             normal = normalize(float3(base + sl * swellAmp, 1.0f));
         }
     }
-#line 1310 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1311 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float sigma2 = proceduralWaves ? waveSigma2 : afSigma2;
-#line 1336 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1337 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (rippleAmp > 0.0f && !flatWater) {
         float3 rip = rainRipples(worldXY, ripplePhase, rainCell, rainPeriod, rippleLife,
                                   rainDensity, rippleSlots, rippleAmp, rippleLamMin, rippleLamMax,
@@ -4299,7 +4305,7 @@ rg - 1.0f;
         normal = normalize(float3(base + rip.xy, 1.0f));
         sigma2 += rip.z;
     }
-#line 1358 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1359 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (simG1.y > 0.5f && !flatWater) {
         float2 texel = (surfPos.xy - simG0.xy) * simG0.z;
         float2 uv = texel / simG0.w;
@@ -4348,11 +4354,43 @@ rg - 1.0f;
 
 
 
+    float swWW = 0.0f;
+    {
+        const float4x4 SWP = transpose(gBatch.worlds[15]);
+        const float4 s0 = SWP[0];
+        const float4 s1 = SWP[1];
+        const float4 s2 = SWP[2];
+        if (s0.w > 0.5f && !flatWater)
+        {
+            const float2 suv = (In.RestXY - s0.xy) * s0.z;
+            const float2 se = min(suv, 1.0f - suv);
+            const float sw = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(se.x, se.y))
+                             * (1.0f - smoothstep(SWP[3].x, max(SWP[3].y, SWP[3].x + 1.0f), abs(s2.w)));
+            if (sw > 0.0f)
+            {
+                const float tx = 16.0f * s0.z;
+                const float hR = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv + float2(tx, 0.0f), 0.0f).z;
+                const float hL = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv - float2(tx, 0.0f), 0.0f).z;
+                const float hU = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv + float2(0.0f, tx), 0.0f).z;
+                const float hD = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv - float2(0.0f, tx), 0.0f).z;
+
+                const float2 sslope = -float2(hR - hL, hU - hD) / 32.0f * s1.x * s1.z * sw;
+                const float2 base5 = normal.xy / max(normal.z, 1e-4f);
+                normal = normalize(float3(base5 + sslope, 1.0f));
+                swWW = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv, 0.0f).w * s1.w * sw;
+            }
+        }
+    }
+
+
+
+
+
     float alpha = sqrt(alphaBase * alphaBase + sigma2);
-#line 1454 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1487 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float reflTexelRad = max(pixAngle * (gShadowParams.screenParams.x / max(reflSize, 1.0f)), 1e-7f);
     float cosI = abs(EyeVec.z);
-#line 1474 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1507 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float reflDevZ = SampleLvlTex2D(gReflectDepth, gSamplerPointClamp,
                                       In.Position.xy * invScreen, 0.0f).r;
     float reflDist = length(reconstructWorld(invVP, In.Position.xy * invScreen, reflDevZ));
@@ -4360,14 +4398,14 @@ rg - 1.0f;
 
     float lobeMajor = 2.0f * alpha * hitFrac;
     float lobeMinor = lobeMajor * cosI;
-#line 1505 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1538 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float tapEff = max(lobeMinor, reflTexelRad);
     float anisoReq = lobeMajor / max(tapEff, 1e-9f);
     uint smearN = (smearTaps > 1u)
                    ? (uint)clamp(ceil(anisoReq), 1.0f, (float)smearTaps) : 1u;
     float tapRad = (smearN > 1u) ? max(tapEff, lobeMajor / (float)smearN) : lobeMinor;
     float reflLodRaw = log2(max(reflBlurGain * tapRad / reflTexelRad, 1.0f));
-#line 1525 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1558 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float nz = (EyeVec.z < 0.0f) ? 1.0f : -1.0f;
     float sinI = max(length(EyeVec.xy), 1e-4f);
     float3 smearDir = float3(cosI * EyeVec.xy / sinI, sinI * nz);
@@ -4376,16 +4414,16 @@ rg - 1.0f;
 
 
     float2 smearUV = max(lobeMajor - tapRad, 0.0f) * smearPx * invScreen;
-#line 1555 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1588 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float reflLod = min(reflLodRaw, (float) 3 );
-#line 1577 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1610 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float over = max(reflLodRaw - (float) 3 , 0.0f);
     float reflSkyMix = 1.0f - exp2(-over);
 
     float2 baseUV = In.Position.xy * invAlloc;
-#line 1594 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1627 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (underwater) {
-#line 1614 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1647 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         bool uwUnified = waterFogCameraSubmerged();
 
 
@@ -4403,7 +4441,7 @@ rg - 1.0f;
                                      : saturate(exp(-dist / 500.0f));
         float uwFog = uwUnified ? uwTrans : saturate(exp(-dist / 4096.0f));
         float3 nrm = -normal;
-#line 1711 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1744 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         float3 uwDeep = uwFogCol;
         {
             float volS = waterFogVolStrength();
@@ -4414,7 +4452,7 @@ rg - 1.0f;
                 uwDeep = lerp(uwFogCol, dIns, volS);
             }
         }
-#line 1738 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1771 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         float cosU = dot(-EyeVec, nrm);
         float fresnelU = physFresnel ? fresnelDielectricRough(cosU, alpha,  1.333f )
                                       : pow(saturate(1.12f - 0.65f * cosU), 8.0f);
@@ -4430,13 +4468,13 @@ rg - 1.0f;
 
 
         float2 reffactorU = distortUWFactor * distortAmp * nrm.xy;
-#line 1776 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1809 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         float2 reffactorUR = (1.0f - fresnelU) * reffactorU;
 
 
         float2 ruvU = clampAllocUV(baseUV + (-2.0f * reffactorUR) * invAlloc);
         float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
-#line 1811 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1844 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         refractedU *= snellGain ? ( 1.333f  *  1.333f ) : 1.0f;
 
 
@@ -4460,12 +4498,12 @@ rg - 1.0f;
                        + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
         float4 reflSampleU = sampleReflectSmear(reflUVU, reflLod, smearUV, smearN);
         float3 reflectedU = reflSampleU.rgb + uwDeep * (1.0f - reflSampleU.a);
-#line 1865 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1898 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         float4 reflAvgU = SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, reflUVU,
                                          (float) 5 );
         float3 uwRough = reflAvgU.rgb + uwDeep * (1.0f - reflAvgU.a);
         if (reflSkyMix > 0.0f) { reflectedU = lerp(reflectedU, uwRough, reflSkyMix); }
-#line 1887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1920 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         reflectedU = waterFogBlend(reflectedU, reflectedU, In.WorldPos, uwWf);
 
 
@@ -4487,7 +4525,7 @@ rg - 1.0f;
 
 
         float3 resultU = lerp(refractedU, reflectedU, fresnelU);
-#line 1925 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1958 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         if (!physFresnel) {
             float3 sunPosU = -gFrameData.sunDir.xyz;
             float refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
@@ -4496,9 +4534,9 @@ rg - 1.0f;
 
         return (float4(resultU, 1.0f));
     }
-#line 1987 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2020 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (flatWater) { normal = float3(0.0f, 0.0f, 1.0f); }
-#line 2001 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2034 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float NoV = saturate(dot(-EyeVec, normal));
     float fresnel;
     if (physFresnel) {
@@ -4530,7 +4568,7 @@ rg - 1.0f;
 
 
     float2 reffactor = distortAmp * normal.xy;
-#line 2060 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2093 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float shorePre = 0.0f;
     if (shoreDepthMax > 0.0f) {
         float shoreDevZ = waterSceneDevZ(baseUV);
@@ -4541,7 +4579,7 @@ rg - 1.0f;
                  * (1.0f - occlusionFrom(dist, shoreDist, gFrameData.lodParams.w));
     }
     float shoreCancel = 1.0f - shorePre;
-#line 2097 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2130 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 reffactorR = (1.0f - fresnel) * shoreCancel * wcut * reffactor;
 
 
@@ -4549,7 +4587,7 @@ rg - 1.0f;
     float sceneDevZ= waterSceneDevZ(distUV);
     float3 sceneW = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
     float sceneDist= length(sceneW);
-#line 2172 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2205 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float refrNear = gFrameData.lodParams.w;
     float refrOccl = (1.0f - smoothstep(refrNear, refrNear + 128.0f, sceneDist))
                       * smoothstep(0.0f, 384.0f, dist - sceneDist);
@@ -4558,7 +4596,7 @@ rg - 1.0f;
     float3 refrDist = float3(0.0f, 0.0f, 0.0f);
     float3 refrFlat = float3(0.0f, 0.0f, 0.0f);
     float shorefactor = 0.0f;
-#line 2240 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2273 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     {
 
 
@@ -4568,7 +4606,7 @@ rg - 1.0f;
         float2 ruv = clampAllocUV(baseUV + (1.0f - refrOccl) * reffactorR.yx * invAlloc);
         refrDist = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv, 0.0f).rgb;
         refrFlat = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, baseUV, 0.0f).rgb;
-#line 2290 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2323 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
         shorefactor = shorePre;
 
 
@@ -4585,14 +4623,14 @@ rg - 1.0f;
     float NoL = saturate(dot(normal, L));
     float NoH = saturate(dot(normal, H));
     float VoH = saturate(dot(V, H));
-#line 2340 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2373 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 reflBase = In.Position.xy * invScreen;
     float2 reflOff = shoreCancel * float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
     float reflOccl = sceneOcclusionAt(invVP, reflBase + reflOff, texToVp, dist,
                                        gFrameData.lodParams.w);
     float2 reflUV = reflBase + (1.0f - reflOccl) * reflOff;
     float4 reflSample = sampleReflectSmear(reflUV, reflLod, smearUV, smearN);
-#line 2370 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2403 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float3 reflHole = fogSkyColor(In.Position.xy);
     float3 reflected = reflSample.rgb + reflHole * (1.0f - reflSample.a);
 
@@ -4601,13 +4639,13 @@ rg - 1.0f;
     if (reflSkyMix > 0.0f) {
         reflected = lerp(reflected, reflHole, reflSkyMix);
     }
-#line 2469 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2502 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (waterDbg == 1u) {
         float4 rawRefl = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
                                         In.Position.xy * invScreen, 0.0f);
         return (float4(rawRefl.rgb, 1.0f));
     }
-#line 2486 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2519 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (hdrView) {
         float4 raw = SampleLvlTex2D(gReflectColor, gSamplerPointClamp,
                                     In.Position.xy * invScreen, 0.0f);
@@ -4629,13 +4667,13 @@ rg - 1.0f;
 
 
     if (waterDbg == 2u) { RETURN(float4(refrDist, 1.0f)); }
-#line 2525 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2558 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (waterDbg == 3u) {
         return (float4(saturate(reflLod / (float) 3 ),
                       saturate(alpha * 20.0f),
                       saturate(log2(afAniso) / log2((float) 8 )), 1.0f));
     }
-#line 2546 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2579 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (normalView) {
         float3 mirrorDir = reflect(EyeVec, normal);
         float glint = saturate(dot(mirrorDir, -gFrameData.sunDir.xyz));
@@ -4643,10 +4681,10 @@ rg - 1.0f;
                       EyeVec.y,
                       -EyeVec.z, 1.0f));
     }
-#line 2581 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2614 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float3 result = reflected * fresnel;
     float kDst = 1.0f - fresnel;
-#line 2603 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2636 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float aSpec = max(alpha,  0.00465f );
     float aEff = saturate(aSpec +  0.00465f );
     float a2 = aEff * aEff;
@@ -4676,7 +4714,7 @@ rg - 1.0f;
 
     float sphereNorm = (aSpec * aSpec) / max(a2, 1e-8f);
     float3 spec = gFrameData.sunCol.rgb * (D * Vis * F * NoL * min(sphereNorm, 1.0f));
-#line 2657 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2690 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     if (!noReflect) { result += tonemapInPass(clampSceneTerm(spec)); }
 
 
@@ -4692,10 +4730,10 @@ rg - 1.0f;
     float wcutDim = 1.0f - 0.9f * wcutdark;
     result = result * wcutDim;
     kDst = kDst * wcutDim;
-#line 2691 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2724 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     result = result * (1.0f - shorefactor);
     kDst = kDst * (1.0f - shorefactor) + shorefactor;
-#line 2706 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2739 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     {
         const float foamAmt = gShadowParams.waterFlowParams.z;
         const float riverC = bodyW.g;
@@ -4760,7 +4798,38 @@ rg - 1.0f;
             kDst = kDst * (1.0f - foam);
         }
     }
-#line 2838 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+
+
+
+
+
+    if (swWW > 0.002f)
+    {
+        const float kT = 160.0f;
+        const float2 eyeT = frac(gFrameData.lodEye.xy / (kT * 64.0f)) * 64.0f;
+        const float2 fP = In.RestXY / kT + eyeT;
+        const float nf = foamFbm2(fP);
+        const float nfi = foamFbm2(fP * 5.0f + 3.1f);
+        float wf = saturate((saturate(swWW) * (0.6f + nf) - 0.35f) * 2.5f);
+        wf *= lerp(1.0f, saturate(0.5f + nfi), 0.5f);
+        float sunVisW = 1.0f;
+        const float4 so = gShadowParams.sunOcc;
+        const float4 sm = gShadowParams.skyAOMap;
+        if (so.x > 0.0f && sm.z > 0.0f)
+        {
+            const float2 ouv = (surfPos.xy + gFrameData.lodEye.xy - sm.xy) * sm.z;
+            const float blockZ = SampleLvlTex2D(gSunOcc, gSamplerBilinearClamp, ouv, 0.0f).r;
+            float t = saturate(((blockZ - so.z) - (surfPos.z + gFrameData.lodEye.z + 8.0f)) / max(so.y, 1.0e-3f));
+            t = t * t * (3.0f - 2.0f * t);
+            sunVisW = 1.0f - t * so.x;
+        }
+        const float3 Lw = -normalize(gFrameData.sunDir.xyz);
+        const float3 wwCol = 0.6f * (gFrameData.sunCol.rgb * saturate(Lw.z) * sunVisW + gFrameData.ambCol.rgb);
+        wf *= 0.9f;
+        result = lerp(result, wwCol, wf);
+        kDst = kDst * (1.0f - wf);
+    }
+#line 2902 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	if (!noFogMelt) {
 	    float E = fogExtinction(fog, 1.0f);
 	    result *= E;
@@ -4768,15 +4837,15 @@ rg - 1.0f;
 	    result = result * fog
 	            + fogSkyColorAt(In.Position.xy, fog, In.WorldPos) * ((1.0f - fog) * (1.0f - kDst));
 	}
-#line 2898 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2962 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	float2 offPx = (1.0f - refrOccl) * reffactorR;
 	float wOwn = saturate(gShadowParams.waterDistort.z)
 	              * smoothstep(0.5f, 2.0f, length(offPx));
 	float kDstBl = kDst * (1.0f - wOwn);
 	result += kDst * (refrDist - (1.0f - wOwn) * refrFlat);
-#line 2921 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2985 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	if (destProbe) { RETURN(float4(-kDst * refrFlat, 1.0f - kDst)); }
-#line 2933 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 2997 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 	if (flatProbe) { RETURN(float4(refrFlat, 1.0f)); }
 
 

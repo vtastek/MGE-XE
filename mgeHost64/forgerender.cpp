@@ -382,6 +382,8 @@ static int forgeEcoQoSState()
 // R2 actor-ripple wave sim SRT (RippleSimSrtData, Persistent frequency). ripplesim.comp +
 // ripplenormal.comp both include it. Model, sizing and the ping-pong rationale: ripplesim.srt.h.
 #include "shaders/FSL/ripplesim.srt.h"
+// S: the local shallow-water sim (SwSimSrtData, Persistent). Model + layout: swsim.srt.h.
+#include "shaders/FSL/swsim.srt.h"
 // W23: tiling caustics (CausticSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature; caustic.comp + causticresolve.comp both include it. Why a photon SCATTER
 // rather than a forward 1/|det J| map, and why its mean is 1.0 by construction: caustic.srt.h.
@@ -4718,8 +4720,15 @@ namespace {
     // levels, finest cell 128u, 64 cells/side, T-junction stitch + 4 trim variants/level. The host
     // generates verts/indices once and draws one cmdDrawIndexedInstanced per level (DrawIndex=level
     // selects gBatch.worlds[level]). worlds[0..5] = the 6 levels, [6] = packed params, [7] = invVP.
-    constexpr uint32_t kMaxWaterLevels = 6;
-    constexpr uint32_t kWaterLevels    = 6;
+    //
+    // WATER 3D PHASE A (tasks/forge-water-3d.md): 8 levels now, finest cell 32u. The two new rings are
+    // IN FRONT (32u and 64u) so the outer extent and the horizon skirt are unchanged; they exist so
+    // the local sim's displacement (swsim) has vertices to move. Their world matrices live in
+    // gBatch.worlds[13..14] because [6..12] are the water params — see waterLevelSlot(). The instance
+    // VB carries the SLOT, so water.vert still reads worlds[DrawIndex] unchanged.
+    constexpr uint32_t kMaxWaterLevels = 8;
+    constexpr uint32_t kWaterLevels    = 8;
+    inline uint32_t waterLevelSlot(uint32_t k) { return (k < 2u) ? 13u + k : k - 2u; }
     // WT2 reflection RT side (matches MGE texReflection's 1024² budget; sampled with normalized UV).
     // A STARTUP knob (reflectSize, applied before init like every knob): the RTs, the pyramid and every
     // pass that addresses them read reflectSize(), never a literal. Clamped to [256, 2048] and to a
@@ -4781,7 +4790,7 @@ namespace {
     inline float waterTrueLevel(float waterLevelAbs) { return waterLevelAbs - 1.0f; }
     // ...and the plane it MIRRORS about, which is a separate, TUNED question (g_reflWaterLevelOffset).
     inline float waterMirrorZ(float waterLevelAbs);
-    constexpr float    kWaterCell0     = 128.0f;
+    constexpr float    kWaterCell0     = 32.0f;    // Phase A: was 128 with 6 levels; same outer extent
     constexpr int      kWaterGrid      = 64;     // cells per side per level (even)
     // One per-level draw record: which IB sub-range each of the 4 trim variants occupies.
     struct WaterLodLevelHost {
@@ -8602,6 +8611,36 @@ namespace {
     float    g_waterFlowPeriod = 2.5f;      // must divide the 20 s water clock
     float    g_waterSwell      = 0.0f;      // open-sea swell amplitude (0 = off; OFF until the user's eye check)
     float    g_waterFoam       = 0.0f;      // river + shore foam amount (0 = off; OFF until the user's eye check)
+    // S — THE LOCAL WATER SIM (swsim; tasks/forge-water-3d.md). OFF until the user's eye check. All
+    // untuned starting points: "we haven't tuned water displacement" (user, 2026-10-09).
+    bool     g_waterSim        = false;
+    float    g_swVertGain      = 1.0f;      // display: vertical displacement x
+    float    g_swHorizGain     = 1.0f;      // display: horizontal displacement x
+    float    g_swNormalGain    = 1.0f;      // display: sim slope into the normal x
+    float    g_swWWShow        = 1.0f;      // display: whitewater cover x
+    float    g_swHmax          = 60.0f;     // u: depth that sets the open-water wave speed (sqrt(g*H))
+    float    g_swDamp          = 0.08f;     // 1/s velocity damping
+    float    g_swSponge        = 20.0f;     // texels of edge held to the far-field swell
+    float    g_swSpongeRate    = 4.0f;      // 1/s relax rate at the very edge
+    float    g_swSwellAmp      = 12.0f;     // u: swell amplitude entering the window (x body amp)
+    float    g_swSwellLam      = 420.0f;    // u: longest swell wavelength
+    float    g_swGust          = 1.5f;      // u of head: wind gust pressure (x body amp)
+    float    g_swGustScale     = 220.0f;    // u: gust size
+    float    g_swRiverChop     = 3.0f;      // u: river looping chop amplitude
+    float    g_swWWThr         = 80.0f;     // u/s: speed above which whitewater forms
+    float    g_swWWGain        = 2.0f;      // whitewater per s at 2x the threshold
+    float    g_swWWDecay       = 0.5f;      // 1/s whitewater decay
+    float    g_swWWConv        = 0.02f;     // whitewater per unit of convergence (1/s)
+    float    g_swDispRelax     = 0.8f;      // 1/s horizontal displacement relax home
+    float    g_swImpHead       = 6.0f;      // u: swimmer pressure dip
+    float    g_swImpRadius     = 40.0f;     // u: swimmer pressure radius
+    float    g_swEdgeFade      = 0.15f;     // fraction of the window over which display fades out
+    float    g_swGuardHeight   = 60.0f;     // u: eye above the plane at which the eye guard is gone
+    float    g_swGuardRadius   = 300.0f;    // u: radius the eye guard flattens at the waterline
+    float    g_swDeepHold      = 0.15f;     // share of the sponge rate holding deep water to the swell
+    float    g_swFriction      = 0.05f;     // bottom friction coefficient (thin run-up sheets)
+    float    g_swEyeFadeLo     = 900.0f;    // u above the water: display starts fading
+    float    g_swEyeFadeHi     = 2200.0f;   // u above the water: display gone (the sim parks)
     uint32_t g_waterBodyW = 0, g_waterBodyH = 0;
     float    g_waterBodyXf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // origin XY, 1/extent XY
     Texture* g_pWaterBodyTex = nullptr;
@@ -8831,7 +8870,7 @@ namespace {
         // last edge polygons of water surface towards horizon. no additional polygons, gets fogged
         // fully there so shape is no more important."
         //
-        // The clipmap's outer half-extent is exactly kWaterCell0 * 2^(L-1) * (m/2) = 128*32*32 =
+        // The clipmap's outer half-extent is exactly kWaterCell0 * 2^(L-1) * (m/2) = 32*128*32 (was 128*32*32) =
         // 131072 units = 16 cells, which is ALSO the fog end and the draw distance. So the mesh
         // stopped precisely where the fog finished, and the last ring of quads spanned the stretch
         // where fog is not yet opaque. Past that edge there is no water surface at all, and what
@@ -13723,7 +13762,7 @@ namespace {
             // Fill the per-draw instance VB once: DrawIndex[level] = level (selects gBatch.worlds[level]).
             {
                 uint32_t* wi = (uint32_t*)fbw(g_live.pWaterInstanceBuf);
-                for (uint32_t i = 0; i < kMaxWaterLevels; ++i) { wi[i] = i; }
+                for (uint32_t i = 0; i < kMaxWaterLevels; ++i) { wi[i] = waterLevelSlot(i); }
             }
 
             DescriptorSetDesc wbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
@@ -24146,6 +24185,31 @@ namespace {
             { "waterFlowSpeed",      &g_waterFlowSpeed      },
             { "waterFoam",           &g_waterFoam           },
             { "waterSwell",          &g_waterSwell          },
+            { "swVertGain",          &g_swVertGain          },
+            { "swHorizGain",         &g_swHorizGain         },
+            { "swNormalGain",        &g_swNormalGain        },
+            { "swWWShow",            &g_swWWShow            },
+            { "swHmax",              &g_swHmax              },
+            { "swDamp",              &g_swDamp              },
+            { "swSponge",            &g_swSponge            },
+            { "swSpongeRate",        &g_swSpongeRate        },
+            { "swSwellAmp",          &g_swSwellAmp          },
+            { "swSwellLam",          &g_swSwellLam          },
+            { "swGust",              &g_swGust              },
+            { "swGustScale",         &g_swGustScale         },
+            { "swRiverChop",         &g_swRiverChop         },
+            { "swWWThr",             &g_swWWThr             },
+            { "swWWGain",            &g_swWWGain            },
+            { "swWWDecay",           &g_swWWDecay           },
+            { "swWWConv",            &g_swWWConv            },
+            { "swDispRelax",         &g_swDispRelax         },
+            { "swImpHead",           &g_swImpHead           },
+            { "swImpRadius",         &g_swImpRadius         },
+            { "swEdgeFade",          &g_swEdgeFade          },
+            { "swDeepHold",          &g_swDeepHold          },
+            { "swFriction",          &g_swFriction          },
+            { "swEyeFadeLo",         &g_swEyeFadeLo         },
+            { "swEyeFadeHi",         &g_swEyeFadeHi         },
             { "giBlend",             &g_giBlend             },
             { "skyAOGroundExempt",   &g_skyAOGroundExempt   },
             { "pbrGradRadius",       &g_pbrGradRadius       },
@@ -24328,6 +24392,7 @@ namespace {
             { "sunActorCasters",     &g_sunActorCasters     },
             { "weatherSurface",      &g_weatherSurface      },
             { "waterBodies",         &g_waterBodies         },
+            { "waterSim",            &g_waterSim            },
             { "sunBlurFused",        &g_sunBlurFused        },
             { "preLinSkip",          &g_preLinSkip          },
             { "skyVrs",              &g_skyVrs              },
@@ -27131,6 +27196,22 @@ namespace {
           t.sliderF("Water flow speed (rivers downstream, beach onshore; 0 = off)", &g_waterFlowSpeed, 0.0f, 300.0f, 5.0f);
           t.sliderF("Water foam (rivers + shore; 0 = off)", &g_waterFoam, 0.0f, 2.0f, 0.05f);
           t.sliderF("Water open-sea swell (0 = off)", &g_waterSwell, 0.0f, 3.0f, 0.05f);
+          t.checkbox("Water SIM (local 44 m push-pull: 3D displacement + whitewater)", &g_waterSim);
+          t.sliderF("Water sim: vertical gain", &g_swVertGain, 0.0f, 4.0f, 0.05f);
+          t.sliderF("Water sim: horizontal gain", &g_swHorizGain, 0.0f, 4.0f, 0.05f);
+          t.sliderF("Water sim: normal gain", &g_swNormalGain, 0.0f, 4.0f, 0.05f);
+          t.sliderF("Water sim: whitewater show", &g_swWWShow, 0.0f, 4.0f, 0.05f);
+          t.sliderF("Water sim: swell amp (u)", &g_swSwellAmp, 0.0f, 60.0f, 0.5f);
+          t.sliderF("Water sim: swell wavelength (u)", &g_swSwellLam, 64.0f, 1500.0f, 10.0f);
+          t.sliderF("Water sim: gust head (u)", &g_swGust, 0.0f, 20.0f, 0.1f);
+          t.sliderF("Water sim: river chop (u)", &g_swRiverChop, 0.0f, 20.0f, 0.1f);
+          t.sliderF("Water sim: Hmax (wave speed depth, u)", &g_swHmax, 4.0f, 300.0f, 1.0f);
+          t.sliderF("Water sim: damping (1/s)", &g_swDamp, 0.0f, 2.0f, 0.01f);
+          t.sliderF("Water sim: whitewater speed threshold (u/s)", &g_swWWThr, 5.0f, 400.0f, 5.0f);
+          t.sliderF("Water sim: whitewater gain", &g_swWWGain, 0.0f, 20.0f, 0.1f);
+          t.sliderF("Water sim: whitewater decay (1/s)", &g_swWWDecay, 0.0f, 5.0f, 0.05f);
+          t.sliderF("Water sim: swimmer push (u)", &g_swImpHead, 0.0f, 40.0f, 0.5f);
+          t.sliderF("Water sim: deep-water hold (0 = edge sponge only)", &g_swDeepHold, 0.0f, 1.0f, 0.01f);
           // The statics layer's only size filter — bound radius, NOT the LOD tier (which is about
           // silhouette at distance and drops the shacks this feature exists for). The floor worth
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
@@ -29360,6 +29441,349 @@ namespace {
             G.inShaderState = true;
         }
         cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // ═══ S — THE LOCAL WATER SIM (tasks/forge-water-3d.md; model and layout: swsim.srt.h) ═══════════
+    //
+    // "the detailed push pull sim doesn't need to be kms. more like 20-50 meters" (user, 2026-10-09):
+    // 192² at 16 u = 3072 u (~44 m) around the eye. Shallow-water equations over the real bed, two
+    // passes per step at a FIXED 60 Hz (the wave speed is physics, so the step must be time, not
+    // frames), up to kSwMaxSteps per frame. Displaces the near water rings (water.vert) and feeds
+    // water.frag its normals and whitewater (gSwField = D[0]). Knob waterSim, default OFF.
+    constexpr uint32_t kSwGrid     = 192;
+    constexpr float    kSwCell     = 16.0f;
+    constexpr uint32_t kSwThreads  = 8;          // SW_THREADS in swsim.comp.fsl
+    constexpr uint32_t kSwMaxSteps = 4;
+    constexpr float    kSwStep     = 1.0f / 60.0f;
+    struct SwSim {
+        Texture*       S[2] = {};                 // RGBA32F state, ping-pong
+        Texture*       D[2] = {};                 // RGBA16F display, ping-pong; D[0] is gSwField
+        // ONE cbuffer and ONE set instance PER DISPATCH (cmdDispatch records; a shared mapped buffer
+        // would hand every dispatch the last values written). Instance i: even = pass 0 (0 -> 1),
+        // odd = pass 1 (1 -> 0), so every step ends in index 0.
+        Buffer*        cbv[2 * kSwMaxSteps] = {};
+        DescriptorSet* set = nullptr;
+        Shader*        shader = nullptr;
+        Pipeline*      pipe = nullptr;
+        bool           ready = false, failed = false, cleared = false, inShaderState = false;
+        float          originX = 0.0f, originY = 0.0f;
+        bool           originValid = false;
+        float          accum = 0.0f;
+        int            lastSteps = 0;
+        bool           bodies = false;            // the set binds the real body/flow maps
+    };
+    SwSim g_sw;
+
+    void swTeardown(Renderer* R) {
+        if (g_sw.set)    { removeDescriptorSet(R, g_sw.set); g_sw.set = nullptr; }
+        if (g_sw.pipe)   { removePipeline(R, g_sw.pipe); g_sw.pipe = nullptr; }
+        if (g_sw.shader) { removeShader(R, g_sw.shader); g_sw.shader = nullptr; }
+        for (Buffer*& b : g_sw.cbv) { if (b) { removeFrameBuf(b); b = nullptr; } }
+        for (int i = 0; i < 2; ++i) {
+            if (g_sw.S[i]) { removeResource(g_sw.S[i]); g_sw.S[i] = nullptr; }
+            if (g_sw.D[i]) { removeResource(g_sw.D[i]); g_sw.D[i] = nullptr; }
+        }
+        g_sw.ready = false;
+    }
+
+    // Lazily, the first frame the sim is wanted and its inputs exist: the bed (pSkyHeight) and, when
+    // the bodies feature is on, the baked body/flow maps — so the set is written ONCE with its final
+    // bindings and never updated while a frame is in flight.
+    bool swEnsure(Renderer* R) {
+        if (g_sw.ready) { return true; }
+        if (g_sw.failed || !g_live.pSkyHeight || !g_live.pPerFrameSet) { return false; }
+        const bool bodiesWanted = g_waterBodies && !g_waterBodyFailed;
+        if (bodiesWanted && !(g_waterBodyBound && g_pWaterBodyTex && g_pWaterFlowTex)) { return false; }
+        auto fail = [&](const char* what) {
+            LOG::logline("!! [swsim] %s FAILED — water sim disabled", what);
+            swTeardown(R); g_sw.failed = true; return false;
+        };
+        ShaderLoadDesc sd = {};
+        sd.mComp.pFileName = "swsim.comp";
+        addShader(R, &sd, &g_sw.shader);
+        if (!g_sw.shader) { return fail("addShader(swsim.comp)"); }
+        PipelineDesc pd = {}; pd.mType = PIPELINE_TYPE_COMPUTE;
+        pd.mComputeDesc.pShaderProgram = g_sw.shader;
+        addPipeline(R, &pd, &g_sw.pipe);
+        if (!g_sw.pipe) { return fail("addPipeline"); }
+        for (int i = 0; i < 4; ++i) {
+            const bool st = i < 2;
+            char name[32];
+            std::snprintf(name, sizeof(name), "swsim%c%d", st ? 'S' : 'D', i & 1);
+            TextureDesc td = {};
+            td.mWidth = kSwGrid; td.mHeight = kSwGrid; td.mDepth = 1; td.mArraySize = 1; td.mMipLevels = 1;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = st ? TinyImageFormat_R32G32B32A32_SFLOAT : TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = name;
+            TextureLoadDesc tld = {};
+            tld.ppTexture = st ? &g_sw.S[i & 1] : &g_sw.D[i & 1];
+            tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+        for (uint32_t i = 0; i < 2 * kSwMaxSteps; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "swsimParams%u", i);
+            BufferLoadDesc pb = {};
+            pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pb.mDesc.mSize        = sizeof(SwSimParams);
+            pb.mDesc.pName        = name;
+            pb.ppBuffer           = &g_sw.cbv[i];
+            addFrameBuf(&pb);
+        }
+        waitForAllResourceLoads();
+        for (int i = 0; i < 2; ++i) { if (!g_sw.S[i] || !g_sw.D[i]) { return fail("texture alloc"); } }
+        for (Buffer* b : g_sw.cbv) { if (!b) { return fail("cbuffer alloc"); } }
+
+        DescriptorSetDesc dsd = SRT_SET_DESC(SwSimSrtData, Persistent, 2 * kSwMaxSteps, 0);
+        addDescriptorSet(R, &dsd, &g_sw.set);
+        if (!g_sw.set) { return fail("addDescriptorSet"); }
+        g_sw.bodies = bodiesWanted;
+        // Without the body maps the slots still need a texture: the bed stands in, and the
+        // bodyMap lane says "no map" so it is never read.
+        Texture* bed   = g_live.pSkyHeight->pTexture;
+        Texture* bodyT = g_sw.bodies ? g_pWaterBodyTex : bed;
+        Texture* flowT = g_sw.bodies ? g_pWaterFlowTex : bed;
+        for (uint32_t i = 0; i < 2 * kSwMaxSteps; ++i) {
+            const uint32_t prev = i & 1u, next = 1u - prev;
+            DescriptorData d[8] = {};
+            d[0].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwParams);    d[0].ppBuffers  = &g_sw.cbv[i];
+            d[1].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwPrevS);     d[1].ppTextures = &g_sw.S[prev];
+            d[2].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwPrevD);     d[2].ppTextures = &g_sw.D[prev];
+            d[3].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwNextS);     d[3].ppTextures = &g_sw.S[next];
+            d[4].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwNextD);     d[4].ppTextures = &g_sw.D[next];
+            d[5].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwSkyHeight); d[5].ppTextures = &bed;
+            d[6].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwBodies);    d[6].ppTextures = &bodyT;
+            d[7].mIndex = SRT_RES_IDX(SwSimSrtData, Persistent, gSwFlow);      d[7].ppTextures = &flowT;
+            updateDescriptorSet(R, i, g_sw.set, 8, d);
+        }
+        // The water pass's PerFrame set (water.vert/water.frag are its only readers).
+        DescriptorData pf = {};
+        pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSwField);
+        pf.mCount = 1; pf.ppTextures = &g_sw.D[0];
+        updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf);
+        g_sw.ready = true;
+        g_sw.cleared = false;
+        g_sw.inShaderState = false;
+        LOG::logline(">> [swsim] ready: %u² x %.0f u = %.0f u window, bodies %s",
+                     kSwGrid, (double)kSwCell, (double)(kSwGrid * kSwCell), g_sw.bodies ? "bound" : "none");
+        return true;
+    }
+
+    void swPark() {
+        if (!g_sw.ready || g_sw.inShaderState) { return; }
+        TextureBarrier fwd = {};
+        fwd.pTexture = g_sw.D[0];
+        fwd.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+        fwd.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &fwd, 0, nullptr);
+        g_sw.inShaderState = true;
+    }
+
+    // Dev: MGE_SW_DUMP=<frame> writes the finished field (S then D, f32 RGBA, N x N, row 0 = south) to
+    // hdrdump\\swsim_<frame>.bin with a header (N, cell, origin XY, water Z), between frames.
+    inline float halfToFloatHost(uint16_t h);   // defined with the sky oracle below
+    void swDumpMaybe(float waterZ) {
+        static long s_at = -2;
+        if (s_at == -2) { const char* e = std::getenv("MGE_SW_DUMP"); s_at = e ? std::atol(e) : -1; }
+        if (s_at < 0 || (long)g_renderFrame != s_at || !g_sw.ready || !g_sw.cleared) { return; }
+        Renderer* R = g_live.pRenderer;
+        waitQueueIdle(g_live.pQueue);
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t pS = roundUp(kSwGrid * 16u, rowAlign), pD = roundUp(kSwGrid * 8u, rowAlign);
+        auto mk = [&](uint64_t size) -> Buffer* {
+            BufferLoadDesc bd = {};
+            bd.mDesc.mSize = roundUp64(size, texAlign);
+            bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+            bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+            Buffer* b = nullptr; bd.ppBuffer = &b;
+            addResource(&bd, nullptr);
+            waitForAllResourceLoads();
+            return b;
+        };
+        Buffer* rbS = mk((uint64_t)pS * kSwGrid);
+        Buffer* rbD = mk((uint64_t)pD * kSwGrid);
+        auto rd = [&](Texture* t, ResourceState st, Buffer* rb) {
+            if (!t || !rb) { return; }
+            TextureCopyDesc c = {}; c.pTexture = t; c.pBuffer = rb; c.mTextureState = st; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+            SyncToken tk = {}; copyResource(&c, &tk); waitForToken(&tk);
+        };
+        rd(g_sw.S[0], RESOURCE_STATE_UNORDERED_ACCESS, rbS);
+        rd(g_sw.D[0], g_sw.inShaderState ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS, rbD);
+        CreateDirectoryA("hdrdump", nullptr);
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof(path), "hdrdump\\swsim_%ld.bin", s_at);
+        if (FILE* f = std::fopen(path, "wb")) {
+            const float hdr[6] = { (float)kSwGrid, kSwCell, g_sw.originX, g_sw.originY, waterZ, (float)g_sw.lastSteps };
+            std::fwrite(hdr, 4, 6, f);
+            const uint8_t* s = (const uint8_t*)rbS->pCpuMappedAddress;
+            for (uint32_t y = 0; y < kSwGrid; ++y) { std::fwrite(s + (size_t)y * pS, 16, kSwGrid, f); }
+            const uint8_t* d = (const uint8_t*)rbD->pCpuMappedAddress;
+            std::vector<float> row(kSwGrid * 4);
+            for (uint32_t y = 0; y < kSwGrid; ++y) {
+                const uint16_t* h = (const uint16_t*)(d + (size_t)y * pD);
+                for (uint32_t x = 0; x < kSwGrid * 4; ++x) { row[x] = halfToFloatHost(h[x]); }
+                std::fwrite(row.data(), 4, kSwGrid * 4, f);
+            }
+            std::fclose(f);
+            LOG::logline(">> [swsim] dumped %s", path);
+        }
+        removeResource(rbS); removeResource(rbD);
+    }
+
+    // One frame of the sim. `on` false parks it (D[0] readable, field frozen) and forgets the field so
+    // switching back on starts from rest.
+    void swAdvance(bool on, float eyeAbsX, float eyeAbsY, float waterZ, float dtFrame) {
+        if (!on) { if (g_sw.ready) { swPark(); g_sw.cleared = false; } return; }
+        if (!swEnsure(g_live.pRenderer)) { return; }
+        swDumpMaybe(waterZ);
+
+        int steps = 0;
+        if (!g_simFrozen) {
+            g_sw.accum += std::min(std::max(dtFrame, 0.0f), 0.25f);
+            steps = (int)(g_sw.accum / kSwStep);
+            if (steps > (int)kSwMaxSteps) { steps = (int)kSwMaxSteps; }
+            g_sw.accum -= (float)steps * kSwStep;
+            if (g_sw.accum > kSwStep) { g_sw.accum = kSwStep; }
+        }
+        if (!g_sw.cleared) { steps = std::max(steps, 1); }
+        g_sw.lastSteps = steps;
+        // No step = no scroll: the origin must stay with the stored field (advanceRippleGrid's lesson).
+        if (steps <= 0) { swPark(); return; }
+
+        const float halfW = 0.5f * (float)kSwGrid * kSwCell;
+        const float newOX = std::floor((eyeAbsX - halfW) / kSwCell) * kSwCell;
+        const float newOY = std::floor((eyeAbsY - halfW) / kSwCell) * kSwCell;
+        int shiftX = 0, shiftY = 0;
+        if (g_sw.originValid && g_sw.cleared) {
+            shiftX = (int)std::lround((newOX - g_sw.originX) / kSwCell);
+            shiftY = (int)std::lround((newOY - g_sw.originY) / kSwCell);
+            if (std::abs(shiftX) >= (int)kSwGrid || std::abs(shiftY) >= (int)kSwGrid) { g_sw.cleared = false; }
+        }
+        if (!g_sw.cleared) { shiftX = shiftY = (int)(2 * kSwGrid); }   // every fetch out of range = rest
+        g_sw.originX = newOX; g_sw.originY = newOY; g_sw.originValid = true;
+
+        // Wind heading: MW's wind vector for the DIRECTION only (its speeds are not trusted — the W
+        // field replaces this). Calm or missing: a fixed heading.
+        float wx = g_grassWind[0], wy = g_grassWind[1];
+        const float wl = std::sqrt(wx * wx + wy * wy);
+        if (wl > 1.0e-4f) { wx /= wl; wy /= wl; } else { wx = 0.8f; wy = 0.6f; }
+
+        SwSimParams base = {};
+        base.grid[0] = (float)kSwGrid; base.grid[1] = kSwCell; base.grid[2] = kSwStep;
+        base.scroll[2] = 9.81f / kMwUnitMetres;
+        base.scroll[3] = waterZ;
+        base.phys[0] = std::max(g_swHmax, 1.0f);
+        base.phys[1] = std::max(g_swDamp, 0.0f);
+        base.phys[2] = std::max(g_swSponge, 1.0f);
+        base.phys[3] = std::max(g_swSpongeRate, 0.0f);
+        base.origin[0] = newOX; base.origin[1] = newOY;
+        base.skyMap[0] = g_skyHeightOrigin[0]; base.skyMap[1] = g_skyHeightOrigin[1];
+        base.skyMap[2] = 1.0f / kSkyHeightExtent; base.skyMap[3] = (float)kSkyHeightRes;
+        if (g_sw.bodies) {
+            base.bodyMap[0] = g_waterBodyXf[0]; base.bodyMap[1] = g_waterBodyXf[1];
+            base.bodyMap[2] = g_waterBodyXf[2]; base.bodyMap[3] = g_waterBodyXf[3];
+        }
+        base.wind[0] = wx; base.wind[1] = wy;
+        base.wind[2] = std::max(g_swSwellAmp, 0.0f);
+        base.wind[3] = std::max(g_swSwellLam, 32.0f);
+        base.chop[0] = std::max(g_swGust, 0.0f);
+        base.chop[1] = std::max(g_swGustScale, 1.0f);
+        base.chop[2] = std::max(g_swRiverChop, 0.0f);
+        base.chop[3] = std::max(g_waterFlowPeriod, 0.1f);
+        base.ww[0] = g_swWWThr; base.ww[1] = g_swWWGain; base.ww[2] = g_swWWDecay; base.ww[3] = g_swWWConv;
+        base.disp[0] = std::max(g_swDispRelax, 0.0f);
+        base.disp[1] = g_waterFlowSpeed;
+        base.disp[2] = std::clamp(g_swDeepHold, 0.0f, 1.0f);
+        base.disp[3] = std::max(g_swFriction, 0.0f);
+        base.bodyAmp[0] = g_waterAmpSea; base.bodyAmp[1] = g_waterAmpRiver;
+        base.bodyAmp[2] = g_waterAmpPond; base.bodyAmp[3] = g_waterAmpBeach;
+        // Swimmers: the wake tracks (moving, extrapolated), as moving pressure dips.
+        uint32_t nImp = 0;
+        for (int i = 0; i < kWakeTracks && nImp < SW_MAX_IMPULSES; ++i) {
+            const WakeTrack& tr = g_wakeTrack[i];
+            if (!tr.active || g_swImpHead <= 0.0f) { continue; }
+            const float tx = (tr.x - newOX) / kSwCell, ty = (tr.y - newOY) / kSwCell;
+            if (tx < 0.0f || ty < 0.0f || tx >= (float)kSwGrid || ty >= (float)kSwGrid) { continue; }
+            base.impulses[nImp][0] = tx; base.impulses[nImp][1] = ty;
+            base.impulses[nImp][2] = std::max(g_swImpRadius, 1.0f) / kSwCell;
+            base.impulses[nImp][3] = g_swImpHead * tr.strength;
+            ++nImp;
+        }
+        base.origin[3] = (float)nImp;
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.5f, 0.9f, "WATER SIM (swsim)");
+        if (g_sw.inShaderState) {
+            TextureBarrier back = {};
+            back.pTexture = g_sw.D[0];
+            back.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            back.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &back, 0, nullptr);
+            g_sw.inShaderState = false;
+        }
+        const uint32_t groups = (kSwGrid + kSwThreads - 1) / kSwThreads;
+        cmdBindPipeline(g_live.pCmd, g_sw.pipe);
+        for (int s = 0; s < steps; ++s) {
+            // Forcing time: the sim clock, wrapped (float precision), advanced per sub-step.
+            const double tS = std::fmod(g_simClock - (double)(steps - 1 - s) * kSwStep, 1200.0);
+            for (int pass = 0; pass < 2; ++pass) {
+                const uint32_t inst = (uint32_t)(2 * s + pass);
+                SwSimParams* p = (SwSimParams*)fbw(g_sw.cbv[inst]);
+                std::memcpy(p, &base, sizeof(base));
+                p->grid[3]   = (float)pass;
+                p->origin[2] = (float)tS;
+                if (!(pass == 0 && s == 0)) { p->scroll[0] = p->scroll[1] = 0.0f; }
+                else { p->scroll[0] = (float)shiftX; p->scroll[1] = (float)shiftY; }
+                TextureBarrier tb[4] = {};
+                Texture* all[4] = { g_sw.S[0], g_sw.S[1], g_sw.D[0], g_sw.D[1] };
+                for (int k = 0; k < 4; ++k) {
+                    tb[k].pTexture = all[k];
+                    tb[k].mCurrentState = tb[k].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 4, tb, 0, nullptr);
+                cmdBindDescriptorSet(g_live.pCmd, inst, g_sw.set);
+                cmdDispatch(g_live.pCmd, groups, groups, 1);
+            }
+        }
+        g_sw.cleared = true;
+        {
+            TextureBarrier tb[2] = {};
+            tb[0].pTexture = g_sw.S[0];
+            tb[0].mCurrentState = tb[0].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb[1].pTexture = g_sw.D[0];
+            tb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb[1].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
+            g_sw.inShaderState = true;
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // gBatch.worlds[15] for the water pass (water.vert/water.frag read it; layout in water.vert.fsl).
+    void swWriteWaterLanes(uint8_t* wbuf, float eyeAbsX, float eyeAbsY, float eyeAbove) {
+        float w[16] = {};
+        const bool on = g_waterSim && g_sw.ready && g_sw.cleared;
+        w[0] = g_sw.originX - eyeAbsX;
+        w[1] = g_sw.originY - eyeAbsY;
+        w[2] = 1.0f / ((float)kSwGrid * kSwCell);
+        w[3] = on ? 1.0f : 0.0f;
+        w[4] = g_swVertGain;
+        w[5] = g_swHorizGain;
+        w[6] = g_swNormalGain;
+        w[7] = g_swWWShow;
+        w[8]  = std::clamp(g_swEdgeFade, 0.01f, 0.5f);
+        w[9]  = std::max(g_swGuardHeight, 1.0f);
+        w[10] = std::max(g_swGuardRadius, 1.0f);
+        w[11] = eyeAbove;
+        w[12] = g_swEyeFadeLo;
+        w[13] = std::max(g_swEyeFadeHi, g_swEyeFadeLo + 1.0f);
+        std::memcpy(wbuf + 15 * 64, w, 64);
     }
 
     // ═══ G7: THE GRASS CRUSH FIELD ═══════════════════════════════════════════════════════════════
@@ -34354,7 +34778,7 @@ void destroyHostWindow(Renderer* R);
                 // Camera-relative, D3DX row-major: scale(cell,cell,1) · translate(origin-eye, waterZ-eye.z).
                 float m[16] = { cell, 0, 0, 0,  0, cell, 0, 0,  0, 0, 1, 0,
                                 originX - eyeAbsX, originY - eyeAbsY, waterZ - eyeAbsZ, 1 };
-                std::memcpy(wbuf + (size_t)k * 64, m, 64);
+                std::memcpy(wbuf + (size_t)waterLevelSlot(k) * 64, m, 64);
             }
             // worlds[6] = packed params (4 float4 groups, row-major; the frag transposes to read).
             {
@@ -34416,6 +34840,7 @@ void destroyHostWindow(Renderer* R);
                 std::memcpy(wbuf + 6 * 64, p, 64);
                 // eyeAbs so the R2 block can make MW's absolute ripple centres eye-relative.
                 writeWaveScales(wbuf, eyeAbsX, eyeAbsY);
+                swWriteWaterLanes(wbuf, eyeAbsX, eyeAbsY, eyeAbsZ - waterLevelAbs);
             }
             // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
             // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
@@ -34466,11 +34891,19 @@ void destroyHostWindow(Renderer* R);
             cmdBindIndexBuffer(g_live.pCmd, g_live.pWaterIB, INDEX_TYPE_UINT16, 0);
             // VRS (g_vrsWater): far water tiles composite once per 2x2. Not while submerged — the
             // rate image is built from the seabed side of the depth and means nothing from below.
+            // ⚠ AND NOT WHILE THE LOCAL SIM DISPLACES THE SURFACE: the rate image comes from the depth
+            // BEHIND flat water, so a crest raised over a far rock was shaded at the far rate — dark
+            // 2x2-rate tiles along every silhouette the waves crossed (swsim, 3x amplitude A/B).
+            // Only the two rings the sim displaces (levels 0-1) lose it; the far rings keep their 2x2.
+            const bool swShown = g_waterSim && g_sw.ready && g_sw.cleared;
             const bool vrsW = g_vrsWater && g_live.vrsBuilt && !underwater && !waterDebugBitsSet();
             g_vrsMaskCur |= 16u | (underwater ? 32u : 0u) | (waterDebugBitsSet() ? 64u : 0u);
-            if (vrsW) { vrsBind(true); g_vrsMaskCur |= 8u; }
+            bool vrsOn = false;
+            if (vrsW) { g_vrsMaskCur |= 8u; }
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
                 const WaterLodLevelHost& lvl = g_waterLevels[k];
+                const bool wantVrs = vrsW && !(swShown && k < 2u);
+                if (wantVrs != vrsOn) { vrsBind(wantVrs); vrsOn = wantVrs; }
                 uint32_t variant = 0;
                 if (lvl.numVariants > 1) {
                     const int ex = (int)(((long long)std::floor(eyeAbsX / lvl.cellSize)) & 1);
@@ -34483,10 +34916,10 @@ void destroyHostWindow(Renderer* R);
                 // lambda bakes it in, like MGE's DrawIndexedPrimitive with BaseVertexIndex=0). Passing
                 // vertBase here too DOUBLE-offset levels 1..5 → only level 0 drew (~1 cell of coverage).
                 cmdDrawIndexedInstanced(g_live.pCmd, lvl.triCount[variant] * 3,
-                                        lvl.ibStart[variant], 1, 0, k);
+                                        lvl.ibStart[variant], 1, 0, k);   // DrawIndex = waterLevelSlot(k)
                 ++g_lastWaterLevels;   // Phase 0 panel
             }
-            if (vrsW) { vrsBind(false); }
+            if (vrsOn) { vrsBind(false); }
         }
 
         cmdBindRenderTargets(g_live.pCmd, nullptr);
@@ -42124,6 +42557,11 @@ void destroyHostWindow(Renderer* R);
             } else {
                 parkRippleGrid(g_live.rippleWake);
             }
+            // S — the local water sim, after the tracks it reads its swimmers from.
+            // Exterior only: its bed is the exterior height map.
+            swAdvance(ripWaterNow && g_waterSim && g_dlExterior && g_skyHeightValid
+                      && std::fabs(g_eyeAbsShadow[2] - (waterParams ? waterParams[0] : 0.0f)) < g_swEyeFadeHi, g_eyeAbsShadow[0], g_eyeAbsShadow[1],
+                      waterParams ? waterParams[0] : 0.0f, dtFrame);
         }
         gpuPhaseEnd(kGpuPhaseRippleSim);
 
@@ -55336,7 +55774,7 @@ void destroyHostWindow(Renderer* R);
             const float originY = std::floor(eye[1] / snap) * snap;
             float m[16] = { cell, 0, 0, 0,  0, cell, 0, 0,  0, 0, 1, 0,
                             originX - eye[0], originY - eye[1], waterZ - eye[2], 1 };
-            std::memcpy(wbuf + (size_t)k * 64, m, 64);
+            std::memcpy(wbuf + (size_t)waterLevelSlot(k) * 64, m, 64);
         }
         {
             float p[16] = {};
@@ -55358,6 +55796,7 @@ void destroyHostWindow(Renderer* R);
             std::memcpy(wbuf + 6 * 64, p, 64);
             // Viewer path: no client, so no actor ripples — the default 0,0 eye is unused.
             writeWaveScales(wbuf);             // worlds[8] = wave scales, worlds[9] = field extras
+            std::memset(wbuf + 15 * 64, 0, 64);   // no water sim in the viewer
         }
         {
             float invVP[16];
@@ -65715,6 +66154,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGiFieldPipeline)     { removePipeline(R, g_live.pGiFieldPipeline); g_live.pGiFieldPipeline = nullptr; }
         if (g_live.pGiFieldShader)       { removeShader(R, g_live.pGiFieldShader); g_live.pGiFieldShader = nullptr; }
         if (g_live.pGiField)             { removeRenderTarget(R, g_live.pGiField); g_live.pGiField = nullptr; }
+        swTeardown(R);
         if (g_pWaterBodyTex)             { removeResource(g_pWaterBodyTex); g_pWaterBodyTex = nullptr; }
         if (g_pWaterFlowTex)             { removeResource(g_pWaterFlowTex); g_pWaterFlowTex = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }

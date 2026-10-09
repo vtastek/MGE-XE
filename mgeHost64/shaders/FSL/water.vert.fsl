@@ -23,8 +23,18 @@ STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float3, WorldPos, TEXCOORD0);     // camera-relative world position (eyePos == 0 this frame)
+    DATA(float2, RestXY,   TEXCOORD1);     // S: the UNDISPLACED camera-relative XY (field lookups)
 };
 
+// S — the local water sim (swsim.srt.h). gBatch.worlds[15], host-written rows:
+//   [0] = (domain origin XY eye-relative, 1/extent, on)
+//   [1] = (vertical gain, horizontal gain, normal gain, whitewater gain)
+//   [2] = (edge fade as a fraction of the domain, eye-guard height, eye-guard radius, eye height
+//          above the plane)
+//   [3] = (eye height where the display starts fading, eye height where it is gone, 0, 0) — a 44 m
+//          detail field around the eye means nothing seen from a hilltop or the sky
+// Only the 32 u and 64 u rings reach into the window; the edge fade lands before the 64 u ring ends,
+// so the stitch to the flat 128 u ring is exact.
 ROOT_SIGNATURE(DefaultRootSignature)
 VSOutput VS_MAIN( VSInput In )
 {
@@ -33,6 +43,33 @@ VSOutput VS_MAIN( VSInput In )
 
     float4x4 world = gBatch.worlds[In.DrawIndex];   // per-LOD-level world (scale·snap·translate)
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
+    Out.RestXY = worldPos.xy;
+
+    const float4x4 SWP = transpose(gBatch.worlds[15]);
+    const float4 s0 = SWP[0];
+    const float4 s1 = SWP[1];
+    const float4 s2 = SWP[2];
+    if (s0.w > 0.5f)
+    {
+        const float2 uv = (worldPos.xy - s0.xy) * s0.z;
+        const float2 e  = min(uv, 1.0f - uv);
+        float w = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(e.x, e.y));
+        // EYE GUARD: with the eye near the waterline, flatten a disc around it so the camera never
+        // sits inside a crest; full displacement again once the eye is s2.y above the plane.
+        const float guardR = max(s2.z, 1.0f);
+        w *= lerp(saturate(length(worldPos.xy) / guardR), 1.0f, saturate(abs(s2.w) / max(s2.y, 1.0f)));
+        w *= 1.0f - smoothstep(SWP[3].x, max(SWP[3].y, SWP[3].x + 1.0f), abs(s2.w));
+        if (w > 0.0f)
+        {
+            // ⚠ THE SAME FUNCTION OF WORLD POSITION ON EVERY RING. The 32 u ring's outer edge and the
+            // 64 u ring's inner edge share vertices; a per-ring filter (a box on the coarse ring
+            // only, the first cut) gave those shared vertices two different heights — a crack along
+            // every crest at the ring boundary.
+            const float4 f = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, uv, 0.0f);
+            worldPos.z  += f.z  * s1.x * w;
+            worldPos.xy += f.xy * s1.y * w;
+        }
+    }
     Out.WorldPos = worldPos.xyz;
     Out.Position = mul(gFrameData.viewProj, worldPos);
     RETURN(Out);

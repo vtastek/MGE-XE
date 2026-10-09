@@ -916,6 +916,12 @@
 #include "ripplesim.comp.fsl"
 #end
 
+// S: the LOCAL WATER SIM (tasks/forge-water-3d.md) — shallow-water equations over the real bed on a
+// camera-centred 192² x 16 u grid; two passes per step (velocity, height). See swsim.srt.h.
+#comp swsim.comp
+#include "swsim.comp.fsl"
+#end
+
 // R2c: the DISPERSIVE wake step, on its own coarse grid. ripplesim.comp cannot produce a Kelvin
 // wedge at any setting — it is the non-dispersive wave equation, in which a moving source draws
 // nested circles or a Mach cone and nothing else. This one applies omega^2 = g|k| as a 21x21

@@ -4,7 +4,7 @@
 
 #define DIRECT3D12
 #define DIRECT3D12
-#define STAGE_VERT
+#define STAGE_COMP
 /*
 * Copyright (c) 2017-2025 The Forge Interactive Inc.
 *
@@ -972,150 +972,401 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 1003 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.vert.fsl"
-#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.vert.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-STRUCT(ObjVelParams)
+#line 922 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swsim.comp.fsl"
+#line 6 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swsim.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swsim.srt.h"
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swsim.srt.h"
+STRUCT(SwSimParams)
 {
 
+    float4 grid;
 
 
 
-    float4x4 viewProj;
+    float4 scroll;
+
+
+    float4 phys;
+
+    float4 origin;
+
+    float4 skyMap;
+
+    float4 bodyMap;
+
+    float4 wind;
+
+
+    float4 chop;
+
+
+    float4 ww;
 
 
 
 
+    float4 disp;
+
+    float4 bodyAmp;
 
 
-    float4x4 prevViewProjRel;
-    float4 screenParams;
-#line 65 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-    float4 opts;
-
-
-
-
-
-
-
-
-    float4 opts2;
-#line 75
+    float4 impulses[ 16 ];
+#line 73
 };
 
-STRUCT(ObjVelBatch)
+        CBUFFER(SwSimParams) gSwParams :  register(b0,space0);
+        RTex2D(float4) gSwPrevS :  register(u1,space0);
+        RTex2D(float4) gSwPrevD :  register(u2,space0);
+        RWTex2D(float4) gSwNextS :  register(u3,space0);
+        RWTex2D(float4) gSwNextD :  register(u4,space0);
+        Tex2D(float) gSwSkyHeight :  register(t5,space0);
+        Tex2D(float4) gSwBodies :  register(t6,space0);
+        Tex2D(float4) gSwFlow :  register(t7,space0);
+#line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swsim.comp.fsl"
+
+
+
+
+
+float swHash(float2 p)
 {
-
-
-
-
-
-
-    float4x4 worlds[ 448 ];
-
-
-
-    float4x4 prevWorlds[ 448 ];
-#line 90
-};
-#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-STRUCT(ObjVelBones)
-{
-
-
-
-
-
-    float4x4 bones[ 1024 ];
-#line 123
-};
-
-        CBUFFER(ObjVelParams) gObjVelParams :  register(b0,space3);
-        CBUFFER(ObjVelBatch) gObjVelBatch :  register(b1,space3);
-
-
-
-        WTex2D(float2) gObjVelOut :  register(u2,space3);
-
-
-
-
-
-
-        RWBuffer(uint) gObjVelFrags :  register(u3,space3);
-
-
-
-
-
-
-
-
-
-        CBUFFER(ObjVelBones) gObjVelBonesCur :  register(b4,space3);
-#line 166 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-        CBUFFER(ObjVelBones) gObjVelBonesPrev :  register(b5,space3);
-#line 188 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-        WTex2D(float) gObjVelDepthOut :  register(u6,space3);
-#line 200 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-        WTex2D(float2) gObjVelBlurOut :  register(u7,space3);
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.vert.fsl"
-
-STRUCT(VSInput)
-{
-    DATA(float3, Position, POSITION);
-    DATA(uint, DrawIndex, TEXCOORD1);
-#line 16
-};
-
-STRUCT(VSOutput)
-{
-    precise DATA(float4, Position, SV_Position);
-#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.vert.fsl"
-    DATA(float4, PrevClip, TEXCOORD0);
-    DATA(float4, CurClip, TEXCOORD1);
-
-
-
-
-
-
-    DATA(float4, PrevStatic, TEXCOORD2);
-#line 48
-};
-
-[RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-VSOutput VS_MAIN( VSInput In )
-{
-    //INIT_MAIN;
-    VSOutput Out;
-
-    uint idx = In.DrawIndex;
-    float4 p = float4(In.Position, 1.0f);
-
-
-
-
-
-
-    float4 worldPos = mul(gObjVelBatch.worlds[idx], p);
-    Out.Position = mul(gObjVelParams.viewProj, worldPos);
-    Out.CurClip = Out.Position;
-
-
-
-
-
-    float4 prevWorldPos = mul(gObjVelBatch.prevWorlds[idx], p);
-    Out.PrevClip = mul(gObjVelParams.prevViewProjRel, prevWorldPos);
-
-
-
-    Out.PrevStatic = mul(gObjVelParams.prevViewProjRel, worldPos);
-
-    return (Out);
+    p = frac(p * float2(0.1031f, 0.1030f));
+    p += dot(p, p.yx + 33.33f);
+    return frac((p.x + p.y) * p.x);
 }
-#line 1004 "FSL/shaders.list"
+float swNoise(float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = p - i;
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    const float a = swHash(i);
+    const float b = swHash(i + float2(1.0f, 0.0f));
+    const float c = swHash(i + float2(0.0f, 1.0f));
+    const float d = swHash(i + float2(1.0f, 1.0f));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+
+float2 swWorld(int2 c)
+{
+    return gSwParams.origin.xy + (float2(c) + 0.5f) * gSwParams.grid.y;
+}
+
+float swBedTap(int2 t, int n)
+{
+    const float z = LoadTex2D(gSwSkyHeight, NO_SAMPLER, clamp(t, int2(0, 0), int2(n, n)), 0).r;
+
+    return (z <  -20000.0f ) ? (gSwParams.scroll.w - 4000.0f) : z;
+}
+
+float swBed(float2 w)
+{
+    const float4 m = gSwParams.skyMap;
+    if (m.w < 1.0f) { return gSwParams.scroll.w - 4000.0f; }
+    const float2 t = (w - m.xy) * m.z * m.w - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f = t - fl;
+    const int2 i = int2(fl);
+    const int n = int(m.w) - 1;
+    const float a = swBedTap(i, n);
+    const float b = swBedTap(i + int2(1, 0), n);
+    const float c = swBedTap(i + int2(0, 1), n);
+    const float d = swBedTap(i + int2(1, 1), n);
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float swD0(float2 w) { return gSwParams.scroll.w - swBed(w); }
+
+float4 swBodyTap(int2 t, int2 n) { return LoadTex2D(gSwBodies, NO_SAMPLER, clamp(t, int2(0, 0), n), 0); }
+float4 swFlowTap(int2 t, int2 n) { return LoadTex2D(gSwFlow, NO_SAMPLER, clamp(t, int2(0, 0), n), 0); }
+
+
+float4 swBodies(float2 w)
+{
+    const float4 m = gSwParams.bodyMap;
+    if (m.z <= 0.0f) { return float4(1.0f, 0.0f, 0.0f, 0.0f); }
+    const int2 dim = GetDimensions(gSwBodies, NO_SAMPLER);
+    const float2 t = (w - m.xy) * m.zw * float2(dim) - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f = t - fl;
+    const int2 i = int2(fl);
+    const int2 n = dim - int2(1, 1);
+    const float4 bw = lerp(lerp(swBodyTap(i, n), swBodyTap(i + int2(1, 0), n), f.x),
+                           lerp(swBodyTap(i + int2(0, 1), n), swBodyTap(i + int2(1, 1), n), f.x), f.y);
+    const float ws = bw.r + bw.g + bw.b + bw.a;
+    return (ws > 1.0e-3f) ? bw / ws : float4(1.0f, 0.0f, 0.0f, 0.0f);
+}
+
+float2 swFlow(float2 w)
+{
+    const float4 m = gSwParams.bodyMap;
+    if (m.z <= 0.0f) { return float2(0.0f, 0.0f); }
+    const int2 dim = GetDimensions(gSwFlow, NO_SAMPLER);
+    const float2 t = (w - m.xy) * m.zw * float2(dim) - 0.5f;
+    const float2 fl = floor(t);
+    const float2 f = t - fl;
+    const int2 i = int2(fl);
+    const int2 n = dim - int2(1, 1);
+    const float3 fv = lerp(lerp(swFlowTap(i, n), swFlowTap(i + int2(1, 0), n), f.x),
+                           lerp(swFlowTap(i + int2(0, 1), n), swFlowTap(i + int2(1, 1), n), f.x), f.y).rgb;
+    const float2 dir = fv.rg * 2.0f - 1.0f;
+    return dir * fv.b * gSwParams.disp.y;
+}
+
+
+
+float swGust(float2 w, float c)
+{
+    const float2 d = gSwParams.wind.xy;
+    const float L = max(gSwParams.chop.y, 1.0f);
+    const float t = gSwParams.origin.z;
+    float2 p = float2(dot(w, d), dot(w, float2(-d.y, d.x)));
+    p.x -= c * t;
+    const float n = (swNoise(p / L) - 0.5f) + 0.5f * (swNoise(p / (0.47f * L) + 17.3f) - 0.5f);
+    return gSwParams.chop.x * 1.33f * n;
+}
+
+
+
+float3 swSwell(float2 w, float c)
+{
+    const float A = gSwParams.wind.z;
+    const float lam = max(gSwParams.wind.w, 32.0f);
+    const float t = gSwParams.origin.z;
+    const float g = gSwParams.scroll.z;
+    float3 r = float3(0.0f, 0.0f, 0.0f);
+    const float lams[3] = { 1.0f, 0.71f, 0.53f };
+    const float angs[3] = { 0.0f, 0.42f, -0.35f };
+    const float amps[3] = { 1.0f, 0.6f, 0.4f };
+    UNROLL for (int k = 0; k < 3; ++k)
+    {
+        const float ca = cos(angs[k]);
+        const float sa = sin(angs[k]);
+        const float2 d = float2(gSwParams.wind.x * ca - gSwParams.wind.y * sa,
+                                 gSwParams.wind.x * sa + gSwParams.wind.y * ca);
+        const float kk = 6.28318531f / (lam * lams[k]);
+        const float e = A * amps[k] * cos(kk * (dot(w, d) - c * t) + 1.7f * float(k));
+        r.x += e;
+        r.yz += d * (g * e / max(c, 1.0f));
+    }
+    return r;
+}
+
+
+float swImpulses(float2 c)
+{
+    float p = 0.0f;
+    const int n = int(gSwParams.origin.w);
+    LOOP for (int i = 0; i < n; ++i)
+    {
+        const float4 imp = gSwParams.impulses[i];
+        const float r = max(imp.z, 0.5f);
+        const float d = length(c - imp.xy) / r;
+        if (d < 1.0f) { p -= imp.w * (1.0f - d * d) * (1.0f - d * d); }
+    }
+    return p;
+}
+
+
+
+
+float swSponge(int2 id, float d0)
+{
+    const int N = int(gSwParams.grid.x);
+    const float e = float(min(min(id.x, id.y), min(N - 1 - id.x, N - 1 - id.y)));
+    const float Hm = max(gSwParams.phys.x, 1.0f);
+    const float edge = saturate(1.0f - e / max(gSwParams.phys.z, 1.0f));
+    const float deep = saturate(gSwParams.disp.z) * saturate((d0 - Hm) / Hm);
+    return max(edge, deep);
+}
+
+bool swInside(int2 c) { const int N = int(gSwParams.grid.x); return c.x >= 0 && c.y >= 0 && c.x < N && c.y < N; }
+
+[RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
+NUM_THREADS( 8 ,  8 , 1)
+void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
+{
+    INIT_MAIN;
+    const int2 id = int2(did.xy);
+    if (!swInside(id))
+    {
+        return;
+    }
+    const float dx = gSwParams.grid.y;
+    const float dt = gSwParams.grid.z;
+    const float g = gSwParams.scroll.z;
+    const float Hm = max(gSwParams.phys.x, 1.0f);
+    const float cM = sqrt(g * Hm);
+
+    if (gSwParams.grid.w < 0.5f)
+    {
+
+        const int2 src = id + int2(gSwParams.scroll.xy);
+        const float2 wC = swWorld(id);
+        const float2 wX = swWorld(id + int2(1, 0));
+        const float2 wY = swWorld(id + int2(0, 1));
+
+
+        const float d0C = swD0(wC);
+        float4 SC = float4(max(0.0f, -d0C), 0.0f, 0.0f, d0C);
+        float4 DC = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (swInside(src))
+        {
+            SC = LoadRWTex2D(gSwPrevS, src);
+            SC.w = d0C;
+            SC.x = max(SC.x, -d0C);
+            DC = LoadRWTex2D(gSwPrevD, src);
+        }
+        float4 SX, SY;
+        if (swInside(src + int2(1, 0))) { SX = LoadRWTex2D(gSwPrevS, src + int2(1, 0)); }
+        else { const float d = swD0(wX); SX = float4(max(0.0f, -d), 0.0f, 0.0f, d); }
+        if (swInside(src + int2(0, 1))) { SY = LoadRWTex2D(gSwPrevS, src + int2(0, 1)); }
+        else { const float d = swD0(wY); SY = float4(max(0.0f, -d), 0.0f, 0.0f, d); }
+
+
+        const float4 bw = swBodies(wC);
+        const float bAmp = dot(bw, gSwParams.bodyAmp);
+        const float pC = swGust(wC, cM) * bAmp + swImpulses(float2(id) + 0.5f);
+        const float pX = swGust(wX, cM) * bAmp + swImpulses(float2(id) + float2(1.5f, 0.5f));
+        const float pY = swGust(wY, cM) * bAmp + swImpulses(float2(id) + float2(0.5f, 1.5f));
+
+        const float keep = exp(-max(gSwParams.phys.y, 0.0f) * dt);
+        const float vMax = 0.25f * dx / max(dt, 1.0e-4f);
+        const float sp = swSponge(id, d0C);
+        const float cf = max(gSwParams.disp.w, 0.0f);
+        const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
+
+        float u = SC.y;
+        const float hX = max(SC.x, SX.x) - max(-SC.w, -SX.w);
+        if (hX >  0.5f )
+        {
+            u -= dt * g * ((SX.x + pX) - (SC.x + pC)) / dx;
+            u *= keep;
+            u /= 1.0f + dt * cf * abs(u) / max(hX,  0.5f );
+            if (sp > 0.0f)
+            {
+                const float c = sqrt(g * clamp(min(SC.w, SX.w), 1.0f, Hm));
+                u = lerp(u, swSwell(0.5f * (wC + wX), c).y * bAmp, relax);
+            }
+            u = clamp(u, -vMax, vMax);
+        }
+        else { u = 0.0f; }
+
+        float v = SC.z;
+        const float hY = max(SC.x, SY.x) - max(-SC.w, -SY.w);
+        if (hY >  0.5f )
+        {
+            v -= dt * g * ((SY.x + pY) - (SC.x + pC)) / dx;
+            v *= keep;
+            v /= 1.0f + dt * cf * abs(v) / max(hY,  0.5f );
+            if (sp > 0.0f)
+            {
+                const float c = sqrt(g * clamp(min(SC.w, SY.w), 1.0f, Hm));
+                v = lerp(v, swSwell(0.5f * (wC + wY), c).z * bAmp, relax);
+            }
+            v = clamp(v, -vMax, vMax);
+        }
+        else { v = 0.0f; }
+
+        Write2D(gSwNextS, id, float4(SC.x, u, v, SC.w));
+        Write2D(gSwNextD, id, DC);
+        return;
+    }
+
+
+    const float4 SC = LoadRWTex2D(gSwPrevS, id);
+    const float4 DC = LoadRWTex2D(gSwPrevD, id);
+    const float d0 = SC.w;
+
+    float4 SW_ = float4(SC.x, 0.0f, 0.0f, d0);
+    float4 SS_ = float4(SC.x, 0.0f, 0.0f, d0);
+    float4 SE_ = float4(SC.x, 0.0f, 0.0f, d0);
+    float4 SN_ = float4(SC.x, 0.0f, 0.0f, d0);
+    if (swInside(id - int2(1, 0))) { SW_ = LoadRWTex2D(gSwPrevS, id - int2(1, 0)); }
+    if (swInside(id - int2(0, 1))) { SS_ = LoadRWTex2D(gSwPrevS, id - int2(0, 1)); }
+    if (swInside(id + int2(1, 0))) { SE_ = LoadRWTex2D(gSwPrevS, id + int2(1, 0)); }
+    if (swInside(id + int2(0, 1))) { SN_ = LoadRWTex2D(gSwPrevS, id + int2(0, 1)); }
+
+
+
+    const float hE = max(SC.x, SE_.x) - max(-d0, -SE_.w);
+    const float hW = max(SC.x, SW_.x) - max(-d0, -SW_.w);
+    const float hN = max(SC.x, SN_.x) - max(-d0, -SN_.w);
+    const float hS = max(SC.x, SS_.x) - max(-d0, -SS_.w);
+    const float Hm2 = Hm;
+    const float fE = (hE >  0.5f ) ? SC.y * min(hE, Hm2) : 0.0f;
+    const float fW = (hW >  0.5f ) ? SW_.y * min(hW, Hm2) : 0.0f;
+    const float fN = (hN >  0.5f ) ? SC.z * min(hN, Hm2) : 0.0f;
+    const float fS = (hS >  0.5f ) ? SS_.z * min(hS, Hm2) : 0.0f;
+    float eta = SC.x - dt * (fE - fW + fN - fS) / dx;
+
+    const float2 wC = swWorld(id);
+    const float4 bw = swBodies(wC);
+    const float bAmp = dot(bw, gSwParams.bodyAmp);
+    const float sp = swSponge(id, d0);
+
+
+
+    if (sp > 0.0f && eta + d0 >  0.5f )
+    {
+        const float c = sqrt(g * clamp(d0, 1.0f, Hm));
+        const float relax = 1.0f - exp(-gSwParams.phys.w * dt * sp);
+        eta = lerp(eta, swSwell(wC, c).x * bAmp, relax);
+    }
+
+
+    if (bw.g > 0.02f && eta + d0 >  0.5f  && gSwParams.chop.z > 0.0f)
+    {
+        const float T = max(gSwParams.chop.w, 0.1f);
+        const float ph = frac(gSwParams.origin.z / T);
+        const float2 fl = swFlow(wC);
+        const float2 p1 = (wC - fl * (ph * T)) / 70.0f;
+        const float2 p2 = (wC - fl * (frac(ph + 0.5f) * T)) / 70.0f + 31.7f;
+        const float wgt = abs(2.0f * ph - 1.0f);
+        const float n = lerp(swNoise(p1), swNoise(p2), wgt) - 0.5f;
+        const float tgt = gSwParams.chop.z * 2.0f * n;
+        eta = lerp(eta, tgt, (1.0f - exp(-3.0f * dt)) * bw.g);
+    }
+    eta = max(eta, -d0);
+    const float H = eta + d0;
+    const bool wet = H >  0.5f ;
+
+
+    const float2 vel = float2(0.5f * (SC.y + SW_.y), 0.5f * (SC.z + SS_.z));
+    const float spd = length(vel);
+    const float conv = -((SC.y - SW_.y) + (SC.z - SS_.z)) / dx;
+
+
+
+    const float dkeep = exp(-max(gSwParams.disp.x, 0.0f) * dt);
+    float2 D = DC.xy * dkeep + (wet ? vel * dt : float2(0.0f, 0.0f));
+
+
+
+    float wwAdv = DC.w;
+    {
+        const float2 p = float2(id) - vel * dt / dx;
+        const float2 fl = floor(p);
+        const float2 f = p - fl;
+        const int2 i = int2(fl);
+        const int N1 = int(gSwParams.grid.x) - 1;
+        const float a = LoadRWTex2D(gSwPrevD, clamp(i, int2(0, 0), int2(N1, N1))).w;
+        const float b = LoadRWTex2D(gSwPrevD, clamp(i + int2(1, 0), int2(0, 0), int2(N1, N1))).w;
+        const float c = LoadRWTex2D(gSwPrevD, clamp(i + int2(0, 1), int2(0, 0), int2(N1, N1))).w;
+        const float d = LoadRWTex2D(gSwPrevD, clamp(i + int2(1, 1), int2(0, 0), int2(N1, N1))).w;
+        wwAdv = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    }
+    const float thr = max(gSwParams.ww.x, 1.0f);
+    float ww = wwAdv * exp(-max(gSwParams.ww.z, 0.0f) * dt)
+             + dt * (gSwParams.ww.y * max(spd - thr, 0.0f) / thr + gSwParams.ww.w * max(conv, 0.0f));
+    ww = wet ? saturate(ww) : saturate(ww) * exp(-4.0f * dt);
+
+
+    const float hDisp = wet ? eta : (min(eta, 0.0f) - 4.0f);
+
+    Write2D(gSwNextS, id, float4(eta, SC.y, SC.z, d0));
+    Write2D(gSwNextD, id, float4(D, hDisp, ww));
+    return;
+}
+#line 923 "FSL/shaders.list"

@@ -274,6 +274,7 @@ STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float3, WorldPos, TEXCOORD0);     // camera-relative world position (eyePos == 0)
+    DATA(float2, RestXY,   TEXCOORD1);     // S: undisplaced camera-relative XY (water.vert)
 };
 
 // Reconstruct camera-relative world position from a screen UV + reverse-Z device depth, exactly as
@@ -1396,6 +1397,38 @@ float4 PS_MAIN( VSOutput In )
             float2 wslope = wfld.zw * wakeG0.z * wakeG1.x * wfade;
             float2 base4  = normal.xy / max(normal.z, 1e-4f);
             normal = normalize(float3(base4 + wslope, 1.0f));
+        }
+    }
+
+    // S — the LOCAL WATER SIM (swsim.srt.h): the surface slope of the displayed height, looked up
+    // at the parcel's REST position (water.vert moved the vertex by the field's own displacement,
+    // so the rest XY is where this water belongs in the field). Whitewater mass rides along for the
+    // surface foam below.
+    float swWW = 0.0f;
+    {
+        const float4x4 SWP = transpose(gBatch.worlds[15]);
+        const float4 s0 = SWP[0];
+        const float4 s1 = SWP[1];
+        const float4 s2 = SWP[2];
+        if (s0.w > 0.5f && !flatWater)
+        {
+            const float2 suv = (In.RestXY - s0.xy) * s0.z;
+            const float2 se  = min(suv, 1.0f - suv);
+            const float  sw  = smoothstep(0.0f, max(s2.x, 1.0e-3f), min(se.x, se.y))
+                             * (1.0f - smoothstep(SWP[3].x, max(SWP[3].y, SWP[3].x + 1.0f), abs(s2.w)));
+            if (sw > 0.0f)
+            {
+                const float tx = 16.0f * s0.z;       // one sim texel (16 u) in uv
+                const float hR = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv + float2(tx, 0.0f), 0.0f).z;
+                const float hL = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv - float2(tx, 0.0f), 0.0f).z;
+                const float hU = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv + float2(0.0f, tx), 0.0f).z;
+                const float hD = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv - float2(0.0f, tx), 0.0f).z;
+                // -dh/dx: the convention every slope above adds (a rising surface tilts the normal back).
+                const float2 sslope = -float2(hR - hL, hU - hD) / 32.0f * s1.x * s1.z * sw;
+                const float2 base5  = normal.xy / max(normal.z, 1e-4f);
+                normal = normalize(float3(base5 + sslope, 1.0f));
+                swWW = SampleLvlTex2D(gSwField, gSamplerBilinearClamp, suv, 0.0f).w * s1.w * sw;
+            }
         }
     }
 
@@ -2766,6 +2799,37 @@ float4 PS_MAIN( VSOutput In )
             result = lerp(result, foamCol, foam);
             kDst   = kDst * (1.0f - foam);
         }
+    }
+
+    // S — WHITEWATER from the sim's mass (speed + convergence; swsim.comp). Same breakup and the same
+    // lighting as the shore foam above, but the COVER is the simulated mass, so it appears where the
+    // water is fast or colliding and drifts away with it. Rest-XY anchored, so it travels with the
+    // displaced surface rather than sliding under it.
+    if (swWW > 0.002f)
+    {
+        const float  kT   = 160.0f;
+        const float2 eyeT = frac(gFrameData.lodEye.xy / (kT * 64.0f)) * 64.0f;
+        const float2 fP   = In.RestXY / kT + eyeT;
+        const float  nf   = foamFbm2(fP);
+        const float  nfi  = foamFbm2(fP * 5.0f + 3.1f);
+        float wf = saturate((saturate(swWW) * (0.6f + nf) - 0.35f) * 2.5f);
+        wf *= lerp(1.0f, saturate(0.5f + nfi), 0.5f);
+        float sunVisW = 1.0f;
+        const float4 so = gShadowParams.sunOcc;
+        const float4 sm = gShadowParams.skyAOMap;
+        if (so.x > 0.0f && sm.z > 0.0f)
+        {
+            const float2 ouv    = (surfPos.xy + gFrameData.lodEye.xy - sm.xy) * sm.z;
+            const float  blockZ = SampleLvlTex2D(gSunOcc, gSamplerBilinearClamp, ouv, 0.0f).r;
+            float t = saturate(((blockZ - so.z) - (surfPos.z + gFrameData.lodEye.z + 8.0f)) / max(so.y, 1.0e-3f));
+            t = t * t * (3.0f - 2.0f * t);
+            sunVisW = 1.0f - t * so.x;
+        }
+        const float3 Lw = -normalize(gFrameData.sunDir.xyz);
+        const float3 wwCol = 0.6f * (gFrameData.sunCol.rgb * saturate(Lw.z) * sunVisW + gFrameData.ambCol.rgb);
+        wf *= 0.9f;
+        result = lerp(result, wwCol, wf);
+        kDst   = kDst * (1.0f - wf);
     }
 
 	// ─── THE AIR SEGMENT: THE ONE FOGGING ────────────────────────────────────────────────────────
