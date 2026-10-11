@@ -1285,8 +1285,18 @@ STRUCT(ShadowMaskParams)
 
     float4 weatherState2;
 
+
+
+
+
+
     float4 skyAOGround;
-#line 1077
+
+
+
+    float4 pgiParams0;
+    float4 pgiParams1;
+#line 1087
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1706,6 +1716,16 @@ STRUCT(LightData)
 
 
 
+        Tex2D(float) gSkyHeightLow :  register(t158,space1);
+
+
+
+
+        Tex2DArray(float4) gPgiSH :  register(t159,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1718,7 +1738,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 740 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 750 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1729,7 +1749,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 764 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 774 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
@@ -2322,6 +2342,33 @@ float3 skyAmbFactorAO(float3 N, float ao)
 
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao + f3(fill);
 }
+#line 345 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float skyLateralFree(float2 uv, float z)
+{
+
+
+    float top = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv, 0).r;
+    float low = -SampleLvlTex2D(gSkyHeightLow, gSamplerBilinearClamp, uv, 0).r;
+    return max(saturate((z - top) * (1.0f / 32.0f)), saturate((low + 32.0f - z) * (1.0f / 32.0f)));
+}
+
+float skyLateralOpen(float3 worldAbs, float R)
+{
+    float4 m = gShadowParams.skyAOMap;
+    float2 uv = (worldAbs.xy - m.xy) * m.z;
+    float r = R * m.z;
+    float sum = 0.0f;
+    UNROLL for (int k = 0; k < 5; ++k)
+    {
+        float az = 0.15708f + 1.25664f * (float)k;
+        float2 d = float2(cos(az), sin(az)) * r;
+        float f = skyLateralFree(uv + d * 0.3333f, worldAbs.z);
+        f = min(f, skyLateralFree(uv + d * 0.6667f, worldAbs.z));
+        f = min(f, skyLateralFree(uv + d, worldAbs.z));
+        sum += f;
+    }
+    return sum * 0.2f;
+}
 
 
 
@@ -2329,16 +2376,79 @@ float3 skyAmbFactorAO(float3 N, float ao)
 
 
 
-float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+float4 pgiIrradiance(float3 N, float3 worldAbs)
+{
+    const float4 P0 = gShadowParams.pgiParams0;
+    const float4 P1 = gShadowParams.pgiParams1;
+    if (P0.x <= 0.0f) { return f4(0.0f); }
+    const float2 e = abs(worldAbs.xy - P1.xy) * P1.z;
+    const float edge = saturate((1.0f - max(e.x, e.y)) * 6.0f);
+    if (edge <= 0.0f) { return f4(0.0f); }
+    const float2 uv = worldAbs.xy * P0.y + P0.z;
+    const float4 m0 =  gPgiSH.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(14)), 0.0f) ;
+    const float4 m1 =  gPgiSH.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(15)), 0.0f) ;
+    float w0 = 0.0f, w1 = 0.0f;
+    if (m0.y > 1.0e-3f && m1.y > 1.0e-3f) {
+        const float z0 = m0.x / m0.y, z1 = m1.x / m1.y;
+        const float t = saturate((worldAbs.z - z0) / max(z1 - z0, 1.0f));
+        w0 = 1.0f - t; w1 = t;
+    } else if (m0.y > 1.0e-3f) { w0 = 1.0f; }
+    else if (m1.y > 1.0e-3f) { w1 = 1.0f; }
+    const float wsum = w0 * m0.y + w1 * m1.y;
+    if (wsum < 1.0e-3f) { return f4(0.0f); }
+    const float inv = 1.0f / wsum;
+    float4 c[7];
+    UNROLL for (int k = 0; k < 7; ++k) {
+        c[k] = (w0 *  gPgiSH.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(k)), 0.0f)  + w1 *  gPgiSH.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(7 + k)), 0.0f) ) * inv;
+    }
+
+    const float3 n = normalize(N);
+    const float Y[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
+                         1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float f[28] = { c[0].x, c[0].y, c[0].z, c[0].w, c[1].x, c[1].y, c[1].z, c[1].w,
+                          c[2].x, c[2].y, c[2].z, c[2].w, c[3].x, c[3].y, c[3].z, c[3].w,
+                          c[4].x, c[4].y, c[4].z, c[4].w, c[5].x, c[5].y, c[5].z, c[5].w,
+                          c[6].x, c[6].y, c[6].z, c[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) {
+        E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b];
+    }
+    return float4(max(E, f3(0.0f)), edge * saturate(wsum));
+}
+
+
+
+float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
 
 
 
-    ao = lerp(ao, 1.0f, gShadowParams.skyAOGround.x * saturate(0.5f - 0.5f * normalize(N).z));
+
+    const float openRef = gShadowParams.skyAOGround.y;
+
+
+    float open = (openRef > 0.0f) ? smoothstep(0.0f, openRef, ao) : 1.0f;
+    const float aoPos = ao;
+
+
+    const float latR = gShadowParams.skyAOGround.w;
+    if (open < 1.0f && latR > 0.0f && normalize(N).z < 0.9f && gShadowParams.skyAOMap.z > 0.0f)
+    {
+        open = max(open, skyLateralOpen(worldPosRel + gFrameData.lodEye.xyz, latR));
+    }
+
+
+
+
+
+
+
+    ao = lerp(ao, 1.0f, gShadowParams.skyAOGround.x * open * saturate(0.5f - 0.5f * normalize(N).z));
     float3 f = skyAmbFactorAO(N, ao);
     float g = gShadowParams.skyAOFloor.z;
-    if (g <= 0.0f || ao >= 1.0f) { return f; }
+    if (g <= 0.0f || aoPos >= 1.0f) { return f; }
     float4 m = gShadowParams.skyAOMap;
     float2 uv = (worldPosRel.xy + gFrameData.lodEye.xy - m.xy) * m.z;
     float2 e = abs(uv - 0.5f) * 2.0f;
@@ -2355,7 +2465,31 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
     float fl = (ambL > 1.0e-6f) ? min(gShadowParams.skyAOFloor.x / ambL, gShadowParams.skyAOFloor.y) : 0.0f;
     float3 amb = max(gFrameData.ambCol.rgb, f3(1.0e-4f));
     float3 bounce = (fld.rgb / max(fld.a, 1.0e-3f)) * g / amb;
-    return f + (bounce - f3(fl)) * (1.0f - ao) * w;
+
+
+
+
+
+    const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
+    return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
+}
+
+
+
+
+float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+{
+
+    if (gShadowParams.pgiParams0.x > 0.0f) {
+        const float4 pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz);
+        if (pg.a > 0.0f) {
+            const float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            if (pg.a >= 0.999f) { return fp; }
+            return lerp(skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
+        }
+    }
+
+    return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 
 float3 skyAmbFactor(float3 N, float3 worldPosRel)

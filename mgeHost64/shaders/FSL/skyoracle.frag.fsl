@@ -94,12 +94,16 @@ PSOut PS_MAIN(VSOutput In)
     float3 L    = -gFrameData.sunDir.xyz;   // to the sampled sky direction
     float  NdotL = dot(N, L);
     float  vis  = 0.0f;
-    if (sel >= 0 && NdotL > 0.0f)
+    // LATERAL band (host skyOracleBand 3, sunNoise.w = 1): sideways openness is a property of the POINT
+    // (does a near-horizontal ray from here escape the enclosure?), so the tangent plane does not cull
+    // it — a mushroom gill facing down still looks out from under its cap.
+    const bool posOnly = gShadowParams.sunNoise.w > 0.5f;
+    if (sel >= 0 && (NdotL > 0.0f || posOnly))
     {
         float  bias  = gShadowParams.sunParams.y;
         float  noff  = gShadowParams.sunParams.w;
         float4 texel = gShadowParams.sunCascadeTexel;
-        float  nls   = saturate(NdotL);
+        float  nls   = saturate(abs(NdotL));
         float  slopeBias = gShadowParams.sunPcf1.y * min(sqrt(1.0f - nls * nls) / max(nls, 0.1f), 10.0f);
         float  occ = sunCascadeShadowMode(sel, P + N * (noff * texel[sel]), P, bias, slopeBias, 0);
         // The same bleed reduction the receiver applies, because it corrects the moment QUADRATURE
@@ -117,6 +121,10 @@ PSOut PS_MAIN(VSOutput In)
     uint  aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
     bool  aoOn    = (aoFlags & 1u) != 0u;
     float gtao    = aoOn ? LoadTex2D(gAO, NO_SAMPLER, int2(pix), 0).a : 1.0f;
-    Out.C = float4(gtao, aoOn ? 1.0f : 0.0f, 0.0f, 1.0f);
+    // C.z = the SHIPPED ambient factor's luma (skyAmbFactorPx: SH sky x sky AO x the GI field), what
+    // opaque.frag multiplies ambCol by — the MODEL column for the irradiance probe oracle
+    // (mgexe-devkit tools/probe-fit.py joins the two dumps by pixel).
+    const float ambF = dot(skyAmbFactorPx(N, P, In.Position.xy), float3(0.2126f, 0.7152f, 0.0722f));
+    Out.C = float4(gtao, aoOn ? 1.0f : 0.0f, ambF, 1.0f);
     RETURN(Out);
 }

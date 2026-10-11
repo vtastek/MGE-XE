@@ -707,6 +707,16 @@ BEGIN_SRT_NO_AB(SrtData)
         // water.vert displaces the near rings with it; water.frag takes normals + whitewater from it.
         // Unbound reads zero = flat. Appended last.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSwField)
+        // pSkyHeightLow: MINUS the lowest STATIC surface per column over gSkyHeight's window (terrain
+        // never folds in; kSkyHeightNone = no static). With gSkyHeight it gives each column an interval,
+        // so skyamb.h.fsl skyLateralOpen can tell the open air under a mushroom cap from a root wall.
+        // Bound only while gShadowParams.skyAOGround.w > 0. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float), gSkyHeightLow)
+        // PROBE GI (pgi.srt.h): the probe field, G x G x 16 RGBA16F, sampled with WRAP (the grid is
+        // stored toroidally). Slices: 7 convolved SH9 planes per layer, then (z*valid, valid) per layer.
+        // Read by skyamb.h.fsl pgiIrradiance when gShadowParams.pgiParams0.x > 0. Unbound reads 0 =
+        // no valid probe = the old ambient. Appended last (one running descriptor counter).
+        DECL_TEXTURE(PerFrame, Tex2DArray(float4), gPgiSH)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

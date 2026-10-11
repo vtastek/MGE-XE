@@ -1285,8 +1285,18 @@ STRUCT(ShadowMaskParams)
 
     float4 weatherState2;
 
+
+
+
+
+
     float4 skyAOGround;
-#line 1077
+
+
+
+    float4 pgiParams0;
+    float4 pgiParams1;
+#line 1087
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

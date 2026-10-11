@@ -1285,8 +1285,18 @@ STRUCT(ShadowMaskParams)
 
     float4 weatherState2;
 
+
+
+
+
+
     float4 skyAOGround;
-#line 1077
+
+
+
+    float4 pgiParams0;
+    float4 pgiParams1;
+#line 1087
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1702,6 +1712,16 @@ STRUCT(LightData)
 
 
 
+        Tex2D(float) gSkyHeightLow :  register(t158,space1);
+
+
+
+
+        Tex2DArray(float4) gPgiSH :  register(t159,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1714,7 +1734,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 740 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 750 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1725,7 +1745,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 764 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 774 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 61 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/swswell.h.fsl"

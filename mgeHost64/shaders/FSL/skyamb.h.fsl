@@ -333,16 +333,121 @@ float3 skyAmbFactorAO(float3 N, float ao)
 // low-frequency RGB radiance in the same units the lit surfaces carry, so dividing by ambCol turns it
 // into this function's factor. Falls back to the floor wherever the field has no data (alpha 0:
 // unbound in this set, outside the window, not yet settled) so a missing field reads as today.
-float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+// LATERAL OPENNESS 0..1: the share of five azimuths along which this point looks out SIDEWAYS through
+// free air. The sky AO cannot tell a giant mushroom's underside (cap overhead, the lit field all around)
+// from a tunnel's deep end (cover overhead AND on every side): both see almost no sky. Sideways they
+// differ, and the two top-down maps together hold it: gSkyHeight is each column's TOP, gSkyHeightLow
+// minus its lowest STATIC surface. A column is free air at my height if I am above its top, or below
+// its lowest static (the air under a cap; terrain never folds into the low map). A direction is open
+// only if every step out to R is free, so a root wall a few hundred units thick closes it however
+// open the field beyond (user, 2026-10-11: "a mushroom in the open field, pretty dark underbelly"
+// while "tunnel is dark, opening is lit ... we want to keep this").
+float skyLateralFree(float2 uv, float z)
 {
+    // BILINEAR: point taps drew the 64 u texels as squares (user, 2026-10-11). At a static's edge the
+    // low map blends toward its none-sentinel, which reads as open air — a soft edge, on the open side.
+    float top = SampleLvlTex2D(gSkyHeight,    gSamplerBilinearClamp, uv, 0).r;
+    float low = -SampleLvlTex2D(gSkyHeightLow, gSamplerBilinearClamp, uv, 0).r;   // none -> +30000
+    return max(saturate((z - top) * (1.0f / 32.0f)), saturate((low + 32.0f - z) * (1.0f / 32.0f)));
+}
+
+float skyLateralOpen(float3 worldAbs, float R)
+{
+    float4 m  = gShadowParams.skyAOMap;
+    float2 uv = (worldAbs.xy - m.xy) * m.z;
+    float  r  = R * m.z;
+    float  sum = 0.0f;
+    UNROLL for (int k = 0; k < 5; ++k)
+    {
+        float  az = 0.15708f + 1.25664f * (float)k;   // 9 degrees + k * 72
+        float2 d  = float2(cos(az), sin(az)) * r;
+        float  f  = skyLateralFree(uv + d * 0.3333f, worldAbs.z);
+        f = min(f, skyLateralFree(uv + d * 0.6667f, worldAbs.z));
+        f = min(f, skyLateralFree(uv + d,           worldAbs.z));
+        sum += f;
+    }
+    return sum * 0.2f;
+}
+
+#ifndef PGI_COMPUTE
+// PROBE GI (pgi.srt.h): E/pi at N from the probe field — the same units ambCol x factor has — and the
+// field's confidence (a). Columns bilinear (WRAP: the grid is toroidal), the two layers of a column
+// blended by height between their probes. Every stored value is premultiplied by validity, so a
+// half-built neighbourhood divides out exactly. a = 0 outside the window or with no probe built.
+#define PgiSampleArr(T, uv, s) T.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(s)), 0.0f)
+float4 pgiIrradiance(float3 N, float3 worldAbs)
+{
+    const float4 P0 = gShadowParams.pgiParams0;
+    const float4 P1 = gShadowParams.pgiParams1;
+    if (P0.x <= 0.0f) { return f4(0.0f); }
+    const float2 e = abs(worldAbs.xy - P1.xy) * P1.z;
+    const float edge = saturate((1.0f - max(e.x, e.y)) * 6.0f);
+    if (edge <= 0.0f) { return f4(0.0f); }
+    const float2 uv = worldAbs.xy * P0.y + P0.z;
+    const float4 m0 = PgiSampleArr(gPgiSH, uv, 14);
+    const float4 m1 = PgiSampleArr(gPgiSH, uv, 15);
+    float w0 = 0.0f, w1 = 0.0f;
+    if (m0.y > 1.0e-3f && m1.y > 1.0e-3f) {
+        const float z0 = m0.x / m0.y, z1 = m1.x / m1.y;
+        const float t = saturate((worldAbs.z - z0) / max(z1 - z0, 1.0f));
+        w0 = 1.0f - t; w1 = t;
+    } else if (m0.y > 1.0e-3f) { w0 = 1.0f; }
+    else if (m1.y > 1.0e-3f)   { w1 = 1.0f; }
+    const float wsum = w0 * m0.y + w1 * m1.y;
+    if (wsum < 1.0e-3f) { return f4(0.0f); }
+    const float inv = 1.0f / wsum;
+    float4 c[7];
+    UNROLL for (int k = 0; k < 7; ++k) {
+        c[k] = (w0 * PgiSampleArr(gPgiSH, uv, k) + w1 * PgiSampleArr(gPgiSH, uv, 7 + k)) * inv;
+    }
+    // Flattened coefficients q = 3 * basis + channel, four per plane.
+    const float3 n = normalize(N);
+    const float Y[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
+                         1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float f[28] = { c[0].x, c[0].y, c[0].z, c[0].w, c[1].x, c[1].y, c[1].z, c[1].w,
+                          c[2].x, c[2].y, c[2].z, c[2].w, c[3].x, c[3].y, c[3].z, c[3].w,
+                          c[4].x, c[4].y, c[4].z, c[4].w, c[5].x, c[5].y, c[5].z, c[5].w,
+                          c[6].x, c[6].y, c[6].z, c[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) {
+        E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b];
+    }
+    return float4(max(E, f3(0.0f)), edge * saturate(wsum));
+}
+#endif
+
+// The pre-probe ambient factor (sky SH x sky AO + the GI field / floor). skyAmbFactorAOp below wraps it.
+float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
+{
+    // OPENNESS, from the POSITION's own sky visibility (before the ground-facing exemption below). The
+    // field is a TOP-DOWN map of what the outside reflects; a spot reaches that light only through the
+    // same openings it sees sky through. A tunnel's deep end sees neither, so it keeps the constant
+    // floor (dark, as before GI); its entrance sees both and takes the bounce (user, 2026-10-11: "the
+    // tunnel should stay dark, additional GI should work on the entrance only").
+    const float openRef = gShadowParams.skyAOGround.y;
+    // SMOOTHSTEP, not a linear ramp: a short ramp with a hard knee drew the knee as a line across a
+    // wall ("below 0.2 it also has a boundary", user 2026-10-11).
+    float       open    = (openRef > 0.0f) ? smoothstep(0.0f, openRef, ao) : 1.0f;
+    const float aoPos   = ao;
+    // ...or open SIDEWAYS (skyLateralOpen): only asked where the sky test said closed and the normal has
+    // a ground-facing share for it to matter to, so open ground pays nothing.
+    const float latR = gShadowParams.skyAOGround.w;
+    if (open < 1.0f && latR > 0.0f && normalize(N).z < 0.9f && gShadowParams.skyAOMap.z > 0.0f)
+    {
+        open = max(open, skyLateralOpen(worldPosRel + gFrameData.lodEye.xyz, latR));
+    }
     // The sky AO is a POSITION measurement (is the sky above this point blocked?), so it may only
     // occlude the share of the normal that LOOKS at the sky. The ground-facing share (0.5 - 0.5 N.z of
     // the cosine lobe) sees the ground, which a cap or a roof above does not block: a mushroom's
     // underside was losing its whole ambient to a cover it faces away from. GTAO still darkens contact.
-    ao = lerp(ao, 1.0f, gShadowParams.skyAOGround.x * saturate(0.5f - 0.5f * normalize(N).z));
+    // Gated by OPENNESS: the ground a sealed spot faces is the enclosure's own dark floor, not the lit
+    // outside, so a tunnel's deep walls and ceiling keep their occlusion ("only the floor of the tunnel
+    // is dark", user 2026-10-11) while an open mushroom underside keeps the exemption.
+    ao = lerp(ao, 1.0f, gShadowParams.skyAOGround.x * open * saturate(0.5f - 0.5f * normalize(N).z));
     float3 f = skyAmbFactorAO(N, ao);
     float  g = gShadowParams.skyAOFloor.z;
-    if (g <= 0.0f || ao >= 1.0f) { return f; }
+    if (g <= 0.0f || aoPos >= 1.0f) { return f; }
     float4 m  = gShadowParams.skyAOMap;
     float2 uv = (worldPosRel.xy + gFrameData.lodEye.xy - m.xy) * m.z;
     float2 e  = abs(uv - 0.5f) * 2.0f;
@@ -359,7 +464,31 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
     float fl   = (ambL > 1.0e-6f) ? min(gShadowParams.skyAOFloor.x / ambL, gShadowParams.skyAOFloor.y) : 0.0f;
     float3 amb = max(gFrameData.ambCol.rgb, f3(1.0e-4f));
     float3 bounce = (fld.rgb / max(fld.a, 1.0e-3f)) * g / amb;
-    return f + (bounce - f3(fl)) * (1.0f - ao) * w;
+    // The GROUND-FACING share under a cover (a giant mushroom's underside) looks at the lit ground
+    // around it — exactly the light the field holds — so it takes the bounce by the POSITION's
+    // occlusion, not by the exempted ao (which is ~1 there and would hand it none). skyAOGround.z is
+    // that share's gain (0 = the old weighting; user, 2026-10-11: "brighten undersides of giant
+    // mushrooms"). The floor is removed only where it was added.
+    const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
+    return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
+}
+
+// The ambient factor: the PROBE FIELD where it is built (it replaces the sky SH, the sky AO and the GI
+// field — what a probe sees already holds all three), the old model elsewhere and as the blend toward
+// the window's edge / an unbuilt neighbourhood.
+float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+{
+#ifndef PGI_COMPUTE
+    if (gShadowParams.pgiParams0.x > 0.0f) {
+        const float4 pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz);
+        if (pg.a > 0.0f) {
+            const float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            if (pg.a >= 0.999f) { return fp; }
+            return lerp(skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
+        }
+    }
+#endif
+    return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 
 float3 skyAmbFactor(float3 N, float3 worldPosRel)

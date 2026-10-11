@@ -69,6 +69,8 @@ def load(dump):
              gpu=B[..., 3] / fr,
              # GTAO visibility the ambient ALSO multiplies by (1 where unknown / AO off).
              gtao=(C[..., 0] / fr) if C is not None else np.ones((H, W), np.float32),
+             # the shipped ambient factor's luma (skyAmbFactorPx), 0 in dumps older than the probe oracle
+             amb=(C[..., 2] / fr) if C is not None else np.zeros((H, W), np.float32),
              ao_on=bool(C is not None and (C[..., 1] > 0.5).any()))
     return stem, d
 

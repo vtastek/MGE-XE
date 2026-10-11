@@ -1073,5 +1073,15 @@ STRUCT(ShadowMaskParams)
     // PUDDLES (weather.h.fsl): x = standing-water level 0..1, y = max share of flat open ground covered.
     DATA(float4,   weatherState2,    None);
     // x = share of a normal's GROUND-facing half exempt from the position-only sky AO (skyamb.h.fsl).
+    // y = GI OPENNESS reference: the GI bounce scales by saturate(skyAO / y), so a spot that sees no
+    //     sky (a tunnel's deep end) keeps the constant floor and only openings take the bounce (0 = off).
+    // z = GI underside gain: the ground-facing share under a cover takes the bounce (0 = off).
+    // w = LATERAL openness radius (u; skyamb.h.fsl skyLateralOpen): open ground beside a covered spot
+    //     at R or 2R makes it open (a mushroom underside) where a tunnel stays closed. 0 = off.
     DATA(float4,   skyAOGround,      None);
+    // PROBE GI (pgi.srt.h; skyamb.h.fsl pgiIrradiance). pgiParams0: x = gain (0 = off), y = 1/(spacing
+    // x G), z = 0.5 / G, w = G. pgiParams1: xy = the probe window's centre (absolute world), z = 1 / its
+    // half extent, w = 0. The probe field REPLACES the ambient factor where it is valid.
+    DATA(float4,   pgiParams0,       None);
+    DATA(float4,   pgiParams1,       None);
 };

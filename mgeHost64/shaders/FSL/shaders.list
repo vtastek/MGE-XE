@@ -1075,3 +1075,20 @@
 #comp goboresolve.comp
 #include "goboresolve.comp.fsl"
 #end
+
+// PROBE GI (pgi.srt.h, tasks/forge-gi.md "Runtime probe GI v1"): place the probe columns over the
+// height map, gather a captured face into the G-buffer atlas, relight + project to convolved SH9.
+#comp pgiplace.comp
+#define PGI_PLACE 1
+#include "pgi.comp.fsl"
+#end
+
+#comp pgigather.comp
+#define PGI_GATHER 1
+#include "pgi.comp.fsl"
+#end
+
+#comp pgirelight.comp
+#define PGI_RELIGHT 1
+#include "pgi.comp.fsl"
+#end

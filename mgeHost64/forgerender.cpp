@@ -384,6 +384,8 @@ static int forgeEcoQoSState()
 #include "shaders/FSL/ripplesim.srt.h"
 // S: the local shallow-water sim (SwSimSrtData, Persistent). Model + layout: swsim.srt.h.
 #include "shaders/FSL/swsim.srt.h"
+// PROBE GI (PgiSrtData, PerBatch): place / gather / relight. Model + layouts: pgi.srt.h.
+#include "shaders/FSL/pgi.srt.h"
 // W23: tiling caustics (CausticSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature; caustic.comp + causticresolve.comp both include it. Why a photon SCATTER
 // rather than a forward 1/|det J| map, and why its mean is 1.0 by construction: caustic.srt.h.
@@ -6402,11 +6404,145 @@ namespace {
     // After the K-th the targets and the height map are read back to hdrdump/skyoracle_NNNN.*.
     float              g_skyOracleAt    = 0.0f;
     float              g_skyOracleDirs  = 128.0f;
-    float              g_skyOracleBand  = 0.0f;         // 0 full, 1 high half, 2 low half (diagnostic)
+    float              g_skyOracleBand  = 0.0f;         // 0 full, 1 high half, 2 low half, 3 LATERAL 5-30 deg position-only
     uint32_t           g_skyOracleStart = 0;        // g_renderFrame of direction 0 (0 = not started)
     uint32_t           g_skyOracleDrawn = 0;        // frames whose pass actually ran (sun map ready)
     bool               g_skyOracleDone  = false;    // written; the tool never re-arms in a session
     bool               g_skyOracleGrassWas = false; // grass casters are paused for the run (see the override)
+    // --- IRRADIANCE PROBE GROUND TRUTH (tasks/forge-gi.md) -------------------------------------------
+    // A DEV TOOL, armed only from MGE_HOST_KNOBS: probeOracleAt = the host frame to start at (0 = off).
+    // That frame's depth picks probe sites (a probeOracleGrid-wide screen grid, or the normalised
+    // "u v" lines of hdrdump\probe_pixels.txt when it exists), each lifted probeOracleLift along its
+    // surface normal. Then ONE CUBE FACE PER FRAME: the water-mirror pass is re-aimed from the probe
+    // (90 deg, no clip plane), so the face is the real lit scene — terrain, distant statics, the near
+    // set the main view drew, sun shadows, sky — and the post-submit hook reads it back. After 6 per
+    // site everything goes to hdrdump/probeoracle_NNNN.{bin,json}; mgexe-devkit tools/probe-fit.py
+    // integrates the irradiance. Water reflections are garbage while it runs. Run it with hizOff=1:
+    // the near set re-executes the MAIN view's occlusion-culled args.
+    float              g_probeOracleAt   = 0.0f;
+    float              g_probeOracleGrid = 8.0f;
+    float              g_probeOracleLift = 4.0f;
+    // probeOracleModes 4 = each face is drawn four times through the SAME mirror pass with the colour
+    // frags' isolation views on the reflect FrameData copy only: lit, debug 5 (albedo), debug 6 (the
+    // light factor the albedo multiplies), debug 7 (its ambient part). The probe's G-BUFFER, for the
+    // deferred-relight test (tasks/forge-gi.md "deferred-probe oracle"). 1 = lit only (PROBORC2).
+    float              g_probeOracleModes = 1.0f;
+    uint32_t           g_probeModes = 1;        // latched at selection
+    struct ProbeSite { float pos[3]; float n[3]; float px, py; };
+    std::vector<ProbeSite> g_probeSites;
+    std::vector<float> g_probeData;             // per face: kProbeFaceRes² × 8 floats (see the writer)
+    std::vector<float> g_probeAux;              // per face: kProbeFaceRes² × 12 {albedo3, litTerm3, ambient3, normal3}
+    float              g_probeSunDrift = 0.0f;  // max angle (deg) the sun moved from job 0 over the run
+    std::vector<float> g_probeJobSun;           // per job {sunDir3, sunCol3}: the sun THAT frame's faces saw
+    std::vector<float> g_probeDepthSmall;       // the selection frame's device depth, quarter res
+    uint32_t           g_probeDepthW = 0, g_probeDepthH = 0, g_probeRenderW = 0, g_probeRenderH = 0;
+    uint32_t           g_probeJob = 0;          // next draw: (site * 6 + face) * g_probeModes + mode
+    int32_t            g_probeJobDrawn = -1;    // the job THIS frame's mirror pass drew (-1 = none)
+    uint32_t           g_probeStall = 0;        // frames the current job has waited for a mirror pass
+    bool               g_probeSelected = false, g_probeDone = false;
+    float              g_probeSelInvVP[16] = {};   // inverse rzViewProj of the selection frame
+    float              g_probeSelEye[3] = {};      // its lodEye (camera-relative origin, absolute)
+    bool               g_probeSelValid = false;
+    float              g_probeFaceVP[16] = {};     // this frame's face matrix (set by the reflect cull)
+    float              g_probeSun[12] = {};        // sunDir, sunCol, ambCol at selection
+    float              g_probeWaterZ = -1.0e9f;    // the water surface (absolute z) at selection
+    constexpr uint32_t kProbeFaceRes = 64;
+    constexpr float    kProbeNear = 1.0f, kProbeFar = 1.0e6f;
+    inline uint32_t probeJobCount() { return (uint32_t)g_probeSites.size() * 6u * g_probeModes; }
+    inline uint32_t probeFaceIndex(uint32_t job) { return job / g_probeModes; }       // site * 6 + face
+    inline uint32_t probeModeOf(uint32_t job) { return job % g_probeModes; }          // 0 lit, 1 albedo, 2 litTerm
+    inline bool probeOracleActive() {
+        return g_probeSelected && !g_probeDone && g_probeJob < probeJobCount();
+    }
+    // Face f: +X, -X, +Y, -Y, +Z, -Z. Texel (u, v) of the DUMPED face (un-flipped) looks along
+    // fwd + (2u-1)·right + (1-2v)·up, u,v in 0..1 over the face.
+    inline void probeFaceBasis(uint32_t f, float fwd[3], float up[3], float right[3]) {
+        static const float F[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+        for (int i = 0; i < 3; ++i) { fwd[i] = F[f][i]; }
+        up[0] = 0; up[1] = (f >= 4) ? 1.0f : 0.0f; up[2] = (f >= 4) ? 0.0f : 1.0f;
+        // LH: right = up x fwd (D3DXMatrixLookAtLH)
+        right[0] = up[1] * fwd[2] - up[2] * fwd[1];
+        right[1] = up[2] * fwd[0] - up[0] * fwd[2];
+        right[2] = up[0] * fwd[1] - up[1] * fwd[0];
+    }
+    // The face matrix in the main view's conventions (camera-relative to eyeAbs, reverse-Z). Morrowind's
+    // world is RIGHT-handed and this basis is D3DX's LEFT-handed lookAt, so the matrix already has the
+    // water mirror's determinant sign: every mirror PSO (opposite winding) culls correctly as is.
+    // kProbeFlipX = true negates clip x and makes the readback un-flip — the opposite parity, kept
+    // as a switch because the first build shipped it and drew every back face.
+    constexpr bool kProbeFlipX = false;
+    // THE CAPTURE FACE: what the water-mirror pass is re-aimed at THIS frame — a probe oracle job or a
+    // runtime probe-GI capture (tasks/forge-gi.md) — or nothing. Latched once per frame beside the
+    // W-gate (pre-beginCmd), read by the reflect cull, the reflect pass and the terrain bind, so all of
+    // them agree on one frame's answer.
+    struct CapFace {
+        bool     active = false;
+        bool     pgi = false;          // a runtime probe-GI capture (gather after the pass)
+        float    pos[3] = {};          // ABSOLUTE probe position
+        uint32_t face = 0;             // +X -X +Y -Y +Z -Z
+        float    dbg = 0.0f;           // debugParams.x on the mirror's FrameData copy (5 = albedo)
+        bool     dbgTerrain = false;   // bind terrain_dbg (the isolation views live only there)
+        uint32_t res = 0;              // viewport side (px); 0 = the whole mirror target
+        bool     steal = false;        // a WET view: keep last frame's reflection, draw only the corner
+    };
+    CapFace g_capFace;
+    // The mirror's horizon scissor top on the last NORMAL reflect frame: rows above it were cleared and
+    // never drawn, and water never samples them — where a stolen probe face may go (pgiSchedule).
+    uint32_t g_reflLastScissorTop = 0;
+    uint32_t g_reflLastScissorFrame = 0;
+    inline void capFaceViewProj(const float eyeAbs[3], const float pos[3], uint32_t face, float vp[16]) {
+        float fwd[3], up[3], right[3];
+        probeFaceBasis(face, fwd, up, right);
+        const float c[3] = { pos[0] - eyeAbs[0], pos[1] - eyeAbs[1], pos[2] - eyeAbs[2] };
+        auto dot3 = [](const float* a, const float* b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; };
+        const float V[16] = { right[0], up[0], fwd[0], 0,
+                              right[1], up[1], fwd[1], 0,
+                              right[2], up[2], fwd[2], 0,
+                              -dot3(c, right), -dot3(c, up), -dot3(c, fwd), 1 };
+        const float q = kProbeFar / (kProbeFar - kProbeNear);
+        const float P[16] = { 1,0,0,0,  0,1,0,0,  0,0,q,1,  0,0,-kProbeNear*q,0 };
+        mul4x4(V, P, vp);
+        vp[2] = vp[3] - vp[2]; vp[6] = vp[7] - vp[6]; vp[10] = vp[11] - vp[10]; vp[14] = vp[15] - vp[14];
+        if (kProbeFlipX) { vp[0] = -vp[0]; vp[4] = -vp[4]; vp[8] = -vp[8]; vp[12] = -vp[12]; }
+    }
+    // ─── PROBE GI, runtime (tasks/forge-gi.md "Runtime probe GI v1"; the system: pgiEnsure & co.) ───
+    float g_pgiOn      = 1.0f;     // knob pgi: the probe field replaces the ambient factor where built
+    float g_pgiGain    = 1.0f;     // knob pgiGain: scales the probe field's irradiance
+    float g_pgiSpacing = 256.0f;   // knob pgiSpacing: column spacing (u); a change rebuilds the grid
+    float g_pgiLift    = 48.0f;    // knob pgiLift: probes sit this far above the cell's low/high top
+    float g_pgiCapRes  = 64.0f;    // knob pgiCapRes: capture viewport side (px, multiple of 8)
+    float g_pgiEvery   = 2.0f;     // knob pgiEvery: capture on every Nth dry frame (1 capture ~1.0 ms GPU)
+    float g_pgiBatch   = 64.0f;    // knob pgiBatch: complete probes relit per frame
+    float g_pgiSteal   = 6.0f;     // knob pgiSteal: on a WET view, steal 1 frame in N (0 = never)
+    constexpr uint32_t kPgiG = 24, kPgiL = 2, kPgiN = kPgiG * kPgiG * kPgiL;
+    constexpr uint64_t kPgiPlaceLane = 16ull * kPgiG * kPgiG;   // one readback lane per frame slot
+    struct PgiColumn {
+        int     ix = INT_MIN, iy = INT_MIN;   // world column index (centre = index x spacing)
+        float   z[2] = {};                    // ABSOLUTE probe heights, layer 0 (low) / 1 (high)
+        bool    zValid = false;
+        uint8_t faces[2] = {};                // captured faces (bit per face) per layer
+        bool    done[2] = {}, justDone[2] = {}, clear[2] = {};
+    };
+    struct Pgi {
+        Texture*       gbuf = nullptr;        // G-buffer atlas, RGBA32_UINT
+        Texture*       sh = nullptr;          // the field, G x G x 16 RGBA16F
+        Buffer*        placeBuf = nullptr;    // RW float4 per slot (lo, hi, ix, iy)
+        Buffer*        placeRb = nullptr;     // its readback, one lane per frame slot
+        Buffer*        probes = nullptr;      // FrameBuf: per probe (abs pos, state)
+        Buffer*        cbv[3] = {};           // per dispatch: 0 place, 1 gather, 2 relight
+        DescriptorSet* set = nullptr;         // PgiSrtData PerBatch, 3 instances (one per cbv)
+        Shader*        sPlace = nullptr; Shader* sGather = nullptr; Shader* sRelight = nullptr;
+        Pipeline*      pPlace = nullptr; Pipeline* pGather = nullptr; Pipeline* pRelight = nullptr;
+        bool           ready = false, failed = false, active = false, shInSR = false, cleared = false;
+        PgiColumn      col[kPgiG * kPgiG];
+        int            ix0 = 0, iy0 = 0;
+        float          spacing = 0.0f;
+        bool           capThis = false;
+        uint32_t       capSlot = 0, capLayer = 0, capFace = 0, everyCount = 0, phase = 0, stealCount = 0;
+        uint32_t       steals = 0;
+        uint32_t       captures = 0, complete = 0;
+    };
+    Pgi g_pgi;
     // The oracle's direction set, shared with the sky-visibility maps below so the two integrate
     // over the SAME directions. Hammersley: u stratified over [uLo, uHi), v the base-2 radical
     // inverse — low-discrepancy, no RNG, bit-identical between runs. Cosine-weighted about +Z
@@ -6815,6 +6951,8 @@ namespace {
     // Sky AO ground share: x = how much of the GROUND-facing share of a normal is exempt from the
     // position-only sky occlusion (skyamb.h.fsl skyAmbFactorAOp), yzw spare.
     constexpr uint32_t kSkyAOGroundFloat      = kWeather2Float + 4;
+    // PROBE GI (shadowparams.h.fsl pgiParams0/1; skyamb.h.fsl pgiIrradiance). Appended last, 8 floats.
+    constexpr uint32_t kPgiFloat              = kSkyAOGroundFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6856,6 +6994,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, skyAOGround) == kSkyAOGroundFloat * sizeof(float),
                   "kSkyAOGroundFloat does not land on ShadowMaskParams::skyAOGround");
+    static_assert((kPgiFloat + 8) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, pgiParams0) == kPgiFloat * sizeof(float),
+                  "kPgiFloat does not land on ShadowMaskParams::pgiParams0");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8667,6 +8809,16 @@ namespace {
     // GROUND, which the cover does not block — "mushroom bottoms are too dark" (user, 2026-10-09).
     // 1 = the ground-facing share (0.5 - 0.5 N.z) is exempt; 0 = the old behaviour.
     float    g_skyAOGroundExempt = 1.0f;
+    // GI openness reference (shadowparams.h.fsl skyAOGround.y): the field's bounce scales by
+    // saturate(skyAO / this), so a tunnel's deep end (sky AO ~0) keeps the dark constant floor and only
+    // its entrance takes the bounce (user, 2026-10-11). 0 = the bounce everywhere, as before.
+    float    g_giOpenRef = 0.02f;   // tunnel save: 0.02 lights the entrance, deep end = GI off
+    // GI underside gain (skyAOGround.z): the ground-facing share under a cover takes the field's bounce
+    // by the position's occlusion (giant mushroom undersides, user 2026-10-11). 0 = the old weighting.
+    float    g_giUnderGain = 4.0f;   // user, 2026-10-11: "4 is good"
+    // Lateral openness radius (skyAOGround.w): a covered spot with open ground beside it at R or 2R
+    // counts as open (giant mushroom undersides) while a tunnel stays closed. 0 = off.
+    float    g_giLatRadius = 0.0f;   // OFF: per-pixel decision off a 64 u map leaks (768) and draws squares (any R)
     // sunBlurFused: the moments blur as ONE groupshared pass per cascade (sunblur2d.comp), caster ->
     // pSunMomentsRaw -> blur -> pSunMoments, instead of H into a scratch tile and V back. Half the
     // map traffic and no 16-bit rounding between the passes. Read at init. 0 = the two-pass original.
@@ -23986,6 +24138,10 @@ namespace {
             { "skyOracleAt",        &g_skyOracleAt        },
             { "skyOracleDirs",      &g_skyOracleDirs      },
             { "skyOracleBand",      &g_skyOracleBand      },
+            { "probeOracleAt",      &g_probeOracleAt      },
+            { "probeOracleGrid",    &g_probeOracleGrid    },
+            { "probeOracleLift",    &g_probeOracleLift    },
+            { "probeOracleModes",   &g_probeOracleModes   },
             { "svmDirs",            &g_svmDirs            },
             { "svmRes",             &g_svmRes             },
             { "svmExtent",          &g_svmExtent          },
@@ -24227,6 +24383,17 @@ namespace {
             { "swEyeFadeHi",         &g_swEyeFadeHi         },
             { "giBlend",             &g_giBlend             },
             { "skyAOGroundExempt",   &g_skyAOGroundExempt   },
+            { "giOpenRef",           &g_giOpenRef           },
+            { "giUnderGain",         &g_giUnderGain         },
+            { "giLatRadius",         &g_giLatRadius         },
+            { "pgi",                 &g_pgiOn               },
+            { "pgiGain",             &g_pgiGain             },
+            { "pgiSpacing",          &g_pgiSpacing          },
+            { "pgiLift",             &g_pgiLift             },
+            { "pgiCapRes",           &g_pgiCapRes           },
+            { "pgiEvery",            &g_pgiEvery            },
+            { "pgiBatch",            &g_pgiBatch            },
+            { "pgiSteal",            &g_pgiSteal            },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -27197,6 +27364,16 @@ namespace {
           t.sliderF("GI field gain (bounce replaces the floor; 0 = off)", &g_giGain, 0.0f, 3.0f, 0.05f);
           t.sliderF("Sky AO: ground-facing share exempt (undersides; 0 = old)", &g_skyAOGroundExempt, 0.0f, 1.0f, 0.05f);
           t.sliderF("GI field blend per frame (lower = slower ease-in)", &g_giBlend, 0.005f, 1.0f, 0.005f);
+          t.sliderF("GI openness (bounce only where sky AO > this; tunnels stay dark; 0 = old)", &g_giOpenRef, 0.0f, 0.2f, 0.005f);
+          t.sliderF("GI underside bounce (ground-facing share under a cover; 0 = old)", &g_giUnderGain, 0.0f, 4.0f, 0.1f);
+          t.sliderF("Sky AO: lateral openness radius (u; open ground beside a cover; 0 = off)", &g_giLatRadius, 0.0f, 2048.0f, 32.0f);
+          // PROBE GI (tasks/forge-gi.md "Runtime probe GI v1"): replaces everything above where built.
+          t.sliderF("PROBE GI (1 = the probe field replaces the ambient where built; 0 = off)", &g_pgiOn, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI gain", &g_pgiGain, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Probe GI: probe lift above the cell's low/high top (u)", &g_pgiLift, 8.0f, 256.0f, 8.0f, "%.0f");
+          t.sliderF("Probe GI: capture every Nth dry frame", &g_pgiEvery, 1.0f, 8.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: probes relit per frame", &g_pgiBatch, 8.0f, 1152.0f, 8.0f, "%.0f");
+          t.sliderF("Probe GI: water in view -> steal 1 mirror frame in N (0 = never)", &g_pgiSteal, 0.0f, 16.0f, 1.0f, "%.0f");
           t.checkbox("Weather surface state (wet / snow from MW weather)", &g_weatherSurface);
           t.sliderF("Weather DEBUG wetness (-1 = live)", &g_weatherDebugWet, -1.0f, 1.0f, 0.05f);
           t.sliderF("Weather DEBUG snow (-1 = live)", &g_weatherDebugSnow, -1.0f, 1.0f, 0.05f);
@@ -30580,6 +30757,368 @@ namespace {
         else              { f = s | ((e + 112u) << 23) | (m << 13); }
         float out; std::memcpy(&out, &f, 4); return out;
     }
+    // IRRADIANCE PROBE ORACLE, the post-submit half (see g_probeOracleAt). Called every frame right after
+    // the frame's submit — the sky oracle's placement — so a waitQueueIdle here has this frame's mirror
+    // face and depth on hand. Selection frame: depth -> sites. Then one face per frame -> g_probeData.
+    void probeOracleStep() {
+        if (g_probeOracleAt <= 0.0f || g_probeDone) { return; }
+        Renderer* R = g_live.pRenderer;
+        if (!R) { return; }
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u)
+                                      ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u)
+                                      ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        auto makeReadback = [&](uint64_t size) -> Buffer* {
+            BufferLoadDesc bd = {};
+            bd.mDesc.mSize = roundUp64(size, texAlign);
+            bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+            bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+            Buffer* b = nullptr; bd.ppBuffer = &b;
+            addResource(&bd, nullptr);
+            waitForAllResourceLoads();
+            return b;
+        };
+        auto readTex = [&](Texture* tex, Buffer* rb) {
+            TextureCopyDesc c = {};
+            c.pTexture = tex; c.pBuffer = rb;
+            c.mTextureState = RESOURCE_STATE_SHADER_RESOURCE; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+            SyncToken tk = {}; copyResource(&c, &tk); waitForToken(&tk);
+        };
+
+        // ---- selection ------------------------------------------------------------------------
+        if (!g_probeSelected) {
+            if (!g_probeSelValid) { return; }   // the cull has not latched a camera yet
+            g_probeSelected = true;
+            if (!g_live.pLinearDepth) {
+                g_probeDone = true;
+                LOG::logline("!! [probeoracle] not started: no depth target");
+                LOG::flush();
+                return;
+            }
+            waitQueueIdle(g_live.pQueue);
+            const uint32_t texW = g_live.pLinearDepth->mWidth, texH = g_live.pLinearDepth->mHeight;
+            const uint32_t W = std::min(g_live.width, texW), H = std::min(g_live.height, texH);
+            const uint32_t pitch = roundUp(texW * 4u, rowAlign);
+            Buffer* rb = makeReadback((uint64_t)pitch * texH);
+            if (!rb) { g_probeDone = true; return; }
+            readTex(g_live.pLinearDepth, rb);
+            const uint8_t* base = (const uint8_t*)rb->pCpuMappedAddress;
+            auto dz = [&](int x, int y) -> float {
+                x = std::clamp(x, 0, (int)W - 1); y = std::clamp(y, 0, (int)H - 1);
+                return ((const float*)(base + (size_t)y * pitch))[x];
+            };
+            auto recon = [&](int x, int y, float P[3]) -> bool {
+                const float z = dz(x, y);
+                if (z <= 0.0f) { return false; }
+                const float nx = ((float)x + 0.5f) / (float)W * 2.0f - 1.0f;
+                const float ny = 1.0f - ((float)y + 0.5f) / (float)H * 2.0f;
+                const float h[4] = { nx, ny, z, 1.0f };
+                float o[4] = {};
+                for (int c = 0; c < 4; ++c) {
+                    for (int r = 0; r < 4; ++r) { o[c] += h[r] * g_probeSelInvVP[r * 4 + c]; }
+                }
+                if (std::fabs(o[3]) < 1e-12f) { return false; }
+                P[0] = o[0] / o[3]; P[1] = o[1] / o[3]; P[2] = o[2] / o[3];
+                return true;
+            };
+            std::vector<std::pair<float, float>> px;   // render pixels
+            if (FILE* pf = std::fopen("hdrdump\\probe_pixels.txt", "r")) {
+                float u = 0, v = 0;
+                while (std::fscanf(pf, "%f %f", &u, &v) == 2) { px.push_back({ u * (float)W, v * (float)H }); }
+                std::fclose(pf);
+            }
+            const bool fromFile = !px.empty();
+            if (!fromFile) {
+                const int nx = std::clamp((int)(g_probeOracleGrid + 0.5f), 1, 32);
+                const int ny = std::max(1, (int)((float)nx * (float)H / (float)W + 0.5f));
+                for (int j = 0; j < ny; ++j) {
+                    for (int i = 0; i < nx; ++i) {
+                        px.push_back({ ((float)i + 0.5f) / (float)nx * (float)W, ((float)j + 0.5f) / (float)ny * (float)H });
+                    }
+                }
+            }
+            const int s = 2;   // normal footprint (pixels)
+            for (const auto& p : px) {
+                const int x = (int)p.first, y = (int)p.second;
+                float P0[3], Pa[3], Pb[3];
+                if (!recon(x, y, P0)) { continue; }
+                // One-sided differences, each from the side whose neighbour is NEARER the centre
+                // point — the side on the same surface, across a depth edge.
+                auto side = [&](int ax, int ay, float d[3]) -> bool {
+                    const bool okA = recon(x + ax, y + ay, Pa), okB = recon(x - ax, y - ay, Pb);
+                    auto dist2 = [&](const float* q) { float t = 0; for (int k = 0; k < 3; ++k) { t += (q[k]-P0[k])*(q[k]-P0[k]); } return t; };
+                    if (okA && (!okB || dist2(Pa) <= dist2(Pb))) { for (int k = 0; k < 3; ++k) { d[k] = Pa[k] - P0[k]; } return true; }
+                    if (okB) { for (int k = 0; k < 3; ++k) { d[k] = P0[k] - Pb[k]; } return true; }
+                    return false;
+                };
+                float dx[3], dy[3];
+                if (!side(s, 0, dx) || !side(0, s, dy)) { continue; }
+                float N[3] = { dy[1]*dx[2] - dy[2]*dx[1], dy[2]*dx[0] - dy[0]*dx[2], dy[0]*dx[1] - dy[1]*dx[0] };
+                const float nl = std::sqrt(N[0]*N[0] + N[1]*N[1] + N[2]*N[2]);
+                if (nl < 1e-12f) { continue; }
+                for (float& c : N) { c /= nl; }
+                if (N[0]*-P0[0] + N[1]*-P0[1] + N[2]*-P0[2] < 0.0f) { for (float& c : N) { c = -c; } }
+                ProbeSite site = {};
+                for (int k = 0; k < 3; ++k) {
+                    site.n[k] = N[k];
+                    site.pos[k] = P0[k] + g_probeSelEye[k] + N[k] * std::max(g_probeOracleLift, 0.0f);
+                }
+                site.px = p.first; site.py = p.second;
+                g_probeSites.push_back(site);
+            }
+            // Quarter-res depth for the tool's context image.
+            g_probeRenderW = W; g_probeRenderH = H;
+            g_probeDepthW = W / 4u; g_probeDepthH = H / 4u;
+            g_probeDepthSmall.resize((size_t)g_probeDepthW * g_probeDepthH);
+            for (uint32_t y = 0; y < g_probeDepthH; ++y) {
+                for (uint32_t x = 0; x < g_probeDepthW; ++x) {
+                    g_probeDepthSmall[(size_t)y * g_probeDepthW + x] = dz((int)x * 4 + 2, (int)y * 4 + 2);
+                }
+            }
+            removeResource(rb);
+            g_probeModes = (g_probeOracleModes >= 1.5f) ? 4u : 1u;
+            g_probeData.assign((size_t)g_probeSites.size() * 6u * kProbeFaceRes * kProbeFaceRes * 8u, 0.0f);
+            if (g_probeModes == 4u) {
+                g_probeAux.assign((size_t)g_probeSites.size() * 6u * kProbeFaceRes * kProbeFaceRes * 12u, 0.0f);
+            }
+            g_probeJobSun.assign((size_t)probeJobCount() * 6u, 0.0f);
+            g_probeJob = 0; g_probeJobDrawn = -1; g_probeStall = 0; g_probeSunDrift = 0.0f;
+            if (g_probeSites.empty()) { g_probeDone = true; }
+            LOG::logline(">> [probeoracle] %zu sites from %s (%zu asked), %ux%u, lift %.1f, %u mode(s) — %u face frames follow",
+                         g_probeSites.size(), fromFile ? "probe_pixels.txt" : "the screen grid", px.size(),
+                         W, H, (double)g_probeOracleLift, g_probeModes, probeJobCount());
+            LOG::flush();
+            return;
+        }
+
+        // ---- one face ---------------------------------------------------------------------------
+        if (g_probeJobDrawn != (int32_t)g_probeJob) {
+            if (++g_probeStall > 600u) {
+                g_probeDone = true;
+                LOG::logline("!! [probeoracle] gave up at face %u: the mirror pass never ran it (water off / F7?)", g_probeJob);
+                LOG::flush();
+            }
+            return;
+        }
+        g_probeJobDrawn = -1; g_probeStall = 0;
+        if (!g_live.pReflectMips || !g_live.pReflectDepthResolved) { g_probeDone = true; return; }
+        waitQueueIdle(g_live.pQueue);
+        const uint32_t rs = g_live.pReflectMips->mWidth;   // mip 0
+        const uint32_t cPitch = roundUp(rs * 8u, rowAlign), dPitch = roundUp(rs * 4u, rowAlign);
+        Buffer* rbC = makeReadback((uint64_t)cPitch * rs);
+        Buffer* rbD = makeReadback((uint64_t)dPitch * rs);
+        const uint32_t faceIdx = probeFaceIndex(g_probeJob), mode = probeModeOf(g_probeJob);
+        if (rbC && rbD && mode != 0u) {
+            // G-buffer views (debug 5 albedo / 6 litTerm): the plain block mean over GEOMETRY pixels
+            // (sky pixels carry the sky, which these views never touch). Depth is the lit job's.
+            readTex(g_live.pReflectMips, rbC);
+            readTex(g_live.pReflectDepthResolved, rbD);
+            const uint8_t* cb = (const uint8_t*)rbC->pCpuMappedAddress;
+            const uint8_t* db = (const uint8_t*)rbD->pCpuMappedAddress;
+            const uint32_t B = rs / kProbeFaceRes;
+            float* aux = g_probeAux.data() + (size_t)faceIdx * kProbeFaceRes * kProbeFaceRes * 12u;
+            for (uint32_t ty = 0; ty < kProbeFaceRes; ++ty) {
+                for (uint32_t tx = 0; tx < kProbeFaceRes; ++tx) {
+                    double acc[3] = {}; uint32_t nGeo = 0;
+                    for (uint32_t j = 0; j < B; ++j) {
+                        const uint32_t y = ty * B + j;
+                        for (uint32_t i = 0; i < B; ++i) {
+                            const uint32_t xd = tx * B + i, xr = kProbeFlipX ? rs - 1u - xd : xd;
+                            if (((const float*)(db + (size_t)y * dPitch))[xr] <= 0.0f) { continue; }
+                            const uint16_t* c = (const uint16_t*)(cb + (size_t)y * cPitch) + (size_t)xr * 4u;
+                            for (int k = 0; k < 3; ++k) { acc[k] += halfToFloatHost(c[k]); }
+                            ++nGeo;
+                        }
+                    }
+                    float* o = aux + ((size_t)ty * kProbeFaceRes + tx) * 12u + (mode - 1u) * 3u;
+                    for (int k = 0; k < 3; ++k) { o[k] = nGeo ? (float)(acc[k] / nGeo) : 0.0f; }
+                }
+            }
+        } else if (rbC && rbD) {
+            readTex(g_live.pReflectMips, rbC);
+            readTex(g_live.pReflectDepthResolved, rbD);
+            const uint8_t* cb = (const uint8_t*)rbC->pCpuMappedAddress;
+            const uint8_t* db = (const uint8_t*)rbD->pCpuMappedAddress;
+            const uint32_t B = rs / kProbeFaceRes;
+            float* out = g_probeData.data() + (size_t)faceIdx * kProbeFaceRes * kProbeFaceRes * 8u;
+            const float qn = kProbeNear * kProbeFar, qd = kProbeFar - kProbeNear;
+            // NORMALS for the G-buffer (modes 3 only): per pixel, the face-space position along its
+            // ray, normal = cross of the right and down neighbours when both continue the same surface
+            // (view depth within 3%), oriented toward the probe; block-averaged, renormalised. Face
+            // space -> world through the face basis.
+            if (g_probeModes == 4u) {
+                float fwd[3], up[3], right[3];
+                probeFaceBasis(faceIdx % 6u, fwd, up, right);
+                auto viewZ = [&](uint32_t x, uint32_t y) -> float {
+                    const uint32_t xr = kProbeFlipX ? rs - 1u - x : x;
+                    const float d = ((const float*)(db + (size_t)y * dPitch))[xr];
+                    return d > 0.0f ? qn / (d * qd + kProbeNear) : -1.0f;
+                };
+                auto posF = [&](uint32_t x, uint32_t y, float z, float P[3]) {
+                    P[0] = (((float)x + 0.5f) / (float)rs * 2.0f - 1.0f) * z;    // right
+                    P[1] = (1.0f - ((float)y + 0.5f) / (float)rs * 2.0f) * z;    // up
+                    P[2] = z;                                                     // fwd
+                };
+                float* aux = g_probeAux.data() + (size_t)faceIdx * kProbeFaceRes * kProbeFaceRes * 12u;
+                for (uint32_t ty = 0; ty < kProbeFaceRes; ++ty) {
+                    for (uint32_t tx = 0; tx < kProbeFaceRes; ++tx) {
+                        double nAcc[3] = {};
+                        for (uint32_t j = 0; j < B; ++j) {
+                            const uint32_t y = ty * B + j;
+                            if (y + 1u >= rs) { continue; }
+                            for (uint32_t i = 0; i < B; ++i) {
+                                const uint32_t x = tx * B + i;
+                                if (x + 1u >= rs) { continue; }
+                                const float z0 = viewZ(x, y), zr = viewZ(x + 1u, y), zd = viewZ(x, y + 1u);
+                                if (z0 <= 0.0f || zr <= 0.0f || zd <= 0.0f) { continue; }
+                                if (std::fabs(zr - z0) > 0.03f * z0 || std::fabs(zd - z0) > 0.03f * z0) { continue; }
+                                float P0[3], Pr[3], Pd[3];
+                                posF(x, y, z0, P0); posF(x + 1u, y, zr, Pr); posF(x, y + 1u, zd, Pd);
+                                const float a[3] = { Pr[0]-P0[0], Pr[1]-P0[1], Pr[2]-P0[2] };
+                                const float b[3] = { Pd[0]-P0[0], Pd[1]-P0[1], Pd[2]-P0[2] };
+                                float n[3] = { a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0] };
+                                const float nl = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+                                if (nl < 1e-20f) { continue; }
+                                if (n[0]*P0[0] + n[1]*P0[1] + n[2]*P0[2] > 0.0f) { for (float& c : n) { c = -c; } }
+                                for (int k = 0; k < 3; ++k) { nAcc[k] += n[k] / nl; }
+                            }
+                        }
+                        float* o = aux + ((size_t)ty * kProbeFaceRes + tx) * 12u + 9u;
+                        double w[3];   // face space -> world
+                        for (int k = 0; k < 3; ++k) { w[k] = nAcc[0] * right[k] + nAcc[1] * up[k] + nAcc[2] * fwd[k]; }
+                        const double wl = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+                        for (int k = 0; k < 3; ++k) { o[k] = wl > 1e-12 ? (float)(w[k] / wl) : 0.0f; }
+                    }
+                }
+            }
+            for (uint32_t ty = 0; ty < kProbeFaceRes; ++ty) {
+                for (uint32_t tx = 0; tx < kProbeFaceRes; ++tx) {
+                    double all[3] = {}, sky[3] = {}, dist = 0.0;
+                    uint32_t nSky = 0, nGeo = 0;
+                    for (uint32_t j = 0; j < B; ++j) {
+                        const uint32_t y = ty * B + j;
+                        for (uint32_t i = 0; i < B; ++i) {
+                            // With clip x negated the dumped column x is rendered column rs-1-x.
+                            const uint32_t xd = tx * B + i, xr = kProbeFlipX ? rs - 1u - xd : xd;
+                            const uint16_t* c = (const uint16_t*)(cb + (size_t)y * cPitch) + (size_t)xr * 4u;
+                            const float rgb[3] = { halfToFloatHost(c[0]), halfToFloatHost(c[1]), halfToFloatHost(c[2]) };
+                            const float d = ((const float*)(db + (size_t)y * dPitch))[xr];
+                            for (int k = 0; k < 3; ++k) { all[k] += rgb[k]; }
+                            if (d <= 0.0f) {
+                                for (int k = 0; k < 3; ++k) { sky[k] += rgb[k]; }
+                                ++nSky;
+                            } else {
+                                const float fx = ((float)xd + 0.5f) / (float)rs * 2.0f - 1.0f;
+                                const float fy = 1.0f - ((float)y + 0.5f) / (float)rs * 2.0f;
+                                const float zv = qn / (d * qd + kProbeNear);
+                                dist += zv * std::sqrt(1.0f + fx * fx + fy * fy);
+                                ++nGeo;
+                            }
+                        }
+                    }
+                    const double inv = 1.0 / (double)(B * B);
+                    float* o = out + ((size_t)ty * kProbeFaceRes + tx) * 8u;
+                    o[0] = (float)(all[0] * inv); o[1] = (float)(all[1] * inv); o[2] = (float)(all[2] * inv);
+                    o[3] = (float)((double)nSky * inv);
+                    o[4] = nSky ? (float)(sky[0] / nSky) : 0.0f;
+                    o[5] = nSky ? (float)(sky[1] / nSky) : 0.0f;
+                    o[6] = nSky ? (float)(sky[2] / nSky) : 0.0f;
+                    o[7] = nGeo ? (float)(dist / nGeo) : -1.0f;
+                }
+            }
+        }
+        if (rbC) { removeResource(rbC); }
+        if (rbD) { removeResource(rbD); }
+        ++g_probeJob;
+        if (g_probeJob < probeJobCount()) { return; }
+
+        // ---- all faces: write ---------------------------------------------------------------------
+        g_probeDone = true;
+        CreateDirectoryA("hdrdump", nullptr);
+        unsigned n = 0;
+        char binPath[MAX_PATH] = {}, jsonPath[MAX_PATH] = {};
+        for (; n < 10000u; ++n) {
+            std::snprintf(binPath, sizeof(binPath), "hdrdump\\probeoracle_%04u.bin", n);
+            if (GetFileAttributesA(binPath) == INVALID_FILE_ATTRIBUTES) { break; }
+        }
+        std::snprintf(jsonPath, sizeof(jsonPath), "hdrdump\\probeoracle_%04u.json", n);
+        bool ok = false;
+        if (FILE* f = std::fopen(binPath, "wb")) {
+            // "PROBORC2", u32 {sites, faceRes, renderW, renderH, depthW, depthH}, f32 {eyeAbs[3],
+            // sunDir[4], sunCol[4], ambCol[4], lift, near, far, waterZ}, per site f32 {pos[3], n[3],
+            // px, py}, per site per face faceRes² × 8 f32 {rgb, skyFrac, skyRgbMean, geoDistMean
+            // (-1 none)}, then depthW×depthH f32 selection device depth (quarter res, reverse-Z, 0 = sky).
+            // PROBORC4 (probeOracleModes 4): after the lit faces, per site per face faceRes² × 12 f32
+            // {albedo rgb (debug 5), litTerm rgb (debug 6), ambient rgb (debug 7), world normal (from the
+            // face depth; 0 = none)}
+            // over GEOMETRY pixels, then the depth image; header float 19 = sun drift over the run (deg).
+            const bool v3 = (g_probeModes == 4u);
+            // PROBORC5 = PROBORC4 + the per-face sun block after the G-buffer (see below).
+            const char magic[8] = { 'P','R','O','B','O','R','C', v3 ? '5' : '2' };
+            const uint32_t hu[6] = { (uint32_t)g_probeSites.size(), kProbeFaceRes, g_probeRenderW, g_probeRenderH,
+                                     g_probeDepthW, g_probeDepthH };
+            float hf[20] = { g_probeSelEye[0], g_probeSelEye[1], g_probeSelEye[2] };
+            std::memcpy(hf + 3, g_probeSun, sizeof(g_probeSun));
+            hf[15] = g_probeOracleLift; hf[16] = kProbeNear; hf[17] = kProbeFar; hf[18] = g_probeWaterZ;
+            hf[19] = g_probeSunDrift;
+            // The header sun = the LAST job's (job 0's can be the sky oracle's swung sun).
+            if (g_probeJobSun.size() >= 6u) {
+                const float* ls = g_probeJobSun.data() + g_probeJobSun.size() - 6u;
+                hf[3] = ls[0]; hf[4] = ls[1]; hf[5] = ls[2]; hf[7] = ls[3]; hf[8] = ls[4]; hf[9] = ls[5];
+            }
+            std::fwrite(magic, 1, 8, f);
+            std::fwrite(hu, 4, 6, f);
+            std::fwrite(hf, 4, v3 ? 20 : 19, f);
+            for (const ProbeSite& s : g_probeSites) { std::fwrite(&s, 4, 8, f); }
+            std::fwrite(g_probeData.data(), 4, g_probeData.size(), f);
+            if (v3) {
+                std::fwrite(g_probeAux.data(), 4, g_probeAux.size(), f);
+                // per site per face 8 f32: {sunDir3, sunCol3} of its LIT job, the max angle (deg) and
+                // max relative colour change over its g_probeModes jobs (a face whose modes saw two
+                // different suns is not a decomposable G-buffer).
+                const uint32_t nf = (uint32_t)g_probeSites.size() * 6u;
+                std::vector<float> fs((size_t)nf * 8u, 0.0f);
+                for (uint32_t fi = 0; fi < nf; ++fi) {
+                    const float* s0 = g_probeJobSun.data() + (size_t)fi * g_probeModes * 6u;
+                    float* o = fs.data() + (size_t)fi * 8u;
+                    for (int k = 0; k < 6; ++k) { o[k] = s0[k]; }
+                    for (uint32_t m = 1; m < g_probeModes; ++m) {
+                        const float* sm = s0 + (size_t)m * 6u;
+                        const float c = (sm[0]*s0[0] + sm[1]*s0[1] + sm[2]*s0[2])
+                            / std::max(1e-12f, std::sqrt((sm[0]*sm[0] + sm[1]*sm[1] + sm[2]*sm[2]) * (s0[0]*s0[0] + s0[1]*s0[1] + s0[2]*s0[2])));
+                        o[6] = std::max(o[6], std::acos(std::clamp(c, -1.0f, 1.0f)) * 57.29578f);
+                        const float l0 = s0[3] + s0[4] + s0[5], lm = sm[3] + sm[4] + sm[5];
+                        o[7] = std::max(o[7], std::fabs(lm - l0) / std::max(1e-6f, std::max(l0, lm)));
+                    }
+                }
+                std::fwrite(fs.data(), 4, fs.size(), f);
+            }
+            std::fwrite(g_probeDepthSmall.data(), 4, g_probeDepthSmall.size(), f);
+            ok = (std::ferror(f) == 0);
+            std::fclose(f);
+        }
+        if (FILE* jf = std::fopen(jsonPath, "w")) {
+            std::fprintf(jf, "{\n  \"bin\": \"probeoracle_%04u.bin\",\n  \"sites\": %zu,\n  \"faceRes\": %u,\n"
+                             "  \"render\": [%u, %u],\n  \"eyeAbs\": [%.3f, %.3f, %.3f],\n"
+                             "  \"sunDir\": [%.5f, %.5f, %.5f],\n  \"lift\": %.2f,\n"
+                             "  \"faces\": \"+X -X +Y -Y +Z -Z; up +Z (side faces) / +Y (Z faces); right = up x fwd;"
+                             " texel (u,v) looks along fwd + (2u-1) right + (1-2v) up\"\n}\n",
+                         n, g_probeSites.size(), kProbeFaceRes, g_probeRenderW, g_probeRenderH,
+                         (double)g_probeSelEye[0], (double)g_probeSelEye[1], (double)g_probeSelEye[2],
+                         (double)g_probeSun[0], (double)g_probeSun[1], (double)g_probeSun[2],
+                         (double)g_probeOracleLift);
+            std::fclose(jf);
+        }
+        LOG::logline(">> [probeoracle] %s %s (%zu sites x 6 faces at %u², %u mode(s), sun drift %.2f deg)", binPath,
+                     ok ? "written" : "WRITE FAILED", g_probeSites.size(), kProbeFaceRes, g_probeModes, (double)g_probeSunDrift);
+        LOG::flush();
+        g_probeData.clear(); g_probeData.shrink_to_fit();
+        g_probeAux.clear(); g_probeAux.shrink_to_fit();
+        g_probeJobSun.clear(); g_probeJobSun.shrink_to_fit();
+    }
+
     void skyOracleFinishIfDue() {
         if (g_skyOracleStart == 0 || g_skyOracleDone) { return; }
         const uint32_t K = (uint32_t)std::max(1.0f, g_skyOracleDirs);
@@ -34402,6 +34941,13 @@ void destroyHostWindow(Renderer* R);
     // parameters keeps every call inside a moved body written exactly as it was, costs nothing at
     // runtime, and puts the bracket in the signature instead of 400 lines inside a 13,000-line
     // function. A pass that does not time anything simply does not take them.
+    // PROBE GI (defined with the GI field producer, far below): forward declarations for the
+    // W-gate scheduler, the reflect pass and the shadow-params publish.
+    void pgiSchedule(const float* fcbvR, bool dry, bool waterOk);
+    void pgiGatherRecord();
+    void pgiFrameRecord(const float* fcbvR);
+    void pgiPublish(float* mp);
+    void pgiTeardown(Renderer* R);
     namespace {
     // PHASE F: distant-light glow billboards. Whole kGpuPhaseColorGlow bracket.
     // The only thing it needs from the frame is the colour target; everything else it touches is
@@ -39017,7 +39563,20 @@ void destroyHostWindow(Renderer* R);
                     const double uLo = (g_skyOracleBand == 2.0f) ? 0.5 : 0.0;
                     const double uHi = (g_skyOracleBand == 1.0f) ? 0.5 : 1.0;
                     // fd[16..18] is the sun's TRAVEL direction; the sampled to-sky vector is its negative.
-                    skyHemiDir(k, K, uLo, uHi, fd + 16);
+                    if (g_skyOracleBand == 3.0f) {
+                        // LATERAL band (GI underside openness truth): elevation 5..30 deg, stratified in
+                        // sin(elevation), Hammersley azimuth; the frag tests POSITION only (sunNoise.w).
+                        skyHemiDir(k, K, 0.0, 1.0, fd + 16);   // for the azimuth
+                        const double az = std::atan2((double)fd[17], (double)fd[16]);
+                        const double s0 = std::sin(5.0 * SceneCal::kPi / 180.0), s1 = std::sin(30.0 * SceneCal::kPi / 180.0);
+                        const double se = s0 + (s1 - s0) * ((double)k + 0.5) / (double)K;
+                        const double ce = std::sqrt(1.0 - se * se);
+                        fd[16] = (float)(ce * std::cos(az));
+                        fd[17] = (float)(ce * std::sin(az));
+                        fd[18] = (float)(-se);
+                    } else {
+                        skyHemiDir(k, K, uLo, uHi, fd + 16);
+                    }
                 }
             }
             // P2b: ...and the SUN DISC's own radiance, off the same cook and THIS frame's sky list.
@@ -42143,7 +42702,40 @@ void destroyHostWindow(Renderer* R);
                                  && !reflWaterVisible(&fcbvR[56], waterLevelAbs, underwater);
             const bool dryScreen  = !underwater && g_aplSplitRan
                                  && g_reflDryFrames >= (uint32_t)std::max(1.0f, g_reflWaterGateHold);
-            g_reflWaterGateOff = waterParams && g_reflWaterGate && (dryTerrain || dryScreen);
+            // The probe oracle re-aims the mirror away from the water entirely, so its frames need the
+            // pass whether or not any water is on screen.
+            g_reflWaterGateOff = waterParams && g_reflWaterGate && (dryTerrain || dryScreen)
+                              && !probeOracleActive();
+            // ...and its SELECTION frame latches this frame's camera here, where rzViewProj and the
+            // camera-relative origin are both this frame's; the post-submit hook reads the depth.
+            if (g_probeOracleAt > 0.0f && !g_probeSelected && !g_probeDone
+                && g_renderFrame >= (uint32_t)g_probeOracleAt) {
+                g_probeSelValid = invert4x4(rzViewProj, g_probeSelInvVP);
+                g_probeSelEye[0] = fcbvR[56]; g_probeSelEye[1] = fcbvR[57]; g_probeSelEye[2] = fcbvR[58];
+                std::memcpy(g_probeSun, fcbvR + 16, sizeof(g_probeSun));   // sunDir, sunCol, ambCol
+                // Water is not in the depth buffer, so a site can land on a river bed; the tool drops
+                // sites below this.
+                g_probeWaterZ = waterParams ? waterTrueLevel(waterLevelAbs) : -1.0e9f;
+            }
+            // THE CAPTURE FACE for this frame: the probe oracle's job, else — on a view with no water on
+            // screen, so nothing samples the mirror — a probe-GI capture. One latch, read by the reflect
+            // cull, the pass and the terrain bind.
+            g_capFace = CapFace();
+            if (probeOracleActive()) {
+                const ProbeSite& s = g_probeSites[probeFaceIndex(g_probeJob) / 6u];
+                const uint32_t m = probeModeOf(g_probeJob);
+                g_capFace.active = true;
+                g_capFace.pos[0] = s.pos[0]; g_capFace.pos[1] = s.pos[1]; g_capFace.pos[2] = s.pos[2];
+                g_capFace.face = probeFaceIndex(g_probeJob) % 6u;
+                g_capFace.dbg = (m == 0u) ? 0.0f : (float)(4u + m);   // 5 albedo, 6 litTerm, 7 ambient
+                g_capFace.dbgTerrain = g_probeModes > 1u;
+            }
+            {
+                const bool waterOk = g_drawReflect && g_live.reflectReady && g_live.reflectMipReady
+                                  && waterEnabled && waterParams && !underwater;
+                pgiSchedule(fcbvR, dryTerrain || dryScreen, waterOk);   // may set g_capFace (pgi)
+                if (g_capFace.pgi) { g_reflWaterGateOff = false; }   // dry or stolen: the pass runs
+            }
             if (waterParams) {
                 ++g_reflWaterGateTotal;
                 if (g_reflWaterGateOff) { ++g_reflWaterGateSkips; }
@@ -43358,6 +43950,11 @@ void destroyHostWindow(Renderer* R);
                 s_reflHave  = true;
             }
         }
+        // PROBE ORACLE: its frames need the pass whatever the water is doing — but only once the cull
+        // above re-aimed the cbuffer (g_reflFrameReady), or the face would be a water mirror.
+        const bool probeFace = g_capFace.active && g_reflFrameReady && g_live.reflectReady
+                            && g_live.reflectMipReady && waterParams;
+        if (probeFace) { reflectOn = true; }
         // Gated-off frames still write the ReflGeo pair (adjacent = ~0) — an index the
         // frame never begins/ends reads back stale garbage at resolve.
         if (!reflectOn) {
@@ -43421,6 +44018,7 @@ void destroyHostWindow(Renderer* R);
                 mirrorVP[1]  += dy * mirrorVP[3];  mirrorVP[5]  += dy * mirrorVP[7];
                 mirrorVP[9]  += dy * mirrorVP[11]; mirrorVP[13] += dy * mirrorVP[15];
             }
+            if (probeFace) { std::memcpy(mirrorVP, g_probeFaceVP, 64); }   // the sky from the probe too
             // Reflect frame cbuffer = a copy of the main frame data (identical lighting/fog/skyParams/
             // skyZenith, incl. gReflWaterClip = pass-all) with ONLY the viewProj replaced by the mirror
             // matrix. 288B covers through skyZenith (float 68..71) so the reflected dome gradient matches.
@@ -43433,7 +44031,8 @@ void destroyHostWindow(Renderer* R);
             // mirrored ray direction — i.e. exactly the reflected ray the water wants. The main
             // view's matrix would have returned the main view's sky in the water, which is what
             // gSkyView exists to prevent (skyview.h.fsl) and what the mirror test in the plan checks.
-            {
+            // (Not from a probe-GI capture: a stolen frame's water still reads the last real mirror.)
+            if (!(probeFace && g_capFace.pgi)) {
                 float reflInvVP[16];
                 if (!invert4x4(mirrorVP, reflInvVP)) {
                     for (int k = 0; k < 16; ++k) { reflInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
@@ -43458,10 +44057,16 @@ void destroyHostWindow(Renderer* R);
             }
             BindRenderTargetsDesc rbind = {};
             rbind.mRenderTargetCount = 1;
-            rbind.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_CLEAR };
-            rbind.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_CLEAR };
+            // A STOLEN probe-GI frame (wet view) keeps last frame's reflection: the face goes into the
+            // top-left corner, which that frame's horizon scissor left cleared and water never reads.
+            const LoadActionType reflLoad = (probeFace && g_capFace.steal) ? LOAD_ACTION_LOAD : LOAD_ACTION_CLEAR;
+            rbind.mRenderTargets[0] = { g_live.pReflectColor, reflLoad };
+            rbind.mDepthStencil = { g_live.pReflectDepth, reflLoad };
             cmdBindRenderTargets(g_live.pCmd, &rbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflectSize(), (float)reflectSize(), 0.0f, 1.0f);
+            // A probe-GI capture draws only a capRes² corner (gathered at 8x8 per face); the rest of
+            // the target stays cleared and nothing samples it on such a frame (dry view).
+            const uint32_t reflVp = (probeFace && g_capFace.res) ? g_capFace.res : reflectSize();
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflVp, (float)reflVp, 0.0f, 1.0f);
 
             // Horizon scissor (parity-safe perf): the water plane can never project ABOVE its own
             // horizon line, so the water frag never samples the reflect RT above it — scissor the WHOLE
@@ -43473,7 +44078,7 @@ void destroyHostWindow(Renderer* R);
             // uses for its screen UV) and taking the min screen-y. Underwater (whole screen can be water)
             // or horizon above the screen top → full RT (keep-all, like reflWaterCullActive=false).
             uint32_t reflScissorTop = 0;
-            if (g_reflHorizonScissor && waterParams[7] <= 0.5f) {
+            if (g_reflHorizonScissor && waterParams[7] <= 0.5f && !probeFace) {
                 const float* MV = fcbvR;                            // row-major D3DX; wp*M (homogeneous)
                 const float waterZrel = waterLevelAbs - eyeAbsZ;    // water plane, camera-relative
                 const float R = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f)
@@ -43497,8 +44102,9 @@ void destroyHostWindow(Renderer* R);
                     reflScissorTop = (uint32_t)topPx;
                 }
             }
-            const uint32_t reflScissorH = (reflScissorTop < reflectSize()) ? (reflectSize() - reflScissorTop) : 1u;
-            cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflectSize(), reflScissorH);
+            const uint32_t reflScissorH = (reflScissorTop < reflVp) ? (reflVp - reflScissorTop) : 1u;
+            cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflVp, reflScissorH);
+            if (!probeFace) { g_reflLastScissorTop = reflScissorTop; g_reflLastScissorFrame = g_renderFrame; }
 
             // Sky draw (mirror): fill the reflect sky buffers + replay the shapes. Cull NONE in the
             // sky PSO makes the mirror's winding flip irrelevant. Same per-shape data as the main sky
@@ -43518,7 +44124,10 @@ void destroyHostWindow(Renderer* R);
             // real reflected sky instead of flat fog colour wherever nothing else drew.
             // NOT underwater, on the same grounds the MW sky draw below is refused there: the
             // underside of the surface reflects the SEABED, never the sky.
-            const bool drawReflSkyHw = g_skyPhys.active && g_skyViewPub[1] && !underwaterR
+            // A probe-GI capture gathers albedo + depth only: its sky texels are the EMPTY depth, so
+            // the sky draws would cost time and change nothing.
+            const bool pgiCap = probeFace && g_capFace.pgi;
+            const bool drawReflSkyHw = g_skyPhys.active && g_skyViewPub[1] && !underwaterR && !pgiCap
                                     && g_live.pSkyHwPipeline && g_live.pPerBatchSetReflectSky;
             if (drawReflSkyHw) {
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (mirror)");
@@ -43543,7 +44152,7 @@ void destroyHostWindow(Renderer* R);
             // the moons in it as much as the sky above does. Same per-item skip, same skyElemPhys
             // narrowing, so the two views cannot disagree about what the sky contains.
             const bool skyElemPhysR = drawReflSkyHw && g_live.sceneReferred && g_live.linearScene;
-            const bool drawReflSky = g_drawSky
+            const bool drawReflSky = g_drawSky && !pgiCap
                                   && skyBlob && skyCount && skyBytes && !underwaterR
                                   && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
             if (drawReflSky) {
@@ -43581,7 +44190,7 @@ void destroyHostWindow(Renderer* R);
                     // → foreshortened/squashed. Pre-flip the z-component of its 3 basis rows here; M then
                     // un-flips the rotation (→ faces the view = round) but still mirrors the translation
                     // (→ correct reflected position). Only the flagged sun shape (moons look fine as-is).
-                    if (it.isSunDisc) {
+                    if (it.isSunDisc && !probeFace) {
                         float* w = (float*)(dst + (size_t)idx * 64);
                         w[2]  = -w[2];    // +X basis z
                         w[6]  = -w[6];    // +Y basis z
@@ -43636,11 +44245,11 @@ void destroyHostWindow(Renderer* R);
                 rsb.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_LOAD };
                 rsb.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_LOAD };
                 cmdBindRenderTargets(g_live.pCmd, &rsb);
-                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflectSize(), (float)reflectSize(), 0.0f, 1.0f);
+                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflVp, (float)reflVp, 0.0f, 1.0f);
                 // Restore the horizon scissor the reflect pass set for itself — rebinding does not
                 // touch scissor state, but the viewport call above pairs with it and leaving the two
                 // out of step is the kind of thing that only shows up as a clipped mirror later.
-                cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflectSize(), reflScissorH);
+                cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflVp, reflScissorH);
             }
 
             // ---- WV2 (real reflection): reflected LAND + STATICS over the reflected sky --------------
@@ -43671,6 +44280,7 @@ void destroyHostWindow(Renderer* R);
                 reflRecordNear(ni);
             }
             gpuPhaseEnd(kGpuPhaseReflGeo);
+            if (probeFace && !g_capFace.pgi) { g_probeJobDrawn = (int32_t)g_probeJob; }   // read back after this submit
 
             static uint32_t s_reflDrawLog = 0;
             if ((s_reflDrawLog++ % 120) == 0) {
@@ -43744,8 +44354,12 @@ void destroyHostWindow(Renderer* R);
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
                 }
                 cmdEndDebugMarker(g_live.pCmd);
+                // PROBE GI: this frame's face is resolved (mip 0 + depth) — into its G-buffer tile.
+                if (probeFace && g_capFace.pgi) { pgiGatherRecord(); }
             }
         }
+        // PROBE GI: place the window + relight a batch, before the colour pass reads the field.
+        pgiFrameRecord((const float*)fbr(g_live.pFrameCbv));
 
         gpuPhaseEnd(kGpuPhaseReflect);
         if (g_aoAsyncFrame) {
@@ -48954,6 +49568,7 @@ void destroyHostWindow(Renderer* R);
         // in the frame a keypress would have: after queueSubmit, before the shared-fence signal.
         // Zeroed before arming so a failed capture cannot re-fire every frame for the rest of the run.
         skyOracleFinishIfDue();   // the sky-AO ground truth's one-shot readback, same placement argument
+        probeOracleStep();        // the irradiance probe oracle: selection, then one cube face per frame
         if (g_dumpAtFrame > 0.0f && g_renderFrame >= (uint32_t)g_dumpAtFrame) {
             g_dumpAtFrame = 0.0f;
             armHdrDump();
@@ -52249,6 +52864,10 @@ void destroyHostWindow(Renderer* R);
     Pipeline* g_pTerrainPipelineEQLite  = nullptr;
     Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
     Shader*   g_pTerrainShaderMirror = nullptr;     // terrain_mirror.vert/.frag: no PBR/macro/displacement
+    // terrain_dbg.frag on the mirror's raster state: the PROBE ORACLE's G-buffer run (probeOracleModes 4)
+    // binds it for every rung and every mode, so the isolation views (5/6/7, compiled only into the
+    // debug variant) reach the ground and lit + G-buffer come from ONE program.
+    Pipeline* g_pTerrainPipelineMirrorDbg = nullptr;
     Pipeline* g_pTerrainPipelineMirrorFull = nullptr;   // the mirror's NEAR rungs: the main shader, CULL_NONE
     Pipeline* g_pTerrainPipelineWire = nullptr;
     Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
@@ -52572,6 +53191,11 @@ void destroyHostWindow(Renderer* R);
         g.pShaderProgram = g_pTerrainShader;
         if (g_pTerrainShaderMirror) {   // the near-rung twin; null => every rung takes the lite one
             addPipeline(R, &pd, &g_pTerrainPipelineMirrorFull);
+        }
+        if (g_pTerrainShaderDbg) {
+            g.pShaderProgram = g_pTerrainShaderDbg;
+            addPipeline(R, &pd, &g_pTerrainPipelineMirrorDbg);
+            g.pShaderProgram = g_pTerrainShader;
         }
         if (!g_pTerrainPipelineMirror) { std::printf("[forge][terrain] addPipeline(mirror) FAILED\n"); return false; }
         g.pRasterizerState = &rs;
@@ -53623,8 +54247,7 @@ void destroyHostWindow(Renderer* R);
         // flows OUT to the sea, never the sea in. BEACH and coastal SEA move ONSHORE = grad of a heavily
         // blurred land(1)/water(0) field, i.e. the coast's broad orientation, not every wiggle.
         std::vector<float> fdx(N, 0.0f), fdy(N, 0.0f), fst(N, 0.0f);
-        {
-            auto boxBlur = [&](std::vector<float>& f, int R, int iters) {
+        auto boxBlur = [&](std::vector<float>& f, int R, int iters) {
                 std::vector<float> tmp(N), pre((size_t)std::max(W, H) + 1);
                 for (int it = 0; it < iters; ++it) {
                     for (int y = 0; y < H; ++y) {
@@ -53645,6 +54268,7 @@ void destroyHostWindow(Renderer* R);
                     }
                 }
             };
+        {
             // River heading off the blurred distance-to-sea, blurred over SEA-CONNECTED WATER ONLY
             // (normalised convolution: blur value*mask and mask, divide). A plain blur pulled the dry
             // banks' placeholder into a 3-4 cell river, so the gradient pointed ACROSS the channel at
@@ -53687,6 +54311,96 @@ void destroyHostWindow(Renderer* R);
                     }
                 }
             }
+        }
+        // SEA / BEACH BORDER, RELAXED (user, 2026-10-11: "the sea vs open sea border is harsh, it should be
+        // more relaxed, half a cell transition zone perhaps"). The beach share over sea+beach water is
+        // blurred across ~8 texels (half an 8192 u cell) by a masked box (normalised convolution over
+        // sea+beach only, so land and rivers neither feed nor take it). The flow strength takes the same
+        // blend so the onshore drift does not step either.
+        {
+            std::vector<float> b(N, 0.0f), m(N, 0.0f), sb(N, 0.0f), sm(N, 0.0f);
+            for (size_t i = 0; i < N; ++i) {
+                const float sea = w4[i * 4 + 0], bch = w4[i * 4 + 3];
+                if (!wet[i] || sea + bch < 0.5f) { continue; }
+                b[i] = bch; m[i] = 1.0f;
+                sb[i] = fst[i]; sm[i] = 1.0f;
+            }
+            boxBlur(b, 2, 2);   // two R=2 passes: a 9-texel triangle, ~half a cell edge to edge
+            boxBlur(m, 2, 2);
+            boxBlur(sb, 2, 2);
+            boxBlur(sm, 2, 2);
+            for (size_t i = 0; i < N; ++i) {
+                const float tot = w4[i * 4 + 0] + w4[i * 4 + 3];
+                if (!wet[i] || tot < 0.5f || m[i] < 1e-4f) { continue; }
+                const float bs = std::clamp(b[i] / m[i], 0.0f, 1.0f);
+                w4[i * 4 + 3] = tot * bs;
+                w4[i * 4 + 0] = tot * (1.0f - bs);
+                if (sm[i] > 1e-4f) { fst[i] = sb[i] / sm[i]; }
+            }
+        }
+        // RIVER PLUME (user, 2026-10-09/11: "whitewater and flow stops early" at a river mouth; "the river
+        // should extend into the sea much much more"). A river's current does not stop at its mouth: it
+        // runs on as a jet that widens and slows over open water. Each sea/beach cell reached FORWARD from
+        // a mouth (a river cell touching sea/beach) takes that mouth's heading and a river share that
+        // fades with distance along the jet and across it; the jet widens as it goes. The share replaces
+        // sea/beach weight (bodies stay a partition of 1) and steers the flow, so the river's chop, foam
+        // and current carry on past the mouth instead of meeting the beach's onshore drift head-on.
+        {
+            constexpr int   kPlumeReach = 48;     // texels (~3 cells) along the jet
+            constexpr float kPlumeSpread = 0.35f; // half-width growth per texel along
+            std::vector<int>   seed(N, -1);
+            std::vector<float> plume(N, 0.0f);
+            q.clear();
+            for (size_t i = 0; i < N; ++i) {
+                if (!wet[i] || w4[i * 4 + 1] < 0.5f || fst[i] <= 0.0f) { continue; }
+                const int x = (int)(i % W), y = (int)(i / W);
+                for (auto& o : nb) {
+                    const int nx = x + o[0], ny = y + o[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                    const size_t j = (size_t)ny * W + nx;
+                    if (wet[j] && w4[j * 4 + 0] + w4[j * 4 + 3] > 0.5f) { seed[i] = (int)i; q.push_back((int)i); break; }
+                }
+            }
+            const size_t nMouths = q.size();
+            for (size_t h = 0; h < q.size(); ++h) {
+                const int c = q[h];
+                const int s = seed[c];
+                const int sx = s % W, sy = s / W;
+                const float hx = fdx[s], hy = fdy[s];
+                const int x = c % W, y = c / W;
+                for (auto& o : nb) {
+                    const int nx = x + o[0], ny = y + o[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) { continue; }
+                    const size_t j = (size_t)ny * W + nx;
+                    if (seed[j] >= 0 || !wet[j] || w4[j * 4 + 0] + w4[j * 4 + 3] < 0.5f) { continue; }
+                    const float rx = (float)(nx - sx), ry = (float)(ny - sy);
+                    const float along = rx * hx + ry * hy;
+                    const float lat   = std::fabs(rx * hy - ry * hx);
+                    const float halfW = riverHalfWidth + kPlumeSpread * std::max(along, 0.0f);
+                    if (along < -1.0f || along > (float)kPlumeReach || lat > halfW * 1.5f) { continue; }
+                    seed[j] = s; q.push_back((int)j);
+                    const float ta = 1.0f - std::clamp(along / (float)kPlumeReach, 0.0f, 1.0f);
+                    const float tl = 1.0f - std::clamp(lat / (halfW * 1.5f), 0.0f, 1.0f);
+                    plume[j] = (ta * ta * (3.0f - 2.0f * ta)) * (tl * tl * (3.0f - 2.0f * tl));
+                }
+            }
+            uint32_t nPlume = 0;
+            for (size_t i = 0; i < N; ++i) {
+                const float p = plume[i];
+                if (p <= 0.0f) { continue; }
+                ++nPlume;
+                const int s = seed[i];
+                w4[i * 4 + 0] *= (1.0f - p);
+                w4[i * 4 + 3] *= (1.0f - p);
+                w4[i * 4 + 1]  = 1.0f - w4[i * 4 + 0] - w4[i * 4 + 2] - w4[i * 4 + 3];
+                // Heading: the jet's, over the coast's onshore drift, by the share.
+                const float ax = fdx[i] * fst[i] * (1.0f - p) + fdx[s] * p;
+                const float ay = fdy[i] * fst[i] * (1.0f - p) + fdy[s] * p;
+                const float l  = std::sqrt(ax * ax + ay * ay);
+                if (l > 1e-6f) { fdx[i] = ax / l; fdy[i] = ay / l; }
+                fst[i] = fst[i] * (1.0f - p) + p;
+            }
+            LOG::logline(">> [water-bodies] river plume: %u cells past %u mouth cells", nPlume, (unsigned)nMouths);
         }
         // One blur pass over wet neighbours; dry cells take their wet neighbours' mean (the shore line
         // samples a valid body on both sides of the bilinear footprint).
@@ -54383,6 +55097,8 @@ void destroyHostWindow(Renderer* R);
         Pipeline* const mainPso = (eqPso && terrainPrepassRan()) ? eqPso : geqPso;
         Pipeline* pso = psoOverride                                 ? psoOverride
                       : (g_terrainWire && g_pTerrainPipelineWire)   ? g_pTerrainPipelineWire
+                      : (mirror && g_capFace.active && g_capFace.dbgTerrain && g_pTerrainPipelineMirrorDbg)
+                                                                    ? g_pTerrainPipelineMirrorDbg
                       : mirror                                      ? g_pTerrainPipelineMirror
                                                                     : mainPso;
         cmdBindPipeline(cmd, pso);
@@ -60363,7 +61079,7 @@ void destroyHostWindow(Renderer* R);
         // nobody can resolve it. The camera itself takes the floor off.
         terrainCullAndBuild(T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
                             (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f,
-                            T.lodBias, T.primary ? 0u : kTerrainBaseLod);
+                            T.lodBias, (T.primary || g_capFace.active) ? 0u : kTerrainBaseLod);
 
         // Phase C: stream + UPLOAD the baked distant lights around the eye. Fill the gLights-layout
         // distant cbuffer with the NEAREST <=128 within the working radius (camera-relative: pos-eye,
@@ -61072,8 +61788,10 @@ void destroyHostWindow(Renderer* R);
         T.lastInst    = &g_liveLastInstRefl;
         T.primary     = false;
         T.suppressNearCut = true;   // draw DL statics to the eye (reflection has no near-scene path)
-        T.distScale   = reflDistScale();   // axis A
-        T.lodBias     = reflLodBias();     // axis B
+        // The probe oracle sits 4 u off the surface the CAMERA saw, so it needs that surface: full
+        // terrain LOD (the floor is lifted in dlCullAndBuild) and the full statics reach.
+        T.distScale   = g_capFace.active ? 1.0f : reflDistScale();   // axis A
+        T.lodBias     = g_capFace.active ? 0u : reflLodBias();       // axis B
         dlCullAndBuild(R, mirrorViewProj, T);
     }
 
@@ -61462,7 +62180,7 @@ void destroyHostWindow(Renderer* R);
         // alone would march a map from the wrong snap cell the frame after a crossing.
         g_reflHeightOccArmed = false;
         if (g_live.pHeightOccCbvRefl && fbr(g_live.pHeightOccCbvRefl)) {
-            const bool arm = g_reflHeightOcc && g_skyHeightValid && g_skyHeightMinValid
+            const bool arm = g_reflHeightOcc && !g_capFace.active && g_skyHeightValid && g_skyHeightMinValid
                           && g_live.skyHeightMinReady && g_live.pSkyHeightMin;
             float* hp = (float*)fbw(g_live.pHeightOccCbvRefl);
             hp[0] = arm ? 1.0f : 0.0f;
@@ -62190,7 +62908,8 @@ void destroyHostWindow(Renderer* R);
         mp[kSunNoiseFloat + 0] = (float)mode;
         mp[kSunNoiseFloat + 1] = (float)(s_sunNoiseFrame & 63u);
         mp[kSunNoiseFloat + 2] = g_terrainMorph ? std::clamp(g_terrainLodScale, 0.25f, 4.0f) : 0.0f;  // terrain geomorph
-        mp[kSunNoiseFloat + 3] = 0.0f;
+        // w = 1 while the sky oracle runs its LATERAL band (skyoracle.frag: position-only test).
+        mp[kSunNoiseFloat + 3] = (g_skyOracleAt > 0.0f && g_skyOracleBand == 3.0f) ? 1.0f : 0.0f;
         // Weather surface state: integrated here, once per frame, off MW's own precipitation
         // counters (the same ramped counters the ripples read), on wall time so it is frame-rate
         // independent. Interiors publish 0 (no sky) but keep the state, so stepping out of a
@@ -62232,9 +62951,22 @@ void destroyHostWindow(Renderer* R);
             mp[kWeather2Float + 2] = 0.0f;
             mp[kWeather2Float + 3] = 0.0f;
             mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
-            mp[kSkyAOGroundFloat + 1] = 0.0f;
-            mp[kSkyAOGroundFloat + 2] = 0.0f;
-            mp[kSkyAOGroundFloat + 3] = 0.0f;
+            mp[kSkyAOGroundFloat + 1] = std::clamp(g_giOpenRef, 0.0f, 1.0f);
+            mp[kSkyAOGroundFloat + 2] = std::clamp(g_giUnderGain, 0.0f, 4.0f);
+            // Lateral openness reads gSkyHeightLow, bound once into the three sets whose receivers take
+            // skyAmbFactor (same set list as the GI field); the radius stays 0 until it is.
+            static bool s_lowBound = false;
+            if (!s_lowBound && g_live.pSkyHeightLow) {
+                DescriptorData dl = {};
+                dl.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeightLow);
+                dl.mCount = 1; dl.ppTextures = &g_live.pSkyHeightLow->pTexture;
+                if (g_live.pPerFrameSet)           { updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSet, 1, &dl); }
+                if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSetReflectGeo, 1, &dl); }
+                if (g_live.pPerFrameSetFP)         { updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSetFP, 1, &dl); }
+                s_lowBound = true;
+            }
+            mp[kSkyAOGroundFloat + 3] = s_lowBound ? std::max(0.0f, g_giLatRadius) : 0.0f;
+            pgiPublish(mp);
         }
         {
             const bool on = g_waterBodies && g_waterBodyBound && g_dlExterior;
@@ -64168,6 +64900,376 @@ void destroyHostWindow(Renderer* R);
         cmdEndDebugMarker(g_live.pCmd);
     }
 
+    // ═══ PROBE GI, runtime (tasks/forge-gi.md "Runtime probe GI v1"; model + layouts: pgi.srt.h) ═════
+    //
+    // The deferred probe that passed the oracle (probe-relight.py V1, all five saves): each probe's
+    // G-BUFFER cube is captured ONCE through the water-mirror pass (debug view 5 = albedo, 64² per face,
+    // only on frames whose view has no water — the W-gate's own dry verdict, so the reflection never
+    // loses a frame), then RELIT on the GPU every few frames with the sun x a height-field shadow + the
+    // renderer's own ambient at each hit, projected to convolved SH9. Receivers: skyamb.h.fsl.
+    void pgiTeardown(Renderer* R) {
+        if (g_pgi.set) { removeDescriptorSet(R, g_pgi.set); g_pgi.set = nullptr; }
+        Pipeline** pp[3] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight };
+        Shader**   ss[3] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight };
+        for (int i = 0; i < 3; ++i) {
+            if (*pp[i]) { removePipeline(R, *pp[i]); *pp[i] = nullptr; }
+            if (*ss[i]) { removeShader(R, *ss[i]); *ss[i] = nullptr; }
+        }
+        for (Buffer*& b : g_pgi.cbv) { if (b) { removeFrameBuf(b); b = nullptr; } }
+        if (g_pgi.probes)  { removeFrameBuf(g_pgi.probes); g_pgi.probes = nullptr; }
+        if (g_pgi.placeBuf) { removeResource(g_pgi.placeBuf); g_pgi.placeBuf = nullptr; }
+        if (g_pgi.placeRb)  { removeResource(g_pgi.placeRb);  g_pgi.placeRb = nullptr; }
+        if (g_pgi.gbuf) { removeResource(g_pgi.gbuf); g_pgi.gbuf = nullptr; }
+        if (g_pgi.sh)   { removeResource(g_pgi.sh);   g_pgi.sh = nullptr; }
+        g_pgi.ready = false;
+    }
+
+    // Lazily (pre-beginCmd: addResource / addPipeline are illegal mid-command-buffer), the first frame
+    // probe GI is on and its inputs exist.
+    bool pgiEnsure(Renderer* R) {
+        if (g_pgi.ready) { return true; }
+        if (g_pgi.failed || !g_live.pSkyHeight || !g_live.pSkyHeightLow || !g_live.pReflectMips
+            || !g_live.pReflectDepthResolved || !g_live.pShadowMaskParamsCbv || !g_live.pPerFrameSet) { return false; }
+        auto fail = [&](const char* what) {
+            LOG::logline("!! [pgi] %s FAILED — probe GI disabled", what);
+            pgiTeardown(R); g_pgi.failed = true; return false;
+        };
+        const char* files[3] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp" };
+        Shader**   ss[3] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight };
+        Pipeline** pp[3] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight };
+        for (int i = 0; i < 3; ++i) {
+            ShaderLoadDesc sd = {}; sd.mComp.pFileName = files[i];
+            addShader(R, &sd, ss[i]);
+            if (!*ss[i]) { return fail(files[i]); }
+            PipelineDesc pd = {}; pd.mType = PIPELINE_TYPE_COMPUTE;
+            pd.mComputeDesc.pShaderProgram = *ss[i];
+            addPipeline(R, &pd, pp[i]);
+            if (!*pp[i]) { return fail("addPipeline"); }
+        }
+        {
+            TextureDesc td = {};
+            td.mWidth = kPgiG * 6u * 8u; td.mHeight = kPgiL * kPgiG * 8u; td.mDepth = 1; td.mArraySize = 1;
+            td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R32G32B32A32_UINT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "pgiGBuf";
+            TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.gbuf; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+        }
+        {
+            TextureDesc td = {};
+            td.mWidth = kPgiG; td.mHeight = kPgiG; td.mDepth = 1; td.mArraySize = 16;
+            td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "pgiSH";
+            TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.sh; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+        }
+        {
+            BufferLoadDesc b = {};
+            b.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+            b.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            b.mDesc.mStructStride = 16;
+            b.mDesc.mElementCount = kPgiG * kPgiG;
+            b.mDesc.mSize         = 16ull * kPgiG * kPgiG;
+            b.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            b.mDesc.pName         = "pgiPlace";
+            b.ppBuffer            = &g_pgi.placeBuf;
+            addResource(&b, nullptr);
+            BufferLoadDesc r = {};
+            r.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            r.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            r.mDesc.mSize        = kPgiPlaceLane * kFrameSlots;
+            r.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+            r.mDesc.pName        = "pgiPlaceReadback";
+            r.ppBuffer           = &g_pgi.placeRb;
+            addResource(&r, nullptr);
+        }
+        {
+            BufferLoadDesc b = {};
+            b.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+            b.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            b.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            b.mDesc.mStructStride = 16;
+            b.mDesc.mElementCount = kPgiN;
+            b.mDesc.mSize         = 16ull * kPgiN;
+            b.mDesc.pName         = "pgiProbes";
+            b.ppBuffer            = &g_pgi.probes;
+            addFrameBuf(&b);
+        }
+        for (uint32_t i = 0; i < 3; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "pgiParams%u", i);
+            BufferLoadDesc pb = {};
+            pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pb.mDesc.mSize        = sizeof(PgiParams);
+            pb.mDesc.pName        = name;
+            pb.ppBuffer           = &g_pgi.cbv[i];
+            addFrameBuf(&pb);
+        }
+        waitForAllResourceLoads();
+        if (!g_pgi.gbuf || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes) { return fail("resource alloc"); }
+        for (Buffer* b : g_pgi.cbv) { if (!b) { return fail("cbuffer alloc"); } }
+        // "No read yet": NaN everywhere, so a lane never written matches no column.
+        std::memset(g_pgi.placeRb->pCpuMappedAddress, 0xFF, (size_t)(kPgiPlaceLane * kFrameSlots));
+
+        DescriptorSetDesc dsd = SRT_SET_DESC(PgiSrtData, PerBatch, 3, 0);
+        addDescriptorSet(R, &dsd, &g_pgi.set);
+        if (!g_pgi.set) { return fail("addDescriptorSet"); }
+        Texture* skyTop = g_live.pSkyHeight->pTexture;
+        Texture* skyLow = g_live.pSkyHeightLow->pTexture;
+        for (uint32_t i = 0; i < 3; ++i) {
+            DescriptorData d[12] = {};
+            d[0].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiParams);    d[0].ppBuffers  = &g_pgi.cbv[i];
+            d[1].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadow);    d[1].ppBuffers  = &g_live.pShadowMaskParamsCbv;
+            d[2].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyAO);     d[2].ppTextures = skyAOHeightTexPP();
+            d[3].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyTop);    d[3].ppTextures = &skyTop;
+            d[4].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyLow);    d[4].ppTextures = &skyLow;
+            d[5].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiDummy4);    d[5].ppTextures = &g_live.pReflectMips;
+            d[6].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiReflColor); d[6].ppTextures = &g_live.pReflectMips;
+            d[7].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiReflDepth); d[7].ppTextures = &g_live.pReflectDepthResolved;
+            d[8].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiProbes);    d[8].ppBuffers  = &g_pgi.probes;
+            d[9].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGBuf);      d[9].ppTextures = &g_pgi.gbuf;
+            d[10].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSHOut);     d[10].ppTextures = &g_pgi.sh;
+            d[11].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiPlaceOut);  d[11].ppBuffers  = &g_pgi.placeBuf;
+            for (DescriptorData& x : d) { x.mCount = 1; }
+            updateDescriptorSet(R, i, g_pgi.set, 12, d);
+        }
+        // The receivers: every set whose lit frags take skyAmbFactor (the GI field's three).
+        DescriptorData pf = {};
+        pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiSH);
+        pf.mCount = 1; pf.ppTextures = &g_pgi.sh;
+        if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
+        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+        if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
+        g_pgi.ready = true;
+        g_pgi.shInSR = false;
+        g_pgi.cleared = false;
+        LOG::logline(">> [pgi] ready: %ux%u columns x %u layers, G-buffer %ux%u, SH %u² x 16", kPgiG, kPgiG, kPgiL,
+                     kPgiG * 48u, kPgiL * kPgiG * 8u, kPgiG);
+        return true;
+    }
+
+    // PRE-beginCmd, beside the W-gate (every frame): scroll the window, take the placement readback,
+    // and — when this view has no water on screen — aim the mirror at the next missing probe face.
+    void pgiSchedule(const float* fcbvR, bool dry, bool waterOk) {
+        const bool want = g_pgiOn > 0.5f && g_dlExterior;
+        if (!want) { g_pgi.active = false; return; }
+        if (!pgiEnsure(g_live.pRenderer)) { g_pgi.active = false; return; }
+        g_pgi.active = true;
+        const float S = std::max(64.0f, g_pgiSpacing);
+        if (S != g_pgi.spacing) {   // a new spacing is a new grid
+            g_pgi.spacing = S;
+            for (PgiColumn& c : g_pgi.col) { c = PgiColumn(); }
+        }
+        const int G = (int)kPgiG;
+        const float ex = fcbvR[56], ey = fcbvR[57];
+        g_pgi.ix0 = (int)std::floor(ex / S + 0.5f) - G / 2;
+        g_pgi.iy0 = (int)std::floor(ey / S + 0.5f) - G / 2;
+        auto wrap = [&](int v) { int m = v % G; return m < 0 ? m + G : m; };
+        for (int sy = 0; sy < G; ++sy) {
+            for (int sx = 0; sx < G; ++sx) {
+                const int ix = g_pgi.ix0 + wrap(sx - g_pgi.ix0), iy = g_pgi.iy0 + wrap(sy - g_pgi.iy0);
+                PgiColumn& c = g_pgi.col[sy * G + sx];
+                if (c.ix != ix || c.iy != iy) { c = PgiColumn(); c.ix = ix; c.iy = iy; c.clear[0] = c.clear[1] = true; }
+            }
+        }
+        // Placement readback (the freshest settled lane): (lo, hi, ix, iy) per storage slot.
+        if (g_pgi.placeRb && g_pgi.placeRb->pCpuMappedAddress) {
+            const float* r = (const float*)((const uint8_t*)g_pgi.placeRb->pCpuMappedAddress + (uint64_t)g_readSlot * kPgiPlaceLane);
+            // Entries are in WINDOW order (the place pass's thread = column ix0 + x); each carries its
+            // column index, which names its storage slot.
+            for (int k = 0; k < G * G; ++k) {
+                const float* e = r + k * 4;
+                if (!(e[2] == e[2]) || !(e[3] == e[3])) { continue; }               // NaN: never written
+                const int eix = (int)e[2], eiy = (int)e[3];
+                PgiColumn& c = g_pgi.col[wrap(eiy) * G + wrap(eix)];
+                if (eix != c.ix || eiy != c.iy) { continue; }                       // an older window
+                if (e[0] < -20000.0f) { continue; }                                // no data under the cell
+                const float lift = std::max(8.0f, g_pgiLift);
+                const float z0 = e[0] + lift;
+                const float z1 = std::max(e[1] + lift, z0 + 128.0f);
+                const float zn[2] = { z0, z1 };
+                for (int l = 0; l < (int)kPgiL; ++l) {
+                    if (!c.zValid || std::fabs(zn[l] - c.z[l]) > 32.0f) {
+                        c.z[l] = zn[l]; c.faces[l] = 0; c.done[l] = false; c.clear[l] = true;
+                    }
+                }
+                c.zValid = true;
+            }
+        }
+        // Capture: nearest incomplete probe, next missing face. Only on a DRY view (nothing on screen
+        // samples the mirror), every pgiEvery-th such frame, and never under the probe oracle.
+        g_pgi.capThis = false;
+        if (!waterOk || probeOracleActive()) { return; }
+        // A WET view (water on screen samples the mirror): steal 1 frame in pgiSteal, and only when
+        // the last normal reflect frame (the previous one) left the corner plus a margin unsampled
+        // above its horizon. That frame's water then shows a one-frame-old reflection.
+        bool steal = false;
+        if (!dry) {
+            const uint32_t capRes = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
+            if (g_pgiSteal < 1.0f || g_reflLastScissorFrame + 1u != g_renderFrame
+                || g_reflLastScissorTop < capRes + 64u) { return; }
+            if (++g_pgi.stealCount < (uint32_t)g_pgiSteal) { return; }
+            g_pgi.stealCount = 0;
+            steal = true;
+        } else {
+            if (++g_pgi.everyCount < (uint32_t)std::max(1.0f, g_pgiEvery)) { return; }
+            g_pgi.everyCount = 0;
+        }
+        int best = -1, bestL = 0; float bestD = 1e30f;
+        for (int s = 0; s < G * G; ++s) {
+            const PgiColumn& c = g_pgi.col[s];
+            if (!c.zValid) { continue; }
+            for (int l = 0; l < (int)kPgiL; ++l) {
+                if (c.faces[l] == 0x3Fu) { continue; }
+                const float dx = (float)c.ix * S - ex, dy = (float)c.iy * S - ey;
+                const float d = dx * dx + dy * dy + (l ? 0.25f * S * S : 0.0f);
+                if (d < bestD) { bestD = d; best = s; bestL = l; }
+            }
+        }
+        if (best < 0) { return; }
+        const PgiColumn& c = g_pgi.col[best];
+        uint32_t face = 0;
+        while (face < 6u && (c.faces[bestL] & (1u << face))) { ++face; }
+        g_pgi.capSlot = (uint32_t)best; g_pgi.capLayer = (uint32_t)bestL; g_pgi.capFace = face;
+        g_pgi.capThis = true;
+        g_capFace.active = true; g_capFace.pgi = true;
+        g_capFace.pos[0] = (float)c.ix * S; g_capFace.pos[1] = (float)c.iy * S; g_capFace.pos[2] = c.z[bestL];
+        g_capFace.face = face; g_capFace.dbg = 5.0f; g_capFace.dbgTerrain = true;
+        g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
+        g_capFace.steal = steal;
+        if (steal) { ++g_pgi.steals; }
+    }
+
+    // Inside the reflect pass, after the pyramid resolved this frame's face: its 8x8 G-buffer tile.
+    void pgiGatherRecord() {
+        if (!g_pgi.ready || !g_pgi.capThis) { return; }
+        const uint32_t s = g_pgi.capSlot, l = g_pgi.capLayer, f = g_pgi.capFace;
+        PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[1]);
+        std::memset(P, 0, sizeof(PgiParams));
+        P->capPos  = float4(g_capFace.pos[0], g_capFace.pos[1], g_capFace.pos[2], (float)f);
+        P->capTile = float4((float)((s % kPgiG) * 48u + f * 8u), (float)((l * kPgiG + s / kPgiG) * 8u),
+                            (float)g_capFace.res, kProbeNear);
+        P->capMisc = float4(kProbeFar, 0.0f, 0.0f, 0.0f);
+        P->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "PGI gather");
+        cmdBindPipeline(g_live.pCmd, g_pgi.pGather);
+        cmdBindDescriptorSet(g_live.pCmd, 1, g_pgi.set);
+        cmdDispatch(g_live.pCmd, 1, 1, 1);
+        TextureBarrier tb = {};
+        tb.pTexture = g_pgi.gbuf; tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        cmdEndDebugMarker(g_live.pCmd);
+        PgiColumn& c = g_pgi.col[s];
+        c.faces[l] |= (uint8_t)(1u << f);
+        if (c.faces[l] == 0x3Fu) { c.done[l] = true; c.justDone[l] = true; }
+        ++g_pgi.captures;
+    }
+
+    // Every exterior frame, in the reflect phase (before the colour pass reads gPgiSH): placement for
+    // the whole window -> readback lane; then relight a batch of complete probes.
+    void pgiFrameRecord(const float* fcbvR) {
+        if (!g_pgi.ready || !g_pgi.active) { return; }
+        Cmd* cmd = g_live.pCmd;
+        ID3D12GraphicsCommandList* cl = cmd->mDx.pCmdList;
+        cmdBeginDebugMarker(cmd, 0.9f, 0.7f, 0.3f, "PGI place + relight");
+        // --- place
+        {
+            PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[0]);
+            std::memset(P, 0, sizeof(PgiParams));
+            P->grid  = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+            P->place = float4((float)g_pgi.ix0, (float)g_pgi.iy0, 0.0f, 0.0f);
+            cmdBindPipeline(cmd, g_pgi.pPlace);
+            cmdBindDescriptorSet(cmd, 0, g_pgi.set);
+            cmdDispatch(cmd, (kPgiG + 7u) / 8u, (kPgiG + 7u) / 8u, 1);
+            BufferBarrier bb = {};
+            bb.pBuffer = g_pgi.placeBuf; bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; bb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+            cmdResourceBarrier(cmd, 1, &bb, 0, nullptr, 0, nullptr);
+            cl->CopyBufferRegion(g_pgi.placeRb->mDx.pResource, (uint64_t)g_live.recSlot * kPgiPlaceLane,
+                                 g_pgi.placeBuf->mDx.pResource, 0, 16ull * kPgiG * kPgiG);
+            bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; bb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(cmd, 1, &bb, 0, nullptr, 0, nullptr);
+        }
+        // --- relight
+        {
+            const uint32_t batch = (uint32_t)std::clamp(g_pgiBatch, 1.0f, (float)kPgiN);
+            const uint32_t R = (kPgiN + batch - 1u) / batch;
+            g_pgi.phase = (g_pgi.phase + 1u) % R;
+            float4* pr = (float4*)fbw(g_pgi.probes);
+            uint32_t complete = 0;
+            for (uint32_t l = 0; l < kPgiL; ++l) {
+                for (uint32_t s = 0; s < kPgiG * kPgiG; ++s) {
+                    PgiColumn& c = g_pgi.col[s];
+                    float state = 0.0f;
+                    if (c.zValid && c.done[l]) { state = c.justDone[l] ? 2.0f : 1.0f; ++complete; }
+                    c.justDone[l] = false;
+                    // State 3 = run now and write zeros: the first frame (the field starts as garbage)
+                    // and a slot whose column or height just changed (it still holds the old probe).
+                    if (state == 0.0f && (!g_pgi.cleared || c.clear[l])) { state = 3.0f; }
+                    c.clear[l] = false;
+                    pr[l * kPgiG * kPgiG + s] = float4((float)c.ix * g_pgi.spacing, (float)c.iy * g_pgi.spacing,
+                                                       c.z[l], state);
+                }
+            }
+            g_pgi.complete = complete;
+            PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[2]);
+            std::memset(P, 0, sizeof(PgiParams));
+            P->ambCol = float4(fcbvR[24], fcbvR[25], fcbvR[26], 0.0f);
+            P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
+            P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
+            P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
+            P->grid   = float4(g_pgi.spacing, (float)kPgiG, (float)g_pgi.phase, (float)R);
+            TextureBarrier tb = {};
+            tb.pTexture = g_pgi.sh;
+            tb.mCurrentState = g_pgi.shInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
+            tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            if (g_pgi.shInSR) { cmdResourceBarrier(cmd, 0, nullptr, 1, &tb, 0, nullptr); }
+            cmdBindPipeline(cmd, g_pgi.pRelight);
+            cmdBindDescriptorSet(cmd, 2, g_pgi.set);
+            cmdDispatch(cmd, kPgiN, 1, 1);
+            tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(cmd, 0, nullptr, 1, &tb, 0, nullptr);
+            g_pgi.shInSR = true;
+            g_pgi.cleared = true;
+        }
+        cmdEndDebugMarker(cmd);
+        static uint32_t s_log = 0;
+        if ((s_log++ % 300u) == 0u) {
+            uint32_t cols = 0;
+            for (const PgiColumn& c : g_pgi.col) { cols += c.zValid ? 1u : 0u; }
+            const float* rb = g_pgi.placeRb ? (const float*)((const uint8_t*)g_pgi.placeRb->pCpuMappedAddress
+                                                             + (uint64_t)g_readSlot * kPgiPlaceLane) : nullptr;
+            const PgiColumn& c0 = g_pgi.col[0];
+            LOG::logline(">> [pgi] window ix0=%d iy0=%d spacing %.0f | placed %u/%u columns | complete %u/%u probes | captures %u"
+                         " (stolen %u) | slot0 col (%d,%d) z %.0f/%.0f, readback lane%u (%.1f %.1f %.1f %.1f)",
+                         g_pgi.ix0, g_pgi.iy0, (double)g_pgi.spacing, cols, kPgiG * kPgiG, g_pgi.complete, kPgiN, g_pgi.captures,
+                         g_pgi.steals,
+                         c0.ix, c0.iy, (double)c0.z[0], (double)c0.z[1], g_readSlot,
+                         rb ? (double)rb[0] : -1.0, rb ? (double)rb[1] : -1.0, rb ? (double)rb[2] : -1.0, rb ? (double)rb[3] : -1.0);
+        }
+    }
+
+    // gShadowParams lanes for the receivers (skyamb.h.fsl pgiIrradiance).
+    void pgiPublish(float* mp) {
+        const bool on = g_pgi.ready && g_pgi.active && g_pgi.shInSR && g_dlExterior;
+        const float S = std::max(1.0f, g_pgi.spacing);
+        mp[kPgiFloat + 0] = on ? std::max(0.0f, g_pgiGain) : 0.0f;
+        mp[kPgiFloat + 1] = 1.0f / (S * (float)kPgiG);
+        mp[kPgiFloat + 2] = 0.5f / (float)kPgiG;
+        mp[kPgiFloat + 3] = (float)kPgiG;
+        const float half = 0.5f * (float)(kPgiG - 1u) * S;
+        mp[kPgiFloat + 4] = ((float)g_pgi.ix0 + 0.5f * (float)(kPgiG - 1u)) * S;
+        mp[kPgiFloat + 5] = ((float)g_pgi.iy0 + 0.5f * (float)(kPgiG - 1u)) * S;
+        mp[kPgiFloat + 6] = 1.0f / std::max(half, 1.0f);
+        mp[kPgiFloat + 7] = 0.0f;
+    }
+
     void renderSunShadow() {
         g_lastSunActorDraws = 0;
         // A2: prefer the sun cull (near + off-screen casters). Fall back to the camera-culled set (A1,
@@ -65020,6 +66122,42 @@ void destroyHostWindow(Renderer* R);
             // measured from the real eye, so the fog ray is `worldPosRel - (0, 0, 2*dRel)`: the
             // direction the mirror actually sees this static in, against the sky it melts into.
             gp[69] = 2.0f * dRel;
+            // THE CAPTURE FACE (probe oracle / probe GI): the same pass, aimed from a probe. Pass-all
+            // clip plane, but with .z NONZERO — that is how every colour frag recognises a non-main view
+            // (inReflect) and stops indexing the main view's screen-space buffers.
+            if (g_capFace.active) {
+              if (probeOracleActive() && !g_capFace.pgi) {
+                // The sun the FACES are lit by: a sky oracle armed on the selection frame (for the
+                // model column) swings the published sun on that frame only.
+                if (g_probeJob == 0) { std::memcpy(g_probeSun, fcbvR + 16, sizeof(g_probeSun)); }
+                else {
+                    const float* sd = fcbvR + 16;
+                    const float c = (sd[0]*g_probeSun[0] + sd[1]*g_probeSun[1] + sd[2]*g_probeSun[2])
+                        / std::max(1e-12f, std::sqrt((sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2])
+                                                     * (g_probeSun[0]*g_probeSun[0] + g_probeSun[1]*g_probeSun[1] + g_probeSun[2]*g_probeSun[2])));
+                    g_probeSunDrift = std::max(g_probeSunDrift, std::acos(std::clamp(c, -1.0f, 1.0f)) * 57.29578f);
+                }
+                // Every job's own sun: a sky oracle armed on the selection frame can still have the
+                // published sun swung on the first job(s), so no single latch is trustworthy.
+                if ((size_t)g_probeJob * 6u + 6u <= g_probeJobSun.size()) {
+                    float* js = g_probeJobSun.data() + (size_t)g_probeJob * 6u;
+                    js[0] = fcbvR[16]; js[1] = fcbvR[17]; js[2] = fcbvR[18];
+                    js[3] = fcbvR[20]; js[4] = fcbvR[21]; js[5] = fcbvR[22];
+                }
+              }
+                // The G-buffer views: the colour frags' own isolation ladder (debugParams.x, float 40)
+                // on THIS copy only — 5 albedo, 6 the light factor albedo multiplies, 7 its ambient.
+                gp[40] = g_capFace.dbg;
+                capFaceViewProj(&fcbvR[56], g_capFace.pos, g_capFace.face, g_probeFaceVP);
+                std::memcpy(mirrorGeoVP, g_probeFaceVP, 64);
+                std::memcpy(gp, g_probeFaceVP, 64);
+                gp[64] = 0.0f; gp[65] = 0.0f; gp[66] = 1.0e-6f; gp[67] = 1.0e8f;
+                gp[69] = 0.0f;
+                // No handover plane and no hero near-cut: the main view splits the near cells between
+                // MW's set (its frustum only) and distant statics, and a probe looks where that split
+                // left nothing. Distant statics to the eye; the near set overdraws the same surfaces.
+                gp[50] = 0.0f; gp[51] = 0.0f;
+            }
         }
         // The mirror matrix + clip plane are now live, which is all the NEAR reflect record needs.
         // This used to sit behind `!g_dlExterior` along with the DL cull below, so an interior — which
@@ -65848,6 +66986,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainPipelineMirror) { removePipeline(R, g_pTerrainPipelineMirror); g_pTerrainPipelineMirror = nullptr; }
         if (g_pTerrainShaderMirror)   { removeShader(R, g_pTerrainShaderMirror);     g_pTerrainShaderMirror = nullptr; }
         if (g_pTerrainPipelineMirrorFull) { removePipeline(R, g_pTerrainPipelineMirrorFull); g_pTerrainPipelineMirrorFull = nullptr; }
+        if (g_pTerrainPipelineMirrorDbg)  { removePipeline(R, g_pTerrainPipelineMirrorDbg);  g_pTerrainPipelineMirrorDbg = nullptr; }
         if (g_pSunShadowTerrainPipeline) { removePipeline(R, g_pSunShadowTerrainPipeline); g_pSunShadowTerrainPipeline = nullptr; }
         if (g_pSvmTerrainPipeline) { removePipeline(R, g_pSvmTerrainPipeline); g_pSvmTerrainPipeline = nullptr; }
         if (g_pSunShadowTerrainShader)   { removeShader(R, g_pSunShadowTerrainShader);     g_pSunShadowTerrainShader = nullptr; }
@@ -66343,6 +67482,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGiFieldShader)       { removeShader(R, g_live.pGiFieldShader); g_live.pGiFieldShader = nullptr; }
         if (g_live.pGiField)             { removeRenderTarget(R, g_live.pGiField); g_live.pGiField = nullptr; }
         swTeardown(R);
+        pgiTeardown(R);
         if (g_pWaterBodyTex)             { removeResource(g_pWaterBodyTex); g_pWaterBodyTex = nullptr; }
         if (g_pWaterFlowTex)             { removeResource(g_pWaterFlowTex); g_pWaterFlowTex = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }

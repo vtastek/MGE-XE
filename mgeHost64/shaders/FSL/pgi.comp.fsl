@@ -1,0 +1,287 @@
+// mgeHost64 — PROBE GI compute (model + layouts: pgi.srt.h). One source, three entry variants:
+// PGI_PLACE, PGI_GATHER, PGI_RELIGHT (shaders.list).
+#include "pgi.srt.h"
+
+// skyamb.h.fsl through aliases onto this SRT: the hits' ambient is the renderer's OWN function, so a
+// relit probe agrees with what the colour frags would have shaded those surfaces with (probe-relight
+// V1 used exactly that and passed in all five saves).
+#define PGI_COMPUTE 1
+#define gFrameData    gPgiParams
+#define gShadowParams gPgiShadow
+#define gSkyHeight    gPgiSkyAO
+#define gSkyHeightLow gPgiSkyLow
+#define gSkyVisScreen gPgiDummy4
+#define gGiField      gPgiDummy4
+#include "skyamb.h.fsl"
+
+#define PGI_FACE_TEX 8u      // texels per face side in the G-buffer
+#define PGI_THREADS  64u     // RELIGHT group size
+#define PGI_NONE     -20000.0f
+
+// Face f: +X -X +Y -Y +Z -Z; up = +Z for the side faces, +Y for the Z faces; right = up x fwd. A face
+// texel (u, v) in 0..1 looks along fwd + (2u-1) right + (1-2v) up — the host's probeFaceBasis.
+void pgiFaceBasis(uint f, out float3 fwd, out float3 up, out float3 right)
+{
+    fwd = f3(0.0f);
+    if (f == 0u) { fwd.x =  1.0f; } else if (f == 1u) { fwd.x = -1.0f; }
+    else if (f == 2u) { fwd.y = 1.0f; } else if (f == 3u) { fwd.y = -1.0f; }
+    else if (f == 4u) { fwd.z = 1.0f; } else { fwd.z = -1.0f; }
+    up = (f >= 4u) ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, 0.0f, 1.0f);
+    right = cross(up, fwd);
+}
+
+uint pgiPackUnorm4(float4 v)
+{
+    uint4 q = uint4(saturate(v) * 255.0f + 0.5f);
+    return q.x | (q.y << 8) | (q.z << 16) | (q.w << 24);
+}
+float4 pgiUnpackUnorm4(uint p)
+{
+    return float4(float(p & 0xFFu), float((p >> 8) & 0xFFu), float((p >> 16) & 0xFFu), float(p >> 24)) * (1.0f / 255.0f);
+}
+// Octahedral unit vector, 2 x 16 bit; a zero vector packs to 0 and unpacks to zero (no normal).
+uint pgiPackNormal(float3 n)
+{
+    float l = abs(n.x) + abs(n.y) + abs(n.z);
+    if (l < 1.0e-6f) { return 0u; }
+    n /= l;
+    float2 e = n.xy;
+    if (n.z < 0.0f) { e = (1.0f - abs(n.yx)) * float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f); }
+    uint2 q = uint2(saturate(e * 0.5f + 0.5f) * 65534.0f + 1.5f);   // 1..65535; 0 = none
+    return q.x | (q.y << 16);
+}
+float3 pgiUnpackNormal(uint p)
+{
+    if (p == 0u) { return f3(0.0f); }
+    float2 e = (float2(float(p & 0xFFFFu), float(p >> 16)) - 1.0f) / 65534.0f * 2.0f - 1.0f;
+    float3 n = float3(e, 1.0f - abs(e.x) - abs(e.y));
+    if (n.z < 0.0f) { n.xy = (1.0f - abs(n.yx)) * float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f); }
+    return normalize(n);
+}
+
+#if defined(PGI_PLACE)
+// ─── PLACE: per window column, the lowest and highest TOP over the cell (raw max map) ────────────
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint G = (uint)gPgiParams.grid.y;
+    if (DispatchThreadID.x >= G || DispatchThreadID.y >= G) { return; }
+    const float S  = gPgiParams.grid.x;
+    const float ix = gPgiParams.place.x + (float)DispatchThreadID.x;
+    const float iy = gPgiParams.place.y + (float)DispatchThreadID.y;
+    const float4 m = gPgiShadow.skyAOMap;          // origin xy, 1/extent
+    int2 dims = GetDimensions(gPgiSkyTop, NO_SAMPLER);
+    // The cell [ix - 0.5, ix + 0.5) x S, in texels; 8 x 8 taps over it.
+    float lo = 1.0e9f, hi = -1.0e9f;
+    for (uint j = 0u; j < 8u; ++j) {
+        for (uint i = 0u; i < 8u; ++i) {
+            float2 w  = float2((ix - 0.5f + ((float)i + 0.5f) / 8.0f) * S, (iy - 0.5f + ((float)j + 0.5f) / 8.0f) * S);
+            float2 uv = (w - m.xy) * m.z;
+            if (any(uv < float2(0.0f, 0.0f)) || any(uv >= float2(1.0f, 1.0f))) { continue; }
+            int2 t = clamp(int2(uv * float2(dims)), int2(0, 0), dims - int2(1, 1));
+            float h = LoadTex2D(gPgiSkyTop, NO_SAMPLER, t, 0).r;
+            if (h < PGI_NONE) { continue; }        // no data under this tap
+            lo = min(lo, h); hi = max(hi, h);
+        }
+    }
+    const uint s = (DispatchThreadID.y * G + DispatchThreadID.x);
+    gPgiPlaceOut[s] = (lo > 1.0e8f) ? float4(PGI_NONE * 2.0f, PGI_NONE * 2.0f, ix, iy) : float4(lo, hi, ix, iy);
+    RETURN();
+}
+
+#elif defined(PGI_GATHER)
+// ─── GATHER: the just-resolved face -> its 8x8 G-buffer tile ────────────────────────────────────
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint  face = (uint)gPgiParams.capPos.w;
+    const uint  res  = (uint)gPgiParams.capTile.z;
+    const float zn = gPgiParams.capTile.w, zf = gPgiParams.capMisc.x;
+    const float qn = zn * zf, qd = zf - zn;
+    const uint  B = res / PGI_FACE_TEX;
+    float3 fwd, up, right;
+    pgiFaceBasis(face, fwd, up, right);
+    float3 alb = f3(0.0f), nAcc = f3(0.0f);
+    float  dist = 0.0f;
+    uint   nGeo = 0u, nSky = 0u;
+    for (uint j = 0u; j < B; ++j) {
+        for (uint i = 0u; i < B; ++i) {
+            const int2 p = int2(DispatchThreadID.xy * B + uint2(i, j));
+            const float d = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p, 0).r;
+            if (d <= 0.0f) { ++nSky; continue; }
+            const float zv = qn / (d * qd + zn);
+            const float fx = ((float)p.x + 0.5f) / (float)res * 2.0f - 1.0f;
+            const float fy = 1.0f - ((float)p.y + 0.5f) / (float)res * 2.0f;
+            alb  += LoadTex2D(gPgiReflColor, NO_SAMPLER, p, 0).rgb;
+            dist += zv * sqrt(1.0f + fx * fx + fy * fy);
+            ++nGeo;
+            // Normal: the right and down neighbours, when both continue this surface (view depth
+            // within 3%), oriented toward the probe. Face space (right, up, fwd).
+            if (p.x + 1 < (int)res && p.y + 1 < (int)res) {
+                const float dr = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p + int2(1, 0), 0).r;
+                const float dd = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p + int2(0, 1), 0).r;
+                if (dr > 0.0f && dd > 0.0f) {
+                    const float zr = qn / (dr * qd + zn), zd = qn / (dd * qd + zn);
+                    if (abs(zr - zv) <= 0.03f * zv && abs(zd - zv) <= 0.03f * zv) {
+                        const float px = 2.0f / (float)res;
+                        const float3 P0 = float3(fx * zv, fy * zv, zv);
+                        const float3 Pr = float3((fx + px) * zr, fy * zr, zr);
+                        const float3 Pd = float3(fx * zd, (fy - px) * zd, zd);
+                        float3 n = cross(Pr - P0, Pd - P0);
+                        const float nl = length(n);
+                        if (nl > 1.0e-20f) {
+                            n /= nl;
+                            if (dot(n, P0) > 0.0f) { n = -n; }
+                            nAcc += n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const float  inv = 1.0f / max((float)nGeo, 1.0f);
+    const float3 nW  = nAcc.x * right + nAcc.y * up + nAcc.z * fwd;
+    const float  skyFrac = (float)nSky / (float)(B * B);
+    uint4 o;
+    o.x = pgiPackUnorm4(float4(alb * inv, skyFrac));
+    o.y = pgiPackNormal(nW);
+    o.z = asuint(nGeo > 0u ? dist * inv : -1.0f);
+    o.w = nGeo;
+    Write2D(gPgiGBuf, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), o);
+    RETURN();
+}
+
+#elif defined(PGI_RELIGHT)
+// ─── RELIGHT: one group per probe; radiance per texel -> SH9 -> convolved planes ─────────────────
+GroupShared(float4, g_pgiA[PGI_THREADS * 7u]);
+
+// Height-field sun visibility from an ABSOLUTE point toward S: log-spaced march over the raw TOP map,
+// open UNDER a static's lowest surface (gPgiSkyLow stores MINUS it; >= 20000 = no static). Outside the
+// map = open. probe-relight.py hf_sun_vis, ported.
+float pgiSunVis(float3 P, float3 S)
+{
+    const float4 m = gPgiShadow.skyAOMap;
+    int2 dims = GetDimensions(gPgiSkyTop, NO_SAMPLER);
+    float vis = 1.0f;
+    for (uint k = 0u; k < 32u; ++k) {
+        const float t = 8.0f * exp2((float)k * (log2(6000.0f / 8.0f) / 31.0f));
+        const float3 Q = P + S * t;
+        const float2 uv = (Q.xy - m.xy) * m.z;
+        if (any(uv < float2(0.0f, 0.0f)) || any(uv >= float2(1.0f, 1.0f))) { continue; }
+        const int2 tx = clamp(int2(uv * float2(dims)), int2(0, 0), dims - int2(1, 1));
+        const float top = LoadTex2D(gPgiSkyTop, NO_SAMPLER, tx, 0).r;
+        const float low = -LoadTex2D(gPgiSkyLow, NO_SAMPLER, tx, 0).r;
+        const bool  noStatic = low > 20000.0f;
+        if (top > Q.z + 4.0f && (noStatic || Q.z >= low - 4.0f)) { vis = 0.0f; break; }
+    }
+    return vis;
+}
+
+// MW's sky, as the radiance it hands an open surface: ambCol x the SH1 shape skyAmbFactorAO applies.
+float3 pgiSkyRadiance(float3 d)
+{
+    const float s = gPgiShadow.skyParams.x;
+    float3 f = f3(1.0f);
+    if (s > 0.0f) {
+        float4 n = float4(d, 1.0f);
+        f = lerp(f3(1.0f), max(float3(dot(gPgiShadow.shAr, n), dot(gPgiShadow.shAg, n), dot(gPgiShadow.shAb, n)), f3(0.0f)), s);
+    }
+    return gPgiParams.ambCol.rgb * f;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
+{
+    INIT_MAIN;
+    const uint G   = (uint)gPgiParams.grid.y;
+    const uint p   = GroupID.x;                       // probe = layer * G*G + storage slot
+    const uint tid = GroupThreadID.x;
+    const float4 pr = gPgiProbes[p];                  // abs pos, w: 0 empty, 1 complete, 2 complete + now, 3 clear now
+    const uint batches = max((uint)gPgiParams.grid.w, 1u);
+    const bool mine = (p % batches) == (uint)gPgiParams.grid.z || pr.w > 1.5f;
+    if (!mine) { return; }                          // uniform per group: no barrier is skipped unevenly
+    const uint layer = p / (G * G), slot = p % (G * G);
+    const uint cx = slot % G, cy = slot / G;
+    const bool valid = pr.w > 0.5f && pr.w < 2.5f;
+
+    // SH9 accumulators, RGB, in 7 float4 lanes (27 floats, flattened c0.rgb c1.rgb ...).
+    float acc[27];
+    for (uint q = 0u; q < 27u; ++q) { acc[q] = 0.0f; }
+    if (valid) {
+        const float3 S = -normalize(gPgiParams.sunDir.xyz);
+        for (uint t = tid; t < 6u * PGI_FACE_TEX * PGI_FACE_TEX; t += PGI_THREADS) {
+            const uint f = t / (PGI_FACE_TEX * PGI_FACE_TEX), ti = t % (PGI_FACE_TEX * PGI_FACE_TEX);
+            const uint tx = ti % PGI_FACE_TEX, ty = ti / PGI_FACE_TEX;
+            float3 fwd, up, right;
+            pgiFaceBasis(f, fwd, up, right);
+            const float a = ((float)tx + 0.5f) / (float)PGI_FACE_TEX * 2.0f - 1.0f;
+            const float b = 1.0f - ((float)ty + 0.5f) / (float)PGI_FACE_TEX * 2.0f;
+            const float3 d = normalize(fwd + a * right + b * up);
+            const float r2 = 1.0f + a * a + b * b;
+            const float dom = (2.0f / (float)PGI_FACE_TEX) * (2.0f / (float)PGI_FACE_TEX) / (r2 * sqrt(r2));
+            const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx,
+                                                         (layer * G + cy) * PGI_FACE_TEX + ty));
+            const float4 as = pgiUnpackUnorm4(gb.x);
+            const float  skyF = as.w;
+            float3 L = skyF * pgiSkyRadiance(d);
+            const float hd = asfloat(gb.z);
+            if (skyF < 0.999f && hd > 0.0f) {
+                float3 N = pgiUnpackNormal(gb.y);
+                if (dot(N, N) < 0.5f) { N = -d; }
+                const float3 P = pr.xyz + d * hd;
+                const float3 Prel = P - gPgiParams.lodEye.xyz;
+                const float sunV = pgiSunVis(P, S);
+                const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV)
+                               + gPgiParams.ambCol.rgb * skyAmbFactorAO(N, skyAOTerm(N, Prel));
+                L += (1.0f - skyF) * as.rgb * E;
+            }
+            const float x = d.x, y = d.y, z = d.z;
+            const float Y[9] = { 0.282095f, 0.488603f * y, 0.488603f * z, 0.488603f * x,
+                                 1.092548f * x * y, 1.092548f * y * z, 0.315392f * (3.0f * z * z - 1.0f),
+                                 1.092548f * x * z, 0.546274f * (x * x - y * y) };
+            for (uint c = 0u; c < 9u; ++c) {
+                acc[c * 3u + 0u] += L.r * Y[c] * dom;
+                acc[c * 3u + 1u] += L.g * Y[c] * dom;
+                acc[c * 3u + 2u] += L.b * Y[c] * dom;
+            }
+        }
+    }
+    for (uint k = 0u; k < 7u; ++k) {
+        g_pgiA[tid * 7u + k] = float4(acc[k * 4u + 0u], acc[k * 4u + 1u], acc[k * 4u + 2u],
+                                      (k * 4u + 3u < 27u) ? acc[k * 4u + 3u] : 0.0f);
+    }
+    GroupMemoryBarrier();
+    for (uint s = PGI_THREADS / 2u; s > 0u; s >>= 1u) {
+        float4 v[7];
+        for (uint k = 0u; k < 7u; ++k) { v[k] = (tid < s) ? g_pgiA[(tid + s) * 7u + k] : f4(0.0f); }
+        GroupMemoryBarrier();
+        if (tid < s) { for (uint k = 0u; k < 7u; ++k) { g_pgiA[tid * 7u + k] = g_pgiA[tid * 7u + k] + v[k]; } }
+        GroupMemoryBarrier();
+    }
+    if (tid < 7u) {
+        // Cosine-lobe convolution / pi, per band: the receiver's dot with the basis is then E/pi —
+        // the units a lit frag's ambient term (ambCol x factor) is in. Flattened index q = 3c + ch.
+        float4 v = g_pgiA[tid];
+        float4 o;
+        for (uint e = 0u; e < 4u; ++e) {
+            const uint q = tid * 4u + e;
+            const uint c = q / 3u;
+            const float band = (c == 0u) ? 1.0f : (c < 4u) ? (2.0f / 3.0f) : 0.25f;
+            const float val = (e == 0u) ? v.x : (e == 1u) ? v.y : (e == 2u) ? v.z : v.w;
+            const float r = (q < 27u) ? val * band : 0.0f;
+            if (e == 0u) { o.x = r; } else if (e == 1u) { o.y = r; } else if (e == 2u) { o.z = r; } else { o.w = r; }
+        }
+        Write3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + tid)), valid ? o : f4(0.0f));
+    }
+    if (tid == 7u) {
+        Write3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)),
+                valid ? float4(pr.z, 1.0f, 0.0f, 0.0f) : f4(0.0f));
+    }
+    RETURN();
+}
+#endif
