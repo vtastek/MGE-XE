@@ -21,6 +21,7 @@
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
+#include "aospecocc.h.fsl"    // aoSpecOcc() — screen-space specular occlusion (GTSO), knob aoSpecOcc
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "gitint.h.fsl"       // giTintCode() / giTintAlbedo() — GI bounce inspection
@@ -654,7 +655,8 @@ float4 PS_MAIN( VSOutput In )
         // polished ones — which is the honest limit of reflecting a probe that has no sharper term.
         const float3 R = reflect(-pbrV, pbrNb);
         float3 env = gFrameData.ambCol.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
-        if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
+        if ((aoFlags & 64u) != 0u && aoValid) { env *= aoSpecOcc(aoSample, pbrNb, R, pbrRough); }   // GTSO: the reflected cone vs the open one
+        else if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
                              + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
         c       += specAdd;

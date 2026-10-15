@@ -39,6 +39,7 @@
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
+#include "aospecocc.h.fsl"    // aoSpecOcc() — screen-space specular occlusion (GTSO), knob aoSpecOcc
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "gobosample.h.fsl" // fixtureGoboVis() — the baked light's fixture self-shadow (G2)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
@@ -1359,7 +1360,8 @@ float4 PS_MAIN( VSOutput In )
         // lodSunAmb, not ambCol: that is terrain's own ambient source (see `amb` above).
         const float3 R = reflect(-pbrV, nShade);
         float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * tAmbW;
-        if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
+        if ((aoFlags & 64u) != 0u) { env *= aoSpecOcc(aoSample, nShade, R, pbrRough); }   // GTSO: the reflected cone vs the open one
+        else if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         env *= pbrHeightVis;                              // ...and so does a pocket in the TEXTURE
         // Scaled by COVERAGE: where only part of the blend carries a _paramh, only that part is a
         // PBR material, and the rest keeps the legacy no-specular look it was authored with.

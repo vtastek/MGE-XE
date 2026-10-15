@@ -3356,15 +3356,29 @@ float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 
 
 
-float4 pgiVolIrradiance(float3 N, float3 worldAbs)
+float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
 {
+    vis = 1.0f;
     const float4 P2 = gShadowParams.pgiParams2;
     const float4 P3 = gShadowParams.pgiParams3;
     const float VX = P2.y, VZ = P2.z;
 
 
 
-    const float3 c = (worldAbs + normalize(N) * (0.5f / P2.x)) * P2.x;
+
+
+
+
+    const float wq = P2.w - 1.0f;
+    const float vk = floor(wq * 0.25f);
+    const float3 Vd = normalize(gFrameData.lodEye.xyz - worldAbs);
+
+
+
+    const float3 nn = normalize(N);
+    float3 bd = lerp(nn, Vd, vk * 0.125f * saturate(1.0f - nn.z));
+    bd = (dot(bd, bd) > 1.0e-6f) ? normalize(bd) : Vd;
+    const float3 c = (worldAbs + bd * ((wq - 4.0f * vk) / P2.x)) * P2.x;
     const float3 r = c - P3.xyz;
     const float3 e = min(r, float3(VX, VX, VZ) - r);
     const float edge = saturate(min(min(e.x, e.y), e.z * 2.0f) - 1.0f);
@@ -3376,6 +3390,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs)
     const float4 m = lerp( gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(7.0f * VZ + s0)), 0.0f) ,  gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(7.0f * VZ + s1)), 0.0f) , t);
     if (m.x < 1.0e-3f) { return f4(0.0f); }
     const float inv = 1.0f / m.x;
+    vis = saturate(m.y * inv);
     float4 q[7];
     UNROLL for (int k = 0; k < 7; ++k) {
         q[k] = lerp( gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)((float)k * VZ + s0)), 0.0f) ,  gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)((float)k * VZ + s1)), 0.0f) , t) * inv;
@@ -3449,7 +3464,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 622 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef = gShadowParams.skyAOGround.y;
@@ -3469,7 +3484,42 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
         float4 pg;
 
 
-        if (gShadowParams.pgiParams2.w > 0.5f) { pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz); }
+        float pvis = 1.0f;
+        if (gShadowParams.pgiParams2.w > 0.5f) {
+            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis);
+
+
+
+
+
+
+
+
+
+            const float rv = gShadowParams.giDebug.z;
+
+
+
+
+
+            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f)); }
+            if (rv > 0.0f) {
+                const float pv = (rv > 1.5f) ? 1.0f : pvis;
+                const float nz = normalize(N).z;
+
+
+
+
+
+
+
+                float r = saturate((ao + 0.003f) / (pv * (0.5f + 0.5f * max(nz, 0.0f)) + 0.003f));
+
+                if (nz < 0.0f) { r = max(r, ((rv > 3.5f) ? pvis : pvis * pvis) * saturate(-2.0f * nz)); }
+                const float t = saturate(r / max(gShadowParams.giDebug.w, 0.01f));
+                pg.rgb *= t * t;
+            }
+        }
         else {
             pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, below);
             if (pg.a > 0.0f && below > 0.0f) { pg.a *= lerp(1.0f, skyOpenness(ao, worldPosRel), below); }
@@ -3675,6 +3725,37 @@ float3 aoAmbientTermProxy(float visibility, uint aoFlags)
                          aoFlags);
 }
 #line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aospecocc.h.fsl"
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aospecocc.h.fsl"
+float aoSpecOccCone(float vis, float3 B, float3 R, float rough)
+{
+    const float kPi = 3.14159265f;
+    const float cosV = sqrt(saturate(1.0f - vis));
+    const float cosS = clamp(exp2(-3.32193f * rough * rough), 0.0f, 0.9999f);
+    const float rv = acos(cosV), rs = acos(cosS);
+    const float d = acos(clamp(dot(B, R), -1.0f, 1.0f));
+    const float mn = min(rv, rs), mx = max(rv, rs);
+    float area;
+    if (d <= mx - mn) { area = 1.0f - cos(mn); }
+    else if (d >= rv + rs) { area = 0.0f; }
+    else {
+        const float x = 1.0f - saturate((d - (mx - mn)) / max(rv + rs - (mx - mn), 1.0e-4f));
+        area = (1.0f - cos(mn)) * smoothstep(0.0f, 1.0f, x);
+    }
+    return saturate(area / max(1.0f - cosS, 1.0e-4f));
+}
+
+
+
+float aoSpecOcc(float4 aoSample, float3 N, float3 R, float rough)
+{
+    const float3 bn = N * aoSample.a + aoSample.rgb;
+    const float l2 = dot(bn, bn);
+    float3 B = (l2 > 1.0e-8f) ? bn * rsqrt(l2) : N;
+    if (dot(B, N) <= 0.0f) { B = N; }
+    return aoSpecOccCone(aoSample.a, B, R, rough);
+}
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 #line 112 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenemax.h.fsl"
@@ -3787,7 +3868,7 @@ float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
 {
     return expandExposedEmissive(emis, albedoRgb, cov) - emis;
 }
-#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
@@ -5199,7 +5280,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 
     return lerp(fogSkyTarget(s, fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir)), behind, fogAir);
 }
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gitint.h.fsl"
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gitint.h.fsl"
 uint giTintCode(float3 originRel)
@@ -5223,7 +5304,7 @@ float3 giTintAlbedo(uint code)
     if (code == 5u) { return float3(a, 0.0f, a); }
     return float3(a, a, 0.0f);
 }
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
 #line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
 float3 enchantCamRight() { return normalize(gFrameData.viewProj[0].xyz); }
@@ -5267,7 +5348,7 @@ float3 enchantGlow(float3 N, float3 worldPos, bool glowing)
 
     return SampleTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv).rgb * enchantTint() * k;
 }
-#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -5291,7 +5372,7 @@ STRUCT(VSOutput)
 
 
     DATA(FLAT(uint), ParamIndex, TEXCOORD12);
-#line 51
+#line 52
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -5299,7 +5380,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
     //INIT_MAIN;
     float3 N = normalize(In.Normal);
-#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     const float3 pbrDPdx = ddx(In.WorldPos);
     const float3 pbrDPdy = ddy(In.WorldPos);
     const float2 pbrDUVdx = ddx(In.Uv);
@@ -5435,7 +5516,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
-#line 232 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 233 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     uint dbgMode = (uint)(gFrameData.debugParams.x + 0.5f);
     bool aoUsed = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
     bool isFP = (gFrameData.alphaShadowParams.z > 0.5f);
@@ -5449,7 +5530,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float4 aoSample = aoValid ? LoadTex2D(gAO, NO_SAMPLER, srcPx, 0)
                               : float4(0.0f, 0.0f, 0.0f, 1.0f);
-#line 264 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 265 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if ((aoFlags & 2u) != 0u && aoValid) {
         float3 bn = N * aoSample.a + aoSample.rgb;
         float bl2 = dot(bn, bn);
@@ -5694,10 +5775,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         }
     }
     d *= gFrameData.dbgScales.y;
-#line 522 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 523 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
                 * gShadowParams.calParams.x;
-#line 548 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 549 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float4 albedo;
     if (paraLive) {
         albedo = sampleBaseGrad(In.TexIndex, In.ClampMode, pbrUv, pbrDUVdx, pbrDUVdy,
@@ -5705,7 +5786,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     } else {
         albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
     }
-#line 566 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 567 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (In.OverlayIndex != 0u) {
         float3 ov;
         if (paraLive) {
@@ -5754,7 +5835,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 628 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 629 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
@@ -5784,7 +5865,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
         const float3 R = reflect(-pbrV, pbrNb);
         float3 env = gFrameData.ambCol.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
-        if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }
+        if ((aoFlags & 64u) != 0u && aoValid) { env *= aoSpecOcc(aoSample, pbrNb, R, pbrRough); }
+        else if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }
         const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
                              + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
         c += specAdd;

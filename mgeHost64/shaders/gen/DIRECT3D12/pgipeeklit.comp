@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 1138 "FSL/shaders.list"
+#line 1144 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 3 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.srt.h"
@@ -1406,9 +1406,11 @@ STRUCT(PgiParams)
         RWTex2DArray(float4) gPgiVolOut :  register(u18,space2);
         RWTex2DArray(uint) gPgiVolTag :  register(u19,space2);
         RWTex2D(float4) gPgiLit :  register(u20,space2);
-        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b21,space2);
-        Tex2D(float4) gPgiAtmosSky :  register(t22,space2);
-        Tex2D(float) gPgiSunOcc :  register(t23,space2);
+        RWBuffer(float4) gPgiBlameOut :  register(u21,space2);
+        RWBuffer(float4) gPgiMoveOut :  register(u22,space2);
+        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b23,space2);
+        Tex2D(float4) gPgiAtmosSky :  register(t24,space2);
+        Tex2D(float) gPgiSunOcc :  register(t25,space2);
 #line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
@@ -1661,7 +1663,7 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 568 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
@@ -1716,7 +1718,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under =  gPgiShadow .skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 622 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef =  gPgiShadow .skyAOGround.y;
@@ -1730,7 +1732,7 @@ float skyOpenness(float ao, float3 worldPosRel)
 
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
-#line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 
@@ -2230,6 +2232,7 @@ float pgiSunVis(float3 P, float3 S)
 
 
 
+float pgiSunOccVis(float3 worldAbs);
 float pgiSunVisMap(float3 P, float3 N)
 {
     if (gPgiShadow.sunParams.x <= 0.0f) { return -1.0f; }
@@ -2242,14 +2245,24 @@ float pgiSunVisMap(float3 P, float3 N)
     int2 dimsI = GetDimensions(gPgiSunDepth, NO_SAMPLER);
     const float2 tile = float2((float)dimsI.x / (float) 2 , (float)dimsI.y);
     const float3 rel = P - gPgiParams.lodEye.xyz;
+
+
+
+    const uint tapMode = (uint)(gPgiParams.sunDir.w + 0.5f);
     UNROLL for (int c = 0; c <  2 ; ++c) {
-        const float3 p = rel + N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]);
+        const float3 p = rel + ((tapMode == 0u) ? N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]) : f3(0.0f));
         float4 q = mul(gPgiShadow.sunViewProj[c], float4(p, 1.0f));
         q.xyz /= q.w;
         if (max(abs(q.x), abs(q.y)) < 0.98f && q.z > 0.0f && q.z < 1.0f) {
             const float2 uv = q.xy * float2(0.5f, -0.5f) + 0.5f;
             const int2 base = int2(((float)c + uv.x) * tile.x, uv.y * tile.y);
             const int2 lo = int2((int)((float)c * tile.x), 0), hi = int2((int)((float)(c + 1) * tile.x) - 1, dimsI.y - 1);
+            if (tapMode != 0u) {
+                const float dS = LoadTex2D(gPgiSunDepth, NO_SAMPLER, clamp(base, lo, hi), 0).r;
+                float v = (dS > q.z + gPgiShadow.sunPcf1.x) ? 0.0f : 1.0f;
+                if (tapMode == 2u) { v = min(v, pgiSunOccVis(P)); }
+                return v;
+            }
             const float ref = q.z + gPgiShadow.sunPcf1.x + slopeBias;
             float occ = 0.0f;
             for (int j = -1; j <= 1; ++j) {
@@ -2416,4 +2429,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gPgiPeek, outAt, float4(pv.rgb * E, 1.0f));
     return;
 }
-#line 1139 "FSL/shaders.list"
+#line 1145 "FSL/shaders.list"

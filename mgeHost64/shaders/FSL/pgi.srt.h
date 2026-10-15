@@ -82,6 +82,8 @@ BEGIN_SRT(PgiSrtData)
         DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiVolOut)         // SPLAT: the volume (opaque.srt.h gPgiVol)
         DECL_RWTEXTURE(PerBatch, RWTex2DArray(uint),    gPgiVolTag)         // SPLAT: each cell's world voxel (0 = none)
         DECL_RWTEXTURE(PerBatch, RWTex2D(float4),       gPgiLit)            // debug: relit radiance per G-buffer texel
+        DECL_RWBUFFER (PerBatch, RWBuffer(float4),      gPgiBlameOut)       // debug BLAME: 2 per probe slot (pgiBlame)
+        DECL_RWBUFFER (PerBatch, RWBuffer(float4),      gPgiMoveOut)        // NUDGE: 2 per probe slot (relight -> host)
         DECL_CBUFFER  (PerBatch, CBUFFER(AtmosphereParams), gPgiAtmos)       // = pAtmosParamsCbv
         DECL_TEXTURE  (PerBatch, Tex2D(float4),  gPgiAtmosSky)              // = pAtmosSkyView (mixed field)
         DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiSunOcc)                // = gSunOcc: the long-range sun occlusion

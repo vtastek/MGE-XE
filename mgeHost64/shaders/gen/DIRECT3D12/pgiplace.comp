@@ -1406,9 +1406,11 @@ STRUCT(PgiParams)
         RWTex2DArray(float4) gPgiVolOut :  register(u18,space2);
         RWTex2DArray(uint) gPgiVolTag :  register(u19,space2);
         RWTex2D(float4) gPgiLit :  register(u20,space2);
-        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b21,space2);
-        Tex2D(float4) gPgiAtmosSky :  register(t22,space2);
-        Tex2D(float) gPgiSunOcc :  register(t23,space2);
+        RWBuffer(float4) gPgiBlameOut :  register(u21,space2);
+        RWBuffer(float4) gPgiMoveOut :  register(u22,space2);
+        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b23,space2);
+        Tex2D(float4) gPgiAtmosSky :  register(t24,space2);
+        Tex2D(float) gPgiSunOcc :  register(t25,space2);
 #line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
@@ -1661,7 +1663,7 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 568 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
@@ -1716,7 +1718,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under =  gPgiShadow .skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 622 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef =  gPgiShadow .skyAOGround.y;
@@ -1730,7 +1732,7 @@ float skyOpenness(float ao, float3 worldPosRel)
 
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
-#line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 

@@ -1099,6 +1099,6 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   skyHaze1,         None);
     DATA(float4,   skyHaze2,         None);
     // GI BOUNCE INSPECTION (gitint.h.fsl): x = share of objects painted a pure colour (0 = off),
-    // y = the painted albedo, zw spare.
+    // y = the painted albedo; z = probe GI's receiver sky-visibility share (knob pgiRecvVis); w = its knee (pgiRecvKnee).
     DATA(float4,   giDebug,          None);
 };

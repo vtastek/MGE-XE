@@ -511,15 +511,29 @@ float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 // PROBE GI VOLUME (ball placement; pgi.comp.fsl PGI_SPLAT): E/pi at N and the volume's confidence.
 // Trilinear: xy by the wrap sampler (the volume is toroidal), z by hand between two slices of each
 // plane. Premultiplied by validity, divided out here; a = validity x the window-edge fade.
-float4 pgiVolIrradiance(float3 N, float3 worldAbs)
+float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
 {
+    vis = 1.0f;
     const float4 P2 = gShadowParams.pgiParams2;
     const float4 P3 = gShadowParams.pgiParams3;
     const float VX = P2.y, VZ = P2.z;
     // NORMAL BIAS (DDGI's): looked up half a voxel out along the normal. A voxel whose centre is inside
     // the surface's own solid sees no probe (the splat's visibility test cuts it), and a lookup AT the
     // surface leaned on it — thick roots and rocks lost their confidence and showed the old model.
-    const float3 c = (worldAbs + normalize(N) * (0.5f / P2.x)) * P2.x;   // continuous voxel coordinate (centre = i + 0.5)
+    // VIEW BIAS (DDGI's surface bias = normal + view; knob pgiViewBias): the offset leans toward the
+    // CAMERA, whose ray to a visible point crosses only open air. Along N alone, a root's edge facing a
+    // thin tunnel wall looked up half a voxel INTO the wall — the outside's voxel, lit by the outside's
+    // probes (the Telvanni root, user 2026-10-15). P2.w = 1 + bias + 4 x round(8 x view share).
+    const float wq = P2.w - 1.0f;
+    const float vk = floor(wq * 0.25f);
+    const float3 Vd = normalize(gFrameData.lodEye.xyz - worldAbs);
+    // An UP-facing surface keeps N: straight up from a floor is open air, and a grazing view ray there
+    // barely lifts the lookup off the ground (open floors lost 12% to the old-model blend). Walls,
+    // edges and ceilings take the view share whole.
+    const float3 nn = normalize(N);
+    float3 bd = lerp(nn, Vd, vk * 0.125f * saturate(1.0f - nn.z));
+    bd = (dot(bd, bd) > 1.0e-6f) ? normalize(bd) : Vd;
+    const float3 c = (worldAbs + bd * ((wq - 4.0f * vk) / P2.x)) * P2.x;   // continuous voxel coordinate (centre = i + 0.5)
     const float3 r = c - P3.xyz;                           // within the window: [0, dims)
     const float3 e = min(r, float3(VX, VX, VZ) - r);       // distance to the window's faces (voxels)
     const float edge = saturate(min(min(e.x, e.y), e.z * 2.0f) - 1.0f);
@@ -531,6 +545,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs)
     const float4 m = lerp(PgiSampleArr(gPgiVol, uv, 7.0f * VZ + s0), PgiSampleArr(gPgiVol, uv, 7.0f * VZ + s1), t);
     if (m.x < 1.0e-3f) { return f4(0.0f); }
     const float inv = 1.0f / m.x;
+    vis = saturate(m.y * inv);   // the probes' sky visibility here (pgi.comp.fsl slice 16 + layer)
     float4 q[7];
     UNROLL for (int k = 0; k < 7; ++k) {
         q[k] = lerp(PgiSampleArr(gPgiVol, uv, (float)k * VZ + s0), PgiSampleArr(gPgiVol, uv, (float)k * VZ + s1), t) * inv;
@@ -638,7 +653,42 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
         float4 pg;
         // Ball placement: the splatted volume — probes stand where rays reached, and a point a probe
         // cannot see takes nothing from it, so no column / openness gating is needed.
-        if (gShadowParams.pgiParams2.w > 0.5f) { pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz); }
+        float pvis = 1.0f;
+        if (gShadowParams.pgiParams2.w > 0.5f) {
+            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis);
+            // RECEIVER VISIBILITY (knob pgiRecvVis, user 2026-10-15: "directional skyAO should normally
+            // cover this"): probes stand in the open middle of a passage and see the sky holes a wall
+            // or a tunnel floor does not. This point keeps its own sky visibility's share of theirs —
+            // as open as the probes: their light as is; a tube's wall under a hole they see: dark.
+            // The sky AO is POSITIONAL: a surface loses the dome behind its own plane, 0.5 + 0.5 N.z of
+            // it (exact for the cosine-weighted dome), which the probes' directional light already
+            // accounts for — so the probes' visibility is taken through that plane. KNEE (giDebug.w):
+            // the two estimators disagree by ~0.8 on open ground (receivers among clutter, probes
+            // above it); only a ratio under the knee darkens — a tunnel's is ~0.1-0.2.
+            const float rv = gShadowParams.giDebug.z;
+            // MODE 2 (receiver only): the probes' own visibility drops out. Dividing by it was unstable
+            // where the probes see no sky either (deep in a tunnel, Vp ~ 0): the ratio went back to ~1
+            // and their bounce passed whole — the root and the bright spots in play (user 2026-10-15).
+            // DEBUG (pgiRecvVis 3): the gate's inputs, red = this point's sky AO, green = the probes'
+            // sky visibility here (as the share tint does, through ambCol so the albedo x ambient shows it).
+            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f)); }
+            if (rv > 0.0f) {
+                const float pv = (rv > 1.5f) ? 1.0f : pvis;
+                const float nz = normalize(N).z;
+                // A DOWN-facing surface is judged like a wall (plane term floored at 0.5): with the plane
+                // at 0 a tunnel's ceiling read r = 1 whatever its sky AO, and kept the probes' light
+                // (user 2026-10-15, "last save has a bit of leak"). Its own open question is SIDEWAYS —
+                // a giant mushroom's underside sees free air around it, a tunnel's ceiling sees rock —
+                // and the probes beneath it measured exactly that: their sky visibility (open all round
+                // under a cap, ~5% in a tunnel). The old model's lateral map is off by default (giLatRadius
+                // 0: squares, leaks), so the probes answer it.
+                float r = saturate((ao + 0.003f) / (pv * (0.5f + 0.5f * max(nz, 0.0f)) + 0.003f));   // a tunnel's probes see ~5% sky: a small epsilon
+                // squared (mode 2): a tunnel's leftover visibility stays shut; mode 4 = linear (A/B).
+                if (nz < 0.0f) { r = max(r, ((rv > 3.5f) ? pvis : pvis * pvis) * saturate(-2.0f * nz)); }
+                const float t  = saturate(r / max(gShadowParams.giDebug.w, 0.01f));
+                pg.rgb *= t * t;   // squared under the knee: open ground (r >= knee) untouched
+            }
+        }
         else {
             pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, below);
             if (pg.a > 0.0f && below > 0.0f) { pg.a *= lerp(1.0f, skyOpenness(ao, worldPosRel), below); }

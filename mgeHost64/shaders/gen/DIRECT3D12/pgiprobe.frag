@@ -1802,7 +1802,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    if (In.Info.w > 3.5f) {
+    const float blame = (In.Info.w > 19.5f) ? 2.0f : (In.Info.w > 9.5f) ? 1.0f : 0.0f;
+    const float3 blameTint = (blame > 1.5f) ? float3(1.0f, 0.45f, 0.0f) : float3(1.0f, 0.0f, 1.0f);
+
+
+
+    if (blame < 0.5f && In.Info.w > 3.5f) {
         const uint t = (uint)(In.Info.w + 0.5f);
         float3 bc = (t == 4u) ? float3(0.0f, 0.9f, 1.0f) : (t == 5u) ? float3(1.0f, 0.85f, 0.0f) : f3(1.0f);
         if (In.IsBox > 0.5f) { RETURN(float4(bc * 2.0f, 1.0f)); }
@@ -1810,17 +1815,19 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         return (float4(bc * k, 1.0f));
     }
     const float G = gShadowParams.pgiParams0.w;
+    const float stIn = In.Info.w - ((blame > 1.5f) ? 20.0f : (blame > 0.5f) ? 10.0f : 0.0f);
     const float2 uv = (In.Info.xy + 0.5f) / max(G, 1.0f);
     const uint layer = (uint)(In.Info.z + 0.5f);
     const float4 meta =  gPgiSH.SampleLevel(gSamplerPointClamp, float3(uv, (float)(14u + layer)), 0.0f) ;
     const float rej =  gPgiSH.SampleLevel(gSamplerPointClamp, float3(uv, (float)(layer * 7u + 6u)), 0.0f) .w;
     if (In.IsBox > 0.5f) {
-        const uint st = (uint)(In.Info.w + 0.5f);
+        const uint st = (uint)(stIn + 0.5f);
         float3 c = float3(0.5f, 0.5f, 0.5f);
         if (st == 1u) { c = float3(1.0f, 0.85f, 0.0f); }
         if (st == 2u) { c = float3(0.0f, 1.0f, 0.0f); }
         if (st == 3u) { c = float3(0.1f, 0.3f, 1.0f); }
         if (rej > 0.5f) { c = float3(1.0f, 0.0f, 0.0f); }
+        if (blame > 0.5f) { c = blameTint; }
         return (float4(c * 2.0f, 1.0f));
     }
     const float w = meta.y;
@@ -1841,6 +1848,11 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    return (float4(max(E, f3(0.0f)) * max(gShadowParams.pgiParams0.x, 0.0f) * 0.8f, 1.0f));
+    const float3 lit = max(E, f3(0.0f)) * max(gShadowParams.pgiParams0.x, 0.0f) * 0.8f;
+    if (blame > 0.5f) {
+        const float l = max(dot(lit, float3(0.2126f, 0.7152f, 0.0722f)), 1.0e-6f);
+        return (float4(blameTint * l * 2.0f, 1.0f));
+    }
+    return (float4(lit, 1.0f));
 }
 #line 535 "FSL/shaders.list"

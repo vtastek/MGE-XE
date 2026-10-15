@@ -6566,8 +6566,35 @@ namespace {
                                     // they show the tunnel bright spots again since captures drop MW's set)
     float g_pgiVolTau    = 0.5f;    // knob pgiVolTau: the volume's temporal smoothing (s)
     float g_pgiVolPeriod = 4.0f;    // knob pgiVolPeriod: each voxel re-splatted every N frames
+    float g_pgiBlame     = 0.0f;    // knob pgiBlame (debug): rank the probes lighting the crosshair's point; worst = magenta ball
+    // NUDGE (DDGI relocation, user 2026-10-15: "there are already two red probes in vicinity ... the nudge
+    // is not working"): a REJECTED ball (inside geometry) is moved through its nearest back face, plus a
+    // margin, and recaptured; up to pgiNudgeTries times, each move at most pgiNudgeMax. A ball still
+    // rejected after that stops vouching for its surroundings (new balls past pgiNudgeKeep join beside it).
+    float g_pgiNudge      = 1.0f;     // knob pgiNudge (0 = off, the A/B)
+    float g_pgiNudgeMargin = 24.0f;   // knob pgiNudgeMargin (u past the back face)
+    float g_pgiNudgeTries = 2.0f;     // knob pgiNudgeTries
+    float g_pgiNudgeMax   = 256.0f;   // knob pgiNudgeMax (u per move)
+    float g_pgiNudgeKeep  = 32.0f;    // knob pgiNudgeKeep: a given-up rejected ball absorbs new balls only this near
+    float g_pgiBlameU     = 0.5f;     // knob pgiBlameU / pgiBlameV: the screen point BLAME scores (0.5 0.5 = the crosshair)
+    float g_pgiBlameV     = 0.5f;
+    float g_pgiSunTap     = 2.0f;     // knob pgiSunTap: the relight's sun-map test (0 renderer offsets + 3x3, 1 one exact tap, 2 = 1 x the long-range map)
+    float g_pgiRepel      = 0.0f;     // knob pgiRepel: DARK REPELS LIT exponent in the splat (pgi.comp.fsl pgiRepel; 0 = off). OFF: the leak saves read zero without it once the sun test and view bias were fixed, and it costs +0.14 ms (castle 0.37 -> 0.52 ms gpu pgi); 4 = the tested strength
+    float g_pgiRecvKnee  = 0.25f;    // knob pgiRecvKnee: receiver / probe visibility ratio below which it darkens
+    float g_pgiRecvVis   = 2.0f;    // knob pgiRecvVis: 0 off, 1 receiver sky AO over the probes' visibility, 2 receiver sky AO alone
     float g_pgiKernK     = 2.5f;    // knob pgiKernK: splat kernel radius = this x the pool's merge radius there
+                                    // (1 also darkens a tunnel, but the receivers' own sky visibility does it
+                                    // without narrowing the probes' reach: pgiRecvVis)
     float g_pgiVolFull   = 0.75f;   // knob pgiVolFull: summed kernel weight that counts as a fully covered voxel
+    float g_pgiNormalBias = 0.5f;   // knob pgiNormalBias: receiver lookup pushed out by this x a voxel
+    float g_pgiViewBias   = 1.0f;   // knob pgiViewBias: that push's direction, 0 = along N .. 1 = toward the camera (skyamb.h.fsl)
+    // 0.25 L + 32 -> 0.1 L + 16 (2026-10-15): probes OUTSIDE a tunnel's rock passed the test to the
+    // voxels just inside it and handed them their open sky — the probes' sky visibility read high deep in
+    // the Telvanni tunnel (gate debug pgiRecvVis=3), which let undersides there keep GI ("some more
+    // leak, last save"). Tunnel / leak saves = GI off; castle floors 0.94 -> 0.88, openfield unchanged.
+    float g_pgiSlackK     = 0.1f;   // knob pgiSlackK: splat visibility slack = K x distance ...
+    float g_pgiSlackC     = 16.0f;  // knob pgiSlackC: ... + C (u)
+    float g_pgiUncapReach = 1.0e9f; // knob pgiUncapReach: a probe face not captured yet passes visibility to this distance (u)
     float g_pgiBallsCam   = 128.0f;   // knob pgiBallsCam: camera balls per frame
     float g_pgiBallsSun   = 128.0f;   // knob pgiBallsSun: sun balls per frame
     float g_pgiPool       = 2048.0f;  // knob pgiPool: ball probes kept (farthest from the camera evicted)
@@ -6584,6 +6611,10 @@ namespace {
     float g_pgiWorldMove  = 1024.0f;  // knob pgiWorldMove: re-shot at the camera once this far from it (u)
     float g_pgiWorldEvery = 10.0f;    // knob pgiWorldEvery: and re-shot in place every N s (cells stream in; its sky is every probe's)
     float g_pgiLiveSky    = 1.0f;     // knob pgiLiveSky: every probe's sky texels take the world probe's (0 = their own capture)
+    float g_pgiBackMax    = 0.2f;     // knob pgiBackMax: a COMPLETE probe seeing more back faces than this share is inside geometry
+    float g_pgiBackMaxPart = 0.5f;    // knob pgiBackMaxPartial: ... and a PARTIAL one
+    float g_pgiFillGain   = 1.0f;     // knob pgiFillGain (test): the missing-face fill's share (0 = missing faces dark)
+    float g_pgiSkyGain    = 1.0f;     // knob pgiSkyGain (test): the sky texels' share in the relight
     float g_pgiFillOld    = 0.0f;     // knob pgiFillOld: a probe's missing faces take the mean of its captured ones (1 = the old model, A/B)
     float g_pgiViewExp    = 0.5f;     // knob pgiViewExp: the probe preview's FIXED exposure (not the frame's; its rect is unmetered)
     float g_pgiSkyLive    = 0.0f;     // knob pgiSkyLive: probes' sky = the atmosphere's sky-view field (0 = captured / stand-in). OFF: under full overcast the mixed field reads several x the DRAWN sky (2026-10-14)
@@ -6596,8 +6627,11 @@ namespace {
         float p[3]; float n[3]; uint32_t type; uint32_t hits; double t;
         // PHASE 2: the probe slot it owns (-1 none) and its capture state, as a column layer has.
         int slot = -1; uint8_t faces = 0; bool done = false; float trans = 0.0f;
+        uint8_t nudges = 0; bool rej = false;   // NUDGE: moves made; the relight's last verdict (inside geometry)
     };
     constexpr uint64_t kPgiPlaceLane = 16ull * kPgiG * kPgiG;   // one readback lane per frame slot
+    constexpr uint64_t kPgiBlameLane = 32ull * kPgiN;           // BLAME: 2 float4 per probe slot
+    constexpr uint64_t kPgiMoveLane  = 32ull * kPgiN;           // NUDGE: 2 float4 per probe slot
     // The field's readback (probeOracleAtProbes): 16 slices of G x G RGBA16F, rows padded to 256 B.
     constexpr uint64_t kPgiShRowPitch = 256, kPgiShSlice = kPgiShRowPitch * kPgiG, kPgiShLane = kPgiShSlice * 16ull;
     static_assert(kPgiG * 8u <= kPgiShRowPitch && kPgiShSlice % 512u == 0u, "pgi SH readback footprint");
@@ -6654,6 +6688,17 @@ namespace {
         Texture*       volTag = nullptr;      // R32_UINT VX x VX x VZ
         Shader*        sSplat = nullptr;
         Pipeline*      pSplat = nullptr;
+        Shader*        sBlame = nullptr;      // debug (pgiBlame): each probe's share of the crosshair's point
+        Pipeline*      pBlame = nullptr;
+        Buffer*        blameBuf = nullptr;
+        Buffer*        blameRb = nullptr;
+        bool           blameN[kFrameSlots] = {};
+        Buffer*        moveBuf = nullptr;     // NUDGE: the relight's verdict + nearest back face per slot
+        Buffer*        moveRb = nullptr;
+        bool           moveN[kFrameSlots] = {};
+        uint32_t       nudged = 0, nudgeGaveUp = 0;   // heartbeat (cumulative)
+        int            blameTop[5] = { -1, -1, -1, -1, -1 };   // probe slots, worst first
+        double         blameLogT = 0.0;
         Shader*        sPeekLit = nullptr;    // debug (pgiDebug 8|64): the peek relit at full resolution
         Pipeline*      pPeekLit = nullptr;
         bool           volInSR = false, volLive = false, volInit = false;
@@ -20830,7 +20875,8 @@ namespace {
     // g_ao* knob, so this declaration IS the persistence story — the host starts every session with
     // AO live and nothing needs ticking. The checkbox stays, as an A/B.
     bool  g_aoEnable         = true;    // AO visibility modulates ambient (also arms the AO dispatch)
-    bool  g_bentNormalEnable = true;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
+    bool  g_bentNormalEnable = true;
+    bool  g_aoSpecOcc        = true;    // bit6: screen-space SPECULAR occlusion (GTSO, aospecocc.h.fsl); off = env x AO   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
     bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
     // AO MULTI-BOUNCE (Activision/Jimenez GTAO course notes) — bit5. `ambient *= visibility` drives
     // an occluded pocket toward BLACK, and a crevice in a green field is dark GREEN because the
@@ -21530,6 +21576,16 @@ namespace {
     // authority and there is no step at the handover; and gated on g_skyPhys.active, so interiors
     // (which have their own 40-50 row and genuinely need the authority) are untouched.
     float  g_expMaxNight = 8.0f;
+    // THE OPEN-SKY CEILING (user, 2026-10-15): a dark place in daylight may adapt at most this many
+    // stops above what OPEN SKY needs right now — E_open, the exposure that puts an upward 18% card in
+    // open air at mid-grey: 1 / (sun x sin(elevation) + ambient), the physical sky's own light in
+    // scene units. Measured on the Telvanni walk: outside E 0.46; the tunnel with lanterns +8.2 stops,
+    // lanterns off +11 (railed at 1000) — *"if lanterns go 8, it can go 2 more stops without
+    // lanterns"*. Exteriors with the sky model only; interiors and full night keep their own limits.
+    // 9 over E_open = +10 over the servo's own outdoor E: E_open reads ~1 stop above it (walk: open
+    // 0.948, outside E 0.46), the servo setting overcast land a little brighter than mid-grey.
+    float  g_expOpenStops = 9.0f;    // knob expOpenStops (0 = off)
+    double g_expOpenNow   = 0.0;     // the E_open of the last servo step (heartbeat `open=`)
     // At full night the ceiling above is also the floor (see the servo's expMinNow): a dark exterior
     // is exposed wide open, and adaptation can no longer stop it down. Off = the old free floor.
     bool   g_expNightFloor = true;
@@ -23743,6 +23799,7 @@ namespace {
     double   g_lastGlowWalkMs = 0.0;             // diagnostics: CPU walk cost only (excl. RT bind + draw record)
     bool  g_useFroxel       = true;              // clustered forward A/B: OFF forces the brute gLights loop
                                                  // (SAME lights) so the froxel image can be diffed vs brute
+    bool  g_nearLightsOff   = false;             // knob nearLightsOff (test): 1 = no near point lights (lanterns off)
     bool  g_useFroxelNear   = true;              // NEAR clustered forward A/B: OFF forces the near brute loop
                                                  // (opaque/multimap frags) so the near froxel image diffs vs brute
     bool  g_dlLightNearDedup = true;             // Phase E handoff dedup: drop baked lights the NEAR path owns
@@ -24745,6 +24802,10 @@ namespace {
             { "pgiWorldEvery",       &g_pgiWorldEvery       },
             { "pgiLiveSky",          &g_pgiLiveSky          },
             { "pgiFillOld",          &g_pgiFillOld          },
+            { "pgiFillGain",         &g_pgiFillGain         },
+            { "pgiBackMax",          &g_pgiBackMax          },
+            { "pgiBackMaxPartial",   &g_pgiBackMaxPart      },
+            { "pgiSkyGain",          &g_pgiSkyGain          },
             { "pgiViewExp",          &g_pgiViewExp          },
             { "pgiSunGain",          &g_pgiSunGain          },
             { "pgiSunMarch",         &g_pgiSunMarch         },
@@ -24753,7 +24814,24 @@ namespace {
             { "pgiVolTau",           &g_pgiVolTau           },
             { "pgiVolPeriod",        &g_pgiVolPeriod        },
             { "pgiKernK",            &g_pgiKernK            },
+            { "pgiRecvVis",          &g_pgiRecvVis          },
+            { "pgiRecvKnee",         &g_pgiRecvKnee         },
+            { "pgiBlame",            &g_pgiBlame            },
+            { "pgiNudge",            &g_pgiNudge            },
+            { "pgiNudgeMargin",      &g_pgiNudgeMargin      },
+            { "pgiNudgeTries",       &g_pgiNudgeTries       },
+            { "pgiNudgeMax",         &g_pgiNudgeMax         },
+            { "pgiNudgeKeep",        &g_pgiNudgeKeep        },
+            { "pgiRepel",            &g_pgiRepel            },
+            { "pgiSunTap",           &g_pgiSunTap           },
+            { "pgiBlameU",           &g_pgiBlameU           },
+            { "pgiBlameV",           &g_pgiBlameV           },
             { "pgiVolFull",          &g_pgiVolFull          },
+            { "pgiNormalBias",       &g_pgiNormalBias       },
+            { "pgiViewBias",         &g_pgiViewBias         },
+            { "pgiSlackK",           &g_pgiSlackK           },
+            { "pgiSlackC",           &g_pgiSlackC           },
+            { "pgiUncapReach",       &g_pgiUncapReach       },
             { "pgiVoxel",            &g_pgiVoxel            },
             { "pgiFade",             &g_pgiFade             },
             { "pgiFaceRank",         &g_pgiFaceRank         },
@@ -24869,6 +24947,7 @@ namespace {
             { "expResidDark",        &g_expResidDark        },
             { "expTauRise",          &g_expTauRise          },
             { "expTauFall",          &g_expTauFall          },
+            { "expOpenStops",        &g_expOpenStops        },
     };
     const BKnob bknobs[] = {
             // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
@@ -24948,6 +25027,7 @@ namespace {
             { "cullSurvivorList",    &g_cullSurvivorList    },
             { "skyDeferred",         &g_skyDeferred         },
             { "waterRefractRegion",  &g_waterRefractRegion  },
+            { "nearLightsOff",       &g_nearLightsOff       },   // test: no near point lights
             { "drawDistLights",      &g_drawDistLights      },   // baked lamps on distant land (G7 has none)
             { "terrainLean",         &g_terrainLean         },
             { "terrainVrs",          &g_terrainVrs          },
@@ -25119,6 +25199,7 @@ namespace {
             // AO multi-bounce (aomultibounce.h.fsl). 0 = the scalar `ambient *= visibility` that
             // shipped, byte for byte, so every AO measurement predating it stays comparable.
             { "aoMultiBounce",       &g_aoMultiBounce       },
+            { "aoSpecOcc",           &g_aoSpecOcc           },   // GTSO specular occlusion (aospecocc.h.fsl)
             { "grassOn",             &g_drawGrass           },
             // G1f: the Z-prepass pair. 0 restores the single GEQUAL draw with grass.frag's own
             // SV_Coverage — i.e. the exact shader that shipped — so this knob, unlike grassOn,
@@ -27776,6 +27857,12 @@ namespace {
           t.sliderF("Probe GI: face rank cost (columns; 0 = finish near probes first)", &g_pgiFaceRank, 0.0f, 4.0f, 0.25f, "%.2f");
           t.sliderF("Probe GI: multi-bounce (hits lit by the probe's own field; 0 = sky only)", &g_pgiBounce, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI DEBUG (bits: 1 probe spheres, 2 receiver probe-share tint, 4 what the near probe sees, 8 peek full-res, 16 peek distance, 32 ball pool, 64 near probes LIT)", &g_pgiDebug, 0.0f, 127.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI BLAME the crosshair (1 = rank the probes lighting the point under it: log [pgi-blame], worst = MAGENTA ball, next four ORANGE; view with DEBUG 33)", &g_pgiBlame, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI NUDGE (1 = a probe inside geometry, red, is moved through its nearest back face and recaptured)", &g_pgiNudge, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI nudge margin past the back face (u)", &g_pgiNudgeMargin, 0.0f, 128.0f, 4.0f, "%.0f");
+          t.sliderF("Probe GI DARK REPELS LIT (exponent: a probe brighter than the one a point leans on, and farther, is cut; 0 = off)", &g_pgiRepel, 0.0f, 16.0f, 0.5f, "%.1f");
+          t.sliderF("Probe GI relight sun test (0 renderer offsets + 3x3, 1 one exact tap, 2 = 1 x the long-range map)", &g_pgiSunTap, 0.0f, 2.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI receiver bias toward the camera (0 = along N; floors keep N)", &g_pgiViewBias, 0.0f, 1.0f, 0.125f, "%.3f");
           t.sliderF("GI DEBUG: share of objects painted a pure colour (bounce inspection, 0 = off)", &g_giTint, 0.0f, 1.0f, 0.01f, "%.2f");
           t.sliderF("GI DEBUG: painted albedo", &g_giTintLevel, 0.0f, 1.0f, 0.05f, "%.2f");
           t.checkbox("Weather surface state (wet / snow from MW weather)", &g_weatherSurface);
@@ -34383,10 +34470,22 @@ void destroyHostWindow(Renderer* R);
         // whole family by m — so the ceiling is divided by m, or a clear night (m = 2^-3) sits on
         // the rail 3 stops under its setpoint. Same number in the knob, correct in either family.
         const double expMaxNightNow = (double)g_expMaxNight / (double)sunnyM();
-        const double expMaxNow = (g_skyPhys.active)
+        double expMaxNow = (g_skyPhys.active)
             ? (expMaxNightNow + ((double)g_expMax - expMaxNightNow)
                                      * std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp)))
             : (double)g_expMax;
+        // The open-sky ceiling (g_expOpenStops). Never below the night ceiling, so dusk hands over to
+        // the night's own limit without a step.
+        g_expOpenNow = 0.0;
+        if (g_skyPhys.active && g_expOpenStops > 0.0f) {
+            const double sinEl = std::sin((double)g_skyPhys.elevLight * SceneCal::kPi / 180.0);
+            const double Eopen = (double)SceneCal::luma709(g_skyPhys.sunScene) * std::max(0.0, sinEl)
+                               + (double)SceneCal::luma709(g_skyPhys.ambScene);
+            if (Eopen > 1.0e-9) {
+                g_expOpenNow = 1.0 / Eopen;
+                expMaxNow = std::min(expMaxNow, std::max(expMaxNightNow, g_expOpenNow * std::exp2((double)g_expOpenStops)));
+            }
+        }
         // THE NIGHT FLOOR (g_expNightFloor): at full night the ceiling is also the BASE — a camera
         // wide open on a dark exterior, which the moon, a lantern or a lit window must not stop
         // down (user: "adaptation bringing it down too much. max out should be the base"). It opens
@@ -39422,7 +39521,7 @@ void destroyHostWindow(Renderer* R);
                              " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
                              " exp=%.3g(%s,%s,%s) EVapplied=%.2f s16=%s(R 2^%.2f m 2^%.2f fog x%.3g)"
-                             " rail=%s(ceil %.3g) adapt=%s(snaps %u last %+.2f st) cal=(sun %.2f amb %.2f emis %.2f)",
+                             " rail=%s(ceil %.3g open %.3g) adapt=%s(snaps %u last %+.2f st) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
@@ -39436,7 +39535,7 @@ void destroyHostWindow(Renderer* R);
                              evApplied,
                              g_sunny16 ? "ON" : "off", std::log2((double)sunnyR()),
                              std::log2((double)sunnyM()), (double)g_sunnyFogK,
-                             railTxt, (double)g_expMaxNow,
+                             railTxt, (double)g_expMaxNow, g_expOpenNow,
                              (g_expSnap > 0.5f) ? "cap" : "ease", g_expSnaps, (double)g_expLastSnap,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
 
@@ -40363,7 +40462,8 @@ void destroyHostWindow(Renderer* R);
                            | (g_ambientWhite ? 4u : 0u)      // AO toggles (bits 0-2)
                            | (g_alphaHighlight ? 8u : 0u)    // bit3: alpha.frag magenta highlight (opaque ignores)
                                                              // bit4 (two-sided flip) retired — see alpha.frag
-                           | (g_aoMultiBounce ? 32u : 0u));  // bit5: AO multi-bounce (aomultibounce.h.fsl)
+                           | (g_aoMultiBounce ? 32u : 0u)    // bit5: AO multi-bounce (aomultibounce.h.fsl)
+                           | (g_aoSpecOcc && g_aoEnable ? 64u : 0u));   // bit6: GTSO specular occlusion
                                                              // ⚠ bit4 stays RETIRED rather than reused —
                                                              // a recycled bit is how a stale consumer starts
                                                              // reading a live flag as its old meaning.
@@ -40480,6 +40580,7 @@ void destroyHostWindow(Renderer* R);
             if (nL > kMaxPointLights) { nL = kMaxPointLights; }
             const uint32_t haveLights = lightBytes / (uint32_t)sizeof(IPC::PointLightWire);
             if (nL > haveLights) { nL = haveLights; }
+            if (g_nearLightsOff) { nL = 0u; }   // knob nearLightsOff: judge the GI alone
             uint8_t* lc = (uint8_t*)fbw(g_live.pLightCbv);
             ((float*)lc)[0] = (float)nL;   // lightParams.x = count
             // lightParams.y = point-light reach in RADII. The frag drives attenuation to zero
@@ -45775,6 +45876,9 @@ void destroyHostWindow(Renderer* R);
                             const uint32_t sl = (uint32_t)b.slot % (kPgiG * kPgiG);
                             e[4] = (float)(sl % kPgiG); e[5] = (float)(sl / kPgiG); e[6] = (float)((uint32_t)b.slot / (kPgiG * kPgiG));
                             e[7] = (b.faces == 0) ? 0.0f : (b.trans > 0.0f) ? 3.0f : b.done ? 2.0f : 1.0f;
+                            // BLAME (pgiBlame): the worst contributor to the crosshair +10 (magenta), the next four +20 (orange).
+                            if (b.slot == g_pgi.blameTop[0]) { e[7] += 10.0f; e[3] *= 3.0f; }
+                            else { for (int t = 1; t < 5; ++t) { if (b.slot == g_pgi.blameTop[t]) { e[7] += 20.0f; e[3] *= 2.0f; break; } } }
                         }
                         ++n;
                     }
@@ -63671,8 +63775,8 @@ void destroyHostWindow(Renderer* R);
             }
             mp[kGiDebugFloat + 0] = std::clamp(g_giTint, 0.0f, 1.0f);   // GI bounce inspection (gitint.h.fsl)
             mp[kGiDebugFloat + 1] = std::clamp(g_giTintLevel, 0.0f, 1.0f);
-            mp[kGiDebugFloat + 2] = 0.0f;
-            mp[kGiDebugFloat + 3] = 0.0f;
+            mp[kGiDebugFloat + 2] = std::clamp(std::round(g_pgiRecvVis), 0.0f, 4.0f);   // 3 = debug view of the gate's inputs, 4 = mode 2 with a LINEAR underside rule   // probe GI: receiver / probe sky visibility share (skyamb.h.fsl)
+            mp[kGiDebugFloat + 3] = std::clamp(g_pgiRecvKnee, 0.01f, 1.0f);   // ... and its knee
             mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 1] = std::clamp(g_giOpenRef, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 2] = std::clamp(g_giUnderGain, 0.0f, 4.0f);
@@ -65632,9 +65736,9 @@ void destroyHostWindow(Renderer* R);
     // renderer's own ambient at each hit, projected to convolved SH9. Receivers: skyamb.h.fsl.
     void pgiTeardown(Renderer* R) {
         if (g_pgi.set) { removeDescriptorSet(R, g_pgi.set); g_pgi.set = nullptr; }
-        Pipeline** pp[6] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit };
-        Shader**   ss[6] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit };
-        for (int i = 0; i < 6; ++i) {
+        Pipeline** pp[7] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit, &g_pgi.pBlame };
+        Shader**   ss[7] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit, &g_pgi.sBlame };
+        for (int i = 0; i < 7; ++i) {
             if (*pp[i]) { removePipeline(R, *pp[i]); *pp[i] = nullptr; }
             if (*ss[i]) { removeShader(R, *ss[i]); *ss[i] = nullptr; }
         }
@@ -65648,6 +65752,10 @@ void destroyHostWindow(Renderer* R);
         if (g_pgi.placeRb)  { removeResource(g_pgi.placeRb);  g_pgi.placeRb = nullptr; }
         if (g_pgi.ballBuf)  { removeResource(g_pgi.ballBuf);  g_pgi.ballBuf = nullptr; }
         if (g_pgi.ballRb)   { removeResource(g_pgi.ballRb);   g_pgi.ballRb = nullptr; }
+        if (g_pgi.blameBuf) { removeResource(g_pgi.blameBuf); g_pgi.blameBuf = nullptr; }
+        if (g_pgi.blameRb)  { removeResource(g_pgi.blameRb);  g_pgi.blameRb = nullptr; }
+        if (g_pgi.moveBuf)  { removeResource(g_pgi.moveBuf);  g_pgi.moveBuf = nullptr; }
+        if (g_pgi.moveRb)   { removeResource(g_pgi.moveRb);   g_pgi.moveRb = nullptr; }
         if (g_pgi.shRb)     { removeResource(g_pgi.shRb);     g_pgi.shRb = nullptr; }
         g_pgi.pool.clear();
         if (g_pgi.gbuf) { removeResource(g_pgi.gbuf); g_pgi.gbuf = nullptr; }
@@ -65668,11 +65776,11 @@ void destroyHostWindow(Renderer* R);
             LOG::logline("!! [pgi] %s FAILED — probe GI disabled", what);
             pgiTeardown(R); g_pgi.failed = true; return false;
         };
-        const char* files[6] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp", "pgiballs.comp", "pgisplat.comp",
-                                 "pgipeeklit.comp" };
-        Shader**   ss[6] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit };
-        Pipeline** pp[6] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit };
-        for (int i = 0; i < 6; ++i) {
+        const char* files[7] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp", "pgiballs.comp", "pgisplat.comp",
+                                 "pgipeeklit.comp", "pgiblame.comp" };
+        Shader**   ss[7] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit, &g_pgi.sBlame };
+        Pipeline** pp[7] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit, &g_pgi.pBlame };
+        for (int i = 0; i < 7; ++i) {
             ShaderLoadDesc sd = {}; sd.mComp.pFileName = files[i];
             addShader(R, &sd, ss[i]);
             if (!*ss[i]) { return fail(files[i]); }
@@ -65730,7 +65838,7 @@ void destroyHostWindow(Renderer* R);
         }
         {
             TextureDesc td = {};
-            td.mWidth = kPgiG; td.mHeight = kPgiG; td.mDepth = 1; td.mArraySize = 16;
+            td.mWidth = kPgiG; td.mHeight = kPgiG; td.mDepth = 1; td.mArraySize = 18;   // 16+layer: the probe's sky visibility
             td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
             td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -65770,6 +65878,28 @@ void destroyHostWindow(Renderer* R);
             br.mDesc.pName       = "pgiBallsReadback";
             br.ppBuffer          = &g_pgi.ballRb;
             addResource(&br, nullptr);
+            // BLAME (debug): 2 float4 per probe slot, and its readback.
+            BufferLoadDesc lb = b;
+            lb.mDesc.mElementCount = 2ull * kPgiN;
+            lb.mDesc.mSize         = kPgiBlameLane;
+            lb.mDesc.pName         = "pgiBlame";
+            lb.ppBuffer            = &g_pgi.blameBuf;
+            addResource(&lb, nullptr);
+            BufferLoadDesc lr = r;
+            lr.mDesc.mSize       = kPgiBlameLane * kFrameSlots;
+            lr.mDesc.pName       = "pgiBlameReadback";
+            lr.ppBuffer          = &g_pgi.blameRb;
+            addResource(&lr, nullptr);
+            BufferLoadDesc mb = lb;
+            mb.mDesc.mSize         = kPgiMoveLane;
+            mb.mDesc.pName         = "pgiMove";
+            mb.ppBuffer            = &g_pgi.moveBuf;
+            addResource(&mb, nullptr);
+            BufferLoadDesc mr = lr;
+            mr.mDesc.mSize       = kPgiMoveLane * kFrameSlots;
+            mr.mDesc.pName       = "pgiMoveReadback";
+            mr.ppBuffer          = &g_pgi.moveRb;
+            addResource(&mr, nullptr);
             BufferLoadDesc sr = r;
             sr.mDesc.mSize       = kPgiShLane * kFrameSlots;
             sr.mDesc.pName       = "pgiSHReadback";
@@ -65802,11 +65932,12 @@ void destroyHostWindow(Renderer* R);
         }
         waitForAllResourceLoads();
         if (!g_pgi.gbuf || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
-            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit) { return fail("resource alloc"); }
+            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.blameBuf || !g_pgi.blameRb || !g_pgi.moveBuf || !g_pgi.moveRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit) { return fail("resource alloc"); }
         for (Buffer* b : g_pgi.cbv) { if (!b) { return fail("cbuffer alloc"); } }
         // "No read yet": NaN everywhere, so a lane never written matches no column.
         std::memset(g_pgi.placeRb->pCpuMappedAddress, 0xFF, (size_t)(kPgiPlaceLane * kFrameSlots));
         std::memset(g_pgi.ballRb->pCpuMappedAddress, 0, (size_t)(kPgiBallLane * kFrameSlots));   // type 0 = no ball
+        std::memset(g_pgi.moveRb->pCpuMappedAddress, 0, (size_t)(kPgiMoveLane * kFrameSlots));   // no verdicts
 
         DescriptorSetDesc dsd = SRT_SET_DESC(PgiSrtData, PerBatch, 6, 0);
         addDescriptorSet(R, &dsd, &g_pgi.set);
@@ -65819,7 +65950,7 @@ void destroyHostWindow(Renderer* R);
         Texture* camDepth = g_live.pLinearDepth;
         if (!camDepth) { return fail("camera depth"); }
         for (uint32_t i = 0; i < 6; ++i) {
-            DescriptorData d[24] = {};
+            DescriptorData d[26] = {};
             d[0].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiParams);    d[0].ppBuffers  = &g_pgi.cbv[i];
             d[1].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadow);    d[1].ppBuffers  = &g_live.pShadowMaskParamsCbv;
             d[2].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyAO);     d[2].ppTextures = skyAOHeightTexPP();
@@ -65850,8 +65981,10 @@ void destroyHostWindow(Renderer* R);
             // The renderer's LONG-RANGE sun occlusion: the relight shadows hits past the cascades with it.
             d[23].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSunOcc);
             d[23].ppTextures = g_live.pSunOcc ? &g_live.pSunOcc : &skyTop;
+            d[24].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiBlameOut);  d[24].ppBuffers = &g_pgi.blameBuf;
+            d[25].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiMoveOut);   d[25].ppBuffers = &g_pgi.moveBuf;
             for (DescriptorData& x : d) { x.mCount = 1; }
-            updateDescriptorSet(R, i, g_pgi.set, 24, d);
+            updateDescriptorSet(R, i, g_pgi.set, 26, d);
         }
         // The receivers: every set whose lit frags take skyAmbFactor (the GI field's three).
         DescriptorData pf = {};
@@ -65967,6 +66100,78 @@ void destroyHostWindow(Renderer* R);
                 g_pgi.worldFaces = g_pgi.worldPend = 0;
             }
         }
+        // NUDGE: the relight's verdicts. A report names the position it judged; one about a ball that has
+        // moved since (or a slot with a new owner) matches no ball and is dropped.
+        if (g_pgi.ballMode && g_pgi.moveRb && g_pgi.moveRb->pCpuMappedAddress && g_pgi.moveN[g_readSlot % kFrameSlots]) {
+            g_pgi.moveN[g_readSlot % kFrameSlots] = false;
+            const float* r = (const float*)((const uint8_t*)g_pgi.moveRb->pCpuMappedAddress + (uint64_t)g_readSlot * kPgiMoveLane);
+            for (uint32_t k = 0; k < kPgiWorldSlot; ++k) {
+                const int bi = g_pgi.slotOwner[k];
+                if (bi < 0 || bi >= (int)g_pgi.pool.size()) { continue; }
+                PgiBall& b = g_pgi.pool[bi];
+                const float* e0 = r + 8u * k;
+                const float* e1 = e0 + 4;
+                if (!b.faces || std::fabs(e1[0] - b.p[0]) > 0.5f || std::fabs(e1[1] - b.p[1]) > 0.5f || std::fabs(e1[2] - b.p[2]) > 0.5f) { continue; }
+                const bool rej = e1[3] > 0.5f;
+                if (!rej) { b.rej = false; continue; }
+                const float mv = e0[3] + std::max(0.0f, g_pgiNudgeMargin);
+                if (g_pgiNudge > 0.5f && e0[3] > 0.0f && b.nudges < (uint8_t)std::clamp(g_pgiNudgeTries, 0.0f, 8.0f)
+                    && mv <= std::max(8.0f, g_pgiNudgeMax)) {
+                    b.p[0] += e0[0] * mv; b.p[1] += e0[1] * mv; b.p[2] += e0[2] * mv;
+                    ++b.nudges;
+                    b.rej = false; b.faces = 0; b.done = false; b.trans = 0.0f;
+                    g_pgi.slotClear[k] = true;   // the old probe's field goes; the new spot is captured afresh
+                    ++g_pgi.nudged;
+                } else if (!b.rej) {
+                    b.rej = true;
+                    ++g_pgi.nudgeGaveUp;
+                }
+            }
+        }
+        // BLAME (debug, pgiBlame): rank the probes lighting the crosshair's point (pgiblame.comp).
+        if (g_pgi.blameRb && g_pgi.blameRb->pCpuMappedAddress && g_pgi.blameN[g_readSlot % kFrameSlots]) {
+            g_pgi.blameN[g_readSlot % kFrameSlots] = false;
+            const float* r = (const float*)((const uint8_t*)g_pgi.blameRb->pCpuMappedAddress + (uint64_t)g_readSlot * kPgiBlameLane);
+            int top[5] = { -1, -1, -1, -1, -1 };
+            double sum = 0.0, sumW = 0.0;
+            for (uint32_t k = 0; k < kPgiN; ++k) {
+                const float sc = r[8u * k];
+                if (!(sc > 0.0f)) { continue; }
+                sum += sc; sumW += r[8u * k + 1u];
+                for (int t = 0; t < 5; ++t) {
+                    if (top[t] < 0 || sc > r[8u * (uint32_t)top[t]]) {
+                        for (int u = 4; u > t; --u) { top[u] = top[u - 1]; }
+                        top[t] = (int)k; break;
+                    }
+                }
+            }
+            for (int t = 0; t < 5; ++t) { g_pgi.blameTop[t] = top[t]; }
+            const double now = hostNowMs() * 1.0e-3;
+            if (now - g_pgi.blameLogT > 0.5) {
+                g_pgi.blameLogT = now;
+                const float* x = r + 4;   // probe 0's second float4 holds the point
+                char line[1400]; int o = 0;
+                o += std::snprintf(line + o, sizeof(line) - (size_t)o, ">> [pgi-blame] point (%.0f,%.0f,%.0f) eye (%.0f,%.0f,%.0f) | %s",
+                                   (double)x[0], (double)x[1], (double)x[2],
+                                   (double)g_eyeAbsShadow[0], (double)g_eyeAbsShadow[1], (double)g_eyeAbsShadow[2],
+                                   (top[0] < 0) ? "no probe reaches it" : "share / weight / DC lum / skyVis / ball:");
+                for (int t = 0; t < 5 && top[t] >= 0 && o < (int)sizeof(line) - 200; ++t) {
+                    const uint32_t k = (uint32_t)top[t];
+                    const int bi = (k < kPgiN) ? g_pgi.slotOwner[k] : -1;
+                    const PgiBall* b = (bi >= 0 && bi < (int)g_pgi.pool.size()) ? &g_pgi.pool[bi] : nullptr;
+                    o += std::snprintf(line + o, sizeof(line) - (size_t)o,
+                                       " #%d slot %u %.0f%% w%.2f L%.3g V%.2f skyAll %.4f %s(%.0f,%.0f,%.0f) %s hits %u faces %02x%s;",
+                                       t + 1, k, (sum > 0.0) ? 100.0 * (double)r[8u * k] / sum : 0.0,
+                                       (double)r[8u * k + 1u], (double)r[8u * k + 2u], (double)r[8u * k + 3u], (double)r[8u * k + 7u],
+                                       b ? "at " : "", b ? (double)b->p[0] : 0.0, b ? (double)b->p[1] : 0.0, b ? (double)b->p[2] : 0.0,
+                                       b ? (b->type == 1u ? "camera" : b->type == 2u ? "sun" : b->type == 3u ? "zenith" : "?") : "no ball",
+                                       b ? b->hits : 0u, b ? (unsigned)b->faces : 0u, b && b->done ? " done" : "");
+                }
+                LOG::logline("%s", line);
+            }
+        } else if (g_pgiBlame <= 0.5f) {
+            for (int& t : g_pgi.blameTop) { t = -1; }
+        }
         if (g_pgi.ballRb && g_pgi.ballRb->pCpuMappedAddress && g_pgi.ballN[g_readSlot % kFrameSlots]) {
             const uint32_t nb = std::min(g_pgi.ballN[g_readSlot % kFrameSlots], kPgiBallMax);
             g_pgi.ballN[g_readSlot % kFrameSlots] = 0;
@@ -65998,7 +66203,8 @@ void destroyHostWindow(Renderer* R);
                         for (uint32_t k : it->second) {
                             const PgiBall& b = g_pgi.pool[k];
                             const float qx = b.p[0] - e0[0], qy = b.p[1] - e0[1], qz = b.p[2] - e0[2];
-                            if (qx * qx + qy * qy + qz * qz < rad * rad) { hit = (int)k; break; }
+                            const float rr = b.rej ? std::min(rad, std::max(0.0f, g_pgiNudgeKeep)) : rad;   // NUDGE gave up: it vouches for nothing around it
+                            if (qx * qx + qy * qy + qz * qz < rr * rr) { hit = (int)k; break; }
                         }
                     }
                 }
@@ -66396,17 +66602,17 @@ void destroyHostWindow(Renderer* R);
             PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[2]);
             std::memset(P, 0, sizeof(PgiParams));
             P->ambCol = float4(fcbvR[24], fcbvR[25], fcbvR[26], 0.0f);
-            P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
-            P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
-            P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
+            P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], std::clamp(g_pgiBackMaxPart, 0.0f, 1.0f));   // w = partial probes' back-face limit
+            P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));   // w = the sun-map test (pgiSunTap)
+            P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], std::clamp(g_pgiBackMax, 0.0f, 1.0f));     // w = complete probes' back-face limit
             P->grid   = float4(g_pgi.spacing, (float)kPgiG, (float)g_pgi.phase, (float)R);
             // y = a transition's blend toward its new value; z = MULTI-BOUNCE on (knob pgiBounce)
             P->capMisc = float4(g_pgiLiveSky > 0.5f ? 1.0f : 0.0f, alpha, g_pgiBounce > 0.5f ? 1.0f : 0.0f, ((int)g_pgiDebug & 64) ? 1.0f : 0.0f);   // x = live sky, w = lit preview
             P->place   = float4(g_pgiFillOld > 0.5f ? 1.0f : 0.0f, std::max(0.0f, g_pgiSunGain),
-                                (g_pgiSunMarch > 0.5f || !g_live.pSunOcc) ? 1.0f : 0.0f, 0.0f);   // z = the old sun march
+                                (g_pgiSunMarch > 0.5f || !g_live.pSunOcc) ? 1.0f : 0.0f, std::max(0.0f, g_pgiFillGain));   // z = the old sun march, w = fill share (pgiFillGain)
             // The LIVE sky: the atmosphere's sky-view field in scene units (skyhw.frag's own scale).
             const bool skyLive = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
-            P->skyLive = float4(skyLive ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);   // x = missing faces take the old model (pgiFillOld), y = sun share (pgiSunGain)
+            P->skyLive = float4(skyLive ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, std::max(0.0f, g_pgiSkyGain));   // w = sky share (pgiSkyGain); x = missing faces take the old model (pgiFillOld), y = sun share (pgiSunGain)
             TextureBarrier tb = {};
             tb.pTexture = g_pgi.sh;
             tb.mCurrentState = g_pgi.shInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
@@ -66415,6 +66621,17 @@ void destroyHostWindow(Renderer* R);
             cmdBindPipeline(cmd, g_pgi.pRelight);
             cmdBindDescriptorSet(cmd, 2, g_pgi.set);
             cmdDispatch(cmd, kPgiN, 1, 1);
+            // NUDGE: the relight's verdicts -> this frame's readback lane (pgiSchedule moves the balls).
+            if (g_pgi.ballMode && g_pgi.moveBuf && g_pgi.moveRb) {
+                BufferBarrier mb = {};
+                mb.pBuffer = g_pgi.moveBuf; mb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; mb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+                cmdResourceBarrier(cmd, 1, &mb, 0, nullptr, 0, nullptr);
+                cl->CopyBufferRegion(g_pgi.moveRb->mDx.pResource, (uint64_t)g_live.recSlot * kPgiMoveLane,
+                                     g_pgi.moveBuf->mDx.pResource, 0, kPgiMoveLane);
+                mb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; mb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 1, &mb, 0, nullptr, 0, nullptr);
+                g_pgi.moveN[g_live.recSlot % kFrameSlots] = true;
+            }
             // LIT PEEK (debug, pgiDebug 8|64): the two peeked probes' full-resolution captures relit
             // with the relight's own terms, into the peek atlas's rows 2-3 (pgiview.frag shows them).
             if (g_pgi.ballMode && g_pgi.pPeekLit && ((int)g_pgiDebug & 8) && ((int)g_pgiDebug & 64)
@@ -66431,7 +66648,7 @@ void destroyHostWindow(Renderer* R);
                     std::memset(Q, 0, sizeof(PgiParams));
                     Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], 0.0f);
                     Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
-                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
                     Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
                     Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
                     Q->capPos  = float4(b0.p[0], b0.p[1], b0.p[2], 0.0f);
@@ -66471,6 +66688,9 @@ void destroyHostWindow(Renderer* R);
                 const float kk  = std::max(0.5f, g_pgiKernK);
                 Q->vol2   = float4(kk * g_pgiPoolR0, kk * g_pgiPoolRk, g_pgi.volInit ? (float)period : 1.0f, va);
                 Q->vol3   = float4(g_pgi.volInit ? (float)g_pgi.volPhase : 0.0f, (float)kPgiVX, (float)kPgiVZ, std::max(0.01f, g_pgiVolFull));
+                Q->capMisc = float4(std::max(0.0f, g_pgiSlackK), std::max(0.0f, g_pgiSlackC), std::max(0.0f, g_pgiUncapReach),
+                                    std::max(0.0f, g_pgiRepel));   // SPLAT: visibility slack, uncaptured faces' reach, dark-repels-lit exponent
+                Q->place  = float4(std::clamp(g_pgiBlameU, 0.0f, 1.0f), std::clamp(g_pgiBlameV, 0.0f, 1.0f), 0.0f, 0.0f);   // BLAME's screen point
                 TextureBarrier vb = {};
                 vb.pTexture = g_pgi.vol;
                 vb.mCurrentState = g_pgi.volInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
@@ -66479,6 +66699,21 @@ void destroyHostWindow(Renderer* R);
                 cmdBindPipeline(cmd, g_pgi.pSplat);
                 cmdBindDescriptorSet(cmd, 4, g_pgi.set);
                 cmdDispatch(cmd, kPgiVX / 4u, kPgiVX / 4u, kPgiVZ / 4u);
+                // BLAME (debug, pgiBlame): the same parameters, scored at the crosshair's point.
+                if (g_pgiBlame > 0.5f && g_pgi.pBlame && g_pgi.blameBuf && g_pgi.blameRb) {
+                    cmdBindPipeline(cmd, g_pgi.pBlame);
+                    cmdBindDescriptorSet(cmd, 4, g_pgi.set);
+                    cmdDispatch(cmd, (kPgiN + 63u) / 64u, 1, 1);
+                    BufferBarrier lb = {};
+                    lb.pBuffer = g_pgi.blameBuf; lb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; lb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+                    cmdResourceBarrier(cmd, 1, &lb, 0, nullptr, 0, nullptr);
+                    ID3D12GraphicsCommandList* bcl = cmd->mDx.pCmdList;
+                    bcl->CopyBufferRegion(g_pgi.blameRb->mDx.pResource, (uint64_t)g_live.recSlot * kPgiBlameLane,
+                                          g_pgi.blameBuf->mDx.pResource, 0, kPgiBlameLane);
+                    lb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; lb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(cmd, 1, &lb, 0, nullptr, 0, nullptr);
+                    g_pgi.blameN[g_live.recSlot % kFrameSlots] = true;
+                }
                 vb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; vb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(cmd, 0, nullptr, 1, &vb, 0, nullptr);
                 g_pgi.volInSR = true;
@@ -66605,9 +66840,11 @@ void destroyHostWindow(Renderer* R);
             if (!g_pgi.pool.empty() || g_pgi.ballIn) {
                 uint32_t byType[4] = {};
                 for (const PgiBall& b : g_pgi.pool) { ++byType[std::min(b.type, 3u)]; }
-                LOG::logline(">> [pgi] balls: pool %zu (camera %u, sun %u, zenith %u) | joined %u merged %u evicted %u (cumulative) | sun map %s | gpu pgi %.3f ms"
+                uint32_t nRej = 0;
+                for (const PgiBall& b : g_pgi.pool) { if (b.rej) { ++nRej; } }
+                LOG::logline(">> [pgi] balls: pool %zu (camera %u, sun %u, zenith %u) | rejected %u, nudged %u gave up %u | joined %u merged %u evicted %u (cumulative) | sun map %s | gpu pgi %.3f ms"
                              " | world faces %02x pend %02x shots %u at (%.0f,%.0f,%.0f)",
-                             g_pgi.pool.size(), byType[1], byType[2], byType[3], g_pgi.ballIn, g_pgi.ballMerged,
+                             g_pgi.pool.size(), byType[1], byType[2], byType[3], nRej, g_pgi.nudged, g_pgi.nudgeGaveUp, g_pgi.ballIn, g_pgi.ballMerged,
                              g_pgi.ballEvicted, g_pgiSunVPValid ? "yes" : "no", (double)g_lastGpuPhaseMs[kGpuPhasePgi],
                              (unsigned)g_pgi.worldFaces, (unsigned)g_pgi.worldPend, g_pgi.worldShots,
                              (double)g_pgi.worldP[0], (double)g_pgi.worldP[1], (double)g_pgi.worldP[2]);
@@ -66647,7 +66884,8 @@ void destroyHostWindow(Renderer* R);
         mp[kPgiFloat + 8]  = 1.0f / std::max(16.0f, g_pgiVoxel);
         mp[kPgiFloat + 9]  = (float)kPgiVX;
         mp[kPgiFloat + 10] = (float)kPgiVZ;
-        mp[kPgiFloat + 11] = (on && g_pgi.volLive) ? 1.0f : 0.0f;
+        mp[kPgiFloat + 11] = (on && g_pgi.volLive)   // > 0.5 = ON; minus 1 = the bias (voxels) + 4 x its view share in eighths
+                           ? 1.0f + std::clamp(g_pgiNormalBias, 0.0f, 3.9f) + 4.0f * std::round(std::clamp(g_pgiViewBias, 0.0f, 1.0f) * 8.0f) : 0.0f;
         mp[kPgiFloat + 12] = (float)g_pgi.volO[0];
         mp[kPgiFloat + 13] = (float)g_pgi.volO[1];
         mp[kPgiFloat + 14] = (float)g_pgi.volO[2];

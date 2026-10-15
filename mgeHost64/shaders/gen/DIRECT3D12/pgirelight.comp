@@ -1406,9 +1406,11 @@ STRUCT(PgiParams)
         RWTex2DArray(float4) gPgiVolOut :  register(u18,space2);
         RWTex2DArray(uint) gPgiVolTag :  register(u19,space2);
         RWTex2D(float4) gPgiLit :  register(u20,space2);
-        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b21,space2);
-        Tex2D(float4) gPgiAtmosSky :  register(t22,space2);
-        Tex2D(float) gPgiSunOcc :  register(t23,space2);
+        RWBuffer(float4) gPgiBlameOut :  register(u21,space2);
+        RWBuffer(float4) gPgiMoveOut :  register(u22,space2);
+        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b23,space2);
+        Tex2D(float4) gPgiAtmosSky :  register(t24,space2);
+        Tex2D(float) gPgiSunOcc :  register(t25,space2);
 #line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
@@ -1661,7 +1663,7 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 568 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
@@ -1716,7 +1718,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under =  gPgiShadow .skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 622 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef =  gPgiShadow .skyAOGround.y;
@@ -1730,7 +1732,7 @@ float skyOpenness(float ao, float3 worldPosRel)
 
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
-#line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 
@@ -2230,6 +2232,7 @@ float pgiSunVis(float3 P, float3 S)
 
 
 
+float pgiSunOccVis(float3 worldAbs);
 float pgiSunVisMap(float3 P, float3 N)
 {
     if (gPgiShadow.sunParams.x <= 0.0f) { return -1.0f; }
@@ -2242,14 +2245,24 @@ float pgiSunVisMap(float3 P, float3 N)
     int2 dimsI = GetDimensions(gPgiSunDepth, NO_SAMPLER);
     const float2 tile = float2((float)dimsI.x / (float) 2 , (float)dimsI.y);
     const float3 rel = P - gPgiParams.lodEye.xyz;
+
+
+
+    const uint tapMode = (uint)(gPgiParams.sunDir.w + 0.5f);
     UNROLL for (int c = 0; c <  2 ; ++c) {
-        const float3 p = rel + N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]);
+        const float3 p = rel + ((tapMode == 0u) ? N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]) : f3(0.0f));
         float4 q = mul(gPgiShadow.sunViewProj[c], float4(p, 1.0f));
         q.xyz /= q.w;
         if (max(abs(q.x), abs(q.y)) < 0.98f && q.z > 0.0f && q.z < 1.0f) {
             const float2 uv = q.xy * float2(0.5f, -0.5f) + 0.5f;
             const int2 base = int2(((float)c + uv.x) * tile.x, uv.y * tile.y);
             const int2 lo = int2((int)((float)c * tile.x), 0), hi = int2((int)((float)(c + 1) * tile.x) - 1, dimsI.y - 1);
+            if (tapMode != 0u) {
+                const float dS = LoadTex2D(gPgiSunDepth, NO_SAMPLER, clamp(base, lo, hi), 0).r;
+                float v = (dS > q.z + gPgiShadow.sunPcf1.x) ? 0.0f : 1.0f;
+                if (tapMode == 2u) { v = min(v, pgiSunOccVis(P)); }
+                return v;
+            }
             const float ref = q.z + gPgiShadow.sunPcf1.x + slopeBias;
             float occ = 0.0f;
             for (int j = -1; j <= 1; ++j) {
@@ -2329,7 +2342,10 @@ float3 pgiSkyRadiance(float3 d)
     }
     return gPgiParams.ambCol.rgb * f;
 }
-#line 478 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 492 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#define srt_g_pgiNear g_pgiNear
+#line 492
+groupshared float4 g_pgiNear[ 64u ];
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(64, 1, 1)
 void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID )
@@ -2392,6 +2408,9 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     for (uint q = 0u; q < 9u; ++q) { missY[q] = 0.0f; }
     float3 capL = f3(0.0f);
     float capD = 0.0f;
+    float visS = 0.0f, visW = 0.0f;
+    float skyAll = 0.0f;
+    float4 nearB = float4(0.0f, 0.0f, 0.0f, 1.0e9f);
     const bool fillOld = gPgiParams.place.x > 0.5f;
 
 
@@ -2450,6 +2469,10 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
             const float skyF = as.w;
             const uint nGeoT = gb.w & 0xFFu, nBackT = (gb.w >> 8u) & 0xFFu;
             if (nGeoT > 0u) { backAcc += (float)nBackT / (float)nGeoT * (1.0f - skyF) * dom; }
+            if (2u * nBackT > nGeoT) {
+                const float hb = pgiGbDist(gb);
+                if (hb > 0.0f && hb < nearB.w) { nearB = float4(d, hb); }
+            }
 
 
             float3 skyCap = pgiUnpackR11G11B10(gb.z);
@@ -2465,7 +2488,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
                 if (pgiUnpackUnorm4(wg.x).w > 0.0f && (ws.r + ws.g + ws.b) > 0.0f) { skyCap = ws; }
             }
             const bool useCap = (skyCap.r + skyCap.g + skyCap.b) > 0.0f && dot(d, S) < 0.9962f;
-            float3 L = skyF * (skyLive ? pgiSkyLive(d) : useCap ? skyCap : pgiSkyRadiance(d));
+            float3 L = skyF * gPgiParams.skyLive.w * (skyLive ? pgiSkyLive(d) : useCap ? skyCap : pgiSkyRadiance(d));
             const float hd = pgiGbDist(gb);
             if (skyF < 0.999f && hd > 0.0f) {
                 float3 N = pgiUnpackNormal(gb.y);
@@ -2501,6 +2524,9 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
             }
             capL += L * dom;
             capD += dom;
+            visS += skyF * max(d.z, 0.0f) * dom;
+            skyAll += skyF * dom;
+            visW += max(d.z, 0.0f) * dom;
             const float x = d.x, y = d.y, z = d.z;
             const float Y[9] = { 0.282095f, 0.488603f * y, 0.488603f * z, 0.488603f * x,
                                  1.092548f * x * y, 1.092548f * y * z, 0.315392f * (3.0f * z * z - 1.0f),
@@ -2519,13 +2545,16 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     g_pgiA[tid *  11u  + 7u] = float4(missY[0], missY[1], missY[2], missY[3]);
     g_pgiA[tid *  11u  + 8u] = float4(missY[4], missY[5], missY[6], missY[7]);
     g_pgiA[tid *  11u  + 9u] = float4(missY[8], capL);
-    g_pgiA[tid *  11u  + 10u] = float4(capD, 0.0f, 0.0f, 0.0f);
+    g_pgiA[tid *  11u  + 10u] = float4(capD, visS, visW, skyAll);
+    g_pgiNear[tid] = nearB;
     GroupMemoryBarrier();
     for (uint s =  64u  / 2u; s > 0u; s >>= 1u) {
         float4 v[ 11u ];
         for (uint k = 0u; k <  11u ; ++k) { v[k] = (tid < s) ? g_pgiA[(tid + s) *  11u  + k] : f4(0.0f); }
+        const float4 nb = (tid < s) ? g_pgiNear[tid + s] : float4(0.0f, 0.0f, 0.0f, 1.0e9f);
         GroupMemoryBarrier();
         if (tid < s) { for (uint k = 0u; k <  11u ; ++k) { g_pgiA[tid *  11u  + k] = g_pgiA[tid *  11u  + k] + v[k]; } }
+        if (tid < s && nb.w < g_pgiNear[tid].w) { g_pgiNear[tid] = nb; }
         GroupMemoryBarrier();
     }
 
@@ -2538,8 +2567,15 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
 
 
 
-        const float backMax = (fmask == 63u) ?  0.2f  : 0.5f;
+        const float backMax = (fmask == 63u) ? gPgiParams.sunCol.w : gPgiParams.lodEye.w;
         if (capDom > 0.0f && g_pgiA[6].w / capDom > backMax) { valid = false; rejected = true; }
+    }
+
+
+    if (tid == 9u) {
+        const float4 nb = g_pgiNear[0];
+        gPgiMoveOut[2u * p] = (rejected && nb.w < 1.0e8f) ? nb : float4(0.0f, 0.0f, 0.0f, -1.0f);
+        gPgiMoveOut[2u * p + 1u] = float4(pr.xyz, rejected ? 1.0f : 0.0f);
     }
     if (tid < 7u) {
 
@@ -2548,7 +2584,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
 
         const float4 m7 = g_pgiA[7], m8 = g_pgiA[8], m9 = g_pgiA[9];
         const float mY[9] = { m7.x, m7.y, m7.z, m7.w, m8.x, m8.y, m8.z, m8.w, m9.x };
-        const float3 mean = (g_pgiA[10].x > 1.0e-6f) ? m9.yzw / g_pgiA[10].x : f3(0.0f);
+        const float3 mean = (g_pgiA[10].x > 1.0e-6f) ? m9.yzw / g_pgiA[10].x * gPgiParams.place.w : f3(0.0f);
         float4 o;
         for (uint e = 0u; e < 4u; ++e) {
             const uint q = tid * 4u + e;
@@ -2596,6 +2632,17 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
         const int3 at = int3((int)cx, (int)cy, (int)(14u + layer));
         if (trans) { mz = lerp(LoadRWTex3D(gPgiSHOut, at), mz, gPgiParams.capMisc.y); }
         Write3D(gPgiSHOut, at, mz);
+    }
+    if (tid == 8u) {
+
+
+
+        const float vp = (g_pgiA[10].z > 1.0e-6f) ? saturate(g_pgiA[10].y / g_pgiA[10].z) : 1.0f;
+        const float va = (g_pgiA[10].x > 1.0e-6f) ? saturate(g_pgiA[10].w / g_pgiA[10].x) : 0.0f;
+        float4 vz = valid ? float4(vp, 1.0f, va, 0.0f) : f4(0.0f);
+        const int3 at = int3((int)cx, (int)cy, (int)(16u + layer));
+        if (trans) { vz = lerp(LoadRWTex3D(gPgiSHOut, at), vz, gPgiParams.capMisc.y); }
+        Write3D(gPgiSHOut, at, vz);
     }
     return;
 }

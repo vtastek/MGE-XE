@@ -1,0 +1,46 @@
+// mgeHost64 — SPECULAR OCCLUSION from the screen-space AO (Jimenez et al. 2016, "Practical Real-Time
+// Strategies for Accurate Indirect Occlusion", GTSO). User, 2026-10-15: "my idea is doing specular
+// occlusion in screen space" — the environment specular reflected sky a sealed tunnel does not have
+// (a root's rim in the Telvanni tunnel) because it was only multiplied by the AO scalar.
+//
+// The unoccluded directions at a point are modelled as a CONE around the bent normal B whose
+// cosine-weighted share equals the visibility a: cos(aperture) = sqrt(1 - a). The specular lobe is a
+// cone around the mirror direction R whose aperture follows the roughness. The occlusion is the
+// share of the specular cone's solid angle inside the visibility cone — the cap-cap intersection,
+// with the smoothstep approximation for the partial overlap (as in the reference). a = 1 (nothing
+// occludes) gives a hemisphere around B, so a reflection anywhere above the surface keeps 1.
+//
+// Knob aoSpecOcc (FrameData.debugParams.w bit 6); off = the old `env *= a`.
+#ifndef AO_SPEC_OCC_H_FSL
+#define AO_SPEC_OCC_H_FSL
+
+float aoSpecOccCone(float vis, float3 B, float3 R, float rough)
+{
+    const float kPi = 3.14159265f;
+    const float cosV = sqrt(saturate(1.0f - vis));                 // visibility cone
+    const float cosS = clamp(exp2(-3.32193f * rough * rough), 0.0f, 0.9999f);   // specular cone (Lagarde)
+    const float rv = acos(cosV), rs = acos(cosS);
+    const float d  = acos(clamp(dot(B, R), -1.0f, 1.0f));
+    const float mn = min(rv, rs), mx = max(rv, rs);
+    float area;   // in units of 2 pi
+    if (d <= mx - mn)      { area = 1.0f - cos(mn); }              // one cap inside the other
+    else if (d >= rv + rs) { area = 0.0f; }                        // apart
+    else {
+        const float x = 1.0f - saturate((d - (mx - mn)) / max(rv + rs - (mx - mn), 1.0e-4f));
+        area = (1.0f - cos(mn)) * smoothstep(0.0f, 1.0f, x);
+    }
+    return saturate(area / max(1.0f - cosS, 1.0e-4f));
+}
+
+// gAO's contract (aocommon.h.fsl): rgb = bent - a * (the AO pass's normal), so the bent direction is
+// normalize(N * a + rgb); exactly N where nothing occludes.
+float aoSpecOcc(float4 aoSample, float3 N, float3 R, float rough)
+{
+    const float3 bn = N * aoSample.a + aoSample.rgb;
+    const float  l2 = dot(bn, bn);
+    float3 B = (l2 > 1.0e-8f) ? bn * rsqrt(l2) : N;
+    if (dot(B, N) <= 0.0f) { B = N; }
+    return aoSpecOccCone(aoSample.a, B, R, rough);
+}
+
+#endif // AO_SPEC_OCC_H_FSL

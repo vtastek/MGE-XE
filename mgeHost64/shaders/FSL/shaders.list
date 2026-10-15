@@ -1132,6 +1132,12 @@
 #include "pgi.comp.fsl"
 #end
 
+// ...and BLAME (debug, knob pgiBlame): each probe's share of the crosshair's point.
+#comp pgiblame.comp
+#define PGI_BLAME 1
+#include "pgi.comp.fsl"
+#end
+
 // ...and the LIT PEEK (debug, pgiDebug 8|64): the peeked captures relit at full resolution.
 #comp pgipeeklit.comp
 #define PGI_PEEKLIT 1

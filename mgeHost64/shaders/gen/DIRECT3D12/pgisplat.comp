@@ -1406,9 +1406,11 @@ STRUCT(PgiParams)
         RWTex2DArray(float4) gPgiVolOut :  register(u18,space2);
         RWTex2DArray(uint) gPgiVolTag :  register(u19,space2);
         RWTex2D(float4) gPgiLit :  register(u20,space2);
-        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b21,space2);
-        Tex2D(float4) gPgiAtmosSky :  register(t22,space2);
-        Tex2D(float) gPgiSunOcc :  register(t23,space2);
+        RWBuffer(float4) gPgiBlameOut :  register(u21,space2);
+        RWBuffer(float4) gPgiMoveOut :  register(u22,space2);
+        CBUFFER(AtmosphereParams) gPgiAtmos :  register(b23,space2);
+        Tex2D(float4) gPgiAtmosSky :  register(t24,space2);
+        Tex2D(float) gPgiSunOcc :  register(t25,space2);
 #line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
@@ -1661,7 +1663,7 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 568 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
@@ -1716,7 +1718,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under =  gPgiShadow .skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 622 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef =  gPgiShadow .skyAOGround.y;
@@ -1730,7 +1732,7 @@ float skyOpenness(float ao, float3 worldPosRel)
 
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
-#line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 
@@ -2197,7 +2199,82 @@ float3 pgiUnpackR11G11B10(uint v)
     return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
 }
 float pgiGbDist(uint4 g) { return f16tof32(g.w >> 16u); }
-#line 882 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 923 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+float pgiSplatWeight(uint p, float3 X, float R, uint G, out float4 meta)
+{
+    meta = f4(0.0f);
+    const float4 pr = gPgiProbes[p];
+    if (pr.w < 0.5f || pr.w > 2.5f) { return 0.0f; }
+    const float3 d = X - pr.xyz;
+    const float dd = dot(d, d);
+    if (dd >= R * R) { return 0.0f; }
+    const uint layer = p / (G * G), slot = p % (G * G), cx = slot % G, cy = slot / G;
+    meta = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)));
+    if (meta.y < 1.0e-3f) { return 0.0f; }
+    if (LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + 6u))).w > 0.5f) { return 0.0f; }
+    float k1 = 1.0f - dd / (R * R);
+    float wgt = k1 * k1;
+
+
+    const float L = sqrt(dd);
+    if (L > 1.0f) {
+        const float3 a = abs(d);
+        const uint f = (a.x >= a.y && a.x >= a.z) ? (d.x > 0.0f ? 0u : 1u)
+                     : (a.y >= a.z) ? (d.y > 0.0f ? 2u : 3u) : (d.z > 0.0f ? 4u : 5u);
+        const uint fmask = (uint)(frac(pr.w) * 128.0f + 0.5f) & 63u;
+        if ((fmask & (1u << f)) == 0u) {
+            if (L > gPgiParams.capMisc.z) { wgt = 0.0f; }
+        } else {
+            float3 fwd, up, right;
+            pgiFaceBasis(f, fwd, up, right);
+            const float fz = dot(d, fwd);
+            const float u = dot(d, right) / fz, v = dot(d, up) / fz;
+            const uint tx = min((uint)((u * 0.5f + 0.5f) * (float) 8u ),  8u  - 1u);
+            const uint ty = min((uint)((0.5f - v * 0.5f) * (float) 8u ),  8u  - 1u);
+            const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u *  8u  + f *  8u  + tx,
+                                                         (layer * G + cy) *  8u  + ty));
+            const float hd = pgiGbDist(gb);
+            if ((gb.w & 0xFFu) != 0u && hd > 0.0f) {
+                const float slack = gPgiParams.capMisc.x * L + gPgiParams.capMisc.y;
+                wgt *= saturate((hd + slack - L) / max(slack, 1.0f));
+            }
+        }
+    }
+    return max(wgt, 0.0f);
+}
+
+
+float pgiProbeLum(uint p, uint G, float4 meta)
+{
+    const uint layer = p / (G * G), slot = p % (G * G), cx = slot % G, cy = slot / G;
+    const float4 dc = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u))) / max(meta.y, 1.0e-3f);
+    return max(dot(dc.xyz, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f);
+}
+
+
+
+
+
+
+
+void pgiRepelAnchor(float3 X, float R, uint G, out float dA, out float lA)
+{
+    dA = 0.0f; lA = -1.0f;
+    float best = 0.0f;
+    for (uint q = 0u; q < 2u * G * G; ++q) {
+        float4 mq;
+        const float wq = pgiSplatWeight(q, X, R, G, mq) * mq.y;
+        if (wq > best) { best = wq; dA = length(X - gPgiProbes[q].xyz); lA = pgiProbeLum(q, G, mq); }
+    }
+}
+float pgiRepel(float dp, float lp, float dA, float lA)
+{
+    const float K = gPgiParams.capMisc.w;
+    if (K <= 0.0f || lA < 0.0f || lp <= lA || dp <= dA) { return 1.0f; }
+    const float r = (1.0f - lA / lp) * saturate((dp - dA) / max(dp, 1.0f));
+    return pow(saturate(1.0f - r), K);
+}
+#line 1008 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(4, 4, 4)
 void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
@@ -2222,50 +2299,22 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     const uint G = (uint)gPgiParams.grid.y;
     float4 acc[7];
     UNROLL for (uint k = 0u; k < 7u; ++k) { acc[k] = f4(0.0f); }
-    float sumW = 0.0f;
+    float sumW = 0.0f, accV = 0.0f;
+    float dA = 0.0f, lA = -1.0f;
+    if (gPgiParams.capMisc.w > 0.0f) { pgiRepelAnchor(X, R, G, dA, lA); }
     for (uint p = 0u; p < 2u * G * G; ++p) {
-        const float4 pr = gPgiProbes[p];
-        if (pr.w < 0.5f || pr.w > 2.5f) { continue; }
-        const float3 d = X - pr.xyz;
-        const float dd = dot(d, d);
-        if (dd >= R * R) { continue; }
+        float4 meta;
+        float wgt = pgiSplatWeight(p, X, R, G, meta);
         const uint layer = p / (G * G), slot = p % (G * G), cx = slot % G, cy = slot / G;
-        const float4 meta = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)));
-        if (meta.y < 1.0e-3f) { continue; }
-        if (LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + 6u))).w > 0.5f) { continue; }
-        float k1 = 1.0f - dd / (R * R);
-        float wgt = k1 * k1;
-
-
-        const float L = sqrt(dd);
-        if (L > 1.0f) {
-            const float3 a = abs(d);
-            const uint f = (a.x >= a.y && a.x >= a.z) ? (d.x > 0.0f ? 0u : 1u)
-                         : (a.y >= a.z) ? (d.y > 0.0f ? 2u : 3u) : (d.z > 0.0f ? 4u : 5u);
-            const uint fmask = (uint)(frac(pr.w) * 128.0f + 0.5f) & 63u;
-            if ((fmask & (1u << f)) != 0u) {
-                float3 fwd, up, right;
-                pgiFaceBasis(f, fwd, up, right);
-                const float fz = dot(d, fwd);
-                const float u = dot(d, right) / fz, v = dot(d, up) / fz;
-                const uint tx = min((uint)((u * 0.5f + 0.5f) * (float) 8u ),  8u  - 1u);
-                const uint ty = min((uint)((0.5f - v * 0.5f) * (float) 8u ),  8u  - 1u);
-                const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u *  8u  + f *  8u  + tx,
-                                                             (layer * G + cy) *  8u  + ty));
-                const float hd = pgiGbDist(gb);
-                if ((gb.w & 0xFFu) != 0u && hd > 0.0f) {
-                    const float slack = 0.25f * L + 32.0f;
-                    wgt *= saturate((hd + slack - L) / slack);
-                }
-            }
-        }
         if (wgt <= 0.0f) { continue; }
+        wgt *= pgiRepel(length(X - gPgiProbes[p].xyz), pgiProbeLum(p, G, meta), dA, lA);
 
 
         UNROLL for (uint k = 0u; k < 7u; ++k) {
             acc[k] += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + k)));
         }
         sumW += wgt * meta.y;
+        accV += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(16u + layer))).x;
     }
     const float v = saturate(sumW / max(gPgiParams.vol3.w, 1.0e-4f));
     const float s = (sumW > 1.0e-5f) ? v / sumW : 0.0f;
@@ -2276,7 +2325,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     }
     {
         const int3 at = int3(id.xy, 7 * VZ + id.z);
-        Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(v, 0.0f, 0.0f, 0.0f), alpha));
+        Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(v, accV * s, 0.0f, 0.0f), alpha));
     }
     Write3D(gPgiVolTag, id, tag);
     return;
