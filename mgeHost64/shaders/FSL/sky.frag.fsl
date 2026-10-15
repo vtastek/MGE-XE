@@ -139,6 +139,7 @@ float4 PS_MAIN( VSOutput In )
         // S2i — so under broken cloud the dark limb was the veiled sky on an unveiled one.
         c.rgb = atmosSkyRadianceNative(normalize(In.WorldDir), gSkyView.sunDirW.w)
               * gSkyView.radiance.w;
+        c.rgb = atmosSkyHazed(In.WorldDir, c.rgb);   // S3.5b: the same haze skyhw.frag draws
     } else if (cls == SKY_CLASS_MOON && gShadowParams.agxCurve.w > 0.5f) {
         // ─── THE MOON PIN ────────────────────────────────────────────────────────────────────────
         // *"moons need to preserve their phase. clear night, moons should be at their exposed look,
@@ -238,6 +239,8 @@ float4 PS_MAIN( VSOutput In )
         // change with NO KNOB. The moons are immune by construction, which is the point of pinning
         // them. Nebula and star CONTENT is untouched — only the level.
         c.rgb *= gSkyView.elemRadiance.x;
+        // S3.5b: additive, so only the haze's extinction applies (its own light is in the sky under them).
+        if (atmosHazeOn() > 0.0f) { c.rgb *= atmosHazeT(In.WorldDir); }
     } else if (cls == SKY_CLASS_CLOUD && gShadowParams.toneParams.y > 0.5f) {
         // ─── THE CLOUDS, ANCHORED ────────────────────────────────────────────────────────────────
         // P2b shipped these "left alone", on the reasoning that anchoring the dome and not the
@@ -274,6 +277,11 @@ float4 PS_MAIN( VSOutput In )
             anchor += gSkyView.elemRadiance.z * atmosSunBeamAt(gSkyView.elemRadiance.w);
         }
         c.rgb *= anchor;
+        // S3.5d: the air between the eye and the deck (virtual depth: the ray's hit on the deck shell).
+        c.rgb = atmosCloudAerial(In.WorldDir, c.rgb);
+        // S3.5b: the haze in front of the layer — thin overhead, the cloud level at the horizon.
+        // Blended over the hazed sky this is exactly T*(a*cloud + (1-a)*sky) + L_haze*(1-T).
+        c.rgb = atmosSkyHazed(In.WorldDir, c.rgb);
     } else {
         // CLOUD / DOME / OTHER, and every class at all when the physical sky is not drawing.
         // Class 2 (scenecolor.h.fsl): lift the authored colour so resolve.frag's curve returns it

@@ -216,6 +216,8 @@ float4 PS_MAIN( VSOutput In )
 
     // F12 debug views (lockstep with multimap.frag; alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
         // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the

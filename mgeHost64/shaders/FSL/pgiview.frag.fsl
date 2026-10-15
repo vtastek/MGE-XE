@@ -1,0 +1,87 @@
+// mgeHost64 — PROBE GI debug "what the probe sees" (pgiview.vert.fsl has the layout).
+//
+// Six faces left to right (+X -X +Y -Y +Z down) in two rows, 8 x 8 G-buffer texels each:
+//   TOP    what the probe captured: albedo where it hit geometry, the captured SKY radiance where it
+//          did not (blended by the texel's sky fraction), MAGENTA by the share of BACK faces (inside
+//          geometry), dark checker = face not captured yet.
+//   BOTTOM hit distance, log grey (white near ~32 u, black ~8 km); sky = blue.
+// Written into the scene colour (linear), so the frame's exposure applies to it like everything else.
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float2,       Uv,       TEXCOORD0);
+    DATA(FLAT(float4), Info,     TEXCOORD1);
+    DATA(FLAT(float4), Misc,     TEXCOORD2);
+};
+
+float3 pgivUnpackR11G11B10(uint v)
+{
+    return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // Two scales. RADIANCE (the LIT row, captured sky) x Misc.x = pgiViewExp / E: a FIXED exposure,
+    // the rect unmetered. LEGEND (frames, distances, albedo) x 1/E: the same on screen at any exposure.
+    const float lg = 1.0f / max(gShadowParams.calParams.y, 1.0e-4f);
+    const uint face = min((uint)(In.Uv.x * 6.0f), 5u);
+    // PEEK (pgiDebug 8): one row of six faces at the capture's full resolution, Misc.y = its side (px);
+    // Misc.z = 1 shows the hit distance instead (same legend as below).
+    if (In.Misc.y > 0.5f) {
+        const float2 pf = float2(frac(In.Uv.x * 6.0f), In.Uv.y);
+        if (pf.x < 0.004f || pf.x > 0.996f) { RETURN(float4(f3(0.2f) * lg, 1.0f)); }
+        const uint pmask = (uint)(In.Info.w + 0.5f);
+        if ((pmask & (1u << face)) == 0u) { RETURN(float4(f3(0.04f) * lg, 1.0f)); }
+        const uint R = (uint)(In.Misc.y + 0.5f);
+        const uint2 pt = min(uint2(pf * (float)R), uint2(R - 1u, R - 1u));
+        // LIT (Misc.w, pgiDebug 8|64): rows 2-3 hold the same captures RELIT at full resolution
+        // (pgi.comp.fsl PGI_PEEKLIT): radiance, at the preview's fixed exposure; w = -2 a back face.
+        if (In.Misc.w > 0.5f && In.Misc.z < 0.5f) {
+            const float4 pl = LoadTex2D(gPgiPeekView, NO_SAMPLER, int2(face * R + pt.x, ((uint)(In.Info.z + 0.5f) + 2u) * R + pt.y), 0);
+            if (pl.w < -1.5f) { RETURN(float4(float3(1.0f, 0.0f, 1.0f) * lg, 1.0f)); }
+            RETURN(float4(pl.rgb * In.Misc.x, 1.0f));
+        }
+        const float4 pv = LoadTex2D(gPgiPeekView, NO_SAMPLER, int2(face * R + pt.x, (uint)(In.Info.z + 0.5f) * R + pt.y), 0);
+        if (In.Misc.z > 0.5f) {
+            if (pv.w <= 0.0f) { RETURN(float4(float3(0.1f, 0.2f, 0.6f) * lg, 1.0f)); }
+            const float pk = saturate(1.0f - log2(max(pv.w, 32.0f) / 32.0f) / 8.0f);
+            RETURN(float4(f3(pk) * lg, 1.0f));
+        }
+        RETURN(float4(pv.rgb * lg, 1.0f));
+    }
+    const uint row  = (In.Uv.y < 0.5f) ? 0u : 1u;
+    const float2 fuv = float2(frac(In.Uv.x * 6.0f), frac(In.Uv.y * 2.0f));
+    // A thin frame between faces so their edges read.
+    if (fuv.x < 0.02f || fuv.x > 0.98f || fuv.y < 0.02f || fuv.y > 0.98f) { RETURN(float4(f3(0.2f) * lg, 1.0f)); }
+    const uint2 t = min(uint2(fuv * 8.0f), uint2(7u, 7u));
+    const uint mask = (uint)(In.Info.w + 0.5f);
+    if ((mask & (1u << face)) == 0u) {
+        const float c = ((((t.x + t.y) & 1u) != 0u) ? 0.03f : 0.06f) * lg;
+        RETURN(float4(c, c, c, 1.0f));
+    }
+    const uint G = 24u;
+    const uint cx = (uint)(In.Info.x + 0.5f), cy = (uint)(In.Info.y + 0.5f), layer = (uint)(In.Info.z + 0.5f);
+    const int2 at = int2(cx * 48u + face * 8u + t.x, (layer * G + cy) * 8u + t.y);
+    const uint4 g = LoadTex2D(gPgiGBufView, NO_SAMPLER, at, 0);
+    const float4 a = float4(float(g.x & 0xFFu), float((g.x >> 8u) & 0xFFu), float((g.x >> 16u) & 0xFFu), float(g.x >> 24u)) / 255.0f;
+    const float skyF = a.w;
+    const uint nGeo = g.w & 0xFFu, nBack = (g.w >> 8u) & 0xFFu;
+    if (row == 0u) {
+        // LIT (Misc.w): the radiance the relight integrated for this texel — sun with its shadow,
+        // bounce, sky — instead of the bare albedo.
+        if (In.Misc.w > 0.5f) { RETURN(float4(LoadTex2D(gPgiLitView, NO_SAMPLER, at, 0).rgb * In.Misc.x, 1.0f)); }
+        const float3 sky = pgivUnpackR11G11B10(g.z);
+        float3 c = lerp(a.rgb * lg, sky * In.Misc.x, skyF);
+        const float back = (nGeo > 0u) ? (float)nBack / (float)nGeo * (1.0f - skyF) : 0.0f;
+        c = lerp(c, float3(1.0f, 0.0f, 1.0f) * lg, saturate(back));
+        RETURN(float4(c, 1.0f));
+    }
+    const float dist = f16tof32(g.w >> 16u);
+    if (nGeo == 0u || dist <= 0.0f) { RETURN(float4(float3(0.1f, 0.2f, 0.6f) * lg, 1.0f)); }
+    const float k = saturate(1.0f - log2(max(dist, 32.0f) / 32.0f) / 8.0f);
+    RETURN(float4(f3(k) * lg, 1.0f));
+}

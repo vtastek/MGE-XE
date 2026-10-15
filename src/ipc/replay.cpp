@@ -106,9 +106,18 @@ namespace IPC {
 		const int loops = (argc > 3) ? (std::max)(1, std::atoi(argv[3])) : 3;
 		const double cpuMs = (argc > 4) ? std::atof(argv[4]) : 0.0;
 		const unsigned window = (argc > 5) ? static_cast<unsigned>((std::max)(1, std::atoi(argv[5]))) : 300u;
-		char dumpEnv[16] = {};
-		const long dumpAt = (GetEnvironmentVariableA("MGE_REPLAY_DUMP", dumpEnv, sizeof(dumpEnv)) > 0)
-			? std::strtol(dumpEnv, nullptr, 10) : -1;
+		// A COMMA LIST dumps every frame in it, so one replay can stop at intervals along a walk.
+		char dumpEnv[512] = {};
+		std::vector<long> dumpAt;
+		if (GetEnvironmentVariableA("MGE_REPLAY_DUMP", dumpEnv, sizeof(dumpEnv)) > 0) {
+			for (char* p = dumpEnv; *p != '\0';) {
+				char* end = nullptr;
+				const long v = std::strtol(p, &end, 10);
+				if (end == p) { break; }
+				dumpAt.push_back(v);
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
 		// MGE_REPLAY_SIZE=WxH overrides the recorded render size (diagnostic: does a pass's cost follow
 		// the pixel count or not). The allocation stays the recorded one; the host clamps to it.
 		unsigned forceW = 0, forceH = 0;
@@ -247,7 +256,7 @@ namespace IPC {
 					params.devReloadShaders = 0;
 					params.devDistLightsToggle = 0;
 					params.devGpuCapture = 0;
-					params.devDumpHdr = (frameNo == dumpAt) ? 1u : 0u;
+					params.devDumpHdr = (std::find(dumpAt.begin(), dumpAt.end(), frameNo) != dumpAt.end()) ? 1u : 0u;
 					if (forceW != 0) {
 						params.renderWidth = forceW;
 						params.renderHeight = forceH;

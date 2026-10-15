@@ -525,6 +525,24 @@
 #include "debugline.frag.fsl"
 #end
 
+// Probe GI debug view (pgiDebug bit 1): shaded probe spheres + status cubes, geometry from vertex id.
+#vert pgiprobe.vert
+#include "pgiprobe.vert.fsl"
+#end
+
+#frag pgiprobe.frag
+#include "pgiprobe.frag.fsl"
+#end
+
+// Probe GI debug "what the probe sees" (pgiDebug bit 4): the nearest probe's six captured faces.
+#vert pgiview.vert
+#include "pgiview.vert.fsl"
+#end
+
+#frag pgiview.frag
+#include "pgiview.frag.fsl"
+#end
+
 // Shadow-atlas debug view (F12 mode 11 static / 12 dynamic): fullscreen triangle that blits the
 // whole D32 shadow atlas, tinting tiles by per-slot active/dyn state. Reuses opaque.srt.h /
 // DefaultRootSignature (gFrameData + the two atlas SRVs appended to the PerFrame set). Graphics
@@ -814,6 +832,16 @@
 #include "reflectmip.comp.fsl"
 #end
 
+// The PROBE-GI capture's resolve: only the samples of sample 0's class (sky / back face / front
+// face), so a silhouette texel's albedo is not part sky. Same SRT and set; the host binds it for a
+// pgi corner. No sc1 twin (one sample cannot mix).
+#comp reflectmipfirst_pgi_sc4.comp
+#define REFLMIP_FIRST 1
+#define REFLMIP_PGI 1
+#define SAMPLE_COUNT 4
+#include "reflectmip.comp.fsl"
+#end
+
 #comp reflectmip.comp
 #include "reflectmip.comp.fsl"
 #end
@@ -1090,5 +1118,22 @@
 
 #comp pgirelight.comp
 #define PGI_RELIGHT 1
+#include "pgi.comp.fsl"
+#end
+
+// ...and BALLS (tasks/forge-gi.md "probes placed by shooting balls"): sun + camera first hits.
+#comp pgiballs.comp
+#define PGI_BALLS 1
+#include "pgi.comp.fsl"
+#end
+
+#comp pgisplat.comp
+#define PGI_SPLAT 1
+#include "pgi.comp.fsl"
+#end
+
+// ...and the LIT PEEK (debug, pgiDebug 8|64): the peeked captures relit at full resolution.
+#comp pgipeeklit.comp
+#define PGI_PEEKLIT 1
 #include "pgi.comp.fsl"
 #end

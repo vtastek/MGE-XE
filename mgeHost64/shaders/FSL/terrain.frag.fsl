@@ -1383,6 +1383,8 @@ float4 PS_MAIN( VSOutput In )
 #ifdef TERRAIN_DEBUG_VIEWS
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    if (pgiCap) { dbg = 5u; }
     // AO buffer views (3/4), same branches as opaque.frag / multimap.frag. Added with the AO
     // receive above: the ground is most of the screen, so without these the AO debug view was
     // mostly normally-shaded terrain — i.e. the one view you'd use to judge terrain AO couldn't
@@ -1415,7 +1417,12 @@ float4 PS_MAIN( VSOutput In )
     //
     // Raw linear values, un-tonemapped and un-fogged, exactly as opaque.frag returns them; fog on
     // an isolated component would darken it toward a colour it has no business converging on.
-    if (dbg == 5u) { RETURN(float4(albedo, 1.0f)); }            // blended land texture x VCLR
+    if (dbg == 5u) {                                            // blended land texture x VCLR
+        // PROBE CAPTURE back-face flag (statics.frag's): the ground seen from BELOW (a buried probe).
+        const float bs = dot(cross(pbrDPdx, pbrDPdy), normal);
+        if (pgiCap && bs * PGI_BACK_SIGN > 0.0f) { RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f)); }
+        RETURN(float4(albedo, 1.0f));
+    }
     if (dbg == 6u) { RETURN(float4(litTerm, 1.0f)); }           // sun + ambient + both point lists
     if (dbg == 7u) { RETURN(float4(amb * tAmbW, 1.0f)); }       // the ambient half of mode 6
     if (dbg == 1u || dbg == 2u) {

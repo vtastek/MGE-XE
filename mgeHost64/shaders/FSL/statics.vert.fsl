@@ -13,6 +13,7 @@
 // viewProj keeps the column-major mul like opaque/distantland). Placeholder linear fog (1c = scatter).
 
 #include "opaque.srt.h"
+#include "gitint.h.fsl"   // giTintCode() — GI bounce inspection (Flags bits 28-30)
 #include "handover.h.fsl" // handoverForward() — the near/far plane, shared with the near stages
 #include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 #include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
@@ -217,6 +218,7 @@ VSOutput VS_MAIN( VSInput In )
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
     Out.Flags    = (uint)(In.InstParams.y + 0.5f);
+    Out.Flags   |= giTintCode(In.W3.xyz) << 28u;   // GI bounce inspection: 0 = not painted
 
     // UV animation (XE Mod Statics.fx::texcoordsModifier). A subset whose source NIF carried an
     // NiUVController is flagged at bake time (static_meshes per-subset bool[2].uvCtrl -> flags bit2)

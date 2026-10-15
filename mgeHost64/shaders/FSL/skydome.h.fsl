@@ -161,7 +161,11 @@ float3 fogHazeTarget(float3 worldPosRel, float fogAir)
         float3 dU  = float3(hz * sqrt(max(0.0f, 1.0f - mu * mu)), mu);
         dir = atmosSunFloorDir(dU, radians(floorDeg));
     }
-    return atmosSkyRadianceNative(dir, gAtmosParams.planet.w) * scale;
+    // S3.4: through the SAME haze the sky passes draw (gShadowParams.skyHaze*), so a fogged static melts
+    // into the horizon that is actually drawn behind it, not the un-hazed LUT ring: *"Fog doesn't match,
+    // statics are colored one color, horizon is another."* (user, 2026-10-15). tauZ 0 = the old target.
+    float3 L = atmosSkyRadianceNative(dir, gAtmosParams.planet.w) * scale;
+    return atmosSkyHazedAt(dir, L, gAtmosParams.planet.w, scale);
 }
 
 // The sky behind this fragment, composited over the haze and faded by the feature's strength.

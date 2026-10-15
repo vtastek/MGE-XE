@@ -45,6 +45,7 @@
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "gobosample.h.fsl" // fixtureGoboVis() — the baked light's fixture self-shadow (G2)
+#include "gitint.h.fsl"    // giTintAlbedo() — GI bounce inspection
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput, CENTROID modifiers included — see the
@@ -175,6 +176,10 @@ PSOut PS_MAIN( VSOutput In )
     uint bucket = In.TexIndex >> 16;
     uint layer  = In.TexIndex & 0xFFFFu;
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+    {   // GI bounce inspection (gitint.h.fsl): the vert's pick rides Flags bits 28-30.
+        const uint gc = (In.Flags >> 28u) & 7u;
+        if (gc != 0u) { tex.rgb = giTintAlbedo(gc); }
+    }
 
     // Cutout alpha test (XE Mod Statics.fx ref 133/255). Only hasAlpha subsets test; opaque ones
     // never discard (stray low alpha is safe) and take the full mask.
@@ -506,6 +511,8 @@ PSOut PS_MAIN( VSOutput In )
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    if (pgiCap) { dbg = 5u; }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
@@ -520,7 +527,16 @@ PSOut PS_MAIN( VSOutput In )
     // mode 28: which PRODUCER drew the pixel — DL statics MAGENTA, MW's near path GREEN (opaque /
     // multimap). Where both draw the same surface the view is a speckle of the two: the z-fight.
     if (dbg == 28u) { Out.Color = float4(1.0f, 0.0f, 1.0f, 1.0f); RETURN(Out); }
-    if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out); }
+    if (dbg == 5u) {
+        // PROBE CAPTURE back-face flag (pgi, culling off): the screen-space geometric normal against
+        // the mesh's own — the viewer is BEHIND the surface where they disagree. Written as a
+        // sentinel no albedo reaches (the target may have no alpha); pgigather counts it, and a
+        // probe that sees many is INSIDE geometry. Not for cut-outs (foliage is two-sided by intent).
+        const float bs = dot(cross(ddx(In.WorldPos), ddy(In.WorldPos)), In.WorldNormal);
+        // Nor for BLENDED ones (0x20): two-sided by intent as well — they showed magenta in the peek.
+        if (pgiCap && (In.Flags & 0x22u) == 0u && bs * PGI_BACK_SIGN > 0.0f) { Out.Color = float4(4.0f, 0.0f, 4.0f, 1.0f); RETURN(Out); }
+        Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out);
+    }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     if (dbg == 19u) {   // mode 19: PBR material COVERAGE, same legend as opaque.frag's and terrain's

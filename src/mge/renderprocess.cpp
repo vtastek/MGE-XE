@@ -582,6 +582,35 @@ namespace {
         }
     }
 
+    // [lowfps] PROBE (2026-10-15): the display MW's window is on, as the slow-state lines need it. The
+    // 10-14 episode sat at a flat 41.4 ms (24 Hz) with the RT copy waiting ~35 ms behind DXVK's queue
+    // and cleared the moment MW lost focus — the shape of a PRESENT locked to a slow rate, not of a
+    // workload. hz = the monitor's current refresh, cover = the window covers its monitor (borderless or
+    // exclusive), fg = foreground, min = minimised. Cheap Win32 queries; called per heartbeat and at
+    // slow-state edges only.
+    void describeDisplay(char* out, size_t n) {
+        const HWND h = g_devHwnd;
+        unsigned hz = 0;
+        int cover = 0, fg = 0, mn = 0;
+        if (h) {
+            MONITORINFOEXW mi = {};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) {
+                DEVMODEW dm = {};
+                dm.dmSize = sizeof(dm);
+                if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) { hz = dm.dmDisplayFrequency; }
+                RECT r = {};
+                if (GetWindowRect(h, &r)) {
+                    cover = (r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top
+                          && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom) ? 1 : 0;
+                }
+            }
+            fg = (GetForegroundWindow() == h) ? 1 : 0;
+            mn = IsIconic(h) ? 1 : 0;
+        }
+        _snprintf_s(out, n, _TRUNCATE, "hz=%u cover=%d fg=%d min=%d", hz, cover, fg, mn);
+    }
+
     // --- M1b: opaque-geometry capture + upload -----------------------------------
     // The cache hands us model-space parts (pos+normal+indices). We assign each a
     // dense host slot, accumulate them into a pending byte blob, and flush them to
@@ -1699,6 +1728,7 @@ namespace {
         PFN_vkCreateSemaphore            CreateSemaphore;
         PFN_vkDestroySemaphore           DestroySemaphore;
         PFN_vkWaitSemaphores             WaitSemaphores;   // optional: the async copy needs it
+        PFN_vkGetSemaphoreCounterValue   GetSemaphoreCounterValue;   // optional: the [lowfps] probe
         // Optional: host-drawn UI reads back DEFAULT-pool textures once, at first sight.
         PFN_vkCreateBuffer               CreateBuffer;
         PFN_vkDestroyBuffer              DestroyBuffer;
@@ -1760,6 +1790,8 @@ namespace {
         vk.CreateSemaphore  = (PFN_vkCreateSemaphore)vk.GetDeviceProcAddr(g_dev, "vkCreateSemaphore");
         vk.DestroySemaphore = (PFN_vkDestroySemaphore)vk.GetDeviceProcAddr(g_dev, "vkDestroySemaphore");
         vk.WaitSemaphores   = (PFN_vkWaitSemaphores)vk.GetDeviceProcAddr(g_dev, "vkWaitSemaphores");
+        vk.GetSemaphoreCounterValue =
+            (PFN_vkGetSemaphoreCounterValue)vk.GetDeviceProcAddr(g_dev, "vkGetSemaphoreCounterValue");
         #define OPT(name) vk.name = (PFN_vk##name)vk.GetDeviceProcAddr(g_dev, "vk" #name)
         OPT(CreateBuffer); OPT(DestroyBuffer); OPT(GetBufferMemoryRequirements); OPT(BindBufferMemory);
         OPT(MapMemory); OPT(UnmapMemory); OPT(CmdCopyImageToBuffer);
@@ -2435,7 +2467,50 @@ namespace {
         }
         const double tcFlush = nowMs();
 
+        // [lowfps] PROBE: before waiting for the previous copy, read where both timelines stand. If the
+        // HOST's fence already passed the value that copy waits on, the host is done and the copy is
+        // stuck behind something else on DXVK's queue (MW's present); if not, we are waiting on the host.
+        std::uint64_t lfPendCopy = 0, lfPendHost = 0, lfCopyNow = 0, lfHostNow = 0;
+        if (vk.GetSemaphoreCounterValue && g_copySemOk) {
+            lfPendCopy = g_copySubmitted.load();
+            {
+                std::lock_guard<std::mutex> lk(g_copyRecMx);
+                lfPendHost = g_copyRec[0].hostFence;
+            }
+            vk.GetSemaphoreCounterValue(g_dev, g_copySem, &lfCopyNow);
+            if (g_frameSemOk) { vk.GetSemaphoreCounterValue(g_dev, g_frameSem, &lfHostNow); }
+        }
+        const double lfW0 = nowMs();
         waitCopyRetired();   // g_cmd is reused: the previous copy must have executed
+        {
+            // SLOW-STATE edges: ENTER after 30 consecutive frames whose wait >= 20 ms, EXIT after 30
+            // under it. Two lines per episode, never per frame. "hostDone" = the share of slow frames
+            // whose host fence had ALREADY passed at the wait's start (-> DXVK's queue, not the host).
+            static unsigned s_slowRun = 0, s_fastRun = 0, s_n = 0, s_hostDone = 0;
+            static bool     s_in = false;
+            static double   s_sum = 0.0;
+            static std::uint32_t s_enter = 0;
+            const double w = nowMs() - lfW0;
+            const bool hostDone = lfPendHost != 0 && lfHostNow >= lfPendHost;
+            if (w >= 20.0) { ++s_slowRun; s_fastRun = 0; } else { ++s_fastRun; s_slowRun = 0; }
+            if (s_in) { ++s_n; s_sum += w; if (hostDone) { ++s_hostDone; } }
+            if (!s_in && s_slowRun >= 30) {
+                char disp[96];
+                describeDisplay(disp, sizeof(disp));
+                LOG::logline("!! [lowfps] ENTER frame=%u: copy wait %.1f ms (30 frames >= 20) | host fence %llu / needs %llu (%s)"
+                             " | copy sem %llu / pending %llu | %s",
+                             g_frame, w, (unsigned long long)lfHostNow, (unsigned long long)lfPendHost,
+                             hostDone ? "host DONE -> stuck behind DXVK's queue" : "host NOT done -> waiting on the host",
+                             (unsigned long long)lfCopyNow, (unsigned long long)lfPendCopy, disp);
+                s_in = true; s_enter = g_frame; s_n = 0; s_sum = 0.0; s_hostDone = 0;
+            } else if (s_in && s_fastRun >= 30) {
+                char disp[96];
+                describeDisplay(disp, sizeof(disp));
+                LOG::logline("!! [lowfps] EXIT frame=%u after %u frames: mean copy wait %.1f ms, host already done on %u/%u | %s",
+                             g_frame, g_frame - s_enter, s_n ? s_sum / s_n : 0.0, s_hostDone, s_n, disp);
+                s_in = false;
+            }
+        }
         vk.ResetCommandBuffer(g_cmd, 0);
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -7464,10 +7539,12 @@ namespace RenderProcess {
                 else if (eco == 0)  { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "off"); }
                 else if (eco == -1) { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "?(noexport)"); }
                 else                { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "?(err=%d)", -eco); }
-                LOG::logline(">> [hb] proc: ecoqos=%s prio=0x%lx fg=%d",
+                char dispBuf[96];
+                describeDisplay(dispBuf, sizeof(dispBuf));   // [lowfps] probe: refresh + window mode
+                LOG::logline(">> [hb] proc: ecoqos=%s prio=0x%lx fg=%d | %s",
                              ecobuf,
                              (unsigned long)GetPriorityClass(GetCurrentProcess()),
-                             (fgPid && fgPid == GetCurrentProcessId()) ? 1 : 0);
+                             (fgPid && fgPid == GetCurrentProcessId()) ? 1 : 0, dispBuf);
             }
             // Host phase split as the CLIENT received it (Tier 1 wire echo). Cross-check against
             // mgeHost64.log's `host split`/`gpu split`: matching numbers prove the x86/x64
@@ -8713,13 +8790,15 @@ namespace RenderProcess {
         devInput.clientWaitMs   = (float)g_lastWaitMsStat;
         devInput.clientDtMs     = (float)dtPresent;
         devInput.clientMwStartMs = (float)g_lastMwStartStat;
-        if (g_devUiVisible) {
-            if (!g_devHwnd) {
-                D3DDEVICE_CREATION_PARAMETERS cp = {};
-                if (SUCCEEDED(device->GetCreationParameters(&cp))) {
-                    g_devHwnd = cp.hFocusWindow;
-                }
+        // MW's window, fetched ONCE whatever the panel state: the [focus] / [watchdog] / [lowfps]
+        // probes need it too, and it used to be read only while the dev UI was open (hz=0 otherwise).
+        if (!g_devHwnd) {
+            D3DDEVICE_CREATION_PARAMETERS cp = {};
+            if (SUCCEEDED(device->GetCreationParameters(&cp))) {
+                g_devHwnd = cp.hFocusWindow;
             }
+        }
+        if (g_devUiVisible) {
             POINT p;
             if (GetCursorPos(&p) && g_devHwnd && ScreenToClient(g_devHwnd, &p)) {
                 devInput.x = p.x;

@@ -38,7 +38,10 @@ STRUCT(SkyViewData)
     // the matrix that view rasterises with, inverted, so a difference of two reconstructed points is
     // the true world-space ray direction for this view (and for the mirror, the REFLECTED ray).
     DATA(float4x4, invViewProj, None);
-    // xyz = SPARE. This held the model's per-channel radiance term; the medium states its own level.
+    // x   = spare (was the S3.5b haze air mass; the haze lives in gShadowParams.skyHaze0..2 since S3.4).
+    // y   = S3.5d cloud aerial perspective share (0 = off; skyradiance.h.fsl atmosCloudAerial).
+    // z   = S3.5d the deck shell's minimum height above the eye, metres.
+    // (xyz once held the model's per-channel radiance term; the medium states its own level.)
     // w   = NATIVE -> SCENE scale, with the sky strength already folded in. Native is
     //       W/(m^2 sr) per linear sRGB primary; scene is what the rest of the renderer works in. One
     //       lane, folded host-side, so no shader ever holds a piece of the conversion.

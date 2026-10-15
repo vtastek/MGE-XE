@@ -13,10 +13,12 @@
 #define gSkyVisScreen gPgiDummy4
 #define gGiField      gPgiDummy4
 #include "skyamb.h.fsl"
+#include "atmosphere.h.fsl"   // atmosSkyViewUvFromDir — the relight's LIVE sky (pgiSkyLive below)
 
 #define PGI_FACE_TEX 8u      // texels per face side in the G-buffer
 #define PGI_THREADS  64u     // RELIGHT group size
 #define PGI_NONE     -20000.0f
+#define PGI_BACK_MAX 0.2f    // a probe whose captured faces see more back faces than this is inside geometry
 
 // Face f: +X -X +Y -Y +Z -Z; up = +Z for the side faces, +Y for the Z faces; right = up x fwd. A face
 // texel (u, v) in 0..1 looks along fwd + (2u-1) right + (1-2v) up — the host's probeFaceBasis.
@@ -59,8 +61,66 @@ float3 pgiUnpackNormal(uint p)
     return normalize(n);
 }
 
+// G-buffer lanes: x albedo rgb + sky fraction (unorm8), y normal (oct16x2), z the texel's mean SKY
+// radiance (R11G11B10 float, 0 = none captured), w geometry pixels (8) | back-face pixels (8) | mean hit
+// distance (half, -1 = no geometry).
+uint pgiPackR11G11B10(float3 c)
+{
+    const uint3 h = f32tof16(max(c, f3(0.0f)));
+    return ((h.x >> 4u) & 0x7FFu) | (((h.y >> 4u) & 0x7FFu) << 11u) | (((h.z >> 5u) & 0x3FFu) << 22u);
+}
+float3 pgiUnpackR11G11B10(uint v)
+{
+    return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
+}
+float pgiGbDist(uint4 g) { return f16tof32(g.w >> 16u); }
+
 #if defined(PGI_PLACE)
-// ─── PLACE: per window column, the lowest and highest TOP over the cell (raw max map) ────────────
+// ─── PLACE: per window column, the lowest FLOOR and highest TOP over the cell ────────────────────
+// The terrain height at an absolute XY (skyheight.comp.fsl's decode), PGI_NONE off the LAND grid.
+float pgiTerrainHeight(float2 w)
+{
+    const float4 g = gPgiParams.terrain;   // minX, minY, spanX, spanY (cells)
+    const int cx = (int)floor(w.x / 8192.0f), cy = (int)floor(w.y / 8192.0f);
+    const int lx = cx - (int)g.x, ly = cy - (int)g.y;
+    if (lx < 0 || ly < 0 || lx >= (int)g.z || ly >= (int)g.w) { return PGI_NONE; }
+    const uint slotP1 = gPgiTerrainCellGrid[(uint)(ly * (int)g.z + lx)];
+    if (slotP1 == 0u) { return PGI_NONE; }
+    const uint  slot = slotP1 - 1u;
+    const float fx = (w.x - (float)cx * 8192.0f) * (1.0f / 128.0f);
+    const float fy = (w.y - (float)cy * 8192.0f) * (1.0f / 128.0f);
+    const int   ix = clamp((int)floor(fx), 0, 63), iy = clamp((int)floor(fy), 0, 63);
+    const float tx = saturate(fx - (float)ix), ty = saturate(fy - (float)iy);
+    float h[4];
+    UNROLL for (uint k = 0u; k < 4u; ++k) {
+        const uint v = (uint)((iy + (int)(k >> 1u)) * 65 + ix + (int)(k & 1u));
+        const uint word = gPgiTerrainHeights[slot * 2113u + (v >> 1u)];
+        int hv = (int)(((v & 1u) != 0u) ? (word >> 16u) : (word & 0xFFFFu));
+        if (hv > 32767) { hv -= 65536; }
+        h[k] = (float)hv * 8.0f;
+    }
+    return lerp(lerp(h[0], h[1], tx), lerp(h[2], h[3], tx), ty);
+}
+
+// FLOOR at an absolute XY (map texel t): the terrain wherever something stands well above it (a giant
+// mushroom's cap, a tree's canopy, a roof), else the top. The height maps cannot say whether the space
+// under a static is open air or the inside of a solid — the low map is the LOWEST static surface per
+// texel, and roots and clutter under a cap fill it to the ground, while a hill of rock statics hides
+// a hollow — so they no longer try: the probe stands on the ground and its own capture decides
+// (pgirelight: a probe that sees back faces is inside geometry and drops out; the receivers' bilinear
+// divides validity out, so its neighbours fill in — a stem's probe leaves no mark).
+// PGI_NONE*2 = no data.
+float pgiFloorAt(float2 w, int2 t)
+{
+    const float h = LoadTex2D(gPgiSkyTop, NO_SAMPLER, t, 0).r;
+    if (h < PGI_NONE) { return PGI_NONE * 2.0f; }
+    const float gnd = pgiTerrainHeight(w);
+    if (gnd > PGI_NONE && h - gnd >= 160.0f) { return gnd; }
+    // Never under the terrain at w: the top is one map texel's value, on a slope the exact terrain at w
+    // can stand above it.
+    return (gnd > PGI_NONE) ? max(h, gnd) : h;
+}
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
@@ -81,10 +141,27 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float2 uv = (w - m.xy) * m.z;
             if (any(uv < float2(0.0f, 0.0f)) || any(uv >= float2(1.0f, 1.0f))) { continue; }
             int2 t = clamp(int2(uv * float2(dims)), int2(0, 0), dims - int2(1, 1));
-            float h = LoadTex2D(gPgiSkyTop, NO_SAMPLER, t, 0).r;
-            if (h < PGI_NONE) { continue; }        // no data under this tap
-            lo = min(lo, h); hi = max(hi, h);
+            const float fl = pgiFloorAt(w, t);
+            if (fl < PGI_NONE) { continue; }       // no data under this tap
+            hi = max(hi, LoadTex2D(gPgiSkyTop, NO_SAMPLER, t, 0).r);
+            lo = min(lo, fl);
         }
+    }
+    // NEVER BELOW ITS OWN FLOOR. The probe stands at the column CENTRE, the cell's lowest floor can be
+    // anywhere in it: on a steep hillside the centre is well above the cell's foot, and "almost half of
+    // the probes are below terrain in this steep hilly area" (user, 2026-10-12) — buried, they saw the
+    // ground from below and rejected themselves. The floor at the centre is the terrain under any tall
+    // static (pgiFloorAt), so a stem or a wall at the centre does not lift the probe onto its top.
+    if (lo < 1.0e8f) {
+        const float2 w  = float2(ix, iy) * S;
+        const float2 uv = (w - m.xy) * m.z;
+        float fc = PGI_NONE * 2.0f;
+        if (all(uv >= float2(0.0f, 0.0f)) && all(uv < float2(1.0f, 1.0f))) {
+            const int2 t = clamp(int2(uv * float2(dims)), int2(0, 0), dims - int2(1, 1));
+            fc = pgiFloorAt(w, t);
+        }
+        if (fc < PGI_NONE) { fc = pgiTerrainHeight(w); }   // centre off the map: the terrain alone
+        if (fc > PGI_NONE) { lo = max(lo, fc); }
     }
     const uint s = (DispatchThreadID.y * G + DispatchThreadID.x);
     gPgiPlaceOut[s] = (lo > 1.0e8f) ? float4(PGI_NONE * 2.0f, PGI_NONE * 2.0f, ix, iy) : float4(lo, hi, ix, iy);
@@ -105,18 +182,38 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     const uint  B = res / PGI_FACE_TEX;
     float3 fwd, up, right;
     pgiFaceBasis(face, fwd, up, right);
-    float3 alb = f3(0.0f), nAcc = f3(0.0f);
+    float3 alb = f3(0.0f), nAcc = f3(0.0f), skyC = f3(0.0f);
     float  dist = 0.0f;
-    uint   nGeo = 0u, nSky = 0u;
+    uint   nGeo = 0u, nSky = 0u, nBack = 0u;
+    const bool peek = gPgiParams.capMisc.y > 0.5f;
     for (uint j = 0u; j < B; ++j) {
         for (uint i = 0u; i < B; ++i) {
             const int2 p = int2(DispatchThreadID.xy * B + uint2(i, j));
             const float d = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p, 0).r;
-            if (d <= 0.0f) { ++nSky; continue; }
+            // PEEK (debug): the raw capture texel — sky, back face (magenta) or what was drawn — and its
+            // hit distance.
+            if (peek) {
+                const float3 pc = LoadTex2D(gPgiReflColor, NO_SAMPLER, p, 0).rgb;
+                float4 o4 = float4(pc, -1.0f);
+                if (d > 0.0f) {
+                    const float px2 = ((float)p.x + 0.5f) / (float)res * 2.0f - 1.0f;
+                    const float py2 = 1.0f - ((float)p.y + 0.5f) / (float)res * 2.0f;
+                    o4.w = qn / (d * qd + zn) * sqrt(1.0f + px2 * px2 + py2 * py2);
+                    if (pc.r > PGI_BACK_SENTINEL && pc.b > PGI_BACK_SENTINEL) { o4.rgb = float3(1.0f, 0.0f, 1.0f); }
+                }
+                Write2D(gPgiPeek, int2(gPgiParams.capMisc.zw) + p, o4);
+            }
+            // SKY: no geometry here. A dry-view capture draws the real sky (pgi captures did not, and the
+            // relight's ambCol x SH-shape stand-in was ~0.6x the sky the renderer actually draws — the
+            // field read ~23% under the probe oracle at the castle, 2026-10-12); its radiance is kept.
+            if (d <= 0.0f) { ++nSky; skyC += LoadTex2D(gPgiReflColor, NO_SAMPLER, p, 0).rgb; continue; }
             const float zv = qn / (d * qd + zn);
             const float fx = ((float)p.x + 0.5f) / (float)res * 2.0f - 1.0f;
             const float fy = 1.0f - ((float)p.y + 0.5f) / (float)res * 2.0f;
-            alb  += LoadTex2D(gPgiReflColor, NO_SAMPLER, p, 0).rgb;
+            const float3 col = LoadTex2D(gPgiReflColor, NO_SAMPLER, p, 0).rgb;
+            // A BACK FACE (the capture frags' sentinel, culling off): a surface seen from behind —
+            // the probe is inside something. Counted; it adds no albedo.
+            if (col.r > PGI_BACK_SENTINEL && col.b > PGI_BACK_SENTINEL) { ++nBack; } else { alb += col; }
             dist += zv * sqrt(1.0f + fx * fx + fy * fy);
             ++nGeo;
             // Normal: the right and down neighbours, when both continue this surface (view depth
@@ -149,15 +246,19 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     uint4 o;
     o.x = pgiPackUnorm4(float4(alb * inv, skyFrac));
     o.y = pgiPackNormal(nW);
-    o.z = asuint(nGeo > 0u ? dist * inv : -1.0f);
-    o.w = nGeo;
+    o.z = (nSky > 0u) ? pgiPackR11G11B10(skyC / (float)nSky) : 0u;
+    o.w = min(nGeo, 255u) | (min(nBack, 255u) << 8u)
+        | (f32tof16(nGeo > 0u ? min(dist * inv, 60000.0f) : -1.0f) << 16u);
     Write2D(gPgiGBuf, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), o);
     RETURN();
 }
 
-#elif defined(PGI_RELIGHT)
+#elif defined(PGI_RELIGHT) || defined(PGI_PEEKLIT)
 // ─── RELIGHT: one group per probe; radiance per texel -> SH9 -> convolved planes ─────────────────
-GroupShared(float4, g_pgiA[PGI_THREADS * 7u]);
+// Reduction lanes per thread: 0-6 the SH9 RGB (27) + back share; 7-9 the MISSING faces' basis weights
+// (9) + the captured faces' radiance x solid angle (rgb); 10 the captured solid angle.
+#define PGI_LANES 11u
+GroupShared(float4, g_pgiA[PGI_THREADS * PGI_LANES]);
 
 // Height-field sun visibility from an ABSOLUTE point toward S: log-spaced march over the raw TOP map,
 // open UNDER a static's lowest surface (gPgiSkyLow stores MINUS it; >= 20000 = no static). Outside the
@@ -181,9 +282,103 @@ float pgiSunVis(float3 P, float3 S)
     return vis;
 }
 
+// The SUN CASCADES' answer for a captured hit (1 lit .. 0 shadowed), -1 where no cascade covers it.
+// The height field above cannot see a ROOF: it calls a point under a static's lowest surface open, and
+// inside a tunnel every point is — the walls were relit sunlit and the tunnel's probes came out
+// bright ("probes need sun shadows ... the tunnels are bright lit", user 2026-10-12). The sun map has
+// the roof. 3 x 3 binary taps; the lookup leans 2 texels along N, which the gather oriented toward the
+// probe (the open side), so a flipped asset normal cannot push it through its own wall.
+float pgiSunVisMap(float3 P, float3 N)
+{
+    if (gPgiShadow.sunParams.x <= 0.0f) { return -1.0f; }
+    // The renderer's own offsets (msmrecv.h.fsl sunShadowVisibilityMode): the normal offset in texels of
+    // the sampled cascade (sunParams.w), the PCF bias + its slope term — a 2-texel lean and a doubled
+    // bias of our own disagreed with the shadows on screen.
+    const float3 Sd = -normalize(gPgiParams.sunDir.xyz);
+    const float NdotL = saturate(dot(N, Sd));
+    const float slopeBias = gPgiShadow.sunPcf1.y * min(sqrt(1.0f - NdotL * NdotL) / max(NdotL, 0.1f), 10.0f);
+    int2 dimsI = GetDimensions(gPgiSunDepth, NO_SAMPLER);
+    const float2 tile = float2((float)dimsI.x / (float)SUN_CASCADES, (float)dimsI.y);
+    const float3 rel = P - gPgiParams.lodEye.xyz;
+    UNROLL for (int c = 0; c < SUN_CASCADES; ++c) {
+        const float3 p = rel + N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]);
+        float4 q = mul(gPgiShadow.sunViewProj[c], float4(p, 1.0f));
+        q.xyz /= q.w;
+        if (max(abs(q.x), abs(q.y)) < 0.98f && q.z > 0.0f && q.z < 1.0f) {
+            const float2 uv = q.xy * float2(0.5f, -0.5f) + 0.5f;
+            const int2 base = int2(((float)c + uv.x) * tile.x, uv.y * tile.y);
+            const int2 lo = int2((int)((float)c * tile.x), 0), hi = int2((int)((float)(c + 1) * tile.x) - 1, dimsI.y - 1);
+            const float ref = q.z + gPgiShadow.sunPcf1.x + slopeBias;   // reverse-Z: toward the sun
+            float occ = 0.0f;
+            for (int j = -1; j <= 1; ++j) {
+                for (int i = -1; i <= 1; ++i) {
+                    const float dS = LoadTex2D(gPgiSunDepth, NO_SAMPLER, clamp(base + int2(i, j), lo, hi), 0).r;
+                    occ += (dS > ref) ? 1.0f : 0.0f;
+                }
+            }
+            return 1.0f - occ / 9.0f;
+        }
+    }
+    return -1.0f;
+}
+
+// THE LIVE SKY (knob pgiSkyLive): the atmosphere's sky-view LUT in direction d, in scene units — the
+// field skyhw.frag draws the visible sky from (its MIXED arm: the clouds' mean cover, the light's
+// answer; skyradiance.h.fsl's below-horizon row clamp). Captures held a sky only on DRY frames: a
+// stolen one draws none, and where water is always in view (rivers, coasts) every probe fell to the
+// ambCol stand-in below — 0.65x the sky at noon, ~10x at dusk (iboebontowernearfar, 2026-10-14).
+float3 pgiSkyLive(float3 d)
+{
+    const float r = gPgiParams.skyLive.z;
+    float2 uv = atmosSkyViewUvFromDir(gPgiAtmos, r, d);
+    const float vRow = 0.5f - 0.5f / max(gPgiAtmos.lutDims.y, 2.0f);
+    if (uv.y > vRow) {
+        uv.y = vRow;
+        float muRow, unusedLvc;
+        atmosSkyViewParams(gPgiAtmos, float2(0.5f, vRow), r, muRow, unusedLvc);
+        const float3 toSun = gPgiAtmos.sunDir.xyz;
+        const float den = sqrt(max(0.0f, 1.0f - muRow * muRow)) * sqrt(max(0.0f, 1.0f - toSun.z * toSun.z));
+        const float lvc = (den > 1.0e-6f) ? clamp((dot(d, toSun) - muRow * toSun.z) / den, -1.0f, 1.0f) : 1.0f;
+        uv.x = atmosSkyViewUv(gPgiAtmos, r, muRow, lvc).x;
+    }
+    return max(SampleLvlTex2D(gPgiAtmosSky, gSamplerBilinearClamp, uv, 0).rgb, f3(0.0f)) * gPgiParams.skyLive.y;
+}
+
+// PAST THE CASCADES: the renderer's own LONG-RANGE sun occlusion (msmrecv.h.fsl sunOccMapOcclusion,
+// gSunOcc = the sun-blocked world Z per column), so a probe's hits are shadowed exactly as the screen
+// shades the same surfaces. The relight used to march its own height field (pgiSunVis): 6000 u of
+// reach — a low sun's long shadows missed it, lighting dusk hits the renderer had in shadow — point
+// taps on 64 u texels (checkerboards) and its own "open under a static" rule (edges, empty insides).
+// Returns visibility, 1 lit .. 0 shadowed.
+float pgiSunOccVis(float3 worldAbs)
+{
+    const float4 so = gPgiShadow.sunOcc;
+    if (so.x <= 0.0f) { return 1.0f; }
+    const float4 m = gPgiShadow.skyAOMap;
+    const float2 uv = (worldAbs.xy - m.xy) * m.z;
+    const float2 e = abs(uv - 0.5f) * 2.0f;
+    const float edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    if (edge <= 0.0f) { return 1.0f; }
+    const float blockZ = SampleLvlTex2D(gPgiSunOcc, gSamplerBilinearClamp, uv, 0).r;
+    float t = saturate(((blockZ - so.z) - worldAbs.z) / max(so.y, 1.0e-3f));
+    t = t * t * (3.0f - 2.0f * t);
+    return 1.0f - t * so.x * edge;
+}
+
+// The relight's sun visibility at a hit: the cascades where they cover, else the long-range map —
+// the renderer's two sources in its order. place.z = 1 (knob pgiSunMarch): the old height-field march.
+float pgiSunVisibility(float3 P, float3 N, float3 S, bool march)
+{
+    const float sunM = pgiSunVisMap(P, N);
+    if (sunM >= 0.0f) { return sunM; }
+    return march ? pgiSunVis(P, S) : pgiSunOccVis(P);
+}
+
 // MW's sky, as the radiance it hands an open surface: ambCol x the SH1 shape skyAmbFactorAO applies.
+// With the live sky on, the LUT instead (a stolen capture's sky texels, the sun's cone).
 float3 pgiSkyRadiance(float3 d)
 {
+    if (gPgiParams.skyLive.x > 0.5f) { return pgiSkyLive(d); }
     const float s = gPgiShadow.skyParams.x;
     float3 f = f3(1.0f);
     if (s > 0.0f) {
@@ -193,6 +388,93 @@ float3 pgiSkyRadiance(float3 d)
     return gPgiParams.ambCol.rgb * f;
 }
 
+#if defined(PGI_PEEKLIT)
+// ─── LIT PEEK (debug, pgiDebug 8|64): the peek's raw captures relit at FULL resolution ────────────────
+// The peek atlas holds the two peeked probes' captures (albedo, or sky radiance; .w = hit distance,
+// <= 0 sky) in rows 0-1. Each texel is relit here with the RELIGHT's own terms — the sun x the same
+// visibility test (cascades, else the height field), plus the probe's OWN irradiance at the texel's
+// normal (its SH, the multi-bounce feedback) — into rows 2-3, so what a probe's light is made of can
+// be inspected in detail. The normal comes from the distances (right/down neighbours, as the gather
+// does). Magenta (w = -2) = a back face. capPos / capMisc .xyz = the two probes' positions; place =
+// their slots (x, y) and captured-face masks (z, w); capTile.z = the peek face size R.
+float3 pgiPeekPos(int2 p, uint R, float3 pos, out bool ok)
+{
+    const float4 v = LoadRWTex2D(gPgiPeek, p);
+    ok = v.w > 0.0f && !(v.r > PGI_BACK_SENTINEL && v.b > PGI_BACK_SENTINEL);
+    const uint f = (uint)p.x / R;
+    float3 fwd, up, right;
+    pgiFaceBasis(f, fwd, up, right);
+    const float a = ((float)((uint)p.x % R) + 0.5f) / (float)R * 2.0f - 1.0f;
+    const float b = 1.0f - ((float)((uint)p.y % R) + 0.5f) / (float)R * 2.0f;
+    return pos + normalize(fwd + a * right + b * up) * v.w;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint R = (uint)gPgiParams.capTile.z;
+    const uint2 id = DispatchThreadID.xy;
+    if (R == 0u || id.x >= 6u * R || id.y >= 2u * R) { return; }
+    const uint row = id.y / R, face = id.x / R;
+    const int2 outAt = int2((int)id.x, (int)(id.y + 2u * R));
+    const uint mask = (uint)((row == 0u) ? gPgiParams.place.z : gPgiParams.place.w);
+    if ((mask & (1u << face)) == 0u) { Write2D(gPgiPeek, outAt, f4(0.0f)); return; }
+    const float4 pv = LoadRWTex2D(gPgiPeek, int2(id));
+    if (pv.w <= 0.0f) {   // sky: the radiance it holds, or the live field when that is on
+        float3 fwd, up, right;
+        pgiFaceBasis(face, fwd, up, right);
+        const float a = ((float)(id.x % R) + 0.5f) / (float)R * 2.0f - 1.0f;
+        const float b = 1.0f - ((float)(id.y % R) + 0.5f) / (float)R * 2.0f;
+        const float3 d = normalize(fwd + a * right + b * up);
+        Write2D(gPgiPeek, outAt, float4((gPgiParams.skyLive.x > 0.5f) ? pgiSkyLive(d) : pv.rgb, 1.0f));
+        return;
+    }
+    if (pv.r > PGI_BACK_SENTINEL && pv.b > PGI_BACK_SENTINEL) { Write2D(gPgiPeek, outAt, float4(0.0f, 0.0f, 0.0f, -2.0f)); return; }
+    const float3 pos = (row == 0u) ? gPgiParams.capPos.xyz : gPgiParams.capMisc.xyz;
+    bool ok0, okR, okD;
+    const float3 P  = pgiPeekPos(int2(id), R, pos, ok0);
+    // Neighbours inside the same face (step back at its right / bottom edge).
+    const int sx = ((id.x % R) + 1u < R) ? 1 : -1, sy = ((id.y % R) + 1u < R) ? 1 : -1;
+    const float3 Pr = pgiPeekPos(int2(id) + int2(sx, 0), R, pos, okR);
+    const float3 Pd = pgiPeekPos(int2(id) + int2(0, sy), R, pos, okD);
+    const float3 d = normalize(P - pos);
+    float3 N = -d;
+    if (okR && okD) {
+        const float L = length(P - pos);
+        const float3 er = (Pr - P) * (float)sx, ed = (Pd - P) * (float)sy;
+        if (length(er) < 0.1f * L + 4.0f && length(ed) < 0.1f * L + 4.0f) {
+            const float3 n = cross(er, ed);
+            if (dot(n, n) > 1.0e-12f) { N = normalize(n); if (dot(N, d) > 0.0f) { N = -N; } }
+        }
+    }
+    const float3 S = -normalize(gPgiParams.sunDir.xyz);
+    const float sunV = pgiSunVisibility(P, N, S, false);
+    // The probe's own irradiance at N (E/pi), as the relight feeds a hit's ambient.
+    const uint G = (uint)gPgiParams.grid.y;
+    const uint slot = (uint)((row == 0u) ? gPgiParams.place.x : gPgiParams.place.y);
+    const uint layer = slot / (G * G), s2 = slot % (G * G), cx = s2 % G, cy = s2 / G;
+    const float4 pm = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)));
+    float3 amb = f3(0.0f);
+    if (pm.y > 1.0e-3f) {
+        float4 c[7];
+        UNROLL for (uint k = 0u; k < 7u; ++k) { c[k] = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + k))) / pm.y; }
+        const float Yn[9] = { 0.282095f, 0.488603f * N.y, 0.488603f * N.z, 0.488603f * N.x,
+                              1.092548f * N.x * N.y, 1.092548f * N.y * N.z, 0.315392f * (3.0f * N.z * N.z - 1.0f),
+                              1.092548f * N.x * N.z, 0.546274f * (N.x * N.x - N.y * N.y) };
+        const float fp[28] = { c[0].x, c[0].y, c[0].z, c[0].w, c[1].x, c[1].y, c[1].z, c[1].w,
+                               c[2].x, c[2].y, c[2].z, c[2].w, c[3].x, c[3].y, c[3].z, c[3].w,
+                               c[4].x, c[4].y, c[4].z, c[4].w, c[5].x, c[5].y, c[5].z, c[5].w,
+                               c[6].x, c[6].y, c[6].z, c[6].w };
+        UNROLL for (uint b = 0u; b < 9u; ++b) { amb += float3(fp[3u * b], fp[3u * b + 1u], fp[3u * b + 2u]) * Yn[b]; }
+        amb = max(amb, f3(0.0f));
+    }
+    const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV) + amb;
+    Write2D(gPgiPeek, outAt, float4(pv.rgb * E, 1.0f));
+    RETURN();
+}
+#else
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
 void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
@@ -207,11 +489,71 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
     if (!mine) { return; }                          // uniform per group: no barrier is skipped unevenly
     const uint layer = p / (G * G), slot = p % (G * G);
     const uint cx = slot % G, cy = slot / G;
-    const bool valid = pr.w > 0.5f && pr.w < 2.5f;
+    // State: 1 settled, 2 in TRANSITION (blend toward the new value), 3 clear; + the captured-face
+    // mask / 128. A probe is usable from its first face (PROGRESSIVE: the relight fills the faces it
+    // does not have yet with the old model's own sky ambient at the probe).
+    // 4 = the WORLD probe (the reserved last slot, skyamb.h.fsl pgiWorldFactor): always in transition,
+    // so every relight eases it toward its new value — it moves with the camera and lights everything.
+    const bool world = pr.w > 3.5f;
+    bool valid = (pr.w > 0.5f && pr.w < 2.5f) || world;
+    bool rejected = false;   // inside geometry (below): no probe, and the receivers are told so
+    const bool  trans = (pr.w > 1.5f && pr.w < 2.5f) || world;
+    const uint  fmask = (uint)(frac(pr.w) * 128.0f + 0.5f) & 63u;
+    // SEE-THROUGH COVER: a probe with a static's lowest surface above it (pgiplace stood it on the
+    // terrain under a floating static) must SEE that surface straight up. A single-sided floor —
+    // a tunnel's, with the terrain buried well below it — is open from beneath, and a probe placed
+    // there looked up through it at the lit world: a bright blob in the tunnel ("smaller bright
+    // spots now", user 2026-10-11). Up-face centre farther than the underside (or sky) -> no probe;
+    // the receivers there keep the old model. A real underside (a mushroom cap) passes.
+    if (valid) {
+        const float4 m = gPgiShadow.skyAOMap;
+        const float2 uv = (pr.xy - m.xy) * m.z;
+        if (all(uv >= float2(0.0f, 0.0f)) && all(uv < float2(1.0f, 1.0f))) {
+            int2 dims = GetDimensions(gPgiSkyLow, NO_SAMPLER);
+            const int2 t = clamp(int2(uv * float2(dims)), int2(0, 0), dims - int2(1, 1));
+            const float low = -LoadTex2D(gPgiSkyLow, NO_SAMPLER, t, 0).r;   // none -> +30000
+            if (low < 20000.0f && low > pr.z + 8.0f && (fmask & 16u) != 0u) {   // the up face is in
+                const float expect = low - pr.z;
+                float seen = 1.0e9f;   // nearest of the up face's four centre texels; sky = infinitely far
+                UNROLL for (uint k = 0u; k < 4u; ++k) {
+                    const uint tx = 3u + (k & 1u), ty = 3u + (k >> 1u);
+                    const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + 4u * PGI_FACE_TEX + tx,
+                                                                 (layer * G + cy) * PGI_FACE_TEX + ty));
+                    const float hd = pgiGbDist(gb);
+                    if (hd > 0.0f) { seen = min(seen, hd); }
+                }
+                if (seen > expect * 1.25f + 64.0f) { valid = false; }
+            }
+        }
+    }
 
     // SH9 accumulators, RGB, in 7 float4 lanes (27 floats, flattened c0.rgb c1.rgb ...).
     float acc[27];
     for (uint q = 0u; q < 27u; ++q) { acc[q] = 0.0f; }
+    float backAcc = 0.0f;   // solid angle of the captured faces that showed BACK faces
+    // OWN-FACES FILL (pgiFillOld 0): the missing faces' basis weights, and the captured faces' radiance
+    // and solid angle. After the reduction the captured MEAN radiance fills the missing share.
+    float missY[9];
+    for (uint q = 0u; q < 9u; ++q) { missY[q] = 0.0f; }
+    float3 capL = f3(0.0f);
+    float  capD = 0.0f;
+    const bool fillOld = gPgiParams.place.x > 0.5f;
+    // MULTI-BOUNCE: the ambient a captured surface is lit by is this probe's OWN previous irradiance
+    // for that surface's normal (DDGI's feedback). The sky model alone (no bounce at all) left the
+    // field ~23% short of the probe oracle on a grassy castle hillside, while the same relight fed the
+    // renderer's own ambient scored 0.98 (tasks/forge-gi.md "Ground truth at the castle"). Albedo < 1
+    // keeps the loop converging; it builds over a few relights. Until the probe has a value: the sky.
+    float4 prevC[7];
+    float  prevW = 0.0f;
+    {
+        const float4 pm = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)));
+        prevW = (gPgiParams.capMisc.z > 0.5f && pm.y > 0.5f) ? pm.y : 0.0f;
+        UNROLL for (uint k = 0u; k < 7u; ++k) {
+            prevC[k] = (prevW > 0.0f) ? LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + k))) / prevW : f4(0.0f);
+        }
+    }
+    // The world probe (layer 1, column (G-1, G-1)) has faces: its sky stands in for every probe's.
+    const bool worldSky = !world && gPgiParams.capMisc.x > 0.5f && gPgiProbes[2u * G * G - 1u].w > 3.5f;   // capMisc.x = knob pgiLiveSky
     if (valid) {
         const float3 S = -normalize(gPgiParams.sunDir.xyz);
         for (uint t = tid; t < 6u * PGI_FACE_TEX * PGI_FACE_TEX; t += PGI_THREADS) {
@@ -224,22 +566,86 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
             const float3 d = normalize(fwd + a * right + b * up);
             const float r2 = 1.0f + a * a + b * b;
             const float dom = (2.0f / (float)PGI_FACE_TEX) * (2.0f / (float)PGI_FACE_TEX) / (r2 * sqrt(r2));
+            if ((fmask & (1u << f)) == 0u) {
+                // Not captured yet. Default (pgiFillOld 0): the MEAN radiance of the faces this probe HAS,
+                // added after the reduction — so a partial probe in a tunnel starts as dark as what it has
+                // seen. The old fill (1, the A/B) was the old model at the probe: its top-down sky AO reads
+                // a tunnel as open sky, and every partial probe there started bright (frame 1750 of the
+                // Telvanni walk: walls 4.90 -> 2.57 of the independent truth without it, 2026-10-13).
+                const float xm = d.x, ym = d.y, zm = d.z;
+                const float Ym[9] = { 0.282095f, 0.488603f * ym, 0.488603f * zm, 0.488603f * xm,
+                                      1.092548f * xm * ym, 1.092548f * ym * zm, 0.315392f * (3.0f * zm * zm - 1.0f),
+                                      1.092548f * xm * zm, 0.546274f * (xm * xm - ym * ym) };
+                if (!fillOld) {
+                    for (uint cm = 0u; cm < 9u; ++cm) { missY[cm] += Ym[cm] * dom; }
+                    continue;
+                }
+                const float3 Prl = pr.xyz - gPgiParams.lodEye.xyz;
+                const float3 Lm = gPgiParams.ambCol.rgb * skyAmbFactorAO(d, skyAOTerm(d, Prl));
+                for (uint cm = 0u; cm < 9u; ++cm) {
+                    acc[cm * 3u + 0u] += Lm.r * Ym[cm] * dom;
+                    acc[cm * 3u + 1u] += Lm.g * Ym[cm] * dom;
+                    acc[cm * 3u + 2u] += Lm.b * Ym[cm] * dom;
+                }
+                continue;
+            }
             const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx,
                                                          (layer * G + cy) * PGI_FACE_TEX + ty));
             const float4 as = pgiUnpackUnorm4(gb.x);
             const float  skyF = as.w;
-            float3 L = skyF * pgiSkyRadiance(d);
-            const float hd = asfloat(gb.z);
+            const uint   nGeoT = gb.w & 0xFFu, nBackT = (gb.w >> 8u) & 0xFFu;
+            if (nGeoT > 0u) { backAcc += (float)nBackT / (float)nGeoT * (1.0f - skyF) * dom; }
+            // The CAPTURED sky where there is one (not near the sun's disc: the sun is added on its own
+            // below), else the stand-in (a stolen frame's capture draws no sky).
+            float3 skyCap = pgiUnpackR11G11B10(gb.z);
+            // LIVE SKY: the WORLD probe's capture of this same direction (same face, same texel — the sky
+            // is at infinity), where it saw sky. It is re-shot every few seconds; a probe's own capture is
+            // as old as the probe, and the ones shot in the first frames held a dark sky for good (floors
+            // 0.15 of the oracle on open ground, 2026-10-13). Its own capture stays the fallback.
+            const bool skyLive = gPgiParams.skyLive.x > 0.5f;
+            if (!skyLive && worldSky && skyF > 0.0f) {
+                const uint4 wg = LoadRWTex2D(gPgiGBuf, int2((G - 1u) * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx,
+                                                            (G + G - 1u) * PGI_FACE_TEX + ty));
+                const float3 ws = pgiUnpackR11G11B10(wg.z);
+                if (pgiUnpackUnorm4(wg.x).w > 0.0f && (ws.r + ws.g + ws.b) > 0.0f) { skyCap = ws; }
+            }
+            const bool   useCap = (skyCap.r + skyCap.g + skyCap.b) > 0.0f && dot(d, S) < 0.9962f;
+            float3 L = skyF * (skyLive ? pgiSkyLive(d) : useCap ? skyCap : pgiSkyRadiance(d));
+            const float hd = pgiGbDist(gb);
             if (skyF < 0.999f && hd > 0.0f) {
                 float3 N = pgiUnpackNormal(gb.y);
                 if (dot(N, N) < 0.5f) { N = -d; }
                 const float3 P = pr.xyz + d * hd;
                 const float3 Prel = P - gPgiParams.lodEye.xyz;
-                const float sunV = pgiSunVis(P, S);
-                const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV)
-                               + gPgiParams.ambCol.rgb * skyAmbFactorAO(N, skyAOTerm(N, Prel));
+                const float sunV = pgiSunVisibility(P, N, S, gPgiParams.place.z > 0.5f);   // the renderer's two sources
+                // No value of its own yet: the old model's ambient at the hit (pgiFillOld 1), or none —
+                // the bounce then builds from the probe's own field over the next relights.
+                float3 amb = (fillOld || gPgiParams.capMisc.z < 0.5f)
+                           ? gPgiParams.ambCol.rgb * skyAmbFactorAO(N, skyAOTerm(N, Prel)) : f3(0.0f);
+                if (prevW > 0.0f) {
+                    const float Yn[9] = { 0.282095f, 0.488603f * N.y, 0.488603f * N.z, 0.488603f * N.x,
+                                          1.092548f * N.x * N.y, 1.092548f * N.y * N.z, 0.315392f * (3.0f * N.z * N.z - 1.0f),
+                                          1.092548f * N.x * N.z, 0.546274f * (N.x * N.x - N.y * N.y) };
+                    const float fp[28] = { prevC[0].x, prevC[0].y, prevC[0].z, prevC[0].w, prevC[1].x, prevC[1].y, prevC[1].z, prevC[1].w,
+                                           prevC[2].x, prevC[2].y, prevC[2].z, prevC[2].w, prevC[3].x, prevC[3].y, prevC[3].z, prevC[3].w,
+                                           prevC[4].x, prevC[4].y, prevC[4].z, prevC[4].w, prevC[5].x, prevC[5].y, prevC[5].z, prevC[5].w,
+                                           prevC[6].x, prevC[6].y, prevC[6].z, prevC[6].w };
+                    float3 Ep = f3(0.0f);
+                    UNROLL for (uint b = 0u; b < 9u; ++b) { Ep += float3(fp[3u * b], fp[3u * b + 1u], fp[3u * b + 2u]) * Yn[b]; }
+                    amb = max(Ep, f3(0.0f));   // E/pi, the units ambCol x factor is in
+                }
+                // place.y = knob pgiSunGain (test): the sun term's share (1 = as is).
+                const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb;
                 L += (1.0f - skyF) * as.rgb * E;
             }
+            // LIT PREVIEW (pgiDebug 64): the radiance this texel hands the SH — sun with its cascade
+            // shadow, the bounce, the sky — beside the G-buffer tile it came from.
+            if (gPgiParams.capMisc.w > 0.5f) {
+                Write2D(gPgiLit, int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx, (layer * G + cy) * PGI_FACE_TEX + ty),
+                        float4(L, 1.0f));
+            }
+            capL += L * dom;
+            capD += dom;
             const float x = d.x, y = d.y, z = d.z;
             const float Y[9] = { 0.282095f, 0.488603f * y, 0.488603f * z, 0.488603f * x,
                                  1.092548f * x * y, 1.092548f * y * z, 0.315392f * (3.0f * z * z - 1.0f),
@@ -252,36 +658,308 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
         }
     }
     for (uint k = 0u; k < 7u; ++k) {
-        g_pgiA[tid * 7u + k] = float4(acc[k * 4u + 0u], acc[k * 4u + 1u], acc[k * 4u + 2u],
-                                      (k * 4u + 3u < 27u) ? acc[k * 4u + 3u] : 0.0f);
+        g_pgiA[tid * PGI_LANES + k] = float4(acc[k * 4u + 0u], acc[k * 4u + 1u], acc[k * 4u + 2u],
+                                             (k * 4u + 3u < 27u) ? acc[k * 4u + 3u] : backAcc);   // lane 27 = back
     }
+    g_pgiA[tid * PGI_LANES + 7u]  = float4(missY[0], missY[1], missY[2], missY[3]);
+    g_pgiA[tid * PGI_LANES + 8u]  = float4(missY[4], missY[5], missY[6], missY[7]);
+    g_pgiA[tid * PGI_LANES + 9u]  = float4(missY[8], capL);
+    g_pgiA[tid * PGI_LANES + 10u] = float4(capD, 0.0f, 0.0f, 0.0f);
     GroupMemoryBarrier();
     for (uint s = PGI_THREADS / 2u; s > 0u; s >>= 1u) {
-        float4 v[7];
-        for (uint k = 0u; k < 7u; ++k) { v[k] = (tid < s) ? g_pgiA[(tid + s) * 7u + k] : f4(0.0f); }
+        float4 v[PGI_LANES];
+        for (uint k = 0u; k < PGI_LANES; ++k) { v[k] = (tid < s) ? g_pgiA[(tid + s) * PGI_LANES + k] : f4(0.0f); }
         GroupMemoryBarrier();
-        if (tid < s) { for (uint k = 0u; k < 7u; ++k) { g_pgiA[tid * 7u + k] = g_pgiA[tid * 7u + k] + v[k]; } }
+        if (tid < s) { for (uint k = 0u; k < PGI_LANES; ++k) { g_pgiA[tid * PGI_LANES + k] = g_pgiA[tid * PGI_LANES + k] + v[k]; } }
         GroupMemoryBarrier();
+    }
+    // INSIDE GEOMETRY (DDGI's probe classification): more than PGI_BACK_MAX of what the captured faces
+    // see is back faces — a stem, a hill's hollow, under a single-sided floor. No probe; the receivers
+    // blend the neighbours (or keep the old model). The height maps cannot tell these from open air
+    // under a cover (clutter fills the low map), the probe's own view can.
+    {
+        const float capDom = (float)countbits(fmask) * (4.0f * 3.14159265f / 6.0f);
+        // A PARTIAL probe (progressive: its down and up faces come first) is judged only on a clear
+        // majority — a side face still to come can carry it over or back under the line, and a probe
+        // that showed green from its first faces then flipped out was the "square blocks turn gray,
+        // then come back" walking up to a castle wall (user, 2026-10-12). Complete: PGI_BACK_MAX.
+        const float backMax = (fmask == 63u) ? PGI_BACK_MAX : 0.5f;
+        if (capDom > 0.0f && g_pgiA[6].w / capDom > backMax) { valid = false; rejected = true; }
     }
     if (tid < 7u) {
         // Cosine-lobe convolution / pi, per band: the receiver's dot with the basis is then E/pi —
         // the units a lit frag's ambient term (ambCol x factor) is in. Flattened index q = 3c + ch.
         float4 v = g_pgiA[tid];
+        // The own-faces fill: the captured mean radiance over the missing faces' basis weights.
+        const float4 m7 = g_pgiA[7], m8 = g_pgiA[8], m9 = g_pgiA[9];
+        const float  mY[9] = { m7.x, m7.y, m7.z, m7.w, m8.x, m8.y, m8.z, m8.w, m9.x };
+        const float3 mean = (g_pgiA[10].x > 1.0e-6f) ? m9.yzw / g_pgiA[10].x : f3(0.0f);
         float4 o;
         for (uint e = 0u; e < 4u; ++e) {
             const uint q = tid * 4u + e;
             const uint c = q / 3u;
             const float band = (c == 0u) ? 1.0f : (c < 4u) ? (2.0f / 3.0f) : 0.25f;
-            const float val = (e == 0u) ? v.x : (e == 1u) ? v.y : (e == 2u) ? v.z : v.w;
+            float val = (e == 0u) ? v.x : (e == 1u) ? v.y : (e == 2u) ? v.z : v.w;
+            if (q < 27u) { const uint ch = q % 3u; val += ((ch == 0u) ? mean.x : (ch == 1u) ? mean.y : mean.z) * mY[c]; }
             const float r = (q < 27u) ? val * band : 0.0f;
             if (e == 0u) { o.x = r; } else if (e == 1u) { o.y = r; } else if (e == 2u) { o.z = r; } else { o.w = r; }
         }
-        Write3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + tid)), valid ? o : f4(0.0f));
+        o = valid ? o : f4(0.0f);
+        // Lane 27 (plane 6 .w, no SH coefficient) = REJECTED: the receivers measure the field's
+        // confidence against the probes that can light them, so a rejected probe hands its cell to its
+        // neighbours instead of to the old model (a gray 256 u square where a wall's probe dropped out).
+        if (tid == 6u) { o.w = rejected ? 1.0f : 0.0f; }
+        const int3 at = int3((int)cx, (int)cy, (int)(layer * 7u + tid));
+        if (trans) { o = lerp(LoadRWTex3D(gPgiSHOut, at), o, gPgiParams.capMisc.y); }
+        Write3D(gPgiSHOut, at, o);
     }
     if (tid == 7u) {
-        Write3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)),
-                valid ? float4(pr.z, 1.0f, 0.0f, 0.0f) : f4(0.0f));
+        // (z, 1, ceiling, floor) * w: a transition blends the validity too, so a probe's FIRST face
+        // fades it in from nothing — the receivers' bilinear divides w out against its neighbours.
+        // CEILING / FLOOR: the nearest surface the probe sees straight up / down (its up/down faces'
+        // centre texels; none = 4000 u). A receiver well past it is across a SLAB from the probe — a
+        // tunnel through a hill whose closed underside roofs the hollow the probe stands in — and
+        // does not take it (skyamb.h.fsl pgiIrradiance, with a dome's worth of slack: a cap's
+        // underside receivers lie ON that surface, higher than its centre).
+        float vu = 4000.0f, vd = 4000.0f;
+        UNROLL for (uint k = 0u; k < 4u; ++k) {
+            const uint tx = 3u + (k & 1u), ty = 3u + (k >> 1u);
+            if ((fmask & 16u) != 0u) {
+                const uint4 g = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + 4u * PGI_FACE_TEX + tx,
+                                                           (layer * G + cy) * PGI_FACE_TEX + ty));
+                const float hu = pgiGbDist(g);
+                if (hu > 0.0f) { vu = min(vu, hu); }
+            }
+            if ((fmask & 32u) != 0u) {
+                const uint4 g = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + 5u * PGI_FACE_TEX + tx,
+                                                           (layer * G + cy) * PGI_FACE_TEX + ty));
+                const float hd = pgiGbDist(g);
+                if (hd > 0.0f) { vd = min(vd, hd); }
+            }
+        }
+        float4 mz = valid ? float4(pr.z, 1.0f, pr.z + vu, pr.z - vd) : f4(0.0f);   // w = 1: premultiplied as is
+        const int3 at = int3((int)cx, (int)cy, (int)(14u + layer));
+        if (trans) { mz = lerp(LoadRWTex3D(gPgiSHOut, at), mz, gPgiParams.capMisc.y); }
+        Write3D(gPgiSHOut, at, mz);
     }
+    RETURN();
+}
+#endif   // PGI_PEEKLIT / PGI_RELIGHT
+
+#elif defined(PGI_BALLS)
+// ─── BALLS: first hits of rays shot from the SUN and the CAMERA (tasks/forge-gi.md, user 2026-10-12) ──
+// No ray tracer: the maps those two already render ARE their rays' first hits. The sun shadow map holds
+// where each sun ray stopped, the camera depth where each eye ray did. A ball sticks at its hit, pushed
+// off the surface along the normal by `lift`, so it always stands in OPEN space in front of what it hit.
+// Importance: sun balls land around the camera (a Gaussian over the cascade tiles, which are centred on
+// it), camera balls toward the view's centre. No sun map (overcast, night): straight down through the
+// sky-top height map instead. Out: two float4 per ball, (absolute position, type: 0 none, 1 camera,
+// 2 sun, 3 zenith) and (normal, 0). The host reads them back and keeps a pruned pool.
+uint pgibHash(uint x)
+{
+    x ^= x >> 16u; x *= 0x7FEB352Du; x ^= x >> 15u; x *= 0x846CA68Bu; x ^= x >> 16u;
+    return x;
+}
+float pgibRand(inout uint s) { s = pgibHash(s); return (float)(s >> 8u) * (1.0f / 16777216.0f); }
+float2 pgibGauss(inout uint s)
+{
+    const float u1 = max(pgibRand(s), 1.0e-6f), u2 = pgibRand(s);
+    const float r = sqrt(-2.0f * log(u1));
+    return r * float2(cos(6.28318531f * u2), sin(6.28318531f * u2));
+}
+// Camera depth texel -> camera-relative position (0 = sky).
+float3 pgibCamPos(int2 p, float2 dims, out bool hit)
+{
+    const float d = LoadTex2D(gPgiCamDepth, NO_SAMPLER, p, 0).r;
+    hit = d > 0.0f;
+    const float2 ndc = float2(((float)p.x + 0.5f) / dims.x * 2.0f - 1.0f, 1.0f - ((float)p.y + 0.5f) / dims.y * 2.0f);
+    const float4 w = mul(gPgiShadow.invViewProj, float4(ndc, d, 1.0f));
+    return w.xyz / w.w;
+}
+// Sun atlas texel of cascade c -> camera-relative position (the cascade's ortho inverse).
+float3 pgibSunPos(uint c, int2 p, float2 tile)
+{
+    const float d = LoadTex2D(gPgiSunDepth, NO_SAMPLER, p, 0).r;
+    const float2 uv = float2(((float)p.x + 0.5f) - (float)c * tile.x, (float)p.y + 0.5f) / tile;
+    const float4 q = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, d, 1.0f);
+    const float4 w = (c == 0u) ? mul(gPgiParams.sunInv0, q) : mul(gPgiParams.sunInv1, q);
+    return w.xyz / w.w;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint i = DispatchThreadID.x;
+    const uint nCam = (uint)gPgiParams.balls.x, nSun = (uint)gPgiParams.balls.y;
+    if (i >= nCam + nSun) { return; }
+    uint s = pgibHash(i * 9781u + (uint)gPgiParams.balls.z * 6271u + 1u);
+    const float lift = gPgiParams.balls.w;
+    const float3 eye = gPgiParams.lodEye.xyz;
+    float4 o0 = f4(0.0f), o1 = f4(0.0f);
+    if (i < nCam) {
+        // CAMERA: a pixel, denser toward the centre; its depth is the eye ray's first hit.
+        if (gPgiParams.ballsMisc.y > 0.5f) {
+            const float2 dims = gPgiShadow.screenParams.xy;
+            const float2 uv = clamp(0.5f + pgibGauss(s) * gPgiParams.ballsMisc.w, f2(0.01f), f2(0.99f));
+            const int2 p = int2(uv * dims);
+            bool h0, hr, hd;
+            const float3 P  = pgibCamPos(p, dims, h0);
+            const float3 Pr = pgibCamPos(p + int2(2, 0), dims, hr);
+            const float3 Pd = pgibCamPos(p + int2(0, 2), dims, hd);
+            if (h0) {
+                float3 n = (hr && hd) ? cross(Pr - P, Pd - P) : -P;
+                if (dot(n, n) < 1.0e-12f) { n = -P; }
+                n = normalize(n);
+                if (dot(n, P) > 0.0f) { n = -n; }                     // toward the camera: the side it saw
+                // A depth edge (the neighbours left this surface): stand back along the ray instead.
+                const float dl = length(P);
+                if (!hr || !hd || abs(length(Pr) - dl) > 0.05f * dl || abs(length(Pd) - dl) > 0.05f * dl) { n = -P / dl; }
+                o0 = float4(P + n * lift + eye, 1.0f);
+                o1 = float4(n, 0.0f);
+            }
+        }
+    } else {
+        if (gPgiParams.ballsMisc.x > 0.5f) {
+            // SUN: half the balls in each cascade, around its centre (the camera); the stored depth is
+            // where that sun ray stopped.
+            const uint c = (i - nCam) & 1u;
+            int2 dimsI = GetDimensions(gPgiSunDepth, NO_SAMPLER);
+            const float2 tile = float2((float)dimsI.x * 0.5f, (float)dimsI.y);
+            const float2 uv = clamp(0.5f + pgibGauss(s) * 0.2f, f2(0.01f), f2(0.98f));
+            const int2 p = int2(((float)c + uv.x) * tile.x, uv.y * tile.y);
+            const float d = LoadTex2D(gPgiSunDepth, NO_SAMPLER, p, 0).r;
+            if (d > 0.0f && d < 1.0f) {
+                const float3 P  = pgibSunPos(c, p, tile);
+                const float3 Pr = pgibSunPos(c, p + int2(1, 0), tile);
+                const float3 Pd = pgibSunPos(c, p + int2(0, 1), tile);
+                const float3 toSun = -normalize(gPgiParams.sunDir.xyz);
+                float3 n = cross(Pr - P, Pd - P);
+                n = (dot(n, n) > 1.0e-12f) ? normalize(n) : toSun;
+                if (dot(n, toSun) < 0.0f) { n = -n; }                 // the lit side: where the ray came from
+                // A cliff between texels: stand back toward the sun.
+                if (abs(dot(Pr - P, toSun)) > 64.0f || abs(dot(Pd - P, toSun)) > 64.0f) { n = toSun; }
+                o0 = float4(P + n * lift + eye, 2.0f);
+                o1 = float4(n, 0.0f);
+            }
+        } else {
+            // ZENITH (overcast / no sun map): straight down through the sky-top map around the camera.
+            const float4 m = gPgiShadow.skyAOMap;     // origin xy, 1/extent
+            int2 dims = GetDimensions(gPgiSkyTop, NO_SAMPLER);
+            const float2 w = eye.xy + pgibGauss(s) * gPgiParams.ballsMisc.z;
+            const float2 uv = (w - m.xy) * m.z;
+            if (all(uv >= f2(0.0f)) && all(uv < f2(1.0f))) {
+                const int2 t = clamp(int2(uv * float2(dims)), int2(1, 1), dims - int2(2, 2));
+                const float h  = LoadTex2D(gPgiSkyTop, NO_SAMPLER, t, 0).r;
+                const float hx = LoadTex2D(gPgiSkyTop, NO_SAMPLER, t + int2(1, 0), 0).r;
+                const float hy = LoadTex2D(gPgiSkyTop, NO_SAMPLER, t + int2(0, 1), 0).r;
+                if (h > PGI_NONE) {
+                    const float tx = 1.0f / (m.z * (float)dims.x);    // texel size (u)
+                    float3 n = normalize(float3(h - hx, h - hy, tx));
+                    if (abs(hx - h) > 64.0f || abs(hy - h) > 64.0f) { n = float3(0.0f, 0.0f, 1.0f); }
+                    o0 = float4(w.x, w.y, h, 3.0f) + float4(n * lift, 0.0f);
+                    o1 = float4(n, 0.0f);
+                }
+            }
+        }
+    }
+    gPgiBallOut[2u * i]      = o0;
+    gPgiBallOut[2u * i + 1u] = o1;
+    RETURN();
+}
+
+#elif defined(PGI_SPLAT)
+// ─── SPLAT: the scattered probes -> a camera-centred volume the receivers filter in hardware ─────────
+// ("lookup, no blotch", user 2026-10-12). Each voxel = the kernel-weighted SH of the probes that can SEE
+// it: weight (1 - d²/R²)² with R growing with the distance to the camera like the pool's own spacing,
+// times VISIBILITY from the probe's captured hit distance toward the voxel (a probe behind a wall gives
+// nothing), times the probe's own validity (its fade-in). Stored premultiplied by the voxel's validity
+// (summed weight / a full weight, capped at 1), so a half-covered neighbourhood divides out at the
+// receiver as the column field did. World-anchored and toroidal: a cell whose tag names another world
+// voxel (the window scrolled) is written outright, every other cell blends toward its new value (the
+// temporal half of "smoothest wins"), a 1/period share of the cells per frame.
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(4, 4, 4)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const int VX = (int)gPgiParams.vol3.y, VZ = (int)gPgiParams.vol3.z;
+    const int3 id = int3(DispatchThreadID);
+    if (id.x >= VX || id.y >= VX || id.z >= VZ) { return; }
+    const int3 dims = int3(VX, VX, VZ);
+    const int3 o = int3(gPgiParams.vol.xyz);
+    const int3 m = ((o % dims) + dims) % dims;
+    const int3 w = o + ((id - m + dims) % dims);            // the world voxel this cell holds now
+    const uint tag = ((uint)w.x & 1023u) | (((uint)w.y & 1023u) << 10u) | (((uint)w.z & 1023u) << 20u) | (1u << 30u);
+    const bool fresh = LoadRWTex3D(gPgiVolTag, id) != tag;
+    const uint period = max((uint)gPgiParams.vol2.z, 1u);
+    const uint lin = (uint)(id.x + id.y * VX + id.z * VX * VX);
+    if (!fresh && (lin % period) != (uint)gPgiParams.vol3.x) { return; }
+
+    const float vs = gPgiParams.vol.w;
+    const float3 X = (float3(w) + 0.5f) * vs;
+    const float  R = gPgiParams.vol2.x + gPgiParams.vol2.y * length(X - gPgiParams.lodEye.xyz);
+    const uint   G = (uint)gPgiParams.grid.y;
+    float4 acc[7];
+    UNROLL for (uint k = 0u; k < 7u; ++k) { acc[k] = f4(0.0f); }
+    float sumW = 0.0f;
+    for (uint p = 0u; p < 2u * G * G; ++p) {
+        const float4 pr = gPgiProbes[p];
+        if (pr.w < 0.5f || pr.w > 2.5f) { continue; }            // empty / being cleared
+        const float3 d = X - pr.xyz;
+        const float dd = dot(d, d);
+        if (dd >= R * R) { continue; }
+        const uint layer = p / (G * G), slot = p % (G * G), cx = slot % G, cy = slot / G;
+        const float4 meta = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)));
+        if (meta.y < 1.0e-3f) { continue; }
+        if (LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + 6u))).w > 0.5f) { continue; }   // rejected
+        float k1 = 1.0f - dd / (R * R);
+        float wgt = k1 * k1;
+        // VISIBILITY: the probe's captured hit distance toward the voxel. Shorter than the voxel by more
+        // than the slack = a surface between them. A face not captured yet says nothing (visible).
+        const float L = sqrt(dd);
+        if (L > 1.0f) {
+            const float3 a = abs(d);
+            const uint f = (a.x >= a.y && a.x >= a.z) ? (d.x > 0.0f ? 0u : 1u)
+                         : (a.y >= a.z) ? (d.y > 0.0f ? 2u : 3u) : (d.z > 0.0f ? 4u : 5u);
+            const uint fmask = (uint)(frac(pr.w) * 128.0f + 0.5f) & 63u;
+            if ((fmask & (1u << f)) != 0u) {
+                float3 fwd, up, right;
+                pgiFaceBasis(f, fwd, up, right);
+                const float fz = dot(d, fwd);
+                const float u = dot(d, right) / fz, v = dot(d, up) / fz;
+                const uint tx = min((uint)((u * 0.5f + 0.5f) * (float)PGI_FACE_TEX), PGI_FACE_TEX - 1u);
+                const uint ty = min((uint)((0.5f - v * 0.5f) * (float)PGI_FACE_TEX), PGI_FACE_TEX - 1u);
+                const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx,
+                                                             (layer * G + cy) * PGI_FACE_TEX + ty));
+                const float hd = pgiGbDist(gb);
+                if ((gb.w & 0xFFu) != 0u && hd > 0.0f) {
+                    const float slack = 0.25f * L + 32.0f;
+                    wgt *= saturate((hd + slack - L) / slack);
+                }
+            }
+        }
+        if (wgt <= 0.0f) { continue; }
+        // The planes are premultiplied by the probe's validity (meta.y): summing wgt x plane and
+        // wgt x meta.y gives the validity-weighted mean, and a fading-in probe counts partly.
+        UNROLL for (uint k = 0u; k < 7u; ++k) {
+            acc[k] += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + k)));
+        }
+        sumW += wgt * meta.y;
+    }
+    const float v = saturate(sumW / max(gPgiParams.vol3.w, 1.0e-4f));
+    const float s = (sumW > 1.0e-5f) ? v / sumW : 0.0f;
+    const float alpha = fresh ? 1.0f : gPgiParams.vol2.w;
+    UNROLL for (uint k = 0u; k < 7u; ++k) {
+        const int3 at = int3(id.xy, (int)k * VZ + id.z);
+        Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), acc[k] * s, alpha));
+    }
+    {
+        const int3 at = int3(id.xy, 7 * VZ + id.z);
+        Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(v, 0.0f, 0.0f, 0.0f), alpha));
+    }
+    Write3D(gPgiVolTag, id, tag);
     RETURN();
 }
 #endif

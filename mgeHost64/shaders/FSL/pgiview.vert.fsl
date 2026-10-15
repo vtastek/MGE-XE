@@ -1,0 +1,35 @@
+// mgeHost64 — PROBE GI debug "what the probe sees" (pgiDebug bit 4): one screen rectangle (6 verts from
+// SV_VertexID), its corners and the probe it shows from one per-instance row:
+//   Rect = NDC x0, y0 (top-left), x1, y1;  Info = the probe's storage texel x, y, layer, face mask.
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float4, Rect, POSITION);
+    DATA(float4, Info, TEXCOORD0);
+    DATA(float4, Misc, TEXCOORD1);   // x = output scale (1: scene units — the strip is metered by auto-exposure like the scene),
+                                     // y = PEEK face side px (0 = the G-buffer view), z = peek shows distance
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float2,       Uv,       TEXCOORD0);
+    DATA(FLAT(float4), Info,     TEXCOORD1);
+    DATA(FLAT(float4), Misc,     TEXCOORD2);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In, SV_VertexID(uint) VertexID )
+{
+    INIT_MAIN;
+    VSOutput Out;
+    const float2 uvs[6] = { float2(0.0f, 0.0f), float2(1.0f, 0.0f), float2(1.0f, 1.0f),
+                            float2(0.0f, 0.0f), float2(1.0f, 1.0f), float2(0.0f, 1.0f) };
+    const float2 uv = uvs[VertexID % 6u];
+    Out.Position = float4(lerp(In.Rect.x, In.Rect.z, uv.x), lerp(In.Rect.y, In.Rect.w, uv.y), 0.5f, 1.0f);
+    Out.Uv = uv;
+    Out.Info = In.Info;
+    Out.Misc = In.Misc;
+    RETURN(Out);
+}

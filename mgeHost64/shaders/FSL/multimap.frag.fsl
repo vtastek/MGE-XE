@@ -304,6 +304,8 @@ float4 PS_MAIN( VSOutput In )
     c = applyFog(c, In.WorldPos, In.Position.xy);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
         // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the

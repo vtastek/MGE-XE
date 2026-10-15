@@ -1,0 +1,38 @@
+// mgeHost64 — GI BOUNCE INSPECTION: a few random objects painted pure bright colours (tasks/forge-gi.md).
+// *"A debug mode where seldom random objects are rendered with pure bright colors would be nice to inspect
+// bounces."* (user, 2026-10-15)
+//
+// Knob giTint (gShadowParams.giDebug.x) = the SHARE of objects painted, 0 = off; giTintLevel (.y) = the
+// painted albedo. The pick is a hash of the object's ABSOLUTE origin (its world matrix's translation + the
+// eye, both camera-relative here), snapped to 16 u, so an object keeps its colour as the camera moves, and
+// a distant static and its near draw (same origin) agree. The ALBEDO is replaced before lighting, so the
+// main view, the probe captures (mode 64) and the F12 albedo view all see the same object — its bounce
+// lands on its neighbours through the probes. Distant statics and near objects only (not terrain, grass,
+// skinned or multimap parts).
+#ifndef GI_TINT_H_FSL
+#define GI_TINT_H_FSL
+
+// 0 = not painted, 1..6 = one of the six pure colours.
+uint giTintCode(float3 originRel)
+{
+    const float share = gShadowParams.giDebug.x;
+    if (!(share > 0.0f)) { return 0u; }
+    const int3 q = int3(floor((originRel + gFrameData.lodEye.xyz) * (1.0f / 16.0f) + 0.5f));
+    uint h = (uint)q.x * 73856093u ^ (uint)q.y * 19349663u ^ (uint)q.z * 83492791u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    if ((float)(h & 0xFFFFu) * (1.0f / 65536.0f) >= share) { return 0u; }
+    return 1u + (h >> 16) % 6u;
+}
+
+float3 giTintAlbedo(uint code)
+{
+    const float a = gShadowParams.giDebug.y;
+    if (code == 1u) { return float3(a, 0.0f, 0.0f); }   // red
+    if (code == 2u) { return float3(0.0f, a, 0.0f); }   // green
+    if (code == 3u) { return float3(0.0f, 0.0f, a); }   // blue
+    if (code == 4u) { return float3(0.0f, a, a); }      // cyan
+    if (code == 5u) { return float3(a, 0.0f, a); }      // magenta
+    return float3(a, a, 0.0f);                          // yellow
+}
+
+#endif // GI_TINT_H_FSL

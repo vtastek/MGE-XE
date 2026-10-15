@@ -79,6 +79,10 @@ STRUCT(AplParams)
     // host's existing write is still the first 96 bytes of the same upload. 112 B against a 256 B
     // cbuffer, so no allocation change.
     DATA(float4, srcDims, None);
+    // A DEBUG OVERLAY'S RECT in normalised output uv (x0, y0, x1, y1), its samples ABSENT like sky's;
+    // zero area = none. The probe preview (pgiview, pgiDebug 4/8/64) draws at a FIXED exposure, so
+    // the servo must not meter it: it fed back once (E fell to 0.019 at the castle). APPENDED.
+    DATA(float4, excl, None);
 };
 
 BEGIN_SRT(AplSrtData)

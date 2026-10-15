@@ -151,4 +151,115 @@ float3 atmosSunBeamAt(float r)
     return tr.rgb * lerp(1.0f, tr.a, saturate(gAtmosParams.deckMix.x)) * gAtmosParams.solar.xyz * cosF;
 }
 
+// ─── S3.5d: THE CLOUD LAYER INSIDE THE PHYSICAL SKY (tasks/forge-atmosphere.md) ──────────────────
+// *"first bring the clouds into the physical sky. assign a virtual depth to cloud layer, and apply the
+// sky ozone etc on it."* (user, 2026-10-14)
+//
+// MW's cloud mesh sits on the dome at no distance at all, so the air never touched it: a cloud at the
+// horizon kept its full overhead level while the sky around it carried 100+ km of air. Here the layer
+// is a SHELL at the deck's radius rc, and each texel is the point where the view ray meets it:
+//   dist = -r mu + sqrt(r^2 mu^2 + (rc - r)(rc + r))    (rc^2 - r^2 factored: float32 at planet scale)
+//   Tv   = T(r, mu) / T(rc, mu_c)                       (Bruneton's two-point transmittance; the
+//                                                         clear air's .rgb: Rayleigh + Mie + ozone)
+//   Lin  = L_sky * (1 - Tv) / (1 - T(r, mu))            (the share of the whole ray's in-scatter that
+//                                                         the eye-to-deck segment holds, by optical
+//                                                         depth; capped at L_sky)
+//   seen = cloud * Tv + Lin
+// Overhead the segment is ~1.5 km and the texture shows; at the horizon it is ~140 km and the layer
+// melts into the sky behind it. rc never sits closer than radiance.z above the eye, so a low deck
+// (Foggy's 50 m base) or a camera above it still gets a depth. radiance.y = the share (0 = off).
+// SCENE units in and out.
+float3 atmosCloudAerial(float3 dir, float3 Lc)
+{
+    float k = saturate(gSkyView.radiance.y);
+    if (!(k > 0.0f)) { return Lc; }
+    float3 d  = dir * rsqrt(max(dot(dir, dir), 1.0e-12f));
+    float  r  = gSkyView.sunDirW.w;
+    float  Rg = gAtmosParams.planet.x;
+    float  rc = max(gSkyView.elemRadiance.w, r + max(gSkyView.radiance.z, 1.0f));
+    float  mu = max(d.z, atmosHorizonCos(r, Rg) + 1.0e-4f);
+    float  dist = -r * mu + sqrt(max(0.0f, r * r * mu * mu + (rc - r) * (rc + r)));
+    float  muc  = clamp((r * mu + dist) / rc, -1.0f, 1.0f);
+    float3 T0 = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp,
+                               atmosTransmittanceUv(gAtmosParams, r, mu), 0).rgb;
+    float3 Tc = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp,
+                               atmosTransmittanceUv(gAtmosParams, rc, muc), 0).rgb;
+    float3 Tv = saturate(T0 / max(Tc, f3(1.0e-6f)));
+    float3 Ls = atmosSkyRadianceNative(d, r) * gSkyView.radiance.w;
+    float3 Lin = min(Ls * (f3(1.0f) - Tv) / max(f3(1.0f) - T0, f3(1.0e-4f)), Ls);
+    return lerp(Lc, Lc * Tv + Lin, k);
+}
+
+// ─── S3.5b SKY HAZE (tasks/forge-atmosphere.md) ──────────────────────────────────────────────────
+// *"the cloud texture is the expected exposure. I wanted fog/haze thickness extinction to get that
+// level and it is okay if thin top volume showed sky texture still."*
+//
+// A haze layer between the eye and everything the sky passes draw: L = L_behind*T + L_haze*(1-T).
+//   T      = exp(-tauZ * exp(-h/H) * airmass(e)), airmass = 1/sqrt(sin^2 e + 1/M^2): thin overhead
+//            (the sky texture shows), saturated at the horizon. h is the eye's altitude in the
+//            medium, so climbing thins it. e < 0 counts as the horizon: the band between the eye plane
+//            and the world's edge, which widens as the camera climbs, takes the haze's own value.
+//   L_haze = the CLOUD anchor's luma (sky.frag's fully-lit texel) x level, in the HUE of the medium's
+//            horizon at the same angle to the sun (sunsets keep their colour; the level is the clouds'),
+//            or (S3.5c, hazeHue.w) in MW's own authored fog hue,
+//            never brighter than that horizon itself (dusk: see the cap below).
+// SCENE units in and out. tauZ = 0 returns L untouched: the pre-haze image.
+//
+// ⚠ ONE COPY OF THE PARAMETERS, IN gShadowParams.skyHaze0..2 (S3.4, 2026-10-15), NOT gSkyView. The fog
+// melts statics toward the sky behind them (skydome.h.fsl fogHazeTarget), and while the haze lived on
+// gSkyView — bound only on the sky passes' PerBatch set — the fog melted toward the UN-hazed horizon:
+// *"Fog doesn't match, statics are colored one color, horizon is another."* (user, 2026-10-15). Every
+// pass binds gShadowParams, so the sky, the clouds, the stars and the fog now read one haze. The
+// caller supplies the eye's radius `r` (m) and the native -> scene `scale`, because the sky passes take
+// them from gSkyView (per view) and the fog from gAtmosParams / gFrameData.
+//   skyHaze0 = (tauZ, H m, horizon air mass M, level x the cloud anchor)
+//   skyHaze1 = (MW fog hue xyz, luma 1; w = its share)
+//   skyHaze2 = (anchor diffuse, beam scale, deck radius m, 0)
+float atmosHazeTAt(float3 dir, float r)
+{
+    float4 h0   = gShadowParams.skyHaze0;
+    float3 d    = dir * rsqrt(max(dot(dir, dir), 1.0e-12f));
+    float  s    = max(d.z, 0.0f);
+    float  M    = max(h0.z, 1.0f);
+    float  h    = max(r - gAtmosParams.planet.x, 0.0f);
+    float  am   = rsqrt(s * s + 1.0f / (M * M));
+    return exp(-h0.x * exp(-h / max(h0.y, 1.0f)) * am);
+}
+
+float3 atmosHazeRadianceAt(float3 dir, float r, float scale)
+{
+    float4 h2 = gShadowParams.skyHaze2;
+    float3 anchor = f3(h2.x);
+    if (h2.y > 0.0f) {
+        anchor += h2.y * atmosSunBeamAt(h2.z);
+    }
+    const float3 kY  = float3(0.2126f, 0.7152f, 0.0722f);
+    float  lvl = dot(anchor, kY) * gShadowParams.skyHaze0.w;
+    float3 d   = dir * rsqrt(max(dot(dir, dir), 1.0e-12f));
+    float3 hz  = atmosSkyRadianceNative(atmosHorizonDirSameAngle(d), r);
+    float  hl  = dot(hz, kY);
+    // CAPPED at the un-hazed horizon itself: the haze only brings a horizon that is brighter than the
+    // clouds DOWN to them. After sunset the cloud anchor (its night floor included) outshines the sky,
+    // and uncapped the haze lifted the dusk sky 2.8x (nearfar @2700, 2026-10-14) — the wrong way, and
+    // into the probes' sky, which dusk already reads too bright.
+    lvl = min(lvl, hl * scale);
+    if (!(hl > 1.0e-20f)) { return f3(0.0f); }
+    // S3.5c: MW's authored horizon hue (luma 1) in place of the medium's, by skyHaze1.w.
+    float4 h1  = gShadowParams.skyHaze1;
+    float3 hue = lerp(hz / hl, h1.xyz, saturate(h1.w));
+    return hue * lvl;
+}
+
+float3 atmosSkyHazedAt(float3 dir, float3 L, float r, float scale)
+{
+    if (!(gShadowParams.skyHaze0.x > 0.0f)) { return L; }
+    float T = atmosHazeTAt(dir, r);
+    return L * T + atmosHazeRadianceAt(dir, r, scale) * (1.0f - T);
+}
+
+// The sky passes' spellings: this view's eye radius and scale, from gSkyView.
+float  atmosHazeOn()                         { return gShadowParams.skyHaze0.x; }
+float  atmosHazeT(float3 dir)                { return atmosHazeTAt(dir, gSkyView.sunDirW.w); }
+float3 atmosSkyHazed(float3 dir, float3 L)   { return atmosSkyHazedAt(dir, L, gSkyView.sunDirW.w, gSkyView.radiance.w); }
+
 #endif // SKY_RADIANCE_H_FSL

@@ -717,6 +717,19 @@ BEGIN_SRT_NO_AB(SrtData)
         // Read by skyamb.h.fsl pgiIrradiance when gShadowParams.pgiParams0.x > 0. Unbound reads 0 =
         // no valid probe = the old ambient. Appended last (one running descriptor counter).
         DECL_TEXTURE(PerFrame, Tex2DArray(float4), gPgiSH)
+        // PROBE GI debug "what the probe sees" (pgiview.frag, pgiDebug bit 4): the probes' G-buffer
+        // atlas (pgi.srt.h gPgiGBuf), bound to the main PerFrame set only and read only by that view
+        // (in SHADER_RESOURCE state only while it is on). Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(uint4), gPgiGBufView)
+        // ...and its PEEK (pgiDebug bit 8): the camera column's two probes' raw captures at full
+        // resolution (pgi.srt.h gPgiPeek: rgb = what the capture drew, a = hit distance, -1 sky).
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gPgiPeekView)
+        // PROBE GI VOLUME (ball placement): VX x VY x (8 VZ) — plane k of voxel z at slice k*VZ + z
+        // (7 convolved SH9 planes + meta (validity)), every value premultiplied by validity. xy wrap in
+        // the sampler, z by hand (skyamb.h.fsl pgiVolIrradiance). Bound to the three receiver sets.
+        DECL_TEXTURE(PerFrame, Tex2DArray(float4), gPgiVol)
+        // ...and the LIT preview (pgiDebug 64): the relit radiance per G-buffer texel (pgi.srt.h gPgiLit).
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gPgiLitView)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

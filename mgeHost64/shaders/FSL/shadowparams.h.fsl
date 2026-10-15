@@ -1084,4 +1084,21 @@ STRUCT(ShadowMaskParams)
     // half extent, w = 0. The probe field REPLACES the ambient factor where it is valid.
     DATA(float4,   pgiParams0,       None);
     DATA(float4,   pgiParams1,       None);
+    // PROBE GI VOLUME (ball placement, knob pgiBalls; skyamb.h.fsl pgiVolIrradiance): the scattered
+    // probes splatted into a camera-centred, world-anchored, toroidal volume (gPgiVol).
+    // pgiParams2: x = 1 / voxel size, y = VX (= VY), z = VZ, w = 1 volume mode ON.
+    // pgiParams3: xyz = the window's first voxel index (absolute), w = the WORLD PROBE's share in the old
+    //             model (skyamb.h.fsl pgiWorldFactor; 0 = off / not built: the sky SH).
+    DATA(float4,   pgiParams2,       None);
+    DATA(float4,   pgiParams3,       None);
+    // SKY HAZE (S3.5b/c, moved here from gSkyView by S3.4 so the FOG reads the same haze as the sky;
+    // skyradiance.h.fsl atmosHazeTAt / atmosHazeRadianceAt). skyHaze0 = (tauZ 0 = off, H m, horizon air
+    // mass, level x cloud anchor); skyHaze1 = (MW fog hue xyz luma 1, its share); skyHaze2 = (anchor
+    // diffuse, beam scale, deck radius m, 0). All zero = no haze.
+    DATA(float4,   skyHaze0,         None);
+    DATA(float4,   skyHaze1,         None);
+    DATA(float4,   skyHaze2,         None);
+    // GI BOUNCE INSPECTION (gitint.h.fsl): x = share of objects painted a pure colour (0 = off),
+    // y = the painted albedo, zw spare.
+    DATA(float4,   giDebug,          None);
 };

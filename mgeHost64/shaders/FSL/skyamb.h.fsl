@@ -288,6 +288,42 @@ float skyAOTermPx(float3 N, float3 worldPosRel, float2 svPos)
     return lerp(skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz), v, cov);
 }
 
+#ifndef PGI_COMPUTE
+// THE WORLD PROBE (pgi.comp.fsl, the pool's reserved LAST slot): one probe in open air a few hundred
+// units above the camera, captured and relit like the others. Its irradiance takes the sky SH's place
+// in the old model below — in ABSOLUTE units (E/pi over ambCol, the probes' own), so the far field and
+// every fallback carry the energy and tint the near probes measure ("for open field ... a single probe
+// affecting the whole world so they just match", user 2026-10-13). pgiParams3.w = its share (0 = off or
+// not built yet: the sky SH, as before). Never inside the relight: a probe's sky stand-in reading the
+// world probe would be the world probe reading itself.
+float3 pgiWorldFactor(float3 N, float3 fSky)
+{
+    const float s = gShadowParams.pgiParams3.w;
+    if (s <= 0.0f) { return fSky; }
+    const float  G  = gShadowParams.pgiParams0.w;
+    const float  c  = (G - 0.5f) / G;   // the slot's texel centre: column (G-1, G-1), layer 1
+    const float3 uv = float3(c, c, 0.0f);
+    const float4 m  = gPgiSH.SampleLevel(gSamplerPointClamp, uv + float3(0.0f, 0.0f, 15.0f), 0.0f);
+    if (m.y < 1.0e-3f) { return fSky; }
+    float4 q[7];
+    UNROLL for (int k = 0; k < 7; ++k) {
+        q[k] = gPgiSH.SampleLevel(gSamplerPointClamp, uv + float3(0.0f, 0.0f, 7.0f + (float)k), 0.0f) / m.y;
+    }
+    const float3 n = normalize(N);
+    const float Y[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
+                         1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float f[28] = { q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w,
+                          q[2].x, q[2].y, q[2].z, q[2].w, q[3].x, q[3].y, q[3].z, q[3].w,
+                          q[4].x, q[4].y, q[4].z, q[4].w, q[5].x, q[5].y, q[5].z, q[5].w,
+                          q[6].x, q[6].y, q[6].z, q[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
+    const float3 fw = max(E, f3(0.0f)) * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+    return lerp(fSky, fw, s * saturate(m.y));
+}
+#endif
+
 // worldPosRel = the CAMERA-RELATIVE world position every one of the six lit paths already carries
 // (near geometry is pre-shifted by -eye, distant statics are host-shifted, terrain subtracts
 // lodEye in its VS). gFrameData.lodEye is the absolute eye and is written EVERY frame, interiors
@@ -310,21 +346,28 @@ float3 skyAmbFactorAO(float3 N, float ao)
     float fill = fl * (1.0f - ao);
 
     float s = gShadowParams.skyParams.x;
-    if (s <= 0.0f) { return f3(ao + fill); }
-
-    float4 n = float4(normalize(N), 1.0f);
-    float3 f = float3(dot(gShadowParams.shAr, n),
-                      dot(gShadowParams.shAg, n),
-                      dot(gShadowParams.shAb, n));
-    // An L1 fit of a strongly directional field goes negative on the far side. Clamp rather than
-    // rescale: rescaling would drag the whole sphere back toward flat, which is the one thing this
-    // is for. The clamp only ever adds a hair of energy, so the "cannot darken the scene" property
-    // survives it.
-    // The AO scales the whole factor. SH1's "can only redistribute, never dim" guarantee is a
-    // property of the SH ALONE and is deliberately not extended here — removing light is precisely
-    // what an occlusion term is for. Keeping them as separate multiplies is what lets the panel
-    // A/B either one against the other.
-    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao + f3(fill);
+    float3 fs = f3(1.0f);
+    if (s > 0.0f)
+    {
+        float4 n = float4(normalize(N), 1.0f);
+        float3 f = float3(dot(gShadowParams.shAr, n),
+                          dot(gShadowParams.shAg, n),
+                          dot(gShadowParams.shAb, n));
+        // An L1 fit of a strongly directional field goes negative on the far side. Clamp rather than
+        // rescale: rescaling would drag the whole sphere back toward flat, which is the one thing this
+        // is for. The clamp only ever adds a hair of energy, so the "cannot darken the scene" property
+        // survives it.
+        // The AO scales the whole factor. SH1's "can only redistribute, never dim" guarantee is a
+        // property of the SH ALONE and is deliberately not extended here — removing light is precisely
+        // what an occlusion term is for. Keeping them as separate multiplies is what lets the panel
+        // A/B either one against the other.
+        fs = lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s);
+    }
+    // The WORLD PROBE, where it is built, in the sky SH's place (pgiWorldFactor above).
+#ifndef PGI_COMPUTE
+    fs = pgiWorldFactor(N, fs);
+#endif
+    return fs * ao + f3(fill);
 }
 
 
@@ -369,14 +412,26 @@ float skyLateralOpen(float3 worldAbs, float R)
     return sum * 0.2f;
 }
 
+// PROBE CAPTURE back-face test (statics/terrain frag mode 5, pgigather): the viewer is behind a
+// surface where dot(cross(ddx P, ddy P), N) * PGI_BACK_SIGN > 0. The sign is the capture pass's
+// screen handedness, set by measurement (wrong = every probe rejected, the field all old model).
+#define PGI_BACK_SIGN (-1.0f)
+#define PGI_BACK_SENTINEL 3.0f
+// The PROBE CAPTURE's G-buffer mode: mode 5 (albedo) PLUS the back-face flag. Its own number because the
+// flag's sign is the capture pass's handedness: in the main view it fired on every front face and the
+// F12 albedo view (5) showed magenta everywhere (user, 2026-10-15). Set only on the capture's
+// FrameData copy (host g_capFace.dbg); never in kDebugModeNames.
+#define PGI_CAPTURE_DBG 64u   // a captured texel whose red exceeds this was a back face (4, 0, 4)
+
 #ifndef PGI_COMPUTE
 // PROBE GI (pgi.srt.h): E/pi at N from the probe field — the same units ambCol x factor has — and the
 // field's confidence (a). Columns bilinear (WRAP: the grid is toroidal), the two layers of a column
 // blended by height between their probes. Every stored value is premultiplied by validity, so a
 // half-built neighbourhood divides out exactly. a = 0 outside the window or with no probe built.
 #define PgiSampleArr(T, uv, s) T.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(s)), 0.0f)
-float4 pgiIrradiance(float3 N, float3 worldAbs)
+float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 {
+    below = 0.0f;
     const float4 P0 = gShadowParams.pgiParams0;
     const float4 P1 = gShadowParams.pgiParams1;
     if (P0.x <= 0.0f) { return f4(0.0f); }
@@ -387,14 +442,51 @@ float4 pgiIrradiance(float3 N, float3 worldAbs)
     const float4 m0 = PgiSampleArr(gPgiSH, uv, 14);
     const float4 m1 = PgiSampleArr(gPgiSH, uv, 15);
     float w0 = 0.0f, w1 = 0.0f;
+    // BELOW THE LOWEST PROBE: a probe stands on its cell's lowest FLOOR (pgiplace), so a point well
+    // under its column's layer 0 has that probe ABOVE it — on top of a cover spanning the cell, as a
+    // tunnel's roof (whose rock reaches the ground, so no floor is found beneath it). The caller then
+    // gates the field by the point's openness. Under a floating cover (a giant mushroom's cap) layer 0
+    // stands on the terrain beneath it, so the underside is ABOVE its probe and takes the field.
+    // A layer-0 probe found INSIDE geometry drops out (pgirelight); where none is left around this
+    // point — a tunnel through a hill, whose ground-level probes sit in the hill — the height that
+    // says "the probe is above you" is layer 1's.
+    if (m0.y > 1.0e-3f)      { below = saturate((m0.x / m0.y - worldAbs.z - 64.0f) * (1.0f / 48.0f)); }
+    else if (m1.y > 1.0e-3f) { below = saturate((m1.x / m1.y - worldAbs.z - 64.0f) * (1.0f / 48.0f)); }
     if (m0.y > 1.0e-3f && m1.y > 1.0e-3f) {
         const float z0 = m0.x / m0.y, z1 = m1.x / m1.y;
         const float t = saturate((worldAbs.z - z0) / max(z1 - z0, 1.0f));
         w0 = 1.0f - t; w1 = t;
     } else if (m0.y > 1.0e-3f) { w0 = 1.0f; }
     else if (m1.y > 1.0e-3f)   { w1 = 1.0f; }
+    // SLAB VISIBILITY: a probe lights only the heights it can see — between the FLOOR and CEILING it
+    // measured straight down and up (pgirelight). A point past them is across a slab from the probe:
+    // a tunnel's floor over a hollow with a probe in it ("tunnel ... lits up", the yellow wall), the
+    // hill over the tunnel with layer 1 on top, a cap's top over its own underside. Invisible layers
+    // drop out and the visible one takes the whole weight; none visible = the old model here.
+    const float zr = worldAbs.z;
+    float v0 = 0.0f, v1 = 0.0f;
+    // Slack 256 u + a 128 u fade past the measured surface: a dome's height (the receivers on a
+    // cap's underside sit on it, above its centre hit) but not a hill's rock (the tunnel ~600 u up).
+    if (m0.y > 1.0e-3f) {
+        v0 = saturate((m0.z / m0.y + 384.0f - zr) * (1.0f / 128.0f)) * saturate((zr - m0.w / m0.y + 384.0f) * (1.0f / 128.0f));
+    }
+    if (m1.y > 1.0e-3f) {
+        v1 = saturate((m1.z / m1.y + 384.0f - zr) * (1.0f / 128.0f)) * saturate((zr - m1.w / m1.y + 384.0f) * (1.0f / 128.0f));
+    }
+    {
+        const float a0 = w0 * v0, a1 = w1 * v1, sa = a0 + a1;
+        if (sa > 1.0e-4f) { w0 = a0 / sa; w1 = a1 / sa; }
+        else if (v0 > 0.0f || v1 > 0.0f) { w0 = (v0 >= v1) ? 1.0f : 0.0f; w1 = 1.0f - w0; }   // the visible one
+        else { return f4(0.0f); }
+    }
+    const float vis = max(v0, v1);
     const float wsum = w0 * m0.y + w1 * m1.y;
     if (wsum < 1.0e-3f) { return f4(0.0f); }
+    // CONFIDENCE against the probes that CAN light this point: each layer's bilinear validity over
+    // the share of its corners not REJECTED (inside geometry, pgirelight lane 27). A probe inside a
+    // castle wall is no reason to fall back to the old model beside it — its neighbours cover it.
+    const float rj0 = PgiSampleArr(gPgiSH, uv, 6).w, rj1 = PgiSampleArr(gPgiSH, uv, 13).w;
+    const float conf = w0 * m0.y / max(1.0f - rj0, 1.0e-3f) + w1 * m1.y / max(1.0f - rj1, 1.0e-3f);
     const float inv = 1.0f / wsum;
     float4 c[7];
     UNROLL for (int k = 0; k < 7; ++k) {
@@ -413,7 +505,47 @@ float4 pgiIrradiance(float3 N, float3 worldAbs)
     UNROLL for (int b = 0; b < 9; ++b) {
         E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b];
     }
-    return float4(max(E, f3(0.0f)), edge * saturate(wsum));
+    return float4(max(E, f3(0.0f)), edge * saturate(conf) * vis);
+}
+
+// PROBE GI VOLUME (ball placement; pgi.comp.fsl PGI_SPLAT): E/pi at N and the volume's confidence.
+// Trilinear: xy by the wrap sampler (the volume is toroidal), z by hand between two slices of each
+// plane. Premultiplied by validity, divided out here; a = validity x the window-edge fade.
+float4 pgiVolIrradiance(float3 N, float3 worldAbs)
+{
+    const float4 P2 = gShadowParams.pgiParams2;
+    const float4 P3 = gShadowParams.pgiParams3;
+    const float VX = P2.y, VZ = P2.z;
+    // NORMAL BIAS (DDGI's): looked up half a voxel out along the normal. A voxel whose centre is inside
+    // the surface's own solid sees no probe (the splat's visibility test cuts it), and a lookup AT the
+    // surface leaned on it — thick roots and rocks lost their confidence and showed the old model.
+    const float3 c = (worldAbs + normalize(N) * (0.5f / P2.x)) * P2.x;   // continuous voxel coordinate (centre = i + 0.5)
+    const float3 r = c - P3.xyz;                           // within the window: [0, dims)
+    const float3 e = min(r, float3(VX, VX, VZ) - r);       // distance to the window's faces (voxels)
+    const float edge = saturate(min(min(e.x, e.y), e.z * 2.0f) - 1.0f);
+    if (edge <= 0.0f) { return f4(0.0f); }
+    const float2 uv = c.xy / VX;
+    const float cz = c.z - 0.5f;
+    const float z0 = floor(cz), t = cz - z0;
+    const float s0 = z0 - VZ * floor(z0 / VZ), s1 = (z0 + 1.0f) - VZ * floor((z0 + 1.0f) / VZ);
+    const float4 m = lerp(PgiSampleArr(gPgiVol, uv, 7.0f * VZ + s0), PgiSampleArr(gPgiVol, uv, 7.0f * VZ + s1), t);
+    if (m.x < 1.0e-3f) { return f4(0.0f); }
+    const float inv = 1.0f / m.x;
+    float4 q[7];
+    UNROLL for (int k = 0; k < 7; ++k) {
+        q[k] = lerp(PgiSampleArr(gPgiVol, uv, (float)k * VZ + s0), PgiSampleArr(gPgiVol, uv, (float)k * VZ + s1), t) * inv;
+    }
+    const float3 n = normalize(N);
+    const float Y[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
+                         1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float f[28] = { q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w,
+                          q[2].x, q[2].y, q[2].z, q[2].w, q[3].x, q[3].y, q[3].z, q[3].w,
+                          q[4].x, q[4].y, q[4].z, q[4].w, q[5].x, q[5].y, q[5].z, q[5].w,
+                          q[6].x, q[6].y, q[6].z, q[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
+    return float4(max(E, f3(0.0f)), saturate(m.x) * edge);
 }
 #endif
 
@@ -476,13 +608,54 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 // The ambient factor: the PROBE FIELD where it is built (it replaces the sky SH, the sky AO and the GI
 // field — what a probe sees already holds all three), the old model elsewhere and as the blend toward
 // the window's edge / an unbuilt neighbourhood.
+//
+// SEALED SPOTS keep the old model. Where a cover spans a whole cell and reaches the ground (a tunnel's
+// rock) the column's probes stand on top of it, and a point inside would take the outside's light
+// ("tunnel looks dark from outside ... walk inside and it lits up", user 2026-10-11). Such a point is
+// BELOW its column's lowest probe (pgiIrradiance's `below`), and there the field's confidence takes
+// the old model's OPENNESS (sky visibility, else lateral): a tunnel's deep end is sealed and hands back
+// to the old model's dark, its mouth is open and keeps the field. A floating cover (a giant mushroom's
+// cap) has its layer 0 on the terrain beneath it (pgiplace), so its underside is above its probe and
+// takes the field unconditionally. (Tried first: a low-map "same side of the cover" test, which missed
+// the tunnel and dropped the underside; openness everywhere, which also closed the underside; a
+// per-texel "under the low map" mode, which drew 64 u blocks where the stems' feet fill the texel.)
+float skyOpenness(float ao, float3 worldPosRel)
+{
+    const float openRef = gShadowParams.skyAOGround.y;
+    float open = (openRef > 0.0f) ? smoothstep(0.0f, openRef, ao) : 1.0f;
+    const float latR = gShadowParams.skyAOGround.w;
+    if (open < 1.0f && latR > 0.0f && gShadowParams.skyAOMap.z > 0.0f) {
+        open = max(open, skyLateralOpen(worldPosRel + gFrameData.lodEye.xyz, latR));
+    }
+    return open;
+}
+
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
 #ifndef PGI_COMPUTE
     if (gShadowParams.pgiParams0.x > 0.0f) {
-        const float4 pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz);
+        float below = 0.0f;
+        float4 pg;
+        // Ball placement: the splatted volume — probes stand where rays reached, and a point a probe
+        // cannot see takes nothing from it, so no column / openness gating is needed.
+        if (gShadowParams.pgiParams2.w > 0.5f) { pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz); }
+        else {
+            pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, below);
+            if (pg.a > 0.0f && below > 0.0f) { pg.a *= lerp(1.0f, skyOpenness(ao, worldPosRel), below); }
+        }
+        // DEBUG (pgiDebug 2): the ambient becomes a tint of WHO lights this point — red the old model,
+        // green the probe field, the blend between them by the field's confidence here.
+        if (gShadowParams.pgiParams1.w > 0.5f) {
+            const float sh = saturate(pg.a);
+            return float3(1.0f - sh, sh, 0.1f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+        }
         if (pg.a > 0.0f) {
-            const float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            // NO FLOOR on the volume (user, 2026-10-14). It was clamped to the old model's constant
+            // floor as a stand-in for the lanterns' bounce, but that floor is a fraction of MW's ambCol,
+            // which does not follow the sky: at dusk the cap bound at half an ambient ~10x the real sky
+            // and lifted the probes 2.6x over the independent truth (iboebontowernearfar). The lanterns
+            // belong to point-light GI; the floor stays in the old model only.
             if (pg.a >= 0.999f) { return fp; }
             return lerp(skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
         }

@@ -233,6 +233,8 @@ PSOut PS_MAIN( VSOutput In )
 
     // F12 distance grayscale parity with statics.frag / distantland.frag / opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    if (pgiCap) { dbg = 5u; }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));

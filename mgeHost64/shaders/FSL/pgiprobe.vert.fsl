@@ -1,0 +1,73 @@
+// mgeHost64 — PROBE GI debug view (knob pgiDebug bit 1): every placed probe as a SHADED SPHERE lit by
+// its own SH9 field (so its colour IS what that probe hands the receivers), with a small STATUS CUBE
+// above it. Drawn twice: wireframe where the scene hides it, solid where it is visible (forgerender.cpp).
+//
+// Geometry is generated from SV_VertexID, no vertex buffer for it: ids 0..575 are a 12 x 8 UV sphere
+// (192 triangles), 576..611 the cube (12 triangles). The one vertex stream is PER INSTANCE (a probe):
+//   PosR = eye-relative centre xyz, radius;  Info = storage texel x, y, layer, host status.
+#include "opaque.srt.h"
+
+#define PGIP_SEG  12u
+#define PGIP_RING 8u
+#define PGIP_SPHERE_VERTS (PGIP_SEG * PGIP_RING * 6u)
+
+STRUCT(VSInput)
+{
+    DATA(float4, PosR, POSITION);
+    DATA(float4, Info, TEXCOORD0);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float3,       Normal,   TEXCOORD0);
+    DATA(FLAT(float4), Info,     TEXCOORD1);
+    DATA(FLAT(float),  IsBox,    TEXCOORD2);
+};
+
+float3 pgipSpherePoint(uint ring, uint seg)
+{
+    const float th = 3.14159265f * (float)ring / (float)PGIP_RING;
+    const float ph = 6.28318531f * (float)seg / (float)PGIP_SEG;
+    return float3(sin(th) * cos(ph), sin(th) * sin(ph), cos(th));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In, SV_VertexID(uint) VertexID )
+{
+    INIT_MAIN;
+    VSOutput Out;
+    const float R = In.PosR.w;
+    float3 n, p;
+    if (VertexID < PGIP_SPHERE_VERTS) {
+        const uint tri = VertexID / 3u, corner = VertexID % 3u;
+        const uint quad = tri / 2u, second = tri % 2u;
+        const uint ring = quad / PGIP_SEG, seg = quad % PGIP_SEG;
+        // quad corners: 0 (r, s), 1 (r+1, s), 2 (r+1, s+1), 3 (r, s+1); tris 0-1-2 and 0-2-3
+        uint c = (second == 0u) ? corner : ((corner == 0u) ? 0u : corner + 1u);
+        const uint r = ring + ((c == 1u || c == 2u) ? 1u : 0u);
+        const uint s = seg + ((c == 2u || c == 3u) ? 1u : 0u);
+        n = pgipSpherePoint(r, s);
+        p = In.PosR.xyz + n * R;
+        Out.IsBox = 0.0f;
+    } else {
+        // The cube: face f = axis f/2, side +/- by f%2; two triangles over (u, v) in [-1, 1]^2.
+        const uint b = VertexID - PGIP_SPHERE_VERTS;
+        const uint f = b / 6u, k = b % 6u;
+        const uint axis = f / 2u;
+        const float sgn = ((f % 2u) == 0u) ? 1.0f : -1.0f;
+        const float2 uvs[6] = { float2(-1.0f, -1.0f), float2(1.0f, -1.0f), float2(1.0f, 1.0f),
+                                float2(-1.0f, -1.0f), float2(1.0f, 1.0f), float2(-1.0f, 1.0f) };
+        const float2 uv = uvs[k];
+        float3 q = f3(0.0f);
+        if (axis == 0u)      { q = float3(sgn, uv.x, uv.y); n = float3(sgn, 0.0f, 0.0f); }
+        else if (axis == 1u) { q = float3(uv.x, sgn, uv.y); n = float3(0.0f, sgn, 0.0f); }
+        else                 { q = float3(uv.x, uv.y, sgn); n = float3(0.0f, 0.0f, sgn); }
+        p = In.PosR.xyz + float3(0.0f, 0.0f, R * 1.8f) + q * (R * 0.4f);
+        Out.IsBox = 1.0f;
+    }
+    Out.Position = mul(gFrameData.viewProj, float4(p, 1.0f));
+    Out.Normal = n;
+    Out.Info = In.Info;
+    RETURN(Out);
+}

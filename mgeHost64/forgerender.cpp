@@ -3634,6 +3634,15 @@ namespace {
         Shader*        pDebugLineShader = nullptr;         // debugline.vert/.frag (flat per-vertex colour)
         Pipeline*      pDebugLinePipeline = nullptr;       // LINE_LIST, depth OFF — light-origin debug boxes
         Buffer*        pDebugLineVB = nullptr;             // dynamic {float3 pos, float4 col} verts, persistent-mapped
+        // Probe GI debug view (pgiDebug bit 1, pgiprobe.vert/.frag): shaded spheres + status cubes.
+        Shader*        pPgiProbeShader = nullptr;
+        Pipeline*      pPgiProbePipeSolid = nullptr;       // depth GEQUAL + write: the visible part, solid
+        Pipeline*      pPgiProbePipeWire = nullptr;        // depth LESS, no write, wireframe: the hidden part
+        Buffer*        pPgiProbeVB = nullptr;              // per instance {float4 posR, float4 info}
+        // ...and "what the probe sees" (pgiDebug bit 4, pgiview.vert/.frag): one screen rect.
+        Shader*        pPgiViewShader = nullptr;
+        Pipeline*      pPgiViewPipe = nullptr;
+        Buffer*        pPgiViewVB = nullptr;               // one instance {float4 rect, float4 info}
         Shader*        pShadowAtlasViewShader = nullptr;   // shadowatlasview.vert/.frag (F12 mode 11/12 atlas blit)
         Pipeline*      pShadowAtlasViewPipeline = nullptr; // fullscreen triangle, depth OFF, colour RT
         Buffer*        pSkyWorldsBuf = nullptr;            // gBatch: one 64KB world window, persistent-mapped
@@ -3727,6 +3736,7 @@ namespace {
         Buffer*        pFPInstanceBufSkin = nullptr;       // skinned per-draw instance VB (uint2)
         Pipeline*      pFPOpaquePipeline = nullptr;        // opaque colour, GEQUAL + WRITE, CCW
         Pipeline*      pFPOpaquePipelineMirror = nullptr;  // … FRONT_FACE_CW
+        Pipeline*      pFPOpaquePipelineNone = nullptr;    // … CULL_NONE: probe-GI captures (back faces flagged)
         Pipeline*      pFPSkinnedPipeline = nullptr;       // skinned colour, GEQUAL + WRITE, CCW
         Pipeline*      pFPSkinnedPipelineMirror = nullptr; // … FRONT_FACE_CW
         // FP1e multi-map arms (a glass weapon's glow map). OWN world + instance windows, for
@@ -3939,6 +3949,8 @@ namespace {
         DescriptorSet* pReflectMipSet = nullptr;           // ReflectMipSrtData Persistent, maxSets = mips
         Shader*        pReflectMipShaderFirst = nullptr;   // reflectmipfirst.comp (pReflectColor -> mip 0)
         Shader*        pReflectMipShader = nullptr;        // reflectmip.comp ([1,3,3,1] tent reduce)
+        Shader*        pReflectMipShaderPgi = nullptr;     // reflectmipfirst_pgi_sc4.comp (a probe capture's class-consistent resolve)
+        Pipeline*      pReflectMipPipelinePgi = nullptr;   // null at 1 sample: the plain first pass is already exact
         Pipeline*      pReflectMipPipelineFirst = nullptr;
         Pipeline*      pReflectMipPipeline = nullptr;
 
@@ -4641,6 +4653,7 @@ namespace {
            kGpuPhaseWaterRefr,     // inside Water: the pRefractColor copy (MSAA resolve)
            kGpuPhaseStaticsDepth,  // inside Prepass: the distant statics Z-prepass (staticsPrepass)
            kGpuPhaseSunBlur,       // inside ShadowSun: the moments blur alone (fused or two-pass)
+           kGpuPhasePgi,           // inside Reflect: probe GI compute (place, relight, splat, balls)
            kGpuPhaseCount };
 
     // MGE_GPU_MARKERS=1: every phase bracket also opens a D3D12 event named after its phase, so an
@@ -4656,7 +4669,7 @@ namespace {
         "ObjVel", "ObjVelFP", "MotionBlur", "AODown", "AOSearch", "AOBlur", "AOUp", "ResolveFilter",
         "HizMip0", "ReLinear", "Apl", "GrassDepth", "GrassColor", "SkyVis", "SkyVisScreen",
         "RippleSim", "FbCopyA", "FbCopyB", "CullCam", "CullScan", "CullSun", "CullGrass", "CullCount",
-        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur"
+        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur", "Pgi"
     };
     bool gpuMarkersOn() {
         static const bool on = [] { const char* e = std::getenv("MGE_GPU_MARKERS"); return e && e[0] == '1'; }();
@@ -4884,6 +4897,7 @@ namespace {
     // shadowparams.h.fsl / msmrecv.h.fsl). Strength 0 is the whole feature's A/B: every receiver
     // early-outs to "fully lit" and the pass costs nothing but the caster draw.
     float              g_sunShadowStrength = 1.0f;   // 0 = sun shadows OFF, 1 = full
+    float              g_sunStaticsCullNone = 1.0f;  // knob sunStaticsCullNone (init): DL statics cast two-sided
     // Depth bias in WORLD units, normalised by the host at publish time. Not normalised units: the
     // slab is 4*g_sunShadowRange deep, so a fixed normalised bias silently rescales every time the
     // far-extent knob moves (going 2560 -> 8192 turned a tuned 15-unit bias into 49 units of
@@ -6430,6 +6444,11 @@ namespace {
     uint32_t           g_probeModes = 1;        // latched at selection
     struct ProbeSite { float pos[3]; float n[3]; float px, py; };
     std::vector<ProbeSite> g_probeSites;
+    // probeOracleAtProbes N > 0 (ball mode): the sites are the N pool probes nearest the camera, AT the
+    // probes (no lift), and a sidecar probeoracle_NNNN_pgi.bin carries each one's slot and STORED SH, so
+    // the tool scores the probes themselves against the independent truth at the same point.
+    float              g_probeOracleAtProbes = 0.0f;
+    std::vector<int>   g_probeSiteSlots;
     std::vector<float> g_probeData;             // per face: kProbeFaceRes² × 8 floats (see the writer)
     std::vector<float> g_probeAux;              // per face: kProbeFaceRes² × 12 {albedo3, litTerm3, ambient3, normal3}
     float              g_probeSunDrift = 0.0f;  // max angle (deg) the sun moved from job 0 over the run
@@ -6509,19 +6528,87 @@ namespace {
     float g_pgiOn      = 1.0f;     // knob pgi: the probe field replaces the ambient factor where built
     float g_pgiGain    = 1.0f;     // knob pgiGain: scales the probe field's irradiance
     float g_pgiSpacing = 256.0f;   // knob pgiSpacing: column spacing (u); a change rebuilds the grid
-    float g_pgiLift    = 48.0f;    // knob pgiLift: probes sit this far above the cell's low/high top
+    float g_pgiLift    = 48.0f;    // knob pgiLift: probes sit this far above their floor / the cell's top
+                                   // (48 left half a steep hillside's probes in the ground, user 2026-10-12)
     float g_pgiCapRes  = 64.0f;    // knob pgiCapRes: capture viewport side (px, multiple of 8)
-    float g_pgiEvery   = 2.0f;     // knob pgiEvery: capture on every Nth dry frame (1 capture ~1.0 ms GPU)
+    float g_pgiEvery   = 1.0f;     // knob pgiEvery: capture on every Nth dry frame (1 capture ~0.27 ms GPU)
     float g_pgiBatch   = 64.0f;    // knob pgiBatch: complete probes relit per frame
     float g_pgiSteal   = 6.0f;     // knob pgiSteal: on a WET view, steal 1 frame in N (0 = never)
+    float g_pgiLead    = 1.5f;     // knob pgiLead: capture toward where the camera will be in this many s
+    float g_pgiFade    = 1.0f;     // knob pgiFade: a probe's change (a new face) blends in over ~this many s
+    float g_pgiBounce  = 1.0f;     // knob pgiBounce: hits lit by the probe's own previous field (multi-bounce)
+    float g_pgiFaceRank = 1.0f;    // knob pgiFaceRank: each face a probe already has costs it this many
+                                   // columns of distance in the capture order (0 = finish near probes first)
+    // GI BOUNCE INSPECTION (shaders gitint.h.fsl): a share of objects painted a pure bright colour, in
+    // the main view and the probe captures alike, so their bounce shows on the neighbours. *"A debug mode
+    // where seldom random objects are rendered with pure bright colors would be nice to inspect
+    // bounces."* (user, 2026-10-15). 0 = off.
+    float g_giTint      = 0.0f;     // knob giTint: share of objects painted (0..1)
+    float g_giTintLevel = 0.8f;     // knob giTintLevel: the painted albedo
+    float g_pgiDebug   = 0.0f;     // knob pgiDebug: bits 1 probe spheres, 2 receiver share tint, 4 what the
+                                   // near probes see (8 x 8), 8 PEEK at it in full resolution, 16 peek distance
+    float g_pgiCapReach = 0.1f;    // knob pgiCapReach: a capture's statics reach (x the mirror tiers; 1 = full),
+                                   // measured from the probe
+    float g_pgiCapMinR  = 96.0f;   // knob pgiCapMinR: statics with a bound radius under this (u) stay out of captures
+    float g_pgiCapNear  = 0.0f;    // knob pgiCapNear: 1 = MW's near set drawn into captures too (test: holes in near cells)
     constexpr uint32_t kPgiG = 24, kPgiL = 2, kPgiN = kPgiG * kPgiG * kPgiL;
+    constexpr uint32_t kPgiPeekRes = 256;   // PEEK: face side (px), clamped to the mirror's size
+    // BALLS (tasks/forge-gi.md "probes placed by shooting balls", phase 1 = placement only, drawn by
+    // pgiDebug 32; the field still comes from the columns).
+    constexpr uint32_t kPgiBallMax = 512;   // balls per frame (camera + sun), 2 float4 each
+    constexpr uint64_t kPgiBallLane = 32ull * kPgiBallMax;
+    constexpr uint32_t kPgiPoolCap = 4096;  // hard cap on the pool (knob pgiPool is clamped to it)
+    // PHASE 2 (knob pgiBalls): the pool drives the probe SLOTS (kPgiN, the columns' capture / relight
+    // machinery unchanged) and the receivers read a SPLATTED volume (pgi.comp.fsl PGI_SPLAT).
+    constexpr uint32_t kPgiVX = 32, kPgiVZ = 16;   // volume: VX x VX x VZ voxels ...
+    float g_pgiVoxel = 192.0f;                     // knob pgiVoxel: ... of this size (u): 6144 x 6144 x 3072 around the camera
+    float g_pgiBalls     = 1.0f;    // knob pgiBalls: 1 = ball placement + volume (0 = the columns, A/B;
+                                    // they show the tunnel bright spots again since captures drop MW's set)
+    float g_pgiVolTau    = 0.5f;    // knob pgiVolTau: the volume's temporal smoothing (s)
+    float g_pgiVolPeriod = 4.0f;    // knob pgiVolPeriod: each voxel re-splatted every N frames
+    float g_pgiKernK     = 2.5f;    // knob pgiKernK: splat kernel radius = this x the pool's merge radius there
+    float g_pgiVolFull   = 0.75f;   // knob pgiVolFull: summed kernel weight that counts as a fully covered voxel
+    float g_pgiBallsCam   = 128.0f;   // knob pgiBallsCam: camera balls per frame
+    float g_pgiBallsSun   = 128.0f;   // knob pgiBallsSun: sun balls per frame
+    float g_pgiPool       = 2048.0f;  // knob pgiPool: ball probes kept (farthest from the camera evicted)
+    float g_pgiPoolR0     = 192.0f;   // knob pgiPoolR0: merge radius at the camera (u) ...
+                                      // (96 + 0.15 d made ~600 probes at the outer tunnel: 60 s to capture)
+    float g_pgiPoolRk     = 0.25f;    // knob pgiPoolRk: ... growing by this x the distance (dense near, sparse far)
+    float g_pgiBallSpread = 0.25f;    // knob pgiBallSpread: camera balls' screen Gaussian sigma (uv)
+    // THE WORLD PROBE (ball mode; skyamb.h.fsl pgiWorldFactor): the reserved LAST slot, one probe in open
+    // air above the camera whose irradiance replaces the sky SH in the old model — the far field and every
+    // fallback then carry what the near probes measure (open field: ball mode 0.51 vs the old model 0.39).
+    constexpr uint32_t kPgiWorldSlot = kPgiN - 1u;   // column (G-1, G-1), layer 1
+    float g_pgiWorld      = 1.0f;     // knob pgiWorld: its share in the old model (0 = the sky SH, A/B)
+    float g_pgiWorldLift  = 384.0f;   // knob pgiWorldLift: u above max(camera, the camera column's top)
+    float g_pgiWorldMove  = 1024.0f;  // knob pgiWorldMove: re-shot at the camera once this far from it (u)
+    float g_pgiWorldEvery = 10.0f;    // knob pgiWorldEvery: and re-shot in place every N s (cells stream in; its sky is every probe's)
+    float g_pgiLiveSky    = 1.0f;     // knob pgiLiveSky: every probe's sky texels take the world probe's (0 = their own capture)
+    float g_pgiFillOld    = 0.0f;     // knob pgiFillOld: a probe's missing faces take the mean of its captured ones (1 = the old model, A/B)
+    float g_pgiViewExp    = 0.5f;     // knob pgiViewExp: the probe preview's FIXED exposure (not the frame's; its rect is unmetered)
+    float g_pgiSkyLive    = 0.0f;     // knob pgiSkyLive: probes' sky = the atmosphere's sky-view field (0 = captured / stand-in). OFF: under full overcast the mixed field reads several x the DRAWN sky (2026-10-14)
+    float g_pgiSunMarch   = 0.0f;     // knob pgiSunMarch: past the cascades, the relight's own height-field march (A/B; 0 = gSunOcc)
+    float g_pgiSunGain    = 1.0f;     // knob pgiSunGain (test): the relight's sun term share
+    float g_aplExcl[4]    = {};       // this frame's preview rect in output uv (apl.srt.h excl), reset by the APL write
+    float g_pgiSunVP[32] = {};        // the sun cascades' view*proj this frame (camera-relative), for the balls
+    bool  g_pgiSunVPValid = false;
+    struct PgiBall {
+        float p[3]; float n[3]; uint32_t type; uint32_t hits; double t;
+        // PHASE 2: the probe slot it owns (-1 none) and its capture state, as a column layer has.
+        int slot = -1; uint8_t faces = 0; bool done = false; float trans = 0.0f;
+    };
     constexpr uint64_t kPgiPlaceLane = 16ull * kPgiG * kPgiG;   // one readback lane per frame slot
+    // The field's readback (probeOracleAtProbes): 16 slices of G x G RGBA16F, rows padded to 256 B.
+    constexpr uint64_t kPgiShRowPitch = 256, kPgiShSlice = kPgiShRowPitch * kPgiG, kPgiShLane = kPgiShSlice * 16ull;
+    static_assert(kPgiG * 8u <= kPgiShRowPitch && kPgiShSlice % 512u == 0u, "pgi SH readback footprint");
     struct PgiColumn {
         int     ix = INT_MIN, iy = INT_MIN;   // world column index (centre = index x spacing)
         float   z[2] = {};                    // ABSOLUTE probe heights, layer 0 (low) / 1 (high)
         bool    zValid = false;
         uint8_t faces[2] = {};                // captured faces (bit per face) per layer
         bool    done[2] = {}, justDone[2] = {}, clear[2] = {};
+        float   trans[2] = {};                // s left of a TRANSITION: relit every frame, blended toward
+                                              // its new value (a face just landed); 0 = settled
     };
     struct Pgi {
         Texture*       gbuf = nullptr;        // G-buffer atlas, RGBA32_UINT
@@ -6529,11 +6616,58 @@ namespace {
         Buffer*        placeBuf = nullptr;    // RW float4 per slot (lo, hi, ix, iy)
         Buffer*        placeRb = nullptr;     // its readback, one lane per frame slot
         Buffer*        probes = nullptr;      // FrameBuf: per probe (abs pos, state)
-        Buffer*        cbv[3] = {};           // per dispatch: 0 place, 1 gather, 2 relight
-        DescriptorSet* set = nullptr;         // PgiSrtData PerBatch, 3 instances (one per cbv)
+        Buffer*        cbv[6] = {};           // per dispatch: 0 place, 1 gather, 2 relight, 3 balls, 4 splat, 5 lit peek
+        DescriptorSet* set = nullptr;         // PgiSrtData PerBatch, 6 instances (one per cbv)
         Shader*        sPlace = nullptr; Shader* sGather = nullptr; Shader* sRelight = nullptr;
         Pipeline*      pPlace = nullptr; Pipeline* pGather = nullptr; Pipeline* pRelight = nullptr;
         bool           ready = false, failed = false, active = false, shInSR = false, cleared = false;
+        bool           gbufInSR = false;      // the G-buffer is readable for "what the probe sees" (pgiDebug 4)
+        // PEEK (pgiDebug 8, user 2026-10-12: "preview the probes in higher resolution, so I can see what
+        // is what in there"): every other capture re-shoots a face of the camera column's two probes at
+        // kPgiPeekRes and the gather copies it raw into this atlas (6 faces x 2 layers).
+        Texture*       lit = nullptr;         // RGBA16F, the G-buffer atlas's shape: relit radiance (pgiDebug 64)
+        Texture*       peek = nullptr;        // RGBA16F, 6 R x 2 R
+        bool           peekThis = false;      // this frame's capture is a peek
+        bool           peekInSR = false;      // readable by the colour pass (like gbufInSR)
+        uint32_t       peekRow = 0;           // the atlas row this peek capture fills
+        uint32_t       peekRes = 0, peekStep = 0, peekTick = 0;
+        int            peekIx = INT_MIN, peekIy = INT_MIN;   // the column the atlas holds
+        uint8_t        peekMask[2] = {};      // faces peeked per layer
+        // BALLS: per-frame hits -> readback lanes -> the pruned pool.
+        Buffer*        ballBuf = nullptr;     // RW float4 x 2 per ball
+        Buffer*        ballRb = nullptr;      // its readback, one lane per frame slot
+        Buffer*        shRb = nullptr;        // the field's readback (probeOracleAtProbes), one lane per frame slot
+        Shader*        sBalls = nullptr;
+        Pipeline*      pBalls = nullptr;
+        bool           ballsOn = false;       // dispatched this frame
+        uint32_t       ballSeed = 0;
+        uint32_t       ballN[kFrameSlots] = {};   // balls written into each readback lane (0 = none)
+        std::vector<PgiBall> pool;
+        uint32_t       ballIn = 0, ballMerged = 0, ballEvicted = 0;   // heartbeat counters
+        // PHASE 2: slot ownership (pool index per slot, -1 free), slots freed this frame (cleared by
+        // the relight), the capture's ball, and the volume.
+        int            slotOwner[kPgiN];
+        bool           slotClear[kPgiN] = {};
+        bool           ballMode = false;      // pgiBalls latched for this frame
+        int            capBall = -1;
+        Texture*       vol = nullptr;         // RGBA16F VX x VX x 8 VZ (opaque.srt.h gPgiVol)
+        Texture*       volTag = nullptr;      // R32_UINT VX x VX x VZ
+        Shader*        sSplat = nullptr;
+        Pipeline*      pSplat = nullptr;
+        Shader*        sPeekLit = nullptr;    // debug (pgiDebug 8|64): the peek relit at full resolution
+        Pipeline*      pPeekLit = nullptr;
+        bool           volInSR = false, volLive = false, volInit = false;
+        int            volO[3] = {};          // the window's first voxel (absolute index)
+        uint32_t       volPhase = 0;
+        // THE WORLD PROBE: where it was last shot, the faces it has (the relight's mask) and the faces
+        // still to re-shoot at that spot. The old faces stay in use until each is replaced, so a move
+        // never drops it back to the sky SH; the relight eases every change in (state 4).
+        float          worldP[3] = {};
+        uint8_t        worldFaces = 0, worldPend = 0;
+        bool           capWorld = false;      // this frame's capture is the world probe's
+        double         worldT = 0.0;          // s at the last full shot (a slow periodic refresh)
+        uint32_t       worldShots = 0;        // heartbeat
+        Pgi() { for (int& s : slotOwner) { s = -1; } }
         PgiColumn      col[kPgiG * kPgiG];
         int            ix0 = 0, iy0 = 0;
         float          spacing = 0.0f;
@@ -6541,6 +6675,10 @@ namespace {
         uint32_t       capSlot = 0, capLayer = 0, capFace = 0, everyCount = 0, phase = 0, stealCount = 0;
         uint32_t       steals = 0;
         uint32_t       captures = 0, complete = 0;
+        uint32_t       zResets = 0;           // probes reset by a placement height change (heartbeat)
+        float          eye[2] = {}, vel[2] = {};   // camera xy and its smoothed velocity (u/s), look-ahead
+        double         eyeT = 0.0;            // seconds at eye[], 0 = none yet
+        float          eyeZ = 0.0f;           // absolute eye height (heartbeat only)
     };
     Pgi g_pgi;
     // The oracle's direction set, shared with the sky-visibility maps below so the two integrate
@@ -6601,7 +6739,10 @@ namespace {
     // an AUTHORED sRGB grey — what an interior cell's ambient is written in (a logged interior:
     // (0.176,0.118,0.118)). 0 = the old pitch-black tunnel. The cap keeps a floor from exceeding
     // this fraction of the open-sky ambient (night: the sky is dimmer than a room).
-    float    g_skyAOFloorAmb = 0.15f;
+    // RETIRED (user, 2026-10-14): default 0. The cap is a fraction of MW's ambCol, which does not
+    // follow the sky (~10x it at dusk), so the floor lit sealed and dusk spots well over the ground
+    // truth; the lanterns' bounce it stood in for belongs to point-light GI. Knob kept for A/B.
+    float    g_skyAOFloorAmb = 0.0f;
     float    g_skyAOFloorMax = 0.5f;
     uint32_t g_svmNext      = 0;             // round-robin cursor
     uint32_t g_svmDrawn     = 0;             // tiles drawn since the last layout change
@@ -6953,6 +7094,10 @@ namespace {
     constexpr uint32_t kSkyAOGroundFloat      = kWeather2Float + 4;
     // PROBE GI (shadowparams.h.fsl pgiParams0/1; skyamb.h.fsl pgiIrradiance). Appended last, 8 floats.
     constexpr uint32_t kPgiFloat              = kSkyAOGroundFloat + 4;
+    // SKY HAZE (shadowparams.h.fsl skyHaze0..2): moved off gSkyView so the fog reads the same haze (S3.4).
+    constexpr uint32_t kSkyHazeFloat          = kPgiFloat + 16;
+    // GI bounce inspection (shadowparams.h.fsl giDebug; gitint.h.fsl).
+    constexpr uint32_t kGiDebugFloat          = kSkyHazeFloat + 12;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -6994,10 +7139,18 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, skyAOGround) == kSkyAOGroundFloat * sizeof(float),
                   "kSkyAOGroundFloat does not land on ShadowMaskParams::skyAOGround");
-    static_assert((kPgiFloat + 8) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kPgiFloat + 16) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, pgiParams0) == kPgiFloat * sizeof(float),
                   "kPgiFloat does not land on ShadowMaskParams::pgiParams0");
+    static_assert((kSkyHazeFloat + 12) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, skyHaze0) == kSkyHazeFloat * sizeof(float),
+                  "kSkyHazeFloat does not land on ShadowMaskParams::skyHaze0");
+    static_assert((kGiDebugFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, giDebug) == kGiDebugFloat * sizeof(float),
+                  "kGiDebugFloat does not land on ShadowMaskParams::giDebug");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -7158,6 +7311,11 @@ namespace {
                                     //   (S2j: minus the beam share skyCloudBeam moves to the deck)
         float  cloudBeamScale;      // S2j: albedo/pi * sceneScale * skyCloudBeam; 0 = no deck beam
         float  cloudDeckRadiusM;    // S2j: where that beam is taken — the deck BASE, from centre (m)
+        // S3.5b SKY HAZE (skyhw.frag / sky.frag): vertical optical depth at the ground (0 = off), its
+        // scale height (m), the horizon air mass, and the haze level as a multiple of the cloud anchor.
+        float  hazeTauZ, hazeH, hazeM, hazeLevel;
+        float  hazeHue[3], hazeHueMix;
+        float  cloudAP, cloudApMinM;    // S3.5d: cloud aerial-perspective share, deck min height (m)  // S3.5c: MW's fog hue (linear, luma 1) and its share
         double cloudOverZenith;     // reported: the ratio the anchor implies, = albedo / q
         bool   sunDiscFound;        // a SUN-class item with an uploaded mesh was in this frame's list
         bool   active;              // exterior, armed, model cooked and non-degenerate
@@ -7337,7 +7495,9 @@ namespace {
         // model's radiance term. A closed form has to be handed its configuration; a LUT does not,
         // and the sky pass now samples gAtmosSkyView instead. Every field below shifted down by 36,
         // and skyview.h.fsl is the layout's one authority.
-        v[16] = 0.0f; v[17] = 0.0f; v[18] = 0.0f;    // spare (was the model's radiance term)
+        v[16] = 0.0f;                                          // x: spare (haze -> gShadowParams.skyHaze*)
+        v[17] = g_skyPhys.active ? g_skyPhys.cloudAP : 0.0f;   // y: S3.5d cloud aerial perspective
+        v[18] = g_skyPhys.cloudApMinM;                         // z: S3.5d deck min height above eye
         // The whole native -> scene conversion in ONE lane, the strength folded in, so no shader ever
         // holds a piece of it. 0 is a legitimate value (interior, feature off) and skyhw.frag must
         // read it as a black sky — NOT as a failed bind, which is the opposite of what P1's
@@ -7359,7 +7519,7 @@ namespace {
         // the radius has to ride here or the deparameterisation reads the wrong row of the LUT.
         v[23] = g_skyPhys.cameraRadiusM;
         v[24] = g_skyPhys.active ? 1.0f : 0.0f;
-        v[25] = 0.0f; v[26] = 0.0f; v[27] = 0.0f;
+        v[25] = 0.0f; v[26] = 0.0f; v[27] = 0.0f;   // params.yzw spare (S3.4 moved the haze to gShadowParams)
         // P2b — the two sky ELEMENTS whose radiance the model sets rather than MW (skyview.h.fsl).
         // Identical in both views, like the coefficients: a moon's radiance does not depend on which
         // camera is looking at it. They ride here anyway, for the reason the coefficients do — the
@@ -7376,6 +7536,7 @@ namespace {
         v[33] = g_skyPhys.cloudScene;
         v[34] = g_skyPhys.active ? g_skyPhys.cloudBeamScale : 0.0f;   // S2j: the deck beam
         v[35] = g_skyPhys.cloudDeckRadiusM;
+        v[36] = 0.0f; v[37] = 0.0f; v[38] = 0.0f; v[39] = 0.0f;   // retired (S3.4: gShadowParams.skyHaze1)
         g_skyViewPub[view] = true;
     }
 
@@ -8726,7 +8887,8 @@ namespace {
     float    g_terrainFarNoPbrRung = 0.0f;   // cost probe (terrainRecord): cell rungs >= this draw no-PBR
     // Weather surface state (weather.h.fsl): wetness + snow cover from MW's precipitation counters.
     // Identity in dry weather (both 0), so the dry look is untouched.
-    bool     g_weatherSurface    = true;
+    // OFF by default (user, 2026-10-14): wet, snow and puddles were never reviewed; dev-panel A/B only.
+    bool     g_weatherSurface    = false;
     float    g_weatherWetSec     = 10.0f;    // time constant to soak at full rain
     float    g_weatherDrySec     = 120.0f;   // ...to dry once it stops
     float    g_weatherSnowSec    = 180.0f;   // ...for snow to cover at full snowfall
@@ -10874,6 +11036,9 @@ namespace {
             addPipeline(R, &pd, &g_live.pFPOpaquePipeline);
             g.pRasterizerState = &rasterMirror;
             addPipeline(R, &pd, &g_live.pFPOpaquePipelineMirror);
+            RasterizerStateDesc rasterNone = rasterDesc; rasterNone.mCullMode = CULL_MODE_NONE;
+            g.pRasterizerState = &rasterNone;
+            addPipeline(R, &pd, &g_live.pFPOpaquePipelineNone);
             g.pRasterizerState = &rasterDesc;   // restore for any later use of pd
             g.pDepthState = &depthDesc;
             if (!g_live.pFPOpaquePipeline || !g_live.pFPOpaquePipelineMirror) {
@@ -12750,13 +12915,121 @@ namespace {
             dvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             dvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             dvb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            dvb.mDesc.mSize = ((uint64_t)IPC::kMaxPointLights * 24 + (uint64_t)kMaxShadowLights * 384)
-                              * 7 * sizeof(float);
+            // + probe-GI cages (pgiDebug): 3 rings x 8 segments x 2 verts per probe.
+            dvb.mDesc.mSize = ((uint64_t)IPC::kMaxPointLights * 24 + (uint64_t)kMaxShadowLights * 384
+                               + (uint64_t)kPgiN * 48) * 7 * sizeof(float);
             dvb.mDesc.pName = "debugLineVB";
             dvb.pData = nullptr;
             dvb.ppBuffer = &g_live.pDebugLineVB;
             addFrameBuf(&dvb);
             waitForAllResourceLoads();
+
+            // PROBE GI debug view: geometry from SV_VertexID (612 verts = sphere + status cube), one
+            // per-instance stream. Two pipelines over one shader: the HIDDEN part as wireframe (depth
+            // LESS = behind the scene, reverse-Z), drawn first; then the VISIBLE part solid (GEQUAL,
+            // writing depth so a sphere hides its own back). Optional: a failure only loses the view.
+            {
+                ShaderLoadDesc ppd = {};
+                ppd.mVert.pFileName = "pgiprobe.vert";
+                ppd.mFrag.pFileName = "pgiprobe.frag";
+                addShader(R, &ppd, &g_live.pPgiProbeShader);
+                if (g_live.pPgiProbeShader) {
+                    VertexLayout pvl = {};
+                    pvl.mBindingCount = 1;
+                    pvl.mBindings[0].mStride = 8 * sizeof(float);
+                    pvl.mBindings[0].mRate = VERTEX_BINDING_RATE_INSTANCE;
+                    pvl.mAttribCount = 2;
+                    pvl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+                    pvl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                    pvl.mAttribs[0].mBinding = 0; pvl.mAttribs[0].mLocation = 0; pvl.mAttribs[0].mOffset = 0;
+                    pvl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD0;
+                    pvl.mAttribs[1].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                    pvl.mAttribs[1].mBinding = 0; pvl.mAttribs[1].mLocation = 1; pvl.mAttribs[1].mOffset = 4 * sizeof(float);
+                    DepthStateDesc pds = {};
+                    pds.mDepthTest = true; pds.mDepthWrite = true; pds.mDepthFunc = CMP_GEQUAL;
+                    RasterizerStateDesc prs = {};
+                    prs.mCullMode = CULL_MODE_NONE;
+                    PipelineDesc pp = {};
+                    pp.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& pg = pp.mGraphicsDesc;
+                    pg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    pg.mRenderTargetCount = 1;
+                    pg.pColorFormats = &g_live.sceneColorFormat;
+                    pg.mSampleCount = (SampleCount)g_live.sampleCount;
+                    pg.mSampleQuality = 0;
+                    pg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    pg.pDepthState = &pds;
+                    pg.pVertexLayout = &pvl;
+                    pg.pRasterizerState = &prs;
+                    pg.pShaderProgram = g_live.pPgiProbeShader;
+                    addPipeline(R, &pp, &g_live.pPgiProbePipeSolid);
+                    DepthStateDesc pdw = {};
+                    pdw.mDepthTest = true; pdw.mDepthWrite = false; pdw.mDepthFunc = CMP_LESS;
+                    RasterizerStateDesc prw = prs; prw.mFillMode = FILL_MODE_WIREFRAME;
+                    pg.pDepthState = &pdw;
+                    pg.pRasterizerState = &prw;
+                    addPipeline(R, &pp, &g_live.pPgiProbePipeWire);
+                    BufferLoadDesc pvb = {};
+                    pvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                    pvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    pvb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    pvb.mDesc.mSize = (uint64_t)std::max(kPgiN, kPgiPoolCap) * 8 * sizeof(float);   // columns or the ball pool
+                    pvb.mDesc.pName = "pgiProbeVB";
+                    pvb.ppBuffer = &g_live.pPgiProbeVB;
+                    addFrameBuf(&pvb);
+                    waitForAllResourceLoads();
+                }
+                if (!g_live.pPgiProbePipeSolid || !g_live.pPgiProbePipeWire || !g_live.pPgiProbeVB) {
+                    std::printf("[forge] probe-GI debug view unavailable (pgiprobe shader/pipeline)\n");
+                }
+                ShaderLoadDesc pvd = {};
+                pvd.mVert.pFileName = "pgiview.vert";
+                pvd.mFrag.pFileName = "pgiview.frag";
+                addShader(R, &pvd, &g_live.pPgiViewShader);
+                if (g_live.pPgiViewShader) {
+                    VertexLayout vvl = {};
+                    vvl.mBindingCount = 1;
+                    vvl.mBindings[0].mStride = 12 * sizeof(float);
+                    vvl.mBindings[0].mRate = VERTEX_BINDING_RATE_INSTANCE;
+                    vvl.mAttribCount = 3;
+                    vvl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD1;
+                    vvl.mAttribs[2].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                    vvl.mAttribs[2].mBinding = 0; vvl.mAttribs[2].mLocation = 2; vvl.mAttribs[2].mOffset = 8 * sizeof(float);
+                    vvl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+                    vvl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                    vvl.mAttribs[0].mBinding = 0; vvl.mAttribs[0].mLocation = 0; vvl.mAttribs[0].mOffset = 0;
+                    vvl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD0;
+                    vvl.mAttribs[1].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                    vvl.mAttribs[1].mBinding = 0; vvl.mAttribs[1].mLocation = 1; vvl.mAttribs[1].mOffset = 4 * sizeof(float);
+                    DepthStateDesc vds = {};
+                    vds.mDepthTest = false; vds.mDepthWrite = false;
+                    RasterizerStateDesc vrs = {};
+                    vrs.mCullMode = CULL_MODE_NONE;
+                    PipelineDesc vp = {};
+                    vp.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& vg = vp.mGraphicsDesc;
+                    vg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    vg.mRenderTargetCount = 1;
+                    vg.pColorFormats = &g_live.sceneColorFormat;
+                    vg.mSampleCount = (SampleCount)g_live.sampleCount;
+                    vg.mSampleQuality = 0;
+                    vg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    vg.pDepthState = &vds;
+                    vg.pVertexLayout = &vvl;
+                    vg.pRasterizerState = &vrs;
+                    vg.pShaderProgram = g_live.pPgiViewShader;
+                    addPipeline(R, &vp, &g_live.pPgiViewPipe);
+                    BufferLoadDesc vvb = {};
+                    vvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                    vvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    vvb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    vvb.mDesc.mSize = 2 * 12 * sizeof(float);   // the column's two probes
+                    vvb.mDesc.pName = "pgiViewVB";
+                    vvb.ppBuffer = &g_live.pPgiViewVB;
+                    addFrameBuf(&vvb);
+                    waitForAllResourceLoads();
+                }
+            }
             if (!g_live.pDebugLineVB) {
                 return false;
             }
@@ -14659,6 +14932,18 @@ namespace {
                     pd.mType = PIPELINE_TYPE_COMPUTE;
                     pd.mComputeDesc.pShaderProgram = g_live.pReflectMipShader;
                     addPipeline(R, &pd, &g_live.pReflectMipPipeline);
+                }
+                // PROBE GI: the capture's own resolve (sample 0's class only), MSAA only.
+                if (g_live.sampleCount > 1) {
+                    ShaderLoadDesc rpd = {};
+                    rpd.mComp.pFileName = "reflectmipfirst_pgi_sc4.comp";
+                    addShader(R, &rpd, &g_live.pReflectMipShaderPgi);
+                    if (g_live.pReflectMipShaderPgi) {
+                        PipelineDesc pd = {};
+                        pd.mType = PIPELINE_TYPE_COMPUTE;
+                        pd.mComputeDesc.pShaderProgram = g_live.pReflectMipShaderPgi;
+                        addPipeline(R, &pd, &g_live.pReflectMipPipelinePgi);
+                    }
                 }
                 // One set instance per mip, verbatim pHizSet: index 0 = first pass (pReflectColor SRV
                 // -> mip 0), index i = reduce mip i-1 -> i (mUAVMipSlice picks the per-mip UAV).
@@ -21629,6 +21914,37 @@ namespace {
     // buys 58 -> 65 codes of sky spread while clipping goes 0.57% -> 60.94%. Wrong trade, measured.
     float g_skyCloudAlbedo = 0.50f;
 
+    // S3.5b SKY HAZE (tasks/forge-atmosphere.md): a haze layer over the drawn sky and the cloud layer,
+    // L = L_sky*T + L_haze*(1-T), T = exp(-tauZ * exp(-h/H) * airmass(elevation)). Thin overhead, so
+    // the sky texture shows there; saturated at the horizon at the CLOUD layer's level ("the cloud
+    // texture is the expected exposure"), hue from the medium's horizon. Below the eye plane = the
+    // horizon's value, so the band between the eye plane and the world's edge (which widens as the
+    // camera climbs) is never brighter than the clouds. skyHaze 0 = the pre-haze image, bit for bit.
+    float g_skyHaze      = 0.15f;    // tauZ: vertical optical depth from the ground (0 = off), x g_skyHazeW
+    float g_skyHazeH     = 1200.0f;  // scale height, metres of the medium
+    float g_skyHazeM     = 25.0f;    // horizon air mass
+    // ...PER WEATHER, x tauZ, blended across MW's transition. *"haze is not for clear and cloudy weathers
+    // at full strength. it is for the other weathers with the disparity."* (user, 2026-10-14). MW order:
+    // Clear Cloudy Foggy Overcast Rain Thunder Ash Blight Snow Blizzard.
+    // Measured horizon(0-6 deg) / clouds(20-28 deg), off, ibokarthgad2 @2000, 40 deg off the sun:
+    // Clear 1.97, Cloudy 1.75, Foggy 2.00, Overcast 1.75, Rain 1.83, Thunder 2.12, Ash 0.33,
+    // Blight 0.55, Snow 1.68, Blizzard 1.34. Ash and Blight have NO disparity (their horizon is the
+    // darker one) (0 there until S3.5c, below). At share 1: Overcast 1.13, Rain 1.20, Snow 1.12, Blizzard 1.04,
+    // Thunder 1.43 (-> 1.5), Foggy 0.83 (overshoots -> 0.75); Clear 1.51 / Cloudy 1.32 at 0.25.
+    // S3.5c: Ash and Blight take the haze too now that it is in MW's hue: *"blight is no different
+    // from red skies that happen during wildfires."* Their horizon is darker than the clouds, so the
+    // cap leaves the level alone and only the hue moves.
+    float g_skyHazeW[10] = { 0.25f, 0.25f, 0.75f, 1.0f, 1.0f, 1.5f, 1.0f, 1.0f, 1.0f, 1.0f };
+    // S3.5d: THE CLOUD LAYER INSIDE THE PHYSICAL SKY. *"assign a virtual depth to cloud layer, and
+    // apply the sky ozone etc on it."* Each cloud texel is where its ray meets the deck shell; the air
+    // in front of it (transmittance + in-scatter, skyradiance.h.fsl atmosCloudAerial) applies.
+    float g_skyCloudAP     = 1.0f;     // share, 0 = off (the pre-S3.5d layer)
+    float g_skyCloudApMinM = 300.0f;   // the shell never sits closer than this above the eye (m)
+    float g_skyHazeMwHue = 1.0f;     // S3.5c: share of MW's authored fog HUE in the haze (0 = the medium's)
+    float g_skyHazeLevel = 1.0f;     // haze radiance x the cloud anchor (texture white = 1). 1.0 put the
+                                     // horizon ON the clouds at ibokarthgad2 (0.74-1.03 vs 0.73-0.83 p90,
+                                     // 40 deg off the sun); 0.6 left it darker than them.
+
     // ...and how much of that anchor's DIRECT BEAM is taken at the deck's own altitude, per channel,
     // instead of at the ground as one grey luma (S2j; sky.frag's CLOUD branch). At sunset the ground's
     // beam dies first while a deck 1-2 km up is still in it, reddened; E_total/pi dimmed the clouds
@@ -24093,6 +24409,7 @@ namespace {
             { "dlOwnOff",           &g_dlOwnOff           },
             { "debugForce",         &g_debugForce         },
             { "sunShadowStrength",  &g_sunShadowStrength  },
+            { "sunStaticsCullNone", &g_sunStaticsCullNone },
             { "dumpBurst",          &g_dumpBurst          },
             { "dumpBurstX",         &g_dumpBurstX         },
             { "dumpBurstY",         &g_dumpBurstY         },
@@ -24111,6 +24428,23 @@ namespace {
             { "atmosMs",            &g_atmosMs            },
             { "atmosDeckDown",      &g_atmosDeckDown      },
             { "skyCloudAlbedo",     &g_skyCloudAlbedo     },
+            { "skyHaze",            &g_skyHaze            },   // S3.5b: tau at the zenith, 0 = off
+            { "skyHazeH",           &g_skyHazeH           },
+            { "skyHazeM",           &g_skyHazeM           },
+            { "skyHazeLevel",       &g_skyHazeLevel       },
+            { "skyHazeMwHue",       &g_skyHazeMwHue       },   // S3.5c: MW fog hue share
+            { "skyCloudAP",         &g_skyCloudAP         },   // S3.5d: cloud aerial perspective
+            { "skyCloudApMinM",     &g_skyCloudApMinM     },
+            { "skyHazeClear",       &g_skyHazeW[0]        },   // per-weather share of skyHaze
+            { "skyHazeCloudy",      &g_skyHazeW[1]        },
+            { "skyHazeFoggy",       &g_skyHazeW[2]        },
+            { "skyHazeOvercast",    &g_skyHazeW[3]        },
+            { "skyHazeRain",        &g_skyHazeW[4]        },
+            { "skyHazeThunder",     &g_skyHazeW[5]        },
+            { "skyHazeAsh",         &g_skyHazeW[6]        },
+            { "skyHazeBlight",      &g_skyHazeW[7]        },
+            { "skyHazeSnow",        &g_skyHazeW[8]        },
+            { "skyHazeBlizzard",    &g_skyHazeW[9]        },
             { "skyCloudBeam",       &g_skyCloudBeam       },
             // ⚠ THE AgX LOOK, ON THE HARNESS. Four panel sliders that the minimized rig could not
             // reach, so "what does Punchy actually do to the sky" was a question no unattended run
@@ -24142,6 +24476,7 @@ namespace {
             { "probeOracleGrid",    &g_probeOracleGrid    },
             { "probeOracleLift",    &g_probeOracleLift    },
             { "probeOracleModes",   &g_probeOracleModes   },
+            { "probeOracleAtProbes", &g_probeOracleAtProbes },
             { "svmDirs",            &g_svmDirs            },
             { "svmRes",             &g_svmRes             },
             { "svmExtent",          &g_svmExtent          },
@@ -24394,6 +24729,38 @@ namespace {
             { "pgiEvery",            &g_pgiEvery            },
             { "pgiBatch",            &g_pgiBatch            },
             { "pgiSteal",            &g_pgiSteal            },
+            { "pgiLead",             &g_pgiLead             },
+            { "pgiCapReach",         &g_pgiCapReach         },
+            { "pgiCapMinR",          &g_pgiCapMinR          },
+            { "pgiCapNear",          &g_pgiCapNear          },
+            { "pgiBallsCam",         &g_pgiBallsCam         },
+            { "pgiBallsSun",         &g_pgiBallsSun         },
+            { "pgiPool",             &g_pgiPool             },
+            { "pgiPoolR0",           &g_pgiPoolR0           },
+            { "pgiPoolRk",           &g_pgiPoolRk           },
+            { "pgiBallSpread",       &g_pgiBallSpread       },
+            { "pgiWorld",            &g_pgiWorld            },
+            { "pgiWorldLift",        &g_pgiWorldLift        },
+            { "pgiWorldMove",        &g_pgiWorldMove        },
+            { "pgiWorldEvery",       &g_pgiWorldEvery       },
+            { "pgiLiveSky",          &g_pgiLiveSky          },
+            { "pgiFillOld",          &g_pgiFillOld          },
+            { "pgiViewExp",          &g_pgiViewExp          },
+            { "pgiSunGain",          &g_pgiSunGain          },
+            { "pgiSunMarch",         &g_pgiSunMarch         },
+            { "pgiSkyLive",          &g_pgiSkyLive          },
+            { "pgiBalls",            &g_pgiBalls            },
+            { "pgiVolTau",           &g_pgiVolTau           },
+            { "pgiVolPeriod",        &g_pgiVolPeriod        },
+            { "pgiKernK",            &g_pgiKernK            },
+            { "pgiVolFull",          &g_pgiVolFull          },
+            { "pgiVoxel",            &g_pgiVoxel            },
+            { "pgiFade",             &g_pgiFade             },
+            { "pgiFaceRank",         &g_pgiFaceRank         },
+            { "pgiBounce",           &g_pgiBounce           },
+            { "pgiDebug",            &g_pgiDebug            },
+            { "giTint",              &g_giTint              },   // GI bounce inspection share
+            { "giTintLevel",         &g_giTintLevel         },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -26909,6 +27276,21 @@ namespace {
           // reference). Lower it if the silver linings read hot; it is not a dimmer, it is an albedo.
           t.sliderF("Sky: CLOUD albedo (anchors the layer to E_total/pi; hb prints albedo/q)",
                     &g_skyCloudAlbedo, 0.0f, 1.5f, 0.02f, "%.2f");
+          // S3.5b: the haze over the sky + clouds, saturating at the cloud level at the horizon.
+          t.sliderF("Sky: HAZE tau at zenith (0 = off)", &g_skyHaze, 0.0f, 1.0f, 0.01f, "%.2f");
+          t.sliderF("Sky: HAZE scale height (m)", &g_skyHazeH, 100.0f, 5000.0f, 50.0f, "%.0f");
+          t.sliderF("Sky: HAZE horizon air mass", &g_skyHazeM, 2.0f, 60.0f, 1.0f, "%.0f");
+          t.sliderF("Sky: HAZE level (x cloud anchor)", &g_skyHazeLevel, 0.1f, 2.0f, 0.02f, "%.2f");
+          t.sliderF("Sky: HAZE MW fog hue share (0 = medium)", &g_skyHazeMwHue, 0.0f, 1.0f, 0.05f, "%.2f");
+          t.sliderF("Sky: CLOUD aerial perspective (0 = off)", &g_skyCloudAP, 0.0f, 1.0f, 0.05f, "%.2f");
+          t.sliderF("Sky: CLOUD deck min height above eye (m)", &g_skyCloudApMinM, 10.0f, 3000.0f, 10.0f, "%.0f");
+          {
+              static const char* kHazeW[10] = { "Sky: HAZE share Clear", "Sky: HAZE share Cloudy",
+                  "Sky: HAZE share Foggy", "Sky: HAZE share Overcast", "Sky: HAZE share Rain",
+                  "Sky: HAZE share Thunder", "Sky: HAZE share Ash", "Sky: HAZE share Blight",
+                  "Sky: HAZE share Snow", "Sky: HAZE share Blizzard" };
+              for (int i = 0; i < 10; ++i) { t.sliderF(kHazeW[i], &g_skyHazeW[i], 0.0f, 2.0f, 0.05f, "%.2f"); }
+          }
           // S2j: the anchor's direct beam, taken at the DECK's altitude per channel (1) or at the
           // ground as a grey luma (0 = the pre-S2j anchor, bit for bit). The sunset A/B.
           t.sliderF("Sky: CLOUD sunset beam (1 = lit at the deck's altitude, 0 = ground E_total)",
@@ -27371,9 +27753,31 @@ namespace {
           t.sliderF("PROBE GI (1 = the probe field replaces the ambient where built; 0 = off)", &g_pgiOn, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI gain", &g_pgiGain, 0.0f, 3.0f, 0.05f);
           t.sliderF("Probe GI: probe lift above the cell's low/high top (u)", &g_pgiLift, 8.0f, 256.0f, 8.0f, "%.0f");
+          t.sliderF("Probe GI: BALL placement + volume (1) / columns (0)", &g_pgiBalls, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: WORLD probe share in the old model (0 = sky SH)", &g_pgiWorld, 0.0f, 1.0f, 1.0f, "%.2f");
+          t.sliderF("Probe GI: world probe lift above camera / column top (u)", &g_pgiWorldLift, 0.0f, 2048.0f, 384.0f, "%.0f");
+          t.sliderF("Probe GI: world probe re-shot after this move (u)", &g_pgiWorldMove, 64.0f, 8192.0f, 1024.0f, "%.0f");
+          t.sliderF("Probe GI: world probe re-shot in place every (s) - every probe's sky", &g_pgiWorldEvery, 1.0f, 120.0f, 10.0f, "%.0f");
+          t.sliderF("Probe GI: LIVE sky - probes take the world probe's sky (0 = own capture)", &g_pgiLiveSky, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: missing faces - own captured mean (0) / old model (1)", &g_pgiFillOld, 0.0f, 1.0f, 0.0f, "%.0f");
+          t.sliderF("Probe GI: preview strips' FIXED exposure (unmetered)", &g_pgiViewExp, 0.01f, 64.0f, 0.5f, "%.2f");
+          t.sliderF("Probe GI: probes' sky from the atmosphere sky-view (1) / captured (0)", &g_pgiSkyLive, 0.0f, 1.0f, 0.0f, "%.0f");
+          t.sliderF("Probe GI balls: merge radius at the camera (u)", &g_pgiPoolR0, 32.0f, 512.0f, 16.0f, "%.0f");
+          t.sliderF("Probe GI balls: merge radius growth per u of distance", &g_pgiPoolRk, 0.0f, 1.0f, 0.05f, "%.2f");
+          t.sliderF("Probe GI balls: camera balls per frame", &g_pgiBallsCam, 0.0f, 256.0f, 16.0f, "%.0f");
+          t.sliderF("Probe GI balls: sun balls per frame", &g_pgiBallsSun, 0.0f, 256.0f, 16.0f, "%.0f");
+          t.sliderF("Probe GI volume: temporal smoothing (s)", &g_pgiVolTau, 0.0f, 4.0f, 0.1f, "%.1f");
+          t.sliderF("Probe GI volume: splat kernel (x the merge radius)", &g_pgiKernK, 0.5f, 6.0f, 0.25f, "%.2f");
           t.sliderF("Probe GI: capture every Nth dry frame", &g_pgiEvery, 1.0f, 8.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI: probes relit per frame", &g_pgiBatch, 8.0f, 1152.0f, 8.0f, "%.0f");
           t.sliderF("Probe GI: water in view -> steal 1 mirror frame in N (0 = never)", &g_pgiSteal, 0.0f, 16.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: capture look-ahead (s of camera motion)", &g_pgiLead, 0.0f, 4.0f, 0.25f, "%.2f");
+          t.sliderF("Probe GI: a probe's change (new face) blends in over (s)", &g_pgiFade, 0.0f, 4.0f, 0.25f, "%.2f");
+          t.sliderF("Probe GI: face rank cost (columns; 0 = finish near probes first)", &g_pgiFaceRank, 0.0f, 4.0f, 0.25f, "%.2f");
+          t.sliderF("Probe GI: multi-bounce (hits lit by the probe's own field; 0 = sky only)", &g_pgiBounce, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI DEBUG (bits: 1 probe spheres, 2 receiver probe-share tint, 4 what the near probe sees, 8 peek full-res, 16 peek distance, 32 ball pool, 64 near probes LIT)", &g_pgiDebug, 0.0f, 127.0f, 1.0f, "%.0f");
+          t.sliderF("GI DEBUG: share of objects painted a pure colour (bounce inspection, 0 = off)", &g_giTint, 0.0f, 1.0f, 0.01f, "%.2f");
+          t.sliderF("GI DEBUG: painted albedo", &g_giTintLevel, 0.0f, 1.0f, 0.05f, "%.2f");
           t.checkbox("Weather surface state (wet / snow from MW weather)", &g_weatherSurface);
           t.sliderF("Weather DEBUG wetness (-1 = live)", &g_weatherDebugWet, -1.0f, 1.0f, 0.05f);
           t.sliderF("Weather DEBUG snow (-1 = live)", &g_weatherDebugSnow, -1.0f, 1.0f, 0.05f);
@@ -30830,7 +31234,28 @@ namespace {
                 std::fclose(pf);
             }
             const bool fromFile = !px.empty();
-            if (!fromFile) {
+            g_probeSiteSlots.clear();
+            if (g_probeOracleAtProbes > 0.5f && g_pgi.ballMode) {
+                // AT THE PROBES: the pool's probes nearest the camera, each at its own position.
+                std::vector<std::pair<float, int>> byD;
+                for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                    const PgiBall& b = g_pgi.pool[k];
+                    if (b.slot < 0 || b.faces != 0x3Fu) { continue; }
+                    const float qx = b.p[0] - g_probeSelEye[0], qy = b.p[1] - g_probeSelEye[1], qz = b.p[2] - g_probeSelEye[2];
+                    byD.push_back({ qx * qx + qy * qy + qz * qz, k });
+                }
+                std::sort(byD.begin(), byD.end());
+                const size_t want = std::min(byD.size(), (size_t)std::clamp(g_probeOracleAtProbes, 1.0f, 128.0f));
+                for (size_t i = 0; i < want; ++i) {
+                    const PgiBall& b = g_pgi.pool[byD[i].second];
+                    ProbeSite site = {};
+                    for (int k = 0; k < 3; ++k) { site.pos[k] = b.p[k]; }
+                    site.n[2] = 1.0f;
+                    g_probeSites.push_back(site);
+                    g_probeSiteSlots.push_back(b.slot);
+                }
+                px.clear();
+            } else if (!fromFile) {
                 const int nx = std::clamp((int)(g_probeOracleGrid + 0.5f), 1, 32);
                 const int ny = std::max(1, (int)((float)nx * (float)H / (float)W + 0.5f));
                 for (int j = 0; j < ny; ++j) {
@@ -31110,6 +31535,37 @@ namespace {
                          (double)g_probeSun[0], (double)g_probeSun[1], (double)g_probeSun[2],
                          (double)g_probeOracleLift);
             std::fclose(jf);
+        }
+        // AT-PROBES sidecar: per site u32 slot, then the probe's 7 stored planes + meta (32 f32).
+        if (!g_probeSiteSlots.empty() && g_pgi.shRb && g_pgi.shRb->pCpuMappedAddress) {
+            char pgiPath[MAX_PATH] = {};
+            std::snprintf(pgiPath, sizeof(pgiPath), "hdrdump\\probeoracle_%04u_pgi.bin", n);
+            if (FILE* pf = std::fopen(pgiPath, "wb")) {
+                const uint8_t* lane = (const uint8_t*)g_pgi.shRb->pCpuMappedAddress + (uint64_t)g_readSlot * kPgiShLane;
+                auto texel = [&](uint32_t slice, uint32_t x, uint32_t y, float out[4]) {
+                    const uint16_t* h = (const uint16_t*)(lane + slice * kPgiShSlice + y * kPgiShRowPitch + x * 8u);
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t v = h[c], e = (v >> 10) & 31u, m = v & 1023u;
+                        float f = (e == 0) ? std::ldexp((float)m, -24) : (e == 31) ? 65504.0f : std::ldexp((float)(m | 1024u), (int)e - 25);
+                        out[c] = (v & 0x8000u) ? -f : f;
+                    }
+                };
+                const uint32_t cnt = (uint32_t)g_probeSiteSlots.size();
+                std::fwrite("PGISH001", 1, 8, pf);
+                std::fwrite(&cnt, 4, 1, pf);
+                for (int slot : g_probeSiteSlots) {
+                    const uint32_t layer = (uint32_t)slot / (kPgiG * kPgiG), s2 = (uint32_t)slot % (kPgiG * kPgiG);
+                    const uint32_t cx = s2 % kPgiG, cy = s2 / kPgiG;
+                    float v[32];
+                    for (uint32_t k = 0; k < 7u; ++k) { texel(layer * 7u + k, cx, cy, v + k * 4u); }
+                    texel(14u + layer, cx, cy, v + 28);
+                    const uint32_t us = (uint32_t)slot;
+                    std::fwrite(&us, 4, 1, pf);
+                    std::fwrite(v, 4, 32, pf);
+                }
+                std::fclose(pf);
+                LOG::logline(">> [probeoracle] %s: %u probes' stored SH", pgiPath, cnt);
+            }
         }
         LOG::logline(">> [probeoracle] %s %s (%zu sites x 6 faces at %u², %u mode(s), sun drift %.2f deg)", binPath,
                      ok ? "written" : "WRITE FAILED", g_probeSites.size(), kProbeFaceRes, g_probeModes, (double)g_probeSunDrift);
@@ -33564,6 +34020,35 @@ void destroyHostWindow(Renderer* R);
             p.cloudDeckRadiusM = Atmosphere::kGroundRadiusM + baseM;
         }
         p.cloudOverZenith = (p.qZenith > 1.0e-9) ? ((double)g_skyCloudAlbedo / p.qZenith) : 0.0;
+        {
+            // The weather's share of the haze (g_skyHazeW), lerped cur -> next by MW's transition.
+            float wk = 1.0f;
+            const Atmosphere::Live& lv = Atmosphere::live();
+            if (lv.valid) {
+                const int c = std::min(std::max(lv.cur, 0), 9), n = std::min(std::max(lv.next, 0), 9);
+                const float t = std::min(std::max(lv.transition, 0.0f), 1.0f);
+                wk = g_skyHazeW[c] + (g_skyHazeW[n] - g_skyHazeW[c]) * t;
+            }
+            p.hazeTauZ = std::max(0.0f, g_skyHaze * wk);
+        }
+        p.hazeH     = std::max(10.0f, g_skyHazeH);
+        p.hazeM     = std::max(1.0f, g_skyHazeM);
+        p.hazeLevel = std::max(0.0f, g_skyHazeLevel);
+        p.cloudAP     = std::min(std::max(g_skyCloudAP, 0.0f), 1.0f);
+        p.cloudApMinM = std::max(1.0f, g_skyCloudApMinM);
+        {
+            // S3.5c: the haze's HUE from MW's own authored fog colour (already blended for the hour
+            // and the transition on the client). A display code, so linearised, then normalised to
+            // luma 1: only its chromaticity is used, never its level. No fog row (or a black one,
+            // whose hue is undefined) falls back to the medium's hue.
+            const Atmosphere::Live& lv = Atmosphere::live();
+            float lin[3] = { 0.0f, 0.0f, 0.0f };
+            if (lv.valid) { for (int c = 0; c < 3; ++c) { lin[c] = srgbToLinearF(std::min(std::max(lv.fogColRef[c], 0.0f), 1.0f)); } }
+            const float y = 0.2126f * lin[0] + 0.7152f * lin[1] + 0.0722f * lin[2];
+            const bool ok = y > 1.0e-5f;
+            for (int c = 0; c < 3; ++c) { p.hazeHue[c] = ok ? lin[c] / y : 1.0f; }
+            p.hazeHueMix = ok ? std::min(std::max(g_skyHazeMwHue, 0.0f), 1.0f) : 0.0f;
+        }
         p.active = true;
         g_skyPhys = p;
         g_skyPhysLast    = p;   // the door bridge's copy (see its declaration)
@@ -34494,7 +34979,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseCullCount, "cull count" }, { kGpuPhaseCullScatter, "cull scatter" },
             { kGpuPhaseSkySnap, "sky snapshot" }, { kGpuPhaseWaterRefr, "water refract copy" },
             { kGpuPhaseStaticsDepth, "statics depth" },
-            { kGpuPhaseSunBlur, "sun blur" },
+            { kGpuPhaseSunBlur, "sun blur" }, { kGpuPhasePgi, "pgi" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -38716,6 +39201,7 @@ void destroyHostWindow(Renderer* R);
                     { kGpuPhaseColorFP, "fp" },    { kGpuPhaseApl, "apl" },
                     { kGpuPhaseResolveFilter, "rfilter" }, { kGpuPhaseMotionBlur, "mb" },
                     { kGpuPhaseBloom, "bloom" },   { kGpuPhaseResolve, "resolve" },
+                    { kGpuPhasePgi, "pgi" },
                 };
                 const uint32_t nNamed = (uint32_t)(sizeof(kNamed) / sizeof(kNamed[0]));
                 Spread sp[sizeof(kNamed) / sizeof(kNamed[0])];
@@ -42727,7 +43213,8 @@ void destroyHostWindow(Renderer* R);
                 g_capFace.active = true;
                 g_capFace.pos[0] = s.pos[0]; g_capFace.pos[1] = s.pos[1]; g_capFace.pos[2] = s.pos[2];
                 g_capFace.face = probeFaceIndex(g_probeJob) % 6u;
-                g_capFace.dbg = (m == 0u) ? 0.0f : (float)(4u + m);   // 5 albedo, 6 litTerm, 7 ambient
+                // 64 albedo + the back-face flag (skyamb.h.fsl PGI_CAPTURE_DBG), 6 litTerm, 7 ambient
+                g_capFace.dbg = (m == 0u) ? 0.0f : (m == 1u) ? 64.0f : (float)(4u + m);
                 g_capFace.dbgTerrain = g_probeModes > 1u;
             }
             {
@@ -44031,8 +44518,10 @@ void destroyHostWindow(Renderer* R);
             // mirrored ray direction — i.e. exactly the reflected ray the water wants. The main
             // view's matrix would have returned the main view's sky in the water, which is what
             // gSkyView exists to prevent (skyview.h.fsl) and what the mirror test in the plan checks.
-            // (Not from a probe-GI capture: a stolen frame's water still reads the last real mirror.)
-            if (!(probeFace && g_capFace.pgi)) {
+            // A probe-GI capture publishes its own (it draws the sky), a STOLEN one too: only this
+            // pass's own sky draws read the mirror's gSkyView, never the water, and the next real
+            // mirror frame republishes it.
+            {
                 float reflInvVP[16];
                 if (!invert4x4(mirrorVP, reflInvVP)) {
                     for (int k = 0; k < 16; ++k) { reflInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
@@ -44126,8 +44615,11 @@ void destroyHostWindow(Renderer* R);
             // underside of the surface reflects the SEABED, never the sky.
             // A probe-GI capture gathers albedo + depth only: its sky texels are the EMPTY depth, so
             // the sky draws would cost time and change nothing.
-            const bool pgiCap = probeFace && g_capFace.pgi;
-            const bool drawReflSkyHw = g_skyPhys.active && g_skyViewPub[1] && !underwaterR && !pgiCap
+            // Probe-GI captures draw the SKY too: its real radiance is what a probe's sky texels hold.
+            // STOLEN ones as well (2026-10-14): their viewport and scissor are the capRes corner, which
+            // the steal only takes when the last real mirror left it unsampled — and without it, where
+            // water is always in view EVERY probe fell to the ambCol stand-in (~10x the sky at dusk).
+            const bool drawReflSkyHw = g_skyPhys.active && g_skyViewPub[1] && !underwaterR
                                     && g_live.pSkyHwPipeline && g_live.pPerBatchSetReflectSky;
             if (drawReflSkyHw) {
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (mirror)");
@@ -44152,7 +44644,7 @@ void destroyHostWindow(Renderer* R);
             // the moons in it as much as the sky above does. Same per-item skip, same skyElemPhys
             // narrowing, so the two views cannot disagree about what the sky contains.
             const bool skyElemPhysR = drawReflSkyHw && g_live.sceneReferred && g_live.linearScene;
-            const bool drawReflSky = g_drawSky && !pgiCap
+            const bool drawReflSky = g_drawSky
                                   && skyBlob && skyCount && skyBytes && !underwaterR
                                   && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
             if (drawReflSky) {
@@ -44169,6 +44661,10 @@ void destroyHostWindow(Renderer* R);
                 for (uint32_t k = 0; k < nSkyR; ++k) {
                     const IPC::SkyDrawWire& it = skyItemsR[k];
                     if (drawReflSkyHw && it.skyClass == IPC::kSkyClassDome) { continue; }
+                    // NO SUN in a probe capture: the relight adds the sun as direct light, and the disc
+                    // (physically radiant) averaged into an 11-degree G-buffer texel next to the 5-degree
+                    // exclusion cone made the probes' sky 2.3-2.6x the oracle's at dusk (2026-10-14).
+                    if (probeFace && g_capFace.pgi && it.skyClass == IPC::kSkyClassSun) { continue; }
                     const uint32_t cls = skyElemPhysR ? it.skyClass : (uint32_t)IPC::kSkyClassOther;
                     const uint32_t slot = it.slot;
                     if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
@@ -44195,6 +44691,16 @@ void destroyHostWindow(Renderer* R);
                         w[2]  = -w[2];    // +X basis z
                         w[6]  = -w[6];    // +Y basis z
                         w[10] = -w[10];   // +Z basis z
+                    }
+                    // A CAPTURE FACE sees MW's dome from the probe, but the dome is a finite mesh centred
+                    // on the CAMERA: off-centre, the clouds slid and zoomed with the camera's moves ("the
+                    // sky is zooming in and out with camera z and move with camera", user 2026-10-12).
+                    // Recentred on the probe, the probe sees the sky the camera does.
+                    if (probeFace) {
+                        float* w = (float*)(dst + (size_t)idx * 64);
+                        w[12] += g_capFace.pos[0] - fcbvR[56];
+                        w[13] += g_capFace.pos[1] - fcbvR[57];
+                        w[14] += g_capFace.pos[2] - fcbvR[58];
                     }
                     uint32_t* inst = (uint32_t*)fbw(g_live.pReflectSkyInstanceBuf);
                     inst[idx * kStaticInstU32 + 0] = idx;
@@ -44264,7 +44770,11 @@ void destroyHostWindow(Renderer* R);
             // requires distant land — an interior has none, and an interior is the case that needs
             // this most. Drawn AFTER the DL so the near set's depth writes win where they overlap,
             // exactly as in the main colour pass.
-            if (g_reflFrameReady && g_drawReflectNear) {
+            // NOT in a probe-GI capture: MW's near set is only what MW's CAMERA frustum holds, so a
+            // probe saw more of it as the camera turned ("rotating camera was updating the probes with
+            // new statics", user 2026-10-12). The distant statics reach the eye in a capture and carry
+            // everything a probe needs; small clutter does not belong in probes (user).
+            if (g_reflFrameReady && g_drawReflectNear && !(probeFace && g_capFace.pgi && g_pgiCapNear < 0.5f)) {
                 ReflNearInput ni = {};
                 ni.groupCount   = &groupCount[0][0][0];
                 ni.groupOff     = &groupOff[0][0][0];
@@ -44328,12 +44838,20 @@ void destroyHostWindow(Renderer* R);
                     tb[1].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
                 }
-                cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipelineFirst);
+                // A PROBE-GI capture needs only its corner of mip 0 (+ resolved depth): the gather
+                // reads nothing else, a dry frame's water reads no mirror at all, and a stolen frame's
+                // water reads the pyramid the previous frame built — which the corner never reaches.
+                // So the first pass covers the corner and the reductions are skipped.
+                const bool     pgiCorner = probeFace && g_capFace.pgi && g_capFace.res;
+                const uint32_t firstN    = pgiCorner ? g_capFace.res : reflectSize();
+                // Its resolve keeps colour and depth on one surface (reflectmip.comp.fsl REFLMIP_PGI).
+                cmdBindPipeline(g_live.pCmd, (pgiCorner && g_live.pReflectMipPipelinePgi) ? g_live.pReflectMipPipelinePgi
+                                                                                          : g_live.pReflectMipPipelineFirst);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflectMipSet);
-                cmdDispatch(g_live.pCmd, (reflectSize() + 7u) / 8u, (reflectSize() + 7u) / 8u, 1);
+                cmdDispatch(g_live.pCmd, (firstN + 7u) / 8u, (firstN + 7u) / 8u, 1);
                 cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipeline);
                 uint32_t mw = reflectSize();
-                for (uint32_t m = 1; m < kReflectMipCount; ++m) {
+                for (uint32_t m = 1; m < (pgiCorner ? 1u : kReflectMipCount); ++m) {
                     TextureBarrier tb = {};
                     tb.pTexture = g_live.pReflectMips;
                     tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -45127,7 +45645,10 @@ void destroyHostWindow(Renderer* R);
         //  Spheres (g_debugRangeSpheres): a 3-ring cage per ACTIVE shadow slot at its range volume —
         //    inner = g_shadowRangeK·radius (mask test range), dimmer outer = 2·radius (atlas far).
         //    Same debugIdColor(lightId) as the light's box so the two colour-match.
-        if ((g_debugLightBoxes || g_debugRangeSpheres) && g_live.pDebugLinePipeline
+        const bool pgiCages = ((int)g_pgiDebug & 33) && g_pgi.ready && g_pgi.active;   // 1 columns, 32 the ball pool
+        const bool pgiPeek  = ((int)g_pgiDebug & 8) && g_pgi.ready && g_pgi.active && g_pgi.peekInSR;
+        const bool pgiView  = (((int)g_pgiDebug & (4 | 64)) && g_pgi.ready && g_pgi.active && g_pgi.gbufInSR) || pgiPeek;
+        if ((g_debugLightBoxes || g_debugRangeSpheres || pgiCages || pgiView) && g_live.pDebugLinePipeline
             && g_live.pDebugLineVB) {
             struct DbgV { float p[3]; float c[4]; };
             DbgV* dv = (DbgV*)fbw(g_live.pDebugLineVB);
@@ -45225,6 +45746,135 @@ void destroyHostWindow(Renderer* R);
                 const uint32_t stride = 7 * sizeof(float);
                 cmdBindVertexBuffer(g_live.pCmd, 1, &g_live.pDebugLineVB, &stride, nullptr);
                 cmdDraw(g_live.pCmd, vcount, 0);
+            }
+
+            // PROBE GI probes (pgiDebug 1, user 2026-10-12: "full opaque shaded sphere probes, their
+            // lighting would inform me; occluded spheres wire; a little box on top ... to denote
+            // status"): each placed probe a sphere lit by ITS OWN SH (pgiprobe.frag), hidden parts as
+            // wireframe, a status cube above — host status here (0 none, 1 partial, 2 complete,
+            // 3 blending a change in); REJECTED (inside geometry) is read on the GPU and paints red.
+            const bool pgiBallView = (((int)g_pgiDebug & 32) || (g_pgi.ballMode && ((int)g_pgiDebug & 1)))
+                                  && g_pgi.ready && g_pgi.active;
+            if (pgiCages && g_live.pPgiProbePipeSolid && g_live.pPgiProbePipeWire && g_live.pPgiProbeVB) {
+                float* iv = (float*)fbw(g_live.pPgiProbeVB);
+                uint32_t n = 0;
+                const float S = std::max(1.0f, g_pgi.spacing);
+                // BALLS (pgiDebug 32): the pool instead of the columns, coloured by where the ball came
+                // from (status 4 + type: CYAN camera, YELLOW sun, WHITE zenith), radius by its hits.
+                if (pgiBallView) {
+                    for (const PgiBall& b : g_pgi.pool) {
+                        if (n >= kPgiPoolCap) { break; }
+                        float* e = iv + (size_t)n * 8u;
+                        e[0] = b.p[0] - g_eyeAbsShadow[0];
+                        e[1] = b.p[1] - g_eyeAbsShadow[1];
+                        e[2] = b.p[2] - g_eyeAbsShadow[2];
+                        e[3] = 10.0f + 0.1f * (float)std::min(b.hits, 100u);   // 10..20 u
+                        e[4] = b.n[0]; e[5] = b.n[1]; e[6] = b.n[2]; e[7] = 3.0f + (float)b.type;
+                        // BALL MODE: a real probe — shaded by its own SH, status cube as the columns'.
+                        if (g_pgi.ballMode && b.slot >= 0) {
+                            const uint32_t sl = (uint32_t)b.slot % (kPgiG * kPgiG);
+                            e[4] = (float)(sl % kPgiG); e[5] = (float)(sl / kPgiG); e[6] = (float)((uint32_t)b.slot / (kPgiG * kPgiG));
+                            e[7] = (b.faces == 0) ? 0.0f : (b.trans > 0.0f) ? 3.0f : b.done ? 2.0f : 1.0f;
+                        }
+                        ++n;
+                    }
+                }
+                for (uint32_t sl = 0; sl < kPgiG * kPgiG && !pgiBallView; ++sl) {
+                    const PgiColumn& c = g_pgi.col[sl];
+                    if (!c.zValid) { continue; }
+                    for (uint32_t l = 0; l < kPgiL; ++l) {
+                        const float st = (c.faces[l] == 0) ? 0.0f : (c.trans[l] > 0.0f) ? 3.0f : c.done[l] ? 2.0f : 1.0f;
+                        float* e = iv + (size_t)n * 8u;
+                        e[0] = (float)c.ix * S - g_eyeAbsShadow[0];
+                        e[1] = (float)c.iy * S - g_eyeAbsShadow[1];
+                        e[2] = c.z[l] - g_eyeAbsShadow[2];
+                        e[3] = 20.0f;
+                        e[4] = (float)(sl % kPgiG); e[5] = (float)(sl / kPgiG); e[6] = (float)l; e[7] = st;
+                        ++n;
+                    }
+                }
+                fbwRange(g_live.pPgiProbeVB, 0, (uint64_t)n * 8u * sizeof(float));
+                if (n) {
+                    const uint32_t pstride = 8 * sizeof(float);
+                    for (int pass = 0; pass < 2; ++pass) {   // hidden (wire) first, then visible (solid)
+                        cmdBindPipeline(g_live.pCmd, pass == 0 ? g_live.pPgiProbePipeWire : g_live.pPgiProbePipeSolid);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindVertexBuffer(g_live.pCmd, 1, &g_live.pPgiProbeVB, &pstride, nullptr);
+                        cmdDrawInstanced(g_live.pCmd, 612, 0, n, 0);
+                    }
+                }
+            }
+
+            // "WHAT THE PROBE SEES" (pgiDebug 4, user 2026-10-12): the six captured faces of the low
+            // probe in the camera's own column, top-left — albedo / captured sky / back faces on top,
+            // hit distance below (pgiview.frag has the legend).
+            if (pgiView && g_live.pPgiViewPipe && g_live.pPgiViewVB) {
+                const float S = std::max(1.0f, g_pgi.spacing);
+                const int ix = (int)std::floor(g_eyeAbsShadow[0] / S + 0.5f), iy = (int)std::floor(g_eyeAbsShadow[1] / S + 0.5f);
+                const int G = (int)kPgiG;
+                const int sx = ((ix % G) + G) % G, sy = ((iy % G) + G) % G;
+                const PgiColumn& c = g_pgi.col[sy * G + sx];
+                const bool peekOk = pgiPeek && (g_pgi.ballMode ? g_pgi.peekIx >= 0
+                                                               : (g_pgi.peekIx == ix && g_pgi.peekIy == iy));
+                // The two probes a row shows (storage texel x, y, layer + captured faces): the camera
+                // column's two layers, or in ball mode the two pool probes nearest the camera.
+                float rowInfo[2][4] = { { (float)sx, (float)sy, 0.0f, (float)c.faces[0] },
+                                        { (float)sx, (float)sy, 1.0f, (float)c.faces[1] } };
+                bool rowsOk = c.ix == ix && c.iy == iy && c.zValid;
+                if (g_pgi.ballMode) {
+                    int nb[2] = { -1, -1 }; float nd[2] = { 1e30f, 1e30f };
+                    for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                        const PgiBall& b = g_pgi.pool[k];
+                        if (b.slot < 0) { continue; }
+                        const float qx = b.p[0] - g_eyeAbsShadow[0], qy = b.p[1] - g_eyeAbsShadow[1], qz = b.p[2] - g_eyeAbsShadow[2];
+                        const float d = qx * qx + qy * qy + qz * qz;
+                        if (d < nd[0]) { nd[1] = nd[0]; nb[1] = nb[0]; nd[0] = d; nb[0] = k; }
+                        else if (d < nd[1]) { nd[1] = d; nb[1] = k; }
+                    }
+                    rowsOk = nb[0] >= 0 && nb[1] >= 0;
+                    for (int r = 0; r < 2 && rowsOk; ++r) {
+                        const PgiBall& b = g_pgi.pool[nb[r]];
+                        const uint32_t sl = (uint32_t)b.slot % (kPgiG * kPgiG);
+                        rowInfo[r][0] = (float)(sl % kPgiG); rowInfo[r][1] = (float)(sl / kPgiG);
+                        rowInfo[r][2] = (float)((uint32_t)b.slot / (kPgiG * kPgiG)); rowInfo[r][3] = (float)b.faces;
+                    }
+                }
+                if (peekOk || (rowsOk && !pgiPeek)) {
+                    float* v = (float*)fbw(g_live.pPgiViewVB);
+                    const float aspect = (float)g_live.width / std::max(1.0f, (float)g_live.height);
+                    // G-buffer view: 6 square faces x 2 rows (albedo, distance) per probe. PEEK: one row
+                    // of 6 full-resolution faces per probe, the screen's width.
+                    const float w = peekOk ? 1.96f : 1.2f, h = peekOk ? w / 6.0f * aspect : w / 3.0f * aspect;
+                    for (uint32_t l = 0; l < 2u; ++l) {   // layer 0 (low) on top, layer 1 (high) below it
+                        float* e = v + l * 12u;
+                        const float y0 = 0.98f - (float)l * (h + 0.02f);
+                        e[0] = -0.98f; e[1] = y0; e[2] = -0.98f + w; e[3] = y0 - h;
+                        e[4] = rowInfo[l][0]; e[5] = rowInfo[l][1];
+                        e[6] = peekOk ? (float)l : rowInfo[l][2];   // the peek reads its own atlas row
+                        e[7] = peekOk ? (float)g_pgi.peekMask[l] : rowInfo[l][3];
+                        // A FIXED exposure (pgiViewExp), so a sunset or a dark place does not blow the
+                        // preview out or bury it: scaled by pgiViewExp / E, which the resolve's x E
+                        // turns back into pgiViewExp. Its rect is kept out of the metering (g_aplExcl),
+                        // which is what makes this safe: 1/E metered fed back once (E fell to 0.019 at
+                        // the castle).
+                        const float Ecur = std::max(1.0e-4f, (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f);
+                        e[8] = std::max(0.0f, g_pgiViewExp) / Ecur;
+                        e[9] = peekOk ? (float)g_pgi.peekRes : 0.0f;
+                        e[10] = (peekOk && ((int)g_pgiDebug & 16)) ? 1.0f : 0.0f;
+                        e[11] = ((int)g_pgiDebug & 64) ? 1.0f : 0.0f;   // LIT: relit radiance (the peek: its relit rows)
+                    }
+                    // The two rows' rect in output uv, for the metering to skip (apl.srt.h excl).
+                    g_aplExcl[0] = 0.0f; g_aplExcl[1] = 0.0f;
+                    g_aplExcl[2] = (-0.98f + w + 1.0f) * 0.5f + 0.01f;
+                    g_aplExcl[3] = (1.0f - (0.98f - h - (h + 0.02f))) * 0.5f + 0.01f;
+                    const uint32_t vstride = 12 * sizeof(float);
+                    cmdBindPipeline(g_live.pCmd, g_live.pPgiViewPipe);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    cmdBindVertexBuffer(g_live.pCmd, 1, &g_live.pPgiViewVB, &vstride, nullptr);
+                    cmdDrawInstanced(g_live.pCmd, 6, 0, 2, 0);
+                }
             }
         }
 
@@ -48424,7 +49074,7 @@ void destroyHostWindow(Renderer* R);
                     // in a dry view". The gate refuses to engage on the first; the log names which.
                     g_aplSplitRan = splitOn;
                     const float planeRelZ = (sp && lf) ? (sp[kWaterFogPlaneFloat + 0] - lf[58]) : 0.0f;
-                    float p[28] = { (float)g_live.outWidth, (float)g_live.outHeight, (float)aplGrid,
+                    float p[32] = { (float)g_live.outWidth, (float)g_live.outHeight, (float)aplGrid,
                                     1.0f / (float)(aplGrid * aplGrid),
                                     g_aplSkipSky ? 1.0f : 0.0f,
                                     planeRelZ,
@@ -48453,6 +49103,8 @@ void destroyHostWindow(Renderer* R);
                     p[25] = g_wddFrame ? (float)aplGrid : (float)g_live.height;
                     p[26] = 0.0f;
                     p[27] = 0.0f;
+                    // floats 28..31 = excl: this frame's probe-preview rect (uv), unmetered; then reset.
+                    for (int i = 0; i < 4; ++i) { p[28 + i] = g_aplExcl[i]; g_aplExcl[i] = 0.0f; }
                     std::memcpy(fbw(g_live.pAplParamsCbv), p, sizeof(p));
                 }
                 RenderTargetBarrier arb = {};
@@ -49911,6 +50563,19 @@ void destroyHostWindow(Renderer* R);
                 prd.mType = PIPELINE_TYPE_COMPUTE;
                 prd.mComputeDesc.pShaderProgram = g_live.pReflectMipShader;
                 addPipeline(R, &prd, &g_live.pReflectMipPipeline);
+            }
+            if (g_live.pReflectMipPipelinePgi) { removePipeline(R, g_live.pReflectMipPipelinePgi); g_live.pReflectMipPipelinePgi = nullptr; }
+            if (g_live.pReflectMipShaderPgi)   { removeShader(R, g_live.pReflectMipShaderPgi);     g_live.pReflectMipShaderPgi = nullptr; }
+            if (g_live.sampleCount > 1) {
+                ShaderLoadDesc rpd = {};
+                rpd.mComp.pFileName = "reflectmipfirst_pgi_sc4.comp";
+                addShader(R, &rpd, &g_live.pReflectMipShaderPgi);
+                if (g_live.pReflectMipShaderPgi) {
+                    PipelineDesc ppd = {};
+                    ppd.mType = PIPELINE_TYPE_COMPUTE;
+                    ppd.mComputeDesc.pShaderProgram = g_live.pReflectMipShaderPgi;
+                    addPipeline(R, &ppd, &g_live.pReflectMipPipelinePgi);
+                }
             }
             g_live.reflectMipReady = g_live.pReflectMips && g_live.pReflectMipSet
                                   && g_live.pReflectMipPipelineFirst && g_live.pReflectMipPipeline;
@@ -55257,7 +55922,13 @@ void destroyHostWindow(Renderer* R);
                 sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
                 sg.pDepthState = &ds;
                 sg.pVertexLayout = &vl;
-                sg.pRasterizerState = &rs;
+                // TWO-SIDED, like the actors' and heads' casters: a tunnel or canal shell is
+                // single-sided and faces INWARD, so from the sun its roof is all back faces — culled, it
+                // cast nothing and the Vivec underworks stood in full sun ("the vivec tunnels were
+                // correctly shadowed ... this is a new thing", user 2026-10-12). Knob sunStaticsCullNone.
+                RasterizerStateDesc sunRsS = rs;
+                if (g_sunStaticsCullNone > 0.5f) { sunRsS.mCullMode = CULL_MODE_NONE; }
+                sg.pRasterizerState = &sunRsS;
                 sg.pShaderProgram = g_pSunShadowStaticsShader;
                 addPipeline(R, &sunPd, &g_pSunShadowStaticsPipeline);
                 if (!g_pSunShadowStaticsPipeline) { std::printf("[forge][dl] addPipeline(sunshadow statics) FAILED\n"); }
@@ -60908,6 +61579,11 @@ void destroyHostWindow(Renderer* R);
         // less world than the camera does without either of them knowing about the other.
         float                  distScale;   // multiplies the three DL statics tier ends. 1 = the camera's.
         uint32_t               lodBias;     // ADDED to the terrain's per-cell LOD pick. 0 = the camera's.
+        // PROBE-GI capture: the tier ranges are measured from the PROBE (rangeAt, absolute), not the
+        // camera, and statics with a bound radius under minR are not drawn. CPU cull only.
+        bool                   rangeAtSet = false;
+        float                  rangeAt[3] = {};
+        float                  minR = 0.0f;
     };
 
     // One-time distant-land resident load: land + statics library + grid + rings (+ grass field, GPU cull
@@ -61079,7 +61755,7 @@ void destroyHostWindow(Renderer* R);
         // nobody can resolve it. The camera itself takes the floor off.
         terrainCullAndBuild(T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
                             (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f,
-                            T.lodBias, (T.primary || g_capFace.active) ? 0u : kTerrainBaseLod);
+                            T.lodBias, (T.primary || (g_capFace.active && !g_capFace.pgi)) ? 0u : kTerrainBaseLod);
 
         // Phase C: stream + UPLOAD the baked distant lights around the eye. Fill the gLights-layout
         // distant cbuffer with the NEAREST <=128 within the working radius (camera-relative: pos-eye,
@@ -61364,8 +62040,11 @@ void destroyHostWindow(Renderer* R);
         //
         // ⚠ `reflCullVerify` deliberately does NOT skip: the whole point of that arm is that the CPU
         // number still exists to compare the lane against.
+        // (A probe-GI capture always takes the CPU walk: only it measures ranges from the probe.)
         const bool cpuStaticsCull = !((T.primary && g_gpuStaticsCull)
-                                   || (!T.primary && g_reflGpuCull && g_live.reflCullReady));
+                                   || (!T.primary && !T.rangeAtSet && g_reflGpuCull && g_live.reflCullReady));
+        // The point the tier ranges are measured from: the camera, or a capture's probe.
+        const float* rc = T.rangeAtSet ? T.rangeAt : eye;
         uint32_t cellsHit = 0, examined = 0;             // slow-frame diagnostics
         bool overflow = false;
         if (!cpuStaticsCull) {
@@ -61397,9 +62076,9 @@ void destroyHostWindow(Renderer* R);
             // test alone passes cells out to the far plane (>> vfarEnd), so ~all the 96%-rejected
             // examined instances live in too-far cells. Nearest-point dist to the xy AABB (+pad margin).
             {
-                float nx = eye[0] < c.minx ? c.minx : (eye[0] > c.maxx ? c.maxx : eye[0]);
-                float ny = eye[1] < c.miny ? c.miny : (eye[1] > c.maxy ? c.maxy : eye[1]);
-                float ndx = eye[0] - nx, ndy = eye[1] - ny;
+                float nx = rc[0] < c.minx ? c.minx : (rc[0] > c.maxx ? c.maxx : rc[0]);
+                float ny = rc[1] < c.miny ? c.miny : (rc[1] > c.maxy ? c.maxy : rc[1]);
+                float ndx = rc[0] - nx, ndy = rc[1] - ny;
                 float farLimit = vfarEnd + pad;   // pad for static extent (the per-instance test is exact)
                 if (ndx*ndx + ndy*ndy > farLimit*farLimit) { continue; }
             }
@@ -61418,10 +62097,15 @@ void destroyHostWindow(Renderer* R);
                                                                    // (this path also serves the water
                                                                    // reflection and the GPU-cull-off
                                                                    // A/B, so the mirror gets gated too)
+                if (gi.effR < T.minR) { continue; }                // capture: small statics stay out
                 float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
                 float dx = gi.posX - eye[0], dy = gi.posY - eye[1];
                 float dz = gi.posZ - eye[2];   // bound centre, matching cull.comp.fsl's inst.posZ
                 float d2 = dx*dx + dy*dy;
+                if (T.rangeAtSet) {   // capture: the tier range from the probe (frustum + shift stay eye-relative)
+                    const float rx = gi.posX - rc[0], ry = gi.posY - rc[1];
+                    d2 = rx*rx + ry*ry;
+                }
                 float dNear2 = d2 + dz*dz;   // near cut 3D (height-aware, matches DX9); far tier stays horizontal
                 // Ownership half 2 (per INSTANCE): the only rejection left is the free one — an
                 // instance whose whole sphere is inside the slab is clipped away vertex by vertex
@@ -61790,8 +62474,20 @@ void destroyHostWindow(Renderer* R);
         T.suppressNearCut = true;   // draw DL statics to the eye (reflection has no near-scene path)
         // The probe oracle sits 4 u off the surface the CAMERA saw, so it needs that surface: full
         // terrain LOD (the floor is lifted in dlCullAndBuild) and the full statics reach.
-        T.distScale   = g_capFace.active ? 1.0f : reflDistScale();   // axis A
-        T.lodBias     = g_capFace.active ? 0u : reflLodBias();       // axis B
+        // A RUNTIME probe-GI face is 8 x 8 texels of G-buffer: it takes the mirror's coarsest detail
+        // and a short statics reach (pgiCapReach). At full reach a face drew ~13k static instances —
+        // 0.9 ms of GPU for a 64² viewport, the whole cost of a capture.
+        const bool pgiCap = g_capFace.active && g_capFace.pgi;
+        T.distScale   = pgiCap ? std::clamp(g_pgiCapReach, 0.01f, 1.0f)
+                      : g_capFace.active ? 1.0f : reflDistScale();   // axis A
+        T.lodBias     = pgiCap ? kReflLodBiasMax : g_capFace.active ? 0u : reflLodBias();   // axis B
+        // ...and what it sees must not depend on the CAMERA: its reach is measured from the probe, and
+        // small statics stay out (user 2026-10-12: "small clutter doesn't need to be in probes").
+        if (pgiCap) {
+            T.rangeAtSet = true;
+            T.rangeAt[0] = g_capFace.pos[0]; T.rangeAt[1] = g_capFace.pos[1]; T.rangeAt[2] = g_capFace.pos[2];
+            T.minR = std::max(0.0f, g_pgiCapMinR);
+        }
         dlCullAndBuild(R, mirrorViewProj, T);
     }
 
@@ -61807,7 +62503,12 @@ void destroyHostWindow(Renderer* R);
         // parallax, no PBR relief through a wavy mirror; the sun shadow and sky ambient stay.
         const bool np = (!g_pbrStatics || mirror) && g_debugMode == 0u && g_pStaticsPipelineNoPbr
                      && g_pStaticsPipelineCWNoPbr && g_pStaticsPipelineNoneNoPbr;
-        if (g_staticsFacing == 3u) { return np ? g_pStaticsPipelineNoneNoPbr : g_pStaticsPipelineNone; }
+        // A PROBE-GI capture draws BOTH sides: the capture frags flag a back face (statics.frag mode 5)
+        // and a probe that sees many is inside geometry (pgirelight). Culled, it would see straight
+        // through the stem or the hill it sits in.
+        if (g_staticsFacing == 3u || (mirror && g_capFace.active && g_capFace.pgi)) {
+            return np ? g_pStaticsPipelineNoneNoPbr : g_pStaticsPipelineNone;
+        }
         const bool wantCW = mirror ? !cw : cw;
         if (np) { return wantCW ? g_pStaticsPipelineCWNoPbr : g_pStaticsPipelineNoPbr; }
         return wantCW ? g_pStaticsPipelineCW : g_pStaticsPipeline;
@@ -62950,6 +63651,28 @@ void destroyHostWindow(Renderer* R);
             mp[kWeather2Float + 1] = std::clamp(g_weatherPuddleCover, 0.0f, 1.0f);
             mp[kWeather2Float + 2] = 0.0f;
             mp[kWeather2Float + 3] = 0.0f;
+            {
+                // SKY HAZE (S3.5b/c), ONE copy for the sky passes AND the fog (S3.4): see
+                // skyradiance.h.fsl. Zero when the physical sky is not armed = no haze anywhere.
+                const SkyPhysical& sp = g_skyPhys;
+                const bool hz = sp.active;
+                mp[kSkyHazeFloat + 0]  = hz ? sp.hazeTauZ : 0.0f;
+                mp[kSkyHazeFloat + 1]  = sp.hazeH;
+                mp[kSkyHazeFloat + 2]  = sp.hazeM;
+                mp[kSkyHazeFloat + 3]  = sp.hazeLevel;
+                mp[kSkyHazeFloat + 4]  = sp.hazeHue[0];
+                mp[kSkyHazeFloat + 5]  = sp.hazeHue[1];
+                mp[kSkyHazeFloat + 6]  = sp.hazeHue[2];
+                mp[kSkyHazeFloat + 7]  = hz ? sp.hazeHueMix : 0.0f;
+                mp[kSkyHazeFloat + 8]  = sp.cloudScene;
+                mp[kSkyHazeFloat + 9]  = hz ? sp.cloudBeamScale : 0.0f;
+                mp[kSkyHazeFloat + 10] = sp.cloudDeckRadiusM;
+                mp[kSkyHazeFloat + 11] = 0.0f;
+            }
+            mp[kGiDebugFloat + 0] = std::clamp(g_giTint, 0.0f, 1.0f);   // GI bounce inspection (gitint.h.fsl)
+            mp[kGiDebugFloat + 1] = std::clamp(g_giTintLevel, 0.0f, 1.0f);
+            mp[kGiDebugFloat + 2] = 0.0f;
+            mp[kGiDebugFloat + 3] = 0.0f;
             mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 1] = std::clamp(g_giOpenRef, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 2] = std::clamp(g_giUnderGain, 0.0f, 4.0f);
@@ -64909,17 +65632,27 @@ void destroyHostWindow(Renderer* R);
     // renderer's own ambient at each hit, projected to convolved SH9. Receivers: skyamb.h.fsl.
     void pgiTeardown(Renderer* R) {
         if (g_pgi.set) { removeDescriptorSet(R, g_pgi.set); g_pgi.set = nullptr; }
-        Pipeline** pp[3] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight };
-        Shader**   ss[3] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight };
-        for (int i = 0; i < 3; ++i) {
+        Pipeline** pp[6] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit };
+        Shader**   ss[6] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit };
+        for (int i = 0; i < 6; ++i) {
             if (*pp[i]) { removePipeline(R, *pp[i]); *pp[i] = nullptr; }
             if (*ss[i]) { removeShader(R, *ss[i]); *ss[i] = nullptr; }
         }
+        if (g_pgi.vol)    { removeResource(g_pgi.vol);    g_pgi.vol = nullptr; }
+        if (g_pgi.volTag) { removeResource(g_pgi.volTag); g_pgi.volTag = nullptr; }
+        g_pgi.volLive = g_pgi.volInit = g_pgi.volInSR = false;
+        for (int& s : g_pgi.slotOwner) { s = -1; }
         for (Buffer*& b : g_pgi.cbv) { if (b) { removeFrameBuf(b); b = nullptr; } }
         if (g_pgi.probes)  { removeFrameBuf(g_pgi.probes); g_pgi.probes = nullptr; }
         if (g_pgi.placeBuf) { removeResource(g_pgi.placeBuf); g_pgi.placeBuf = nullptr; }
         if (g_pgi.placeRb)  { removeResource(g_pgi.placeRb);  g_pgi.placeRb = nullptr; }
+        if (g_pgi.ballBuf)  { removeResource(g_pgi.ballBuf);  g_pgi.ballBuf = nullptr; }
+        if (g_pgi.ballRb)   { removeResource(g_pgi.ballRb);   g_pgi.ballRb = nullptr; }
+        if (g_pgi.shRb)     { removeResource(g_pgi.shRb);     g_pgi.shRb = nullptr; }
+        g_pgi.pool.clear();
         if (g_pgi.gbuf) { removeResource(g_pgi.gbuf); g_pgi.gbuf = nullptr; }
+        if (g_pgi.peek) { removeResource(g_pgi.peek); g_pgi.peek = nullptr; }
+        if (g_pgi.lit)  { removeResource(g_pgi.lit);  g_pgi.lit = nullptr; }
         if (g_pgi.sh)   { removeResource(g_pgi.sh);   g_pgi.sh = nullptr; }
         g_pgi.ready = false;
     }
@@ -64929,15 +65662,17 @@ void destroyHostWindow(Renderer* R);
     bool pgiEnsure(Renderer* R) {
         if (g_pgi.ready) { return true; }
         if (g_pgi.failed || !g_live.pSkyHeight || !g_live.pSkyHeightLow || !g_live.pReflectMips
-            || !g_live.pReflectDepthResolved || !g_live.pShadowMaskParamsCbv || !g_live.pPerFrameSet) { return false; }
+            || !g_live.pReflectDepthResolved || !g_live.pShadowMaskParamsCbv || !g_live.pPerFrameSet
+            || !g_pTerrainHeights || !g_pTerrainCellGrid) { return false; }
         auto fail = [&](const char* what) {
             LOG::logline("!! [pgi] %s FAILED — probe GI disabled", what);
             pgiTeardown(R); g_pgi.failed = true; return false;
         };
-        const char* files[3] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp" };
-        Shader**   ss[3] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight };
-        Pipeline** pp[3] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight };
-        for (int i = 0; i < 3; ++i) {
+        const char* files[6] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp", "pgiballs.comp", "pgisplat.comp",
+                                 "pgipeeklit.comp" };
+        Shader**   ss[6] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit };
+        Pipeline** pp[6] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit };
+        for (int i = 0; i < 6; ++i) {
             ShaderLoadDesc sd = {}; sd.mComp.pFileName = files[i];
             addShader(R, &sd, ss[i]);
             if (!*ss[i]) { return fail(files[i]); }
@@ -64956,6 +65691,42 @@ void destroyHostWindow(Renderer* R);
             td.pName = "pgiGBuf";
             TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.gbuf; tl.pDesc = &td;
             addResource(&tl, nullptr);
+            TextureDesc tdl = td;
+            tdl.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            tdl.pName = "pgiLit";
+            TextureLoadDesc tll = {}; tll.ppTexture = &g_pgi.lit; tll.pDesc = &tdl;
+            addResource(&tll, nullptr);
+        }
+        {
+            g_pgi.peekRes = std::max(8u, std::min(kPgiPeekRes, reflectSize()) / 8u * 8u);
+            TextureDesc td = {};
+            // rows 0-1 the two peeked probes' raw captures, rows 2-3 the same relit (PGI_PEEKLIT)
+            td.mWidth = 6u * g_pgi.peekRes; td.mHeight = 4u * g_pgi.peekRes; td.mDepth = 1; td.mArraySize = 1;
+            td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "pgiPeek";
+            TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.peek; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+        }
+        {   // the VOLUME (7 SH planes + meta, stacked in slices) and its per-cell world tags
+            TextureDesc td = {};
+            td.mWidth = kPgiVX; td.mHeight = kPgiVX; td.mDepth = 1; td.mArraySize = 8u * kPgiVZ;
+            td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "pgiVol";
+            TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.vol; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+            TextureDesc tg = td;
+            tg.mArraySize = kPgiVZ;
+            tg.mFormat = TinyImageFormat_R32_UINT;
+            tg.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE;
+            tg.pName = "pgiVolTag";
+            TextureLoadDesc tlg = {}; tlg.ppTexture = &g_pgi.volTag; tlg.pDesc = &tg;
+            addResource(&tlg, nullptr);
         }
         {
             TextureDesc td = {};
@@ -64987,6 +65758,23 @@ void destroyHostWindow(Renderer* R);
             r.mDesc.pName        = "pgiPlaceReadback";
             r.ppBuffer           = &g_pgi.placeRb;
             addResource(&r, nullptr);
+            // BALLS: the same shape, 2 float4 per ball.
+            BufferLoadDesc bb = b;
+            bb.mDesc.mElementCount = 2ull * kPgiBallMax;
+            bb.mDesc.mSize         = kPgiBallLane;
+            bb.mDesc.pName         = "pgiBalls";
+            bb.ppBuffer            = &g_pgi.ballBuf;
+            addResource(&bb, nullptr);
+            BufferLoadDesc br = r;
+            br.mDesc.mSize       = kPgiBallLane * kFrameSlots;
+            br.mDesc.pName       = "pgiBallsReadback";
+            br.ppBuffer          = &g_pgi.ballRb;
+            addResource(&br, nullptr);
+            BufferLoadDesc sr = r;
+            sr.mDesc.mSize       = kPgiShLane * kFrameSlots;
+            sr.mDesc.pName       = "pgiSHReadback";
+            sr.ppBuffer          = &g_pgi.shRb;
+            addResource(&sr, nullptr);
         }
         {
             BufferLoadDesc b = {};
@@ -65000,7 +65788,7 @@ void destroyHostWindow(Renderer* R);
             b.ppBuffer            = &g_pgi.probes;
             addFrameBuf(&b);
         }
-        for (uint32_t i = 0; i < 3; ++i) {
+        for (uint32_t i = 0; i < 6; ++i) {
             char name[32];
             std::snprintf(name, sizeof(name), "pgiParams%u", i);
             BufferLoadDesc pb = {};
@@ -65013,18 +65801,25 @@ void destroyHostWindow(Renderer* R);
             addFrameBuf(&pb);
         }
         waitForAllResourceLoads();
-        if (!g_pgi.gbuf || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes) { return fail("resource alloc"); }
+        if (!g_pgi.gbuf || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
+            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit) { return fail("resource alloc"); }
         for (Buffer* b : g_pgi.cbv) { if (!b) { return fail("cbuffer alloc"); } }
         // "No read yet": NaN everywhere, so a lane never written matches no column.
         std::memset(g_pgi.placeRb->pCpuMappedAddress, 0xFF, (size_t)(kPgiPlaceLane * kFrameSlots));
+        std::memset(g_pgi.ballRb->pCpuMappedAddress, 0, (size_t)(kPgiBallLane * kFrameSlots));   // type 0 = no ball
 
-        DescriptorSetDesc dsd = SRT_SET_DESC(PgiSrtData, PerBatch, 3, 0);
+        DescriptorSetDesc dsd = SRT_SET_DESC(PgiSrtData, PerBatch, 6, 0);
         addDescriptorSet(R, &dsd, &g_pgi.set);
         if (!g_pgi.set) { return fail("addDescriptorSet"); }
         Texture* skyTop = g_live.pSkyHeight->pTexture;
         Texture* skyLow = g_live.pSkyHeightLow->pTexture;
-        for (uint32_t i = 0; i < 3; ++i) {
-            DescriptorData d[12] = {};
+        // The balls' rays: the sun cascades' raw depth (else the camera depth stands in, never read —
+        // ballsMisc.x is 0 then) and the camera's resolved depth.
+        Texture* sunDepth = g_live.pSunMomentsDepth ? g_live.pSunMomentsDepth->pTexture : g_live.pLinearDepth;
+        Texture* camDepth = g_live.pLinearDepth;
+        if (!camDepth) { return fail("camera depth"); }
+        for (uint32_t i = 0; i < 6; ++i) {
+            DescriptorData d[24] = {};
             d[0].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiParams);    d[0].ppBuffers  = &g_pgi.cbv[i];
             d[1].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadow);    d[1].ppBuffers  = &g_live.pShadowMaskParamsCbv;
             d[2].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyAO);     d[2].ppTextures = skyAOHeightTexPP();
@@ -65037,8 +65832,26 @@ void destroyHostWindow(Renderer* R);
             d[9].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGBuf);      d[9].ppTextures = &g_pgi.gbuf;
             d[10].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSHOut);     d[10].ppTextures = &g_pgi.sh;
             d[11].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiPlaceOut);  d[11].ppBuffers  = &g_pgi.placeBuf;
+            d[12].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiTerrainHeights);  d[12].ppBuffers = &g_pTerrainHeights;
+            d[13].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiTerrainCellGrid); d[13].ppBuffers = &g_pTerrainCellGrid;
+            d[14].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiPeek);      d[14].ppTextures = &g_pgi.peek;
+            d[15].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSunDepth);  d[15].ppTextures = &sunDepth;
+            d[16].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCamDepth);  d[16].ppTextures = &camDepth;
+            d[17].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiBallOut);   d[17].ppBuffers  = &g_pgi.ballBuf;
+            d[18].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiVolOut);    d[18].ppTextures = &g_pgi.vol;
+            d[19].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiVolTag);    d[19].ppTextures = &g_pgi.volTag;
+            d[20].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiLit);       d[20].ppTextures = &g_pgi.lit;
+            // The LIVE sky (pgiSkyLive): the atmosphere's params + its MIXED sky-view field. Absent
+            // atmosphere: stand-ins, never read (skyLive.x is published 0 then).
+            d[21].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiAtmos);
+            d[21].ppBuffers  = g_live.pAtmosParamsCbv ? &g_live.pAtmosParamsCbv : &g_pgi.cbv[i];
+            d[22].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiAtmosSky);
+            d[22].ppTextures = g_live.pAtmosSkyView ? &g_live.pAtmosSkyView : &g_pgi.lit;
+            // The renderer's LONG-RANGE sun occlusion: the relight shadows hits past the cascades with it.
+            d[23].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSunOcc);
+            d[23].ppTextures = g_live.pSunOcc ? &g_live.pSunOcc : &skyTop;
             for (DescriptorData& x : d) { x.mCount = 1; }
-            updateDescriptorSet(R, i, g_pgi.set, 12, d);
+            updateDescriptorSet(R, i, g_pgi.set, 24, d);
         }
         // The receivers: every set whose lit frags take skyAmbFactor (the GI field's three).
         DescriptorData pf = {};
@@ -65047,6 +65860,23 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
         if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
+        pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiVol);
+        pf.ppTextures = &g_pgi.vol;
+        if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
+        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+        if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
+        {   // "what the probe sees" reads the G-buffer atlas from the main colour pass
+            DescriptorData gv = {};
+            gv.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiGBufView);
+            gv.mCount = 1; gv.ppTextures = &g_pgi.gbuf;
+            if (g_live.pPerFrameSet) { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &gv); }
+            gv.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiPeekView);
+            gv.ppTextures = &g_pgi.peek;
+            if (g_live.pPerFrameSet) { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &gv); }
+            gv.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiLitView);
+            gv.ppTextures = &g_pgi.lit;
+            if (g_live.pPerFrameSet) { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &gv); }
+        }
         g_pgi.ready = true;
         g_pgi.shInSR = false;
         g_pgi.cleared = false;
@@ -65069,6 +65899,21 @@ void destroyHostWindow(Renderer* R);
         }
         const int G = (int)kPgiG;
         const float ex = fcbvR[56], ey = fcbvR[57];
+        g_pgi.eyeZ = fcbvR[58];
+        // Camera velocity for the look-ahead: smoothed over ~0.5 s; a jump (load, teleport) resets it.
+        {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            const double dt = now - g_pgi.eyeT;
+            const float dx = ex - g_pgi.eye[0], dy = ey - g_pgi.eye[1];
+            if (g_pgi.eyeT <= 0.0 || dt <= 0.0 || dt > 0.5 || dx * dx + dy * dy > 1024.0f * 1024.0f) {
+                g_pgi.vel[0] = g_pgi.vel[1] = 0.0f;
+            } else {
+                const float a = (float)std::min(1.0, dt / 0.5);
+                g_pgi.vel[0] += (dx / (float)dt - g_pgi.vel[0]) * a;
+                g_pgi.vel[1] += (dy / (float)dt - g_pgi.vel[1]) * a;
+            }
+            g_pgi.eye[0] = ex; g_pgi.eye[1] = ey; g_pgi.eyeT = now;
+        }
         g_pgi.ix0 = (int)std::floor(ex / S + 0.5f) - G / 2;
         g_pgi.iy0 = (int)std::floor(ey / S + 0.5f) - G / 2;
         auto wrap = [&](int v) { int m = v % G; return m < 0 ? m + G : m; };
@@ -65087,7 +65932,7 @@ void destroyHostWindow(Renderer* R);
             for (int k = 0; k < G * G; ++k) {
                 const float* e = r + k * 4;
                 if (!(e[2] == e[2]) || !(e[3] == e[3])) { continue; }               // NaN: never written
-                const int eix = (int)e[2], eiy = (int)e[3];
+                const int eix = (int)std::floor(e[2] + 0.5f), eiy = (int)std::floor(e[3] + 0.5f);
                 PgiColumn& c = g_pgi.col[wrap(eiy) * G + wrap(eix)];
                 if (eix != c.ix || eiy != c.iy) { continue; }                       // an older window
                 if (e[0] < -20000.0f) { continue; }                                // no data under the cell
@@ -65097,15 +65942,135 @@ void destroyHostWindow(Renderer* R);
                 const float zn[2] = { z0, z1 };
                 for (int l = 0; l < (int)kPgiL; ++l) {
                     if (!c.zValid || std::fabs(zn[l] - c.z[l]) > 32.0f) {
+                        if (c.zValid && c.faces[l]) { ++g_pgi.zResets; }
                         c.z[l] = zn[l]; c.faces[l] = 0; c.done[l] = false; c.clear[l] = true;
                     }
                 }
                 c.zValid = true;
             }
         }
+        // BALLS -> POOL (phase 1). A ball merges into a pool probe within r(d) = R0 + Rk x its distance
+        // to the camera (dense near, sparse far) and confirms it (the older probe is kept); otherwise it
+        // joins. Past the pool size the farthest from the camera go.
+        // PHASE 2 mode switch: the slots change owners wholesale, so every slot is cleared and the pool
+        // (or the columns) start over.
+        {
+            const bool bm = g_pgiBalls > 0.5f;
+            if (bm != g_pgi.ballMode) {
+                g_pgi.ballMode = bm;
+                g_pgi.pool.clear();
+                for (int& s : g_pgi.slotOwner) { s = -1; }
+                for (bool& c : g_pgi.slotClear) { c = true; }
+                for (PgiColumn& c : g_pgi.col) { c.faces[0] = c.faces[1] = 0; c.done[0] = c.done[1] = false; c.clear[0] = c.clear[1] = true; }
+                g_pgi.volLive = false;
+                g_pgi.volInit = false;
+                g_pgi.worldFaces = g_pgi.worldPend = 0;
+            }
+        }
+        if (g_pgi.ballRb && g_pgi.ballRb->pCpuMappedAddress && g_pgi.ballN[g_readSlot % kFrameSlots]) {
+            const uint32_t nb = std::min(g_pgi.ballN[g_readSlot % kFrameSlots], kPgiBallMax);
+            g_pgi.ballN[g_readSlot % kFrameSlots] = 0;
+            const float* r = (const float*)((const uint8_t*)g_pgi.ballRb->pCpuMappedAddress + (uint64_t)g_readSlot * kPgiBallLane);
+            const double now = hostNowMs() * 1.0e-3;
+            const float ez = g_pgi.eyeZ;
+            constexpr float kCell = 256.0f;
+            auto key = [](int x, int y) { return ((uint64_t)(uint32_t)x << 32) | (uint32_t)y; };
+            std::unordered_map<uint64_t, std::vector<uint32_t>> grid;
+            grid.reserve(g_pgi.pool.size() * 2 + 16);
+            for (uint32_t k = 0; k < (uint32_t)g_pgi.pool.size(); ++k) {
+                const PgiBall& b = g_pgi.pool[k];
+                grid[key((int)std::floor(b.p[0] / kCell), (int)std::floor(b.p[1] / kCell))].push_back(k);
+            }
+            for (uint32_t i = 0; i < nb; ++i) {
+                const float* e0 = r + i * 8u;
+                const uint32_t type = (uint32_t)(e0[3] + 0.5f);
+                if (type == 0u || !(e0[0] == e0[0])) { continue; }
+                const float dx = e0[0] - ex, dy = e0[1] - ey, dz = e0[2] - ez;
+                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const float rad = std::min(g_pgiPoolR0 + g_pgiPoolRk * d, 2048.0f);
+                const int cx0 = (int)std::floor((e0[0] - rad) / kCell), cx1 = (int)std::floor((e0[0] + rad) / kCell);
+                const int cy0 = (int)std::floor((e0[1] - rad) / kCell), cy1 = (int)std::floor((e0[1] + rad) / kCell);
+                int hit = -1;
+                for (int cy = cy0; cy <= cy1 && hit < 0; ++cy) {
+                    for (int cx = cx0; cx <= cx1 && hit < 0; ++cx) {
+                        auto it = grid.find(key(cx, cy));
+                        if (it == grid.end()) { continue; }
+                        for (uint32_t k : it->second) {
+                            const PgiBall& b = g_pgi.pool[k];
+                            const float qx = b.p[0] - e0[0], qy = b.p[1] - e0[1], qz = b.p[2] - e0[2];
+                            if (qx * qx + qy * qy + qz * qz < rad * rad) { hit = (int)k; break; }
+                        }
+                    }
+                }
+                if (hit >= 0) { PgiBall& b = g_pgi.pool[hit]; ++b.hits; b.t = now; ++g_pgi.ballMerged; continue; }
+                PgiBall nbl = {};
+                nbl.p[0] = e0[0]; nbl.p[1] = e0[1]; nbl.p[2] = e0[2];
+                nbl.n[0] = e0[4]; nbl.n[1] = e0[5]; nbl.n[2] = e0[6];
+                nbl.type = type; nbl.hits = 1; nbl.t = now;
+                grid[key((int)std::floor(e0[0] / kCell), (int)std::floor(e0[1] / kCell))].push_back((uint32_t)g_pgi.pool.size());
+                g_pgi.pool.push_back(nbl);
+                ++g_pgi.ballIn;
+            }
+            // Ball mode: at most one probe per SLOT (the last is the world probe's).
+            const size_t cap = (size_t)std::clamp(g_pgiPool, 16.0f, g_pgi.ballMode ? (float)kPgiWorldSlot : (float)kPgiPoolCap);
+            if (g_pgi.pool.size() > cap) {
+                auto d2 = [&](const PgiBall& b) {
+                    const float qx = b.p[0] - ex, qy = b.p[1] - ey, qz = b.p[2] - ez;
+                    return qx * qx + qy * qy + qz * qz;
+                };
+                std::nth_element(g_pgi.pool.begin(), g_pgi.pool.begin() + (ptrdiff_t)cap, g_pgi.pool.end(),
+                                 [&](const PgiBall& a, const PgiBall& b) { return d2(a) < d2(b); });
+                for (size_t k = cap; k < g_pgi.pool.size(); ++k) {   // their slots go back, cleared
+                    if (g_pgi.pool[k].slot >= 0) { g_pgi.slotClear[g_pgi.pool[k].slot] = true; }
+                }
+                g_pgi.ballEvicted += (uint32_t)(g_pgi.pool.size() - cap);
+                g_pgi.pool.resize(cap);
+            }
+        }
+        // Slot ownership (ball mode): rebuilt after the pool moved, then a free slot for every ball
+        // without one (a new ball's slot starts cleared).
+        if (g_pgi.ballMode) {
+            for (int& s : g_pgi.slotOwner) { s = -1; }
+            for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                if (g_pgi.pool[k].slot >= 0) { g_pgi.slotOwner[g_pgi.pool[k].slot] = k; }
+            }
+            int freeS = 0;
+            for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                PgiBall& b = g_pgi.pool[k];
+                if (b.slot >= 0) { continue; }
+                while (freeS < (int)kPgiWorldSlot && g_pgi.slotOwner[freeS] >= 0) { ++freeS; }
+                if (freeS >= (int)kPgiWorldSlot) { break; }
+                b.slot = freeS; b.faces = 0; b.done = false; b.trans = 0.0f;
+                g_pgi.slotOwner[freeS] = k;
+                g_pgi.slotClear[freeS] = true;
+            }
+        }
+        // THE WORLD PROBE's spot: above the camera and above the top of the camera's column (a tower, a
+        // canopy), so it sees the open sky and the land around. Re-shot there once the camera has moved
+        // pgiWorldMove from it, and every pgiWorldEvery s (cells stream in; its sky is every probe's); one face per capture, ahead of the pool.
+        if (g_pgi.ballMode) {
+            float top = g_pgi.eyeZ;
+            const int cix = (int)std::floor(ex / S + 0.5f), ciy = (int)std::floor(ey / S + 0.5f);
+            const PgiColumn& cc = g_pgi.col[wrap(ciy) * G + wrap(cix)];
+            if (cc.ix == cix && cc.iy == ciy && cc.zValid) { top = std::max(top, cc.z[1] - std::max(8.0f, g_pgiLift)); }
+            const float tz = top + std::max(0.0f, g_pgiWorldLift);
+            const double now = hostNowMs() * 1.0e-3;
+            if (g_pgi.worldPend == 0) {
+                const float dx = ex - g_pgi.worldP[0], dy = ey - g_pgi.worldP[1], dz = tz - g_pgi.worldP[2];
+                const float mv = std::max(64.0f, g_pgiWorldMove);
+                if (g_pgi.worldFaces != 0x3Fu || dx * dx + dy * dy + dz * dz > mv * mv || now - g_pgi.worldT > (double)std::max(1.0f, g_pgiWorldEvery)) {
+                    g_pgi.worldP[0] = ex; g_pgi.worldP[1] = ey; g_pgi.worldP[2] = tz;
+                    g_pgi.worldPend = 0x3Fu;
+                    g_pgi.worldT = now;
+                    ++g_pgi.worldShots;
+                }
+            }
+        }
         // Capture: nearest incomplete probe, next missing face. Only on a DRY view (nothing on screen
         // samples the mirror), every pgiEvery-th such frame, and never under the probe oracle.
         g_pgi.capThis = false;
+        g_pgi.capBall = -1;
+        g_pgi.capWorld = false;
         if (!waterOk || probeOracleActive()) { return; }
         // A WET view (water on screen samples the mirror): steal 1 frame in pgiSteal, and only when
         // the last normal reflect frame (the previous one) left the corner plus a margin unsampled
@@ -65122,42 +66087,194 @@ void destroyHostWindow(Renderer* R);
             if (++g_pgi.everyCount < (uint32_t)std::max(1.0f, g_pgiEvery)) { return; }
             g_pgi.everyCount = 0;
         }
+        // PEEK (pgiDebug 8): on a dry view, every other capture re-shoots a face of the camera column's
+        // probes at full resolution — layer 0's six faces, then layer 1's, round and round, so the peek
+        // stays live. Its gather also refreshes that probe's G-buffer tile (the same capture).
+        g_pgi.peekThis = false;
+        // Ball mode: the two pool probes nearest the camera (rows 0 and 1), named by their slots.
+        if (g_pgi.ballMode && ((int)g_pgiDebug & 8) && dry && (++g_pgi.peekTick & 1u)) {
+            int nb[2] = { -1, -1 }; float nd[2] = { 1e30f, 1e30f };
+            for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                const PgiBall& b = g_pgi.pool[k];
+                if (b.slot < 0) { continue; }
+                const float qx = b.p[0] - ex, qy = b.p[1] - ey, qz = b.p[2] - g_pgi.eyeZ;
+                const float d = qx * qx + qy * qy + qz * qz;
+                if (d < nd[0]) { nd[1] = nd[0]; nb[1] = nb[0]; nd[0] = d; nb[0] = k; }
+                else if (d < nd[1]) { nd[1] = d; nb[1] = k; }
+            }
+            if (nb[0] >= 0 && nb[1] >= 0) {
+                const int sa = g_pgi.pool[nb[0]].slot, sb = g_pgi.pool[nb[1]].slot;
+                if (sa != g_pgi.peekIx || sb != g_pgi.peekIy) {
+                    g_pgi.peekIx = sa; g_pgi.peekIy = sb; g_pgi.peekStep = 0;
+                    g_pgi.peekMask[0] = g_pgi.peekMask[1] = 0;
+                }
+                const uint32_t st = g_pgi.peekStep++ % 12u, pl = st / 6u, pf = st % 6u;
+                const PgiBall& b = g_pgi.pool[nb[pl]];
+                g_pgi.capSlot = (uint32_t)b.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)b.slot / (kPgiG * kPgiG);
+                g_pgi.capFace = pf; g_pgi.capBall = b.slot; g_pgi.peekRow = pl;
+                g_pgi.capThis = true; g_pgi.peekThis = true;
+                g_capFace.active = true; g_capFace.pgi = true;
+                g_capFace.pos[0] = b.p[0]; g_capFace.pos[1] = b.p[1]; g_capFace.pos[2] = b.p[2];
+                g_capFace.face = pf; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+                g_capFace.res = g_pgi.peekRes;
+                g_capFace.steal = false;
+                return;
+            }
+        }
+        if (!g_pgi.ballMode && ((int)g_pgiDebug & 8) && dry && (++g_pgi.peekTick & 1u)) {
+            const int cix = (int)std::floor(ex / S + 0.5f), ciy = (int)std::floor(ey / S + 0.5f);
+            const int ps = wrap(ciy) * G + wrap(cix);
+            const PgiColumn& pc = g_pgi.col[ps];
+            if (pc.ix == cix && pc.iy == ciy && pc.zValid) {
+                if (cix != g_pgi.peekIx || ciy != g_pgi.peekIy) {
+                    g_pgi.peekIx = cix; g_pgi.peekIy = ciy; g_pgi.peekStep = 0;
+                    g_pgi.peekMask[0] = g_pgi.peekMask[1] = 0;
+                }
+                const uint32_t st = g_pgi.peekStep++ % 12u, pl = st / 6u, pf = st % 6u;
+                g_pgi.capSlot = (uint32_t)ps; g_pgi.capLayer = pl; g_pgi.capFace = pf; g_pgi.peekRow = pl;
+                g_pgi.capThis = true; g_pgi.peekThis = true;
+                g_capFace.active = true; g_capFace.pgi = true;
+                g_capFace.pos[0] = (float)pc.ix * S; g_capFace.pos[1] = (float)pc.iy * S; g_capFace.pos[2] = pc.z[pl];
+                g_capFace.face = pf; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+                g_capFace.res = g_pgi.peekRes;
+                g_capFace.steal = false;
+                return;
+            }
+        }
+        // Order: (0) both layers of the 2 x 2 columns around the camera — what its own receivers blend;
+        // (1) the same around the LOOK-AHEAD point (where the camera will be in pgiLead s, at most 4
+        // columns out); (2) the rest nearest that point first, layer 1 a half column further. Nearest
+        // the camera alone spent a moving camera's captures behind and beside it ("convergence is fast
+        // at first load ... walk to another mushroom ... it is slow", user 2026-10-11).
+        float lx = g_pgi.vel[0] * std::max(0.0f, g_pgiLead), ly = g_pgi.vel[1] * std::max(0.0f, g_pgiLead);
+        const float ll = std::sqrt(lx * lx + ly * ly);
+        if (ll > 4.0f * S) { lx *= 4.0f * S / ll; ly *= 4.0f * S / ll; }
+        const float px = ex + lx, py = ey + ly;
+        auto own = [&](const PgiColumn& c, float x, float y) {
+            const int fx = (int)std::floor(x / S), fy = (int)std::floor(y / S);
+            return c.ix >= fx && c.ix <= fx + 1 && c.iy >= fy && c.iy <= fy + 1;
+        };
+        // PROGRESSIVE (user, 2026-10-11: "first render bottom face, update l0 probes ... render top face,
+        // now l1, render all and set l2"): a probe is usable from its first face, the relight fills
+        // the missing ones with the old model's sky ambient, and faces come in the order that carries
+        // the most light first — down (the lit ground, the bounce), up (the sky), then the sides.
+        // Each face a probe already has pushes it pgiFaceRank columns further out, so mid-distance
+        // probes get their first faces while the near ones are still finishing.
+        static const uint32_t kFaceOrder[6] = { 5u, 4u, 0u, 1u, 2u, 3u };
+        const float rankK = std::max(0.0f, g_pgiFaceRank) * S;
+        // BALL MODE: the same order over the pool — the probes within 512 u of the camera first, then
+        // nearest the look-ahead point, each captured face pushing a probe pgiFaceRank columns out.
+        if (g_pgi.ballMode && g_pgi.worldPend) {
+            uint32_t face = 0;
+            for (uint32_t k = 0; k < 6u; ++k) {
+                if (g_pgi.worldPend & (1u << kFaceOrder[k])) { face = kFaceOrder[k]; break; }
+            }
+            g_pgi.capSlot = kPgiWorldSlot % (kPgiG * kPgiG); g_pgi.capLayer = kPgiWorldSlot / (kPgiG * kPgiG);
+            g_pgi.capFace = face; g_pgi.capBall = (int)kPgiWorldSlot; g_pgi.capWorld = true;
+            g_pgi.capThis = true;
+            g_capFace.active = true; g_capFace.pgi = true;
+            g_capFace.pos[0] = g_pgi.worldP[0]; g_capFace.pos[1] = g_pgi.worldP[1]; g_capFace.pos[2] = g_pgi.worldP[2];
+            g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+            g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
+            g_capFace.steal = steal;
+            if (steal) { ++g_pgi.steals; }
+            return;
+        }
+        if (g_pgi.ballMode) {
+            int bb = -1; float bd = 1e30f;
+            for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                const PgiBall& b = g_pgi.pool[k];
+                if (b.slot < 0 || b.faces == 0x3Fu) { continue; }
+                const float ox = b.p[0] - ex, oy = b.p[1] - ey;
+                const float tier = (ox * ox + oy * oy < 512.0f * 512.0f) ? 0.0f : 1.0e12f;
+                const float dx = b.p[0] - px, dy = b.p[1] - py, dz = b.p[2] - g_pgi.eyeZ;
+                const float rank = (float)__popcnt((unsigned)b.faces);
+                const float d = tier + dx * dx + dy * dy + dz * dz + rank * rankK * rankK;
+                if (d < bd) { bd = d; bb = k; }
+            }
+            if (bb < 0) { return; }
+            const PgiBall& b = g_pgi.pool[bb];
+            uint32_t face = 0;
+            for (uint32_t k = 0; k < 6u; ++k) {
+                if (!(b.faces & (1u << kFaceOrder[k]))) { face = kFaceOrder[k]; break; }
+            }
+            g_pgi.capSlot = (uint32_t)b.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)b.slot / (kPgiG * kPgiG);
+            g_pgi.capFace = face; g_pgi.capBall = b.slot;
+            g_pgi.capThis = true;
+            g_capFace.active = true; g_capFace.pgi = true;
+            g_capFace.pos[0] = b.p[0]; g_capFace.pos[1] = b.p[1]; g_capFace.pos[2] = b.p[2];
+            g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+            g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
+            g_capFace.steal = steal;
+            if (steal) { ++g_pgi.steals; }
+            return;
+        }
         int best = -1, bestL = 0; float bestD = 1e30f;
         for (int s = 0; s < G * G; ++s) {
             const PgiColumn& c = g_pgi.col[s];
             if (!c.zValid) { continue; }
+            const float tier = own(c, ex, ey) ? 0.0f : own(c, px, py) ? 1.0e12f : 2.0e12f;
             for (int l = 0; l < (int)kPgiL; ++l) {
                 if (c.faces[l] == 0x3Fu) { continue; }
-                const float dx = (float)c.ix * S - ex, dy = (float)c.iy * S - ey;
-                const float d = dx * dx + dy * dy + (l ? 0.25f * S * S : 0.0f);
+                const float dx = (float)c.ix * S - px, dy = (float)c.iy * S - py;
+                const float rank = (float)__popcnt((unsigned)c.faces[l]);
+                const float d = tier + dx * dx + dy * dy + (l ? 0.25f * S * S : 0.0f) + rank * rankK * rankK;
                 if (d < bestD) { bestD = d; best = s; bestL = l; }
             }
         }
         if (best < 0) { return; }
         const PgiColumn& c = g_pgi.col[best];
         uint32_t face = 0;
-        while (face < 6u && (c.faces[bestL] & (1u << face))) { ++face; }
+        for (uint32_t k = 0; k < 6u; ++k) {
+            if (!(c.faces[bestL] & (1u << kFaceOrder[k]))) { face = kFaceOrder[k]; break; }
+        }
         g_pgi.capSlot = (uint32_t)best; g_pgi.capLayer = (uint32_t)bestL; g_pgi.capFace = face;
         g_pgi.capThis = true;
         g_capFace.active = true; g_capFace.pgi = true;
         g_capFace.pos[0] = (float)c.ix * S; g_capFace.pos[1] = (float)c.iy * S; g_capFace.pos[2] = c.z[bestL];
-        g_capFace.face = face; g_capFace.dbg = 5.0f; g_capFace.dbgTerrain = true;
+        g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
         g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
         g_capFace.steal = steal;
         if (steal) { ++g_pgi.steals; }
     }
 
+    // The G-buffer atlas rests UAV; "what the probe sees" (pgiDebug 4) reads it in the colour pass, so it
+    // goes SHADER_RESOURCE at the end of pgiFrameRecord and back before the next compute touches it.
+    void pgiGbufState(bool readable) {
+        if (!g_pgi.gbuf || !g_pgi.lit || g_pgi.gbufInSR == readable) { return; }
+        TextureBarrier tb[2] = {};   // the G-buffer and its lit twin travel together
+        tb[0].pTexture = g_pgi.gbuf;
+        tb[0].mCurrentState = readable ? RESOURCE_STATE_UNORDERED_ACCESS : RESOURCE_STATE_SHADER_RESOURCE;
+        tb[0].mNewState     = readable ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
+        tb[1] = tb[0]; tb[1].pTexture = g_pgi.lit;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
+        g_pgi.gbufInSR = readable;
+    }
+    // The same for the PEEK atlas (pgiDebug 8).
+    void pgiPeekState(bool readable) {
+        if (!g_pgi.peek || g_pgi.peekInSR == readable) { return; }
+        TextureBarrier tb = {};
+        tb.pTexture = g_pgi.peek;
+        tb.mCurrentState = readable ? RESOURCE_STATE_UNORDERED_ACCESS : RESOURCE_STATE_SHADER_RESOURCE;
+        tb.mNewState     = readable ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        g_pgi.peekInSR = readable;
+    }
+
     // Inside the reflect pass, after the pyramid resolved this frame's face: its 8x8 G-buffer tile.
     void pgiGatherRecord() {
         if (!g_pgi.ready || !g_pgi.capThis) { return; }
+        pgiGbufState(false);
         const uint32_t s = g_pgi.capSlot, l = g_pgi.capLayer, f = g_pgi.capFace;
         PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[1]);
         std::memset(P, 0, sizeof(PgiParams));
         P->capPos  = float4(g_capFace.pos[0], g_capFace.pos[1], g_capFace.pos[2], (float)f);
         P->capTile = float4((float)((s % kPgiG) * 48u + f * 8u), (float)((l * kPgiG + s / kPgiG) * 8u),
                             (float)g_capFace.res, kProbeNear);
-        P->capMisc = float4(kProbeFar, 0.0f, 0.0f, 0.0f);
+        const uint32_t pr = g_pgi.peekRow & 1u;
+        P->capMisc = float4(kProbeFar, g_pgi.peekThis ? 1.0f : 0.0f, (float)(f * g_pgi.peekRes), (float)(pr * g_pgi.peekRes));
         P->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+        if (g_pgi.peekThis) { pgiPeekState(false); g_pgi.peekMask[pr] |= (uint8_t)(1u << f); }
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "PGI gather");
         cmdBindPipeline(g_live.pCmd, g_pgi.pGather);
         cmdBindDescriptorSet(g_live.pCmd, 1, g_pgi.set);
@@ -65166,16 +66283,34 @@ void destroyHostWindow(Renderer* R);
         tb.pTexture = g_pgi.gbuf; tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
         cmdEndDebugMarker(g_live.pCmd);
+        ++g_pgi.captures;
+        if (g_pgi.capWorld) {
+            g_pgi.worldFaces |= (uint8_t)(1u << f);
+            g_pgi.worldPend &= (uint8_t)~(1u << f);
+            return;
+        }
+        if (g_pgi.ballMode) {   // the capture's ball (its slot's owner), same bookkeeping as a column layer
+            const int k = (g_pgi.capBall >= 0) ? g_pgi.slotOwner[g_pgi.capBall] : -1;
+            if (k >= 0 && k < (int)g_pgi.pool.size()) {
+                PgiBall& b = g_pgi.pool[k];
+                b.faces |= (uint8_t)(1u << f);
+                if (b.faces == 0x3Fu) { b.done = true; }
+                b.trans = std::max(0.05f, g_pgiFade);
+            }
+            return;
+        }
         PgiColumn& c = g_pgi.col[s];
         c.faces[l] |= (uint8_t)(1u << f);
         if (c.faces[l] == 0x3Fu) { c.done[l] = true; c.justDone[l] = true; }
-        ++g_pgi.captures;
+        c.trans[l] = std::max(0.05f, g_pgiFade);   // the new face blends in (relit every frame meanwhile)
     }
 
     // Every exterior frame, in the reflect phase (before the colour pass reads gPgiSH): placement for
     // the whole window -> readback lane; then relight a batch of complete probes.
     void pgiFrameRecord(const float* fcbvR) {
         if (!g_pgi.ready || !g_pgi.active) { return; }
+        pgiGbufState(false);
+        gpuPhaseBeginG(kGpuPhasePgi);   // place + relight + splat + balls; the capture's gather is not in it
         Cmd* cmd = g_live.pCmd;
         ID3D12GraphicsCommandList* cl = cmd->mDx.pCmdList;
         cmdBeginDebugMarker(cmd, 0.9f, 0.7f, 0.3f, "PGI place + relight");
@@ -65185,6 +66320,8 @@ void destroyHostWindow(Renderer* R);
             std::memset(P, 0, sizeof(PgiParams));
             P->grid  = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
             P->place = float4((float)g_pgi.ix0, (float)g_pgi.iy0, 0.0f, 0.0f);
+            P->terrain = float4((float)g_terrainGridMinX, (float)g_terrainGridMinY,
+                                (float)g_terrainGridSpanX, (float)g_terrainGridSpanY);
             cmdBindPipeline(cmd, g_pgi.pPlace);
             cmdBindDescriptorSet(cmd, 0, g_pgi.set);
             cmdDispatch(cmd, (kPgiG + 7u) / 8u, (kPgiG + 7u) / 8u, 1);
@@ -65203,11 +66340,49 @@ void destroyHostWindow(Renderer* R);
             g_pgi.phase = (g_pgi.phase + 1u) % R;
             float4* pr = (float4*)fbw(g_pgi.probes);
             uint32_t complete = 0;
-            for (uint32_t l = 0; l < kPgiL; ++l) {
+            // TRANSITIONS: a probe's field used to change in one frame when a face landed; probes
+            // finish one every few frames, so an area came on in staggered steps ("like a fluorescent
+            // lamp turning on", user 2026-10-11). A probe with a new face is now relit every frame for
+            // pgiFade s, blending toward its new value (alpha = 1 - e^(-dt/tau), tau = pgiFade/3); its
+            // first face blends it in from nothing. State = 1 settled / 2 transition (+ face mask/128).
+            static auto s_fadeT = std::chrono::steady_clock::now();
+            const auto nowT = std::chrono::steady_clock::now();
+            const float dt = std::clamp(std::chrono::duration<float>(nowT - s_fadeT).count(), 0.0f, 0.1f);
+            s_fadeT = nowT;
+            const float alpha = (g_pgiFade > 0.01f) ? 1.0f - std::exp(-dt * 3.0f / g_pgiFade) : 1.0f;
+            // BALL MODE: the slots carry the pool's probes (same states as a column layer).
+            for (uint32_t p = 0; p < kPgiN && g_pgi.ballMode; ++p) {
+                const int k = g_pgi.slotOwner[p];
+                float state = 0.0f;
+                float pos[3] = {};
+                if (k >= 0 && k < (int)g_pgi.pool.size()) {
+                    PgiBall& b = g_pgi.pool[k];
+                    pos[0] = b.p[0]; pos[1] = b.p[1]; pos[2] = b.p[2];
+                    if (b.faces) {
+                        const bool tr = b.trans > 0.0f;
+                        b.trans = std::max(0.0f, b.trans - dt);
+                        state = (tr ? 2.0f : 1.0f) + (float)b.faces / 128.0f;
+                        if (b.done) { ++complete; }
+                    }
+                }
+                if (p == kPgiWorldSlot && g_pgi.worldFaces) {   // the world probe: always easing (state 4)
+                    pos[0] = g_pgi.worldP[0]; pos[1] = g_pgi.worldP[1]; pos[2] = g_pgi.worldP[2];
+                    state = 4.0f + (float)g_pgi.worldFaces / 128.0f;
+                }
+                if (state == 0.0f && (!g_pgi.cleared || g_pgi.slotClear[p])) { state = 3.0f; }
+                g_pgi.slotClear[p] = false;
+                pr[p] = float4(pos[0], pos[1], pos[2], state);
+            }
+            for (uint32_t l = 0; l < kPgiL && !g_pgi.ballMode; ++l) {
                 for (uint32_t s = 0; s < kPgiG * kPgiG; ++s) {
                     PgiColumn& c = g_pgi.col[s];
                     float state = 0.0f;
-                    if (c.zValid && c.done[l]) { state = c.justDone[l] ? 2.0f : 1.0f; ++complete; }
+                    if (c.zValid && c.faces[l]) {
+                        const bool tr = c.trans[l] > 0.0f;
+                        c.trans[l] = std::max(0.0f, c.trans[l] - dt);
+                        state = (tr ? 2.0f : 1.0f) + (float)c.faces[l] / 128.0f;
+                        if (c.done[l]) { ++complete; }
+                    }
                     c.justDone[l] = false;
                     // State 3 = run now and write zeros: the first frame (the field starts as garbage)
                     // and a slot whose column or height just changed (it still holds the old probe).
@@ -65225,6 +66400,13 @@ void destroyHostWindow(Renderer* R);
             P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
             P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
             P->grid   = float4(g_pgi.spacing, (float)kPgiG, (float)g_pgi.phase, (float)R);
+            // y = a transition's blend toward its new value; z = MULTI-BOUNCE on (knob pgiBounce)
+            P->capMisc = float4(g_pgiLiveSky > 0.5f ? 1.0f : 0.0f, alpha, g_pgiBounce > 0.5f ? 1.0f : 0.0f, ((int)g_pgiDebug & 64) ? 1.0f : 0.0f);   // x = live sky, w = lit preview
+            P->place   = float4(g_pgiFillOld > 0.5f ? 1.0f : 0.0f, std::max(0.0f, g_pgiSunGain),
+                                (g_pgiSunMarch > 0.5f || !g_live.pSunOcc) ? 1.0f : 0.0f, 0.0f);   // z = the old sun march
+            // The LIVE sky: the atmosphere's sky-view field in scene units (skyhw.frag's own scale).
+            const bool skyLive = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+            P->skyLive = float4(skyLive ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);   // x = missing faces take the old model (pgiFillOld), y = sun share (pgiSunGain)
             TextureBarrier tb = {};
             tb.pTexture = g_pgi.sh;
             tb.mCurrentState = g_pgi.shInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
@@ -65233,25 +66415,218 @@ void destroyHostWindow(Renderer* R);
             cmdBindPipeline(cmd, g_pgi.pRelight);
             cmdBindDescriptorSet(cmd, 2, g_pgi.set);
             cmdDispatch(cmd, kPgiN, 1, 1);
+            // LIT PEEK (debug, pgiDebug 8|64): the two peeked probes' full-resolution captures relit
+            // with the relight's own terms, into the peek atlas's rows 2-3 (pgiview.frag shows them).
+            if (g_pgi.ballMode && g_pgi.pPeekLit && ((int)g_pgiDebug & 8) && ((int)g_pgiDebug & 64)
+                && g_pgi.peekIx >= 0 && g_pgi.peekIx < (int)kPgiN && g_pgi.peekIy >= 0 && g_pgi.peekIy < (int)kPgiN) {
+                const int k0 = g_pgi.slotOwner[g_pgi.peekIx], k1 = g_pgi.slotOwner[g_pgi.peekIy];
+                if (k0 >= 0 && k1 >= 0 && k0 < (int)g_pgi.pool.size() && k1 < (int)g_pgi.pool.size()) {
+                    TextureBarrier ub = {};
+                    ub.pTexture = g_pgi.sh; ub.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; ub.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(cmd, 0, nullptr, 1, &ub, 0, nullptr);
+                    pgiPeekState(false);
+                    const PgiBall& b0 = g_pgi.pool[k0];
+                    const PgiBall& b1 = g_pgi.pool[k1];
+                    PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[5]);
+                    std::memset(Q, 0, sizeof(PgiParams));
+                    Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], 0.0f);
+                    Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
+                    Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
+                    Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+                    Q->capPos  = float4(b0.p[0], b0.p[1], b0.p[2], 0.0f);
+                    Q->capMisc = float4(b1.p[0], b1.p[1], b1.p[2], 0.0f);
+                    Q->capTile = float4(0.0f, 0.0f, (float)g_pgi.peekRes, 0.0f);
+                    Q->place   = float4((float)g_pgi.peekIx, (float)g_pgi.peekIy, (float)g_pgi.peekMask[0], (float)g_pgi.peekMask[1]);
+                    const bool skyLiveQ = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+                    Q->skyLive = float4(skyLiveQ ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);
+                    cmdBindPipeline(cmd, g_pgi.pPeekLit);
+                    cmdBindDescriptorSet(cmd, 5, g_pgi.set);
+                    cmdDispatch(cmd, (6u * g_pgi.peekRes + 7u) / 8u, (2u * g_pgi.peekRes + 7u) / 8u, 1);
+                }
+            }
+            // SPLAT (ball mode): the relit probes -> the volume, while the SH is still a UAV.
+            if (g_pgi.ballMode && g_pgi.pSplat) {
+                TextureBarrier ub = {};
+                ub.pTexture = g_pgi.sh; ub.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; ub.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &ub, 0, nullptr);
+                // The window: VX x VX x VZ voxels around the camera, re-centred in z only when the
+                // camera leaves the middle half (the tags make any move safe; this just limits it).
+                const float iv = 1.0f / std::max(16.0f, g_pgiVoxel);
+                const int cx = (int)std::floor(fcbvR[56] * iv), cy = (int)std::floor(fcbvR[57] * iv), cz = (int)std::floor(fcbvR[58] * iv);
+                g_pgi.volO[0] = cx - (int)kPgiVX / 2;
+                g_pgi.volO[1] = cy - (int)kPgiVX / 2;
+                if (!g_pgi.volInit || cz < g_pgi.volO[2] + (int)kPgiVZ / 4 || cz >= g_pgi.volO[2] + 3 * (int)kPgiVZ / 4) {
+                    g_pgi.volO[2] = cz - (int)kPgiVZ / 2;
+                }
+                const uint32_t period = (uint32_t)std::clamp(g_pgiVolPeriod, 1.0f, 64.0f);
+                g_pgi.volPhase = (g_pgi.volPhase + 1u) % period;
+                PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[4]);
+                std::memset(Q, 0, sizeof(PgiParams));
+                Q->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
+                Q->grid   = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+                Q->vol    = float4((float)g_pgi.volO[0], (float)g_pgi.volO[1], (float)g_pgi.volO[2], std::max(16.0f, g_pgiVoxel));
+                const float tau = std::max(0.01f, g_pgiVolTau);
+                const float va  = g_pgi.volInit ? 1.0f - std::exp(-dt * (float)period / tau) : 1.0f;
+                const float kk  = std::max(0.5f, g_pgiKernK);
+                Q->vol2   = float4(kk * g_pgiPoolR0, kk * g_pgiPoolRk, g_pgi.volInit ? (float)period : 1.0f, va);
+                Q->vol3   = float4(g_pgi.volInit ? (float)g_pgi.volPhase : 0.0f, (float)kPgiVX, (float)kPgiVZ, std::max(0.01f, g_pgiVolFull));
+                TextureBarrier vb = {};
+                vb.pTexture = g_pgi.vol;
+                vb.mCurrentState = g_pgi.volInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
+                vb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &vb, 0, nullptr);
+                cmdBindPipeline(cmd, g_pgi.pSplat);
+                cmdBindDescriptorSet(cmd, 4, g_pgi.set);
+                cmdDispatch(cmd, kPgiVX / 4u, kPgiVX / 4u, kPgiVZ / 4u);
+                vb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; vb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &vb, 0, nullptr);
+                g_pgi.volInSR = true;
+                g_pgi.volInit = true;
+                g_pgi.volLive = true;
+            } else {
+                g_pgi.volLive = false;
+            }
             tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
             cmdResourceBarrier(cmd, 0, nullptr, 1, &tb, 0, nullptr);
             g_pgi.shInSR = true;
+            // probeOracleAtProbes: the field -> its readback lane, for the oracle's sidecar.
+            if (g_probeOracleAtProbes > 0.5f && g_pgi.shRb) {
+                TextureBarrier cb = {};
+                cb.pTexture = g_pgi.sh; cb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE; cb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
+                for (uint32_t sl = 0; sl < 16u; ++sl) {
+                    D3D12_TEXTURE_COPY_LOCATION src = {};
+                    src.pResource = g_pgi.sh->mDx.pResource;
+                    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    src.SubresourceIndex = sl;   // one mip: subresource = array slice
+                    D3D12_TEXTURE_COPY_LOCATION dst = {};
+                    dst.pResource = g_pgi.shRb->mDx.pResource;
+                    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    dst.PlacedFootprint.Offset = (uint64_t)g_live.recSlot * kPgiShLane + (uint64_t)sl * kPgiShSlice;
+                    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    dst.PlacedFootprint.Footprint.Width = kPgiG;
+                    dst.PlacedFootprint.Footprint.Height = kPgiG;
+                    dst.PlacedFootprint.Footprint.Depth = 1;
+                    dst.PlacedFootprint.Footprint.RowPitch = (UINT)kPgiShRowPitch;
+                    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                }
+                cb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; cb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
+            }
             g_pgi.cleared = true;
         }
+        // --- balls (phase 1: placement only, while pgiDebug 32 shows them)
+        g_pgi.ballsOn = false;
+        g_pgi.ballN[g_live.recSlot % kFrameSlots] = 0;
+        if ((((int)g_pgiDebug & 32) || g_pgi.ballMode) && !g_live.firstFrame) {
+            const uint32_t nCam = (uint32_t)std::clamp(g_pgiBallsCam, 0.0f, (float)kPgiBallMax);
+            const uint32_t nSun = std::min((uint32_t)std::max(0.0f, g_pgiBallsSun), kPgiBallMax - nCam);
+            PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[3]);
+            std::memset(P, 0, sizeof(PgiParams));
+            P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
+            P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
+            P->balls  = float4((float)nCam, (float)nSun, (float)(++g_pgi.ballSeed), 48.0f);
+            // In DOUBLE: a cascade's ortho has det ~1e-12 (1/extent² x 1/slab), under invert4x4's
+            // singular threshold — every sun ball fell back to the zenith path.
+            auto invD = [](const float* m, float* out) {
+                double a[4][8];
+                for (int r = 0; r < 4; ++r) {
+                    for (int c = 0; c < 4; ++c) { a[r][c] = m[r * 4 + c]; a[r][c + 4] = (r == c) ? 1.0 : 0.0; }
+                }
+                for (int c = 0; c < 4; ++c) {
+                    int p = c;
+                    for (int r = c + 1; r < 4; ++r) { if (std::fabs(a[r][c]) > std::fabs(a[p][c])) { p = r; } }
+                    if (std::fabs(a[p][c]) < 1e-300) { return false; }
+                    if (p != c) { for (int k = 0; k < 8; ++k) { std::swap(a[p][k], a[c][k]); } }
+                    const double iv = 1.0 / a[c][c];
+                    for (int k = 0; k < 8; ++k) { a[c][k] *= iv; }
+                    for (int r = 0; r < 4; ++r) {
+                        if (r == c) { continue; }
+                        const double f = a[r][c];
+                        for (int k = 0; k < 8; ++k) { a[r][k] -= f * a[c][k]; }
+                    }
+                }
+                for (int r = 0; r < 4; ++r) { for (int c = 0; c < 4; ++c) { out[r * 4 + c] = (float)a[r][c + 4]; } }
+                return true;
+            };
+            float inv[32];
+            const bool sunOk = g_pgiSunVPValid && g_live.pSunMomentsDepth
+                            && invD(g_pgiSunVP, inv) && invD(g_pgiSunVP + 16, inv + 16);
+            if (sunOk) {
+                std::memcpy((float*)&P->sunInv0, inv, 64);
+                std::memcpy((float*)&P->sunInv1, inv + 16, 64);
+            }
+            P->ballsMisc = float4(sunOk ? 1.0f : 0.0f, 1.0f, 2048.0f, std::max(0.01f, g_pgiBallSpread));
+            cmdBindPipeline(cmd, g_pgi.pBalls);
+            cmdBindDescriptorSet(cmd, 3, g_pgi.set);
+            cmdDispatch(cmd, (nCam + nSun + 63u) / 64u, 1, 1);
+            BufferBarrier bb = {};
+            bb.pBuffer = g_pgi.ballBuf; bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; bb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+            cmdResourceBarrier(cmd, 1, &bb, 0, nullptr, 0, nullptr);
+            cl->CopyBufferRegion(g_pgi.ballRb->mDx.pResource, (uint64_t)g_live.recSlot * kPgiBallLane,
+                                 g_pgi.ballBuf->mDx.pResource, 0, kPgiBallLane);
+            bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; bb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(cmd, 1, &bb, 0, nullptr, 0, nullptr);
+            g_pgi.ballsOn = true;
+            g_pgi.ballN[g_live.recSlot % kFrameSlots] = nCam + nSun;
+        }
         cmdEndDebugMarker(cmd);
+        gpuPhaseEndG(kGpuPhasePgi);
+        pgiGbufState(((int)g_pgiDebug & (4 | 64)) != 0);
+        pgiPeekState(((int)g_pgiDebug & 8) != 0);
         static uint32_t s_log = 0;
         if ((s_log++ % 300u) == 0u) {
-            uint32_t cols = 0;
-            for (const PgiColumn& c : g_pgi.col) { cols += c.zValid ? 1u : 0u; }
+            uint32_t cols = 0, nearDone = 0;
+            const float S = std::max(1.0f, g_pgi.spacing);
+            const int fx = (int)std::floor(g_pgi.eye[0] / S), fy = (int)std::floor(g_pgi.eye[1] / S);
+            for (const PgiColumn& c : g_pgi.col) {
+                cols += c.zValid ? 1u : 0u;
+                if (c.ix >= fx - 1 && c.ix <= fx + 2 && c.iy >= fy - 1 && c.iy <= fy + 2) {   // 4 x 4 around the camera
+                    nearDone += (c.zValid && c.done[0] ? 1u : 0u) + (c.zValid && c.done[1] ? 1u : 0u);
+                }
+            }
+            static double s_t = 0.0;
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            const double secs = s_t > 0.0 ? now - s_t : 0.0;
+            s_t = now;
             const float* rb = g_pgi.placeRb ? (const float*)((const uint8_t*)g_pgi.placeRb->pCpuMappedAddress
                                                              + (uint64_t)g_readSlot * kPgiPlaceLane) : nullptr;
             const PgiColumn& c0 = g_pgi.col[0];
-            LOG::logline(">> [pgi] window ix0=%d iy0=%d spacing %.0f | placed %u/%u columns | complete %u/%u probes | captures %u"
+            LOG::logline(">> [pgi] window ix0=%d iy0=%d spacing %.0f | placed %u/%u columns | complete %u/%u probes | nearDone %u/32"
+                         " | %.1f s, speed %.0f u/s | zResets %u | captures %u"
                          " (stolen %u) | slot0 col (%d,%d) z %.0f/%.0f, readback lane%u (%.1f %.1f %.1f %.1f)",
-                         g_pgi.ix0, g_pgi.iy0, (double)g_pgi.spacing, cols, kPgiG * kPgiG, g_pgi.complete, kPgiN, g_pgi.captures,
+                         g_pgi.ix0, g_pgi.iy0, (double)g_pgi.spacing, cols, kPgiG * kPgiG, g_pgi.complete, kPgiN, nearDone,
+                         secs, (double)std::sqrt(g_pgi.vel[0] * g_pgi.vel[0] + g_pgi.vel[1] * g_pgi.vel[1]), g_pgi.zResets,
+                         g_pgi.captures,
                          g_pgi.steals,
                          c0.ix, c0.iy, (double)c0.z[0], (double)c0.z[1], g_readSlot,
                          rb ? (double)rb[0] : -1.0, rb ? (double)rb[1] : -1.0, rb ? (double)rb[2] : -1.0, rb ? (double)rb[3] : -1.0);
+            if (!g_pgi.pool.empty() || g_pgi.ballIn) {
+                uint32_t byType[4] = {};
+                for (const PgiBall& b : g_pgi.pool) { ++byType[std::min(b.type, 3u)]; }
+                LOG::logline(">> [pgi] balls: pool %zu (camera %u, sun %u, zenith %u) | joined %u merged %u evicted %u (cumulative) | sun map %s | gpu pgi %.3f ms"
+                             " | world faces %02x pend %02x shots %u at (%.0f,%.0f,%.0f)",
+                             g_pgi.pool.size(), byType[1], byType[2], byType[3], g_pgi.ballIn, g_pgi.ballMerged,
+                             g_pgi.ballEvicted, g_pgiSunVPValid ? "yes" : "no", (double)g_lastGpuPhaseMs[kGpuPhasePgi],
+                             (unsigned)g_pgi.worldFaces, (unsigned)g_pgi.worldPend, g_pgi.worldShots,
+                             (double)g_pgi.worldP[0], (double)g_pgi.worldP[1], (double)g_pgi.worldP[2]);
+            }
+            // The 4 x 4 columns around the camera: each probe's height and state (D done, . not),
+            // against the eye's own height — where a receiver's probes stand is the whole question
+            // when one of them looks wrong.
+            char buf[1024]; int n = 0;
+            for (int y = fy - 1; y <= fy + 2 && n < 960; ++y) {
+                for (int x = fx - 1; x <= fx + 2 && n < 960; ++x) {
+                    const PgiColumn& c = g_pgi.col[((y % (int)kPgiG + (int)kPgiG) % (int)kPgiG) * kPgiG
+                                                   + ((x % (int)kPgiG + (int)kPgiG) % (int)kPgiG)];
+                    if (c.ix != x || c.iy != y || !c.zValid) { n += std::snprintf(buf + n, sizeof(buf) - n, " (%d,%d)-", x, y); continue; }
+                    n += std::snprintf(buf + n, sizeof(buf) - n, " (%d,%d)%.0f%c/%.0f%c", x, y,
+                                       (double)c.z[0], c.done[0] ? 'D' : '.', (double)c.z[1], c.done[1] ? 'D' : '.');
+                }
+            }
+            LOG::logline(">> [pgi] near eye (%.0f,%.0f,%.0f):%s", (double)g_pgi.eye[0], (double)g_pgi.eye[1],
+                         (double)g_pgi.eyeZ, buf);
         }
     }
 
@@ -65267,7 +66642,18 @@ void destroyHostWindow(Renderer* R);
         mp[kPgiFloat + 4] = ((float)g_pgi.ix0 + 0.5f * (float)(kPgiG - 1u)) * S;
         mp[kPgiFloat + 5] = ((float)g_pgi.iy0 + 0.5f * (float)(kPgiG - 1u)) * S;
         mp[kPgiFloat + 6] = 1.0f / std::max(half, 1.0f);
-        mp[kPgiFloat + 7] = 0.0f;
+        mp[kPgiFloat + 7] = (on && ((int)g_pgiDebug & 2)) ? 1.0f : 0.0f;   // receiver share tint
+        // The VOLUME (ball placement): its geometry, and ON only once a splat has written it.
+        mp[kPgiFloat + 8]  = 1.0f / std::max(16.0f, g_pgiVoxel);
+        mp[kPgiFloat + 9]  = (float)kPgiVX;
+        mp[kPgiFloat + 10] = (float)kPgiVZ;
+        mp[kPgiFloat + 11] = (on && g_pgi.volLive) ? 1.0f : 0.0f;
+        mp[kPgiFloat + 12] = (float)g_pgi.volO[0];
+        mp[kPgiFloat + 13] = (float)g_pgi.volO[1];
+        mp[kPgiFloat + 14] = (float)g_pgi.volO[2];
+        // The WORLD PROBE's share in the old model (skyamb.h.fsl pgiWorldFactor); its slot's validity
+        // fades it in, so 0 until a first face exists.
+        mp[kPgiFloat + 15] = (on && g_pgi.ballMode && g_pgi.worldFaces) ? std::clamp(g_pgiWorld, 0.0f, 1.0f) : 0.0f;
     }
 
     void renderSunShadow() {
@@ -65282,7 +66668,7 @@ void destroyHostWindow(Renderer* R);
                         && g_dlExterior && g_dlLiveInit && g_staticsLiveOk
                         && (sunDraw || gpuDraw || g_liveLastSubsets > 0);
         // Single exit for "no map this frame": disarm every receiver before returning.
-        if (!ready) { g_live.sunShadowReady = false; publishSunShadowParams(nullptr, nullptr, false); return; }
+        if (!ready) { g_live.sunShadowReady = false; g_pgiSunVPValid = false; publishSunShadowParams(nullptr, nullptr, false); return; }
 
         // Per-cascade sun frame CBV = copy of the main frame data, viewProj := that cascade's ortho VP
         // built from gFrameData.sunDir (float[16..18], camera-relative space — same as statics.vert
@@ -65313,6 +66699,9 @@ void destroyHostWindow(Renderer* R);
         // Phase B: hand the SAME matrices to the receivers. Caster and receiver must project by one
         // matrix or the shadow slides — this is the only place they are built.
         publishSunShadowParams(sunVP, cascadeTexel, true);
+        static_assert(kSunCascades >= 2, "probe balls read two cascades");
+        std::memcpy(g_pgiSunVP, sunVP, sizeof(g_pgiSunVP));   // ...and the probe balls' sun rays
+        g_pgiSunVPValid = true;
 
         // --- TERRAIN caster cull (P1) -------------------------------------------------------------
         // The landscape joins the caster set. Cull it against the OUTERMOST cascade's ortho box, the
@@ -65720,7 +67109,8 @@ void destroyHostWindow(Renderer* R);
         // ⚠ THE COUNT DIFFERS IN KIND between the two arms and that is the command wall: the CPU
         // ring is COMPACTED (g_liveLastSubsetsRefl = touched subsets only), the GPU one is not
         // (cullSubsetCount, most of them zero-instance no-ops).
-        const bool reflDraw = g_reflGpuCull && g_live.reflCullReady && g_live.reflArgsInDrawState
+        const bool reflDraw = g_reflGpuCull && !(g_capFace.active && g_capFace.pgi)   // capture: CPU cull (dlReflectCullAndBuild)
+                           && g_live.reflCullReady && g_live.reflArgsInDrawState
                            && g_reflGpuCullRan;
         if (g_drawDLStatics && g_staticsLiveOk && (reflDraw || g_liveLastSubsetsRefl > 0)) {
             // Opposite winding to the main record (the water-plane mirror flips handedness).
@@ -65775,10 +67165,15 @@ void destroyHostWindow(Renderer* R);
         // Index [mir] with the MAIN pass's mirror flag; the entries are swapped (see header).
         // g_reflNearSwapWinding = false restores the main pass's own choice — a diagnostic A/B, since
         // an inverted winding here shows every reflected surface's backface.
-        Pipeline* const opaquePSO[2] = {
+        Pipeline* opaquePSO[2] = {
             g_reflNearSwapWinding ? g_live.pFPOpaquePipelineMirror : g_live.pFPOpaquePipeline,
             g_reflNearSwapWinding ? g_live.pFPOpaquePipeline       : g_live.pFPOpaquePipelineMirror,
         };
+        // A probe-GI capture draws both sides (opaque.frag flags the back ones; pgirelight rejects a
+        // probe that sees many — inside the tunnel's rock, which is often this near set).
+        if (g_capFace.active && g_capFace.pgi && g_live.pFPOpaquePipelineNone) {
+            opaquePSO[0] = opaquePSO[1] = g_live.pFPOpaquePipelineNone;
+        }
         uint32_t nearDrawn = 0, skinDrawn = 0;
 
         cmdBindPipeline(g_live.pCmd, opaquePSO[0]);
@@ -67131,6 +68526,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pFPMaskAllLit)           { removeResource(g_live.pFPMaskAllLit); }
         if (g_live.pFPOpaquePipeline)        { removePipeline(R, g_live.pFPOpaquePipeline); }
         if (g_live.pFPOpaquePipelineMirror)  { removePipeline(R, g_live.pFPOpaquePipelineMirror); }
+        if (g_live.pFPOpaquePipelineNone)    { removePipeline(R, g_live.pFPOpaquePipelineNone); }
         if (g_live.pFPSkinnedPipeline)       { removePipeline(R, g_live.pFPSkinnedPipeline); }
         if (g_live.pFPSkinnedPipelineMirror) { removePipeline(R, g_live.pFPSkinnedPipelineMirror); }
         if (g_live.pFPMultiMapPipeline)      { removePipeline(R, g_live.pFPMultiMapPipeline); }
@@ -67150,6 +68546,13 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSkyViewCbv[0])          { removeFrameBuf(g_live.pSkyViewCbv[0]); }
         if (g_live.pSkyViewCbv[1])          { removeFrameBuf(g_live.pSkyViewCbv[1]); }
         if (g_live.pDebugLineVB)            { removeFrameBuf(g_live.pDebugLineVB); }
+        if (g_live.pPgiProbeVB)             { removeFrameBuf(g_live.pPgiProbeVB); g_live.pPgiProbeVB = nullptr; }
+        if (g_live.pPgiProbePipeSolid)      { removePipeline(R, g_live.pPgiProbePipeSolid); g_live.pPgiProbePipeSolid = nullptr; }
+        if (g_live.pPgiProbePipeWire)       { removePipeline(R, g_live.pPgiProbePipeWire); g_live.pPgiProbePipeWire = nullptr; }
+        if (g_live.pPgiProbeShader)         { removeShader(R, g_live.pPgiProbeShader); g_live.pPgiProbeShader = nullptr; }
+        if (g_live.pPgiViewVB)              { removeFrameBuf(g_live.pPgiViewVB); g_live.pPgiViewVB = nullptr; }
+        if (g_live.pPgiViewPipe)            { removePipeline(R, g_live.pPgiViewPipe); g_live.pPgiViewPipe = nullptr; }
+        if (g_live.pPgiViewShader)          { removeShader(R, g_live.pPgiViewShader); g_live.pPgiViewShader = nullptr; }
         if (g_live.pDebugLinePipeline)      { removePipeline(R, g_live.pDebugLinePipeline); }
         if (g_live.pDebugLineShader)        { removeShader(R, g_live.pDebugLineShader); }
         if (g_live.pShadowAtlasViewPipeline){ removePipeline(R, g_live.pShadowAtlasViewPipeline); }
@@ -67444,6 +68847,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pReflectMipPipelineFirst){ removePipeline(R, g_live.pReflectMipPipelineFirst); }
         if (g_live.pReflectMipShader)       { removeShader(R, g_live.pReflectMipShader); }
         if (g_live.pReflectMipShaderFirst)  { removeShader(R, g_live.pReflectMipShaderFirst); }
+        if (g_live.pReflectMipPipelinePgi)  { removePipeline(R, g_live.pReflectMipPipelinePgi); }
+        if (g_live.pReflectMipShaderPgi)    { removeShader(R, g_live.pReflectMipShaderPgi); }
         if (g_live.pReflectMips)            { removeResource(g_live.pReflectMips); }
         if (g_live.pReflectDepthResolved)   { removeResource(g_live.pReflectDepthResolved); }
         // P1 point-light shadows.

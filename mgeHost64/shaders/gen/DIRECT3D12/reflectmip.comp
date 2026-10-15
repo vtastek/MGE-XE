@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 818 "FSL/shaders.list"
+#line 846 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/reflectmip.comp.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/reflectmip.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/reflectmip.srt.h"
@@ -999,7 +999,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 {
     INIT_MAIN;
     int2 p = int2(DispatchThreadID.xy);
-#line 81 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/reflectmip.comp.fsl"
+#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/reflectmip.comp.fsl"
     int2 s = p * 2;
     int2 hi = GetDimensions(gReflMipSrc, NO_SAMPLER) - int2(1, 1);
     float w[4]; w[0] = 1.0f; w[1] = 3.0f; w[2] = 3.0f; w[3] = 1.0f;
@@ -1015,4 +1015,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gReflMipDst, p, c);
     return;
 }
-#line 819 "FSL/shaders.list"
+#line 847 "FSL/shaders.list"

@@ -111,6 +111,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float2 lat = (float2(float(gx), float(gy)) + 0.5f) * invGrid;
         int2 p  = int2(int(lat.x * imgSize.x), int(lat.y * imgSize.y));
         int2 pd = int2(int(lat.x * srcSize.x), int(lat.y * srcSize.y));
+        // A debug overlay's rect (apl.srt.h excl): absent, like sky.
+        if (all(lat >= gAplParams.excl.xy) && all(lat < gAplParams.excl.zw)) { continue; }
         // SKY REJECTION. Reverse-Z, cleared to 0.0, and the sky pass writes no depth at all — so
         // depth 0 means "nothing of the world is here" and the pixel is sky. `continue` is safe in
         // this loop specifically because there is no barrier inside it (the comment on the loop

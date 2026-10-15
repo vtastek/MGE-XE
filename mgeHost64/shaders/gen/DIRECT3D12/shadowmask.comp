@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 713 "FSL/shaders.list"
+#line 731 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
@@ -1296,7 +1296,24 @@ STRUCT(ShadowMaskParams)
 
     float4 pgiParams0;
     float4 pgiParams1;
-#line 1087
+
+
+
+
+
+    float4 pgiParams2;
+    float4 pgiParams3;
+
+
+
+
+    float4 skyHaze0;
+    float4 skyHaze1;
+    float4 skyHaze2;
+
+
+    float4 giDebug;
+#line 1104
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 
@@ -1647,4 +1664,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     }
     return;
 }
-#line 714 "FSL/shaders.list"
+#line 732 "FSL/shaders.list"

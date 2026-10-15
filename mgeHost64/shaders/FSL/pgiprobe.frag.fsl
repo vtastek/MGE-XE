@@ -1,0 +1,68 @@
+// mgeHost64 — PROBE GI debug view, fragment (pgiprobe.vert.fsl has the layout).
+//
+// SPHERE: the probe's own irradiance for the sphere's normal — its SH9 planes read at the probe's
+// storage texel (bilinear at the texel centre = that texel alone), divided by its validity, times the
+// field gain: the ambient a white surface facing that way would get from this probe alone. No data =
+// dark grey. CUBE: status — RED rejected (inside geometry), BLUE blending a change in, GREEN complete,
+// YELLOW partial (still capturing faces), GREY no face yet.
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float3,       Normal,   TEXCOORD0);
+    DATA(FLAT(float4), Info,     TEXCOORD1);
+    DATA(FLAT(float),  IsBox,    TEXCOORD2);
+};
+
+// .SampleLevel directly, as skyamb.h.fsl's PgiSampleArr: FSL's SampleLvlTex2DArray is typed Texture3D.
+#define PgipLoad(s) gPgiSH.SampleLevel(gSamplerPointClamp, float3(uv, (float)(s)), 0.0f)
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // BALL POOL (pgiDebug 32, status >= 4): no field yet — a flat colour by origin (4 camera CYAN, 5 sun
+    // YELLOW, 6 zenith WHITE), shaded by the sphere normal against the stored surface normal (Info.xyz)
+    // so the side facing what the ball hit reads bright.
+    if (In.Info.w > 3.5f) {
+        const uint t = (uint)(In.Info.w + 0.5f);
+        float3 bc = (t == 4u) ? float3(0.0f, 0.9f, 1.0f) : (t == 5u) ? float3(1.0f, 0.85f, 0.0f) : f3(1.0f);
+        if (In.IsBox > 0.5f) { RETURN(float4(bc * 2.0f, 1.0f)); }
+        const float k = 0.35f + 0.65f * saturate(dot(normalize(In.Normal), In.Info.xyz) * 0.5f + 0.5f);
+        RETURN(float4(bc * k, 1.0f));
+    }
+    const float G = gShadowParams.pgiParams0.w;   // the grid side (pgiPublish)
+    const float2 uv = (In.Info.xy + 0.5f) / max(G, 1.0f);
+    const uint layer = (uint)(In.Info.z + 0.5f);
+    const float4 meta = PgipLoad(14u + layer);
+    const float rej = PgipLoad(layer * 7u + 6u).w;
+    if (In.IsBox > 0.5f) {
+        const uint st = (uint)(In.Info.w + 0.5f);
+        float3 c = float3(0.5f, 0.5f, 0.5f);                          // grey: no face yet
+        if (st == 1u) { c = float3(1.0f, 0.85f, 0.0f); }              // yellow: partial
+        if (st == 2u) { c = float3(0.0f, 1.0f, 0.0f); }               // green: complete
+        if (st == 3u) { c = float3(0.1f, 0.3f, 1.0f); }               // blue: blending a change in
+        if (rej > 0.5f) { c = float3(1.0f, 0.0f, 0.0f); }             // red: rejected
+        RETURN(float4(c * 2.0f, 1.0f));
+    }
+    const float w = meta.y;
+    if (w < 1.0e-3f) { RETURN(float4(0.04f, 0.04f, 0.04f, 1.0f)); }
+    float4 c[7];
+    UNROLL for (uint k = 0u; k < 7u; ++k) { c[k] = PgipLoad(layer * 7u + k) / w; }
+    const float3 nn = normalize(In.Normal);
+    const float Y[9] = { 0.282095f, 0.488603f * nn.y, 0.488603f * nn.z, 0.488603f * nn.x,
+                         1.092548f * nn.x * nn.y, 1.092548f * nn.y * nn.z, 0.315392f * (3.0f * nn.z * nn.z - 1.0f),
+                         1.092548f * nn.x * nn.z, 0.546274f * (nn.x * nn.x - nn.y * nn.y) };
+    const float f[28] = { c[0].x, c[0].y, c[0].z, c[0].w, c[1].x, c[1].y, c[1].z, c[1].w,
+                          c[2].x, c[2].y, c[2].z, c[2].w, c[3].x, c[3].y, c[3].z, c[3].w,
+                          c[4].x, c[4].y, c[4].z, c[4].w, c[5].x, c[5].y, c[5].z, c[5].w,
+                          c[6].x, c[6].y, c[6].z, c[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (uint b = 0u; b < 9u; ++b) { E += float3(f[3u * b], f[3u * b + 1u], f[3u * b + 2u]) * Y[b]; }
+    // As a 0.8-albedo near-white surface facing that way would show it. Was 0.3 (ordinary albedo, so it
+    // sat at the scene's exposure), but at 0.3 a floor's tint on the underside was too dark to read:
+    // *"maybe balls should be whiter"* (user, 2026-10-15). The ground truth at the probes (grass.mrec,
+    // probe-relight.py chroma) matched the stored SH's colour; the preview was hiding it.
+    RETURN(float4(max(E, f3(0.0f)) * max(gShadowParams.pgiParams0.x, 0.0f) * 0.8f, 1.0f));
+}

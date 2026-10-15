@@ -12,6 +12,7 @@
 #   save.ess     default iboseydaneenwater.ess (shore + statics + water: where the defect shows)
 #   hostKnobs    extra MGE_HOST_KNOBS, comma-separated; dumpAtFrame is added here
 #   weathers     space-separated indices, default "0 1 2 3 4 5 6 7 8 9"
+#   clientEnv    comma-separated client env, e.g. "MGE_SET_HOUR=18.5" (FreezeClock: time-of-day sweeps)
 #
 # ⚠ THE PICTURE IS NAMED BY WHAT THE HOST SAID WAS LIVE, NOT BY WHAT THE SCRIPT ASKED FOR. The
 # `[hdrdump] ... weather=` field is parsed out of the run's own log and goes in the filename, and a
@@ -22,6 +23,7 @@ TAG="${1:-baseline}"
 SAVE="${2:-iboseydaneenwater.ess}"
 KNOBS_EXTRA="${3:-}"
 WEATHERS="${4:-0 1 2 3 4 5 6 7 8 9}"
+CLIENTENV="${5:-}"
 
 INSTALL="/mnt/c/mgem/morrowind64"
 RINGCFG="$INSTALL/Data Files/MWSE/config/tw_weatherring.json"
@@ -59,7 +61,7 @@ PY
 
   KN="dumpAtFrame=$DUMPFRAME"
   [ -n "$KNOBS_EXTRA" ] && KN="$KN,$KNOBS_EXTRA"
-  bash "$HERE/forge-perf-run.sh" "$SAMPLES" "$TIMEOUT" "$SAVE" "" "$KN" >/dev/null 2>&1
+  bash "$HERE/forge-perf-run.sh" "$SAMPLES" "$TIMEOUT" "$SAVE" "" "$KN" "" "$CLIENTENV" >/dev/null 2>&1
 
   # ⚠ THE WHOLE LOG, NOT A BYTE OFFSET TAKEN BEFORE THE RUN. mgeHost64.log is TRUNCATED at every
   # host start, so a `tail -c +N` saved beforehand points PAST the new end and returns nothing —
@@ -78,7 +80,7 @@ PY
   if [ "$GOTIDX" != "$W" ]; then
     echo "[pics] !! weather $W REQUESTED but host reports $GOTNAME($GOTIDX) — naming by what was LIVE"
   fi
-  for EXT in tga exr; do
+  for EXT in tga exr json; do   # json: the camera sidecar (sky-profile.py, fogprobe.py need it)
     [ -f "$DUMPDIR/$SRC.$EXT" ] && mv "$DUMPDIR/$SRC.$EXT" "$OUT/$(printf '%d' "${GOTIDX:-99}")_${GOTNAME:-unknown}.$EXT"
   done
   # ...and a PNG beside the TGA, because the point of the exercise is that somebody LOOKS at it and

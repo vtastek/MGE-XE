@@ -129,6 +129,8 @@ float4 PS_MAIN(VSOutput In)
     // floor, so there is nothing left for a fade to stand in for. The ramp's OTHER job, handing the
     // LIGHTING back to MW's authored night, is untouched and still runs host-side.
     float3 L = Lnative * gSkyView.radiance.w;
+    // S3.5b: the haze in front of it (skyradiance.h.fsl). skyHaze 0 = untouched.
+    L = atmosSkyHazed(dir, L);
 
     // --- the sky is behind water too (W8) ----------------------------------------------------
     // Verbatim the gate and the reasoning sky.frag carries: the sky has no POSITION, only a

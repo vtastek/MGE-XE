@@ -66,7 +66,29 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 #if REFLMIP_FIRST
     // W5: RESOLVE + copy. All four channels with identical weights, same as the reduce — the source
     // is premultiplied and an alpha-weighted resolve is the dark-horizon-fringe bug again.
-  #if SAMPLE_COUNT > 1
+  #if SAMPLE_COUNT > 1 && defined(REFLMIP_PGI)
+    // PROBE-GI capture (reflectmipfirst_pgi_sc4): the gather reads mip 0 as ALBEDO wherever the depth
+    // (sample 0) hit geometry, and as sky radiance where it did not. A plain average mixed the two at
+    // every silhouette: a static's edge texel took (albedo + 3 x sky) / 4, an "albedo" of several
+    // (sky radiance is scene-referred), lit as a bright pixel or — red and blue over the sentinel —
+    // read as a back face (the bright, sometimes magenta skyline pixels in the probes, user
+    // 2026-10-14). So only the samples of sample 0's own class are averaged: sky, back face
+    // (the capture frags' (4, 0, 4); 3.0 = PGI_BACK_SENTINEL, skyamb.h.fsl) or a front face. Colour
+    // and depth then describe one surface.
+    const float4 c0 = LoadTex2DMS(gReflMipSrcTex, NO_SAMPLER, p, 0);
+    const float  d0 = LoadTex2DMS(gReflMipSrcDepth, NO_SAMPLER, p, 0).r;
+    const uint   k0 = (d0 <= 0.0f) ? 0u : ((c0.r > 3.0f && c0.b > 3.0f) ? 1u : 2u);
+    float4 c = c0;
+    float  n = 1.0f;
+    for (int k = 1; k < SAMPLE_COUNT; ++k) {
+        const float4 ck = LoadTex2DMS(gReflMipSrcTex, NO_SAMPLER, p, k);
+        const float  dk = LoadTex2DMS(gReflMipSrcDepth, NO_SAMPLER, p, k).r;
+        const uint   kk = (dk <= 0.0f) ? 0u : ((ck.r > 3.0f && ck.b > 3.0f) ? 1u : 2u);
+        if (kk == k0) { c += ck; n += 1.0f; }
+    }
+    c *= 1.0f / n;
+    Write2D(gReflDepthDst, p, d0);
+  #elif SAMPLE_COUNT > 1
     float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
     for (int k = 0; k < SAMPLE_COUNT; ++k) { c += LoadTex2DMS(gReflMipSrcTex, NO_SAMPLER, p, k); }
     c *= (1.0f / (float)SAMPLE_COUNT);

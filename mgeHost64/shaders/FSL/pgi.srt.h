@@ -6,7 +6,9 @@
 // lives at storage (ix mod G, iy mod G), so the grid scrolls without moving data.
 //
 //   PLACE    one thread per column: min/max of the raw height map over the cell -> gPgiPlaceOut,
-//            read back by the host (it needs probe positions to aim the capture).
+//            read back by the host (it needs probe positions to aim the capture). Where a static
+//            floats over the TERRAIN with room beneath (a giant mushroom's cap, a deck), the floor
+//            there is the terrain, not the static's top: layer 0 then stands UNDER the cover.
 //   GATHER   after the water-mirror pass was re-aimed from a probe face (debug view 5 = ALBEDO) and
 //            resolved: the 8x8 face tile of the probe's G-BUFFER (albedo, sky fraction, normal from
 //            depth, hit distance) -> gPgiGBuf.
@@ -24,6 +26,7 @@
 // through #define aliases in pgi.comp.fsl, onto the resources below.
 #pragma once
 #include "shadowparams.h.fsl"
+#include "atmosparams.h.fsl"   // AtmosphereParams: the relight samples the LIVE sky (RELIGHT skyLive)
 
 STRUCT(PgiParams)
 {
@@ -34,8 +37,26 @@ STRUCT(PgiParams)
     DATA(float4, grid,    None);   // x = spacing, y = G, z = relight batch phase, w = batch count
     DATA(float4, capPos,  None);   // GATHER: probe ABSOLUTE position xyz, w = face (0..5)
     DATA(float4, capTile, None);   // GATHER: atlas tile origin xy (texels), z = capture res (px), w = near
-    DATA(float4, capMisc, None);   // GATHER: x = far
+    DATA(float4, capMisc, None);   // GATHER: x = far, y = 1: also copy the raw capture to gPgiPeek at zw
     DATA(float4, place,   None);   // PLACE: xy = window's first column index (ix0, iy0)
+    DATA(float4, terrain, None);   // PLACE: the LAND grid (skyheight.srt.h gridInfo): minX, minY, spanX, spanY
+    // BALLS: x = camera balls, y = sun balls, z = frame seed, w = lift (u off the hit surface)
+    DATA(float4, balls,   None);
+    // BALLS: x = 1 the sun map is valid this frame (else the sky-top map stands in: overcast / no sun),
+    // y = camera depth valid, z = sun-ball spread (u, the sky-top fallback), w = camera-ball spread (uv)
+    DATA(float4, ballsMisc, None);
+    DATA(float4x4, sunInv0, None);  // BALLS: inverse sun cascade 0 / 1 view*proj (camera-relative)
+    DATA(float4x4, sunInv1, None);
+    // SPLAT: vol xyz = the window's first voxel index (absolute), w = voxel size (u);
+    // vol2 x = kernel R0, y = kernel Rk (radius = R0 + Rk x distance to the camera), z = update period
+    // (frames), w = this update's temporal blend; vol3 x = phase, y = VX (= VY), z = VZ, w = full weight.
+    DATA(float4, vol,  None);
+    DATA(float4, vol2, None);
+    DATA(float4, vol3, None);
+    // RELIGHT: the sky from the atmosphere's sky-view LUT (the field skyhw.frag draws; its MIXED arm,
+    // the clouds' mean cover included). x = 1 on (knob pgiSkyLive), y = native -> scene scale
+    // (gSkyView.radiance.w), z = the camera's radius in the medium (gSkyView.sunDirW.w).
+    DATA(float4, skyLive, None);
 };
 
 BEGIN_SRT(PgiSrtData)
@@ -52,5 +73,17 @@ BEGIN_SRT(PgiSrtData)
         DECL_RWTEXTURE(PerBatch, RWTex2D(uint4),        gPgiGBuf)
         DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiSHOut)
         DECL_RWBUFFER (PerBatch, RWBuffer(float4),      gPgiPlaceOut)
+        DECL_BUFFER   (PerBatch, Buffer(uint),  gPgiTerrainHeights)         // = gSkyTerrainHeights
+        DECL_BUFFER   (PerBatch, Buffer(uint),  gPgiTerrainCellGrid)        // = gSkyTerrainCellGrid
+        DECL_RWTEXTURE(PerBatch, RWTex2D(float4),       gPgiPeek)           // debug: raw captures (pgiDebug 8)
+        DECL_TEXTURE  (PerBatch, Tex2D(float),  gPgiSunDepth)               // = gSunDepth (cascades side by side)
+        DECL_TEXTURE  (PerBatch, Tex2D(float),  gPgiCamDepth)               // = pLinearDepth (device reverse-Z)
+        DECL_RWBUFFER (PerBatch, RWBuffer(float4),      gPgiBallOut)        // BALLS: 2 per ball (pos+type, normal)
+        DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiVolOut)         // SPLAT: the volume (opaque.srt.h gPgiVol)
+        DECL_RWTEXTURE(PerBatch, RWTex2DArray(uint),    gPgiVolTag)         // SPLAT: each cell's world voxel (0 = none)
+        DECL_RWTEXTURE(PerBatch, RWTex2D(float4),       gPgiLit)            // debug: relit radiance per G-buffer texel
+        DECL_CBUFFER  (PerBatch, CBUFFER(AtmosphereParams), gPgiAtmos)       // = pAtmosParamsCbv
+        DECL_TEXTURE  (PerBatch, Tex2D(float4),  gPgiAtmosSky)              // = pAtmosSkyView (mixed field)
+        DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiSunOcc)                // = gSunOcc: the long-range sun occlusion
     END_SRT_SET(PerBatch)
 END_SRT(PgiSrtData)
