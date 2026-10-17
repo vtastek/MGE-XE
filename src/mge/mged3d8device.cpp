@@ -670,18 +670,31 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
     // MGE frame limiter: pace to the target before presenting. Off when
     // Configuration.FPSLimit == 0.
+    LARGE_INTEGER qPace0, qPace1, qPres1;
+    QueryPerformanceCounter(&qPace0);
     {
         MGE_ZoneScopedN("framePace");
         framePaceLimit();
     }
+    QueryPerformanceCounter(&qPace1);
 
     RenderProcess::endUiFrame();   // this frame's captured UI ships with the next kick
 
     HRESULT hr;
+    LARGE_INTEGER qPres0;
+    QueryPerformanceCounter(&qPres0);
     {
         MGE_ZoneScopedN("engPresent");
         hr = ((RenderProcess::seamProbe() & 4u) && RenderProcess::forgeOwnsFrame())
            ? D3D_OK : ProxyDevice::Present(a, b, c, d);   // MGE_SEAM_PROBE bit 2: measurement only
+    }
+    QueryPerformanceCounter(&qPres1);
+    {
+        static LARGE_INTEGER s_qf = {};
+        if (s_qf.QuadPart == 0) { QueryPerformanceFrequency(&s_qf); }
+        const double k = 1000.0 / (double)s_qf.QuadPart;
+        RenderProcess::notePresentTiming(k * (double)(qPace1.QuadPart - qPace0.QuadPart),
+                                         k * (double)(qPres1.QuadPart - qPres0.QuadPart));
     }
     // A0 Cut-4 probe: stamp the engine-Present return; the span to the next
     // BeginScene(0) (MW input/sim/AI/animation — never zoned) lands in [hb] mwstart=.

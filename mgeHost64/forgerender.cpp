@@ -6448,6 +6448,10 @@ namespace {
     // probes (no lift), and a sidecar probeoracle_NNNN_pgi.bin carries each one's slot and STORED SH, so
     // the tool scores the probes themselves against the independent truth at the same point.
     float              g_probeOracleAtProbes = 0.0f;
+    // capPointShadow (default 1): capture faces (oracle + probe GI) shadow the point lights from the
+    // atlases directly, as the first-person arms do (alphaShadowParams.y on the capture's frame cbuffer).
+    // 0 = the old unshadowed mirror lights (gobo only), which lit a tunnel's rock from the far side.
+    float              g_capPointShadow = 1.0f;
     std::vector<int>   g_probeSiteSlots;
     std::vector<float> g_probeData;             // per face: kProbeFaceRes² × 8 floats (see the writer)
     std::vector<float> g_probeAux;              // per face: kProbeFaceRes² × 12 {albedo3, litTerm3, ambient3, normal3}
@@ -6578,6 +6582,12 @@ namespace {
     float g_pgiNudgeKeep  = 32.0f;    // knob pgiNudgeKeep: a given-up rejected ball absorbs new balls only this near
     float g_pgiBlameU     = 0.5f;     // knob pgiBlameU / pgiBlameV: the screen point BLAME scores (0.5 0.5 = the crosshair)
     float g_pgiBlameV     = 0.5f;
+    float g_pgiPoint      = 1.0f;     // knob pgiPoint: the near point lights in the relight, their gain (pgi.comp.fsl pgiPointLight; 0 = off)
+    // The gain the relight is handed: 0 unless the light list and both shadow atlases exist (the probe
+    // set binds stand-ins for them otherwise).
+    inline float pgiPointGain() {
+        return (g_live.pLightCbv && g_live.pShadowAtlas && g_live.pShadowAtlasDyn) ? std::max(0.0f, g_pgiPoint) : 0.0f;
+    }
     float g_pgiSunTap     = 2.0f;     // knob pgiSunTap: the relight's sun-map test (0 renderer offsets + 3x3, 1 one exact tap, 2 = 1 x the long-range map)
     float g_pgiRepel      = 0.0f;     // knob pgiRepel: DARK REPELS LIT exponent in the splat (pgi.comp.fsl pgiRepel; 0 = off). OFF: the leak saves read zero without it once the sun test and view bias were fixed, and it costs +0.14 ms (castle 0.37 -> 0.52 ms gpu pgi); 4 = the tested strength
     float g_pgiRecvKnee  = 0.25f;    // knob pgiRecvKnee: receiver / probe visibility ratio below which it darkens
@@ -14555,7 +14565,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[23] = {};   // was 13; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
+                DescriptorData p[26] = {};   // was 13; +gSkyHeight, +gSunOcc, +the atmosphere pair, +the point atlases (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -14586,6 +14596,18 @@ namespace {
                 if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: REAL — carries the sun VP + knobs
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
                     p[rn].ppBuffers = &g_live.pShadowMaskParamsCbv;
+                    ++rn;
+                }
+                // PROBE CAPTURE VIEWS draw through this set and shadow the point lights from the atlases
+                // directly (fpShadowVisibility, alphaShadowParams.y on the capture's frame cbuffer). Both
+                // rest in SHADER_RESOURCE from the end of passPointLightShadowFaces, which records
+                // before the reflect pass.
+                if (g_live.pShadowAtlas && g_live.pShadowAtlasDyn) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlas);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pShadowAtlas->pTexture;
+                    ++rn;
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlasDyn);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
                     ++rn;
                 }
                 // Phase B: the mirror pass redraws statics + distant land with the SAME receiver frags,
@@ -24534,6 +24556,7 @@ namespace {
             { "probeOracleLift",    &g_probeOracleLift    },
             { "probeOracleModes",   &g_probeOracleModes   },
             { "probeOracleAtProbes", &g_probeOracleAtProbes },
+            { "capPointShadow",     &g_capPointShadow     },
             { "svmDirs",            &g_svmDirs            },
             { "svmRes",             &g_svmRes             },
             { "svmExtent",          &g_svmExtent          },
@@ -24823,6 +24846,8 @@ namespace {
             { "pgiNudgeMax",         &g_pgiNudgeMax         },
             { "pgiNudgeKeep",        &g_pgiNudgeKeep        },
             { "pgiRepel",            &g_pgiRepel            },
+            { "pgiPoint",            &g_pgiPoint            },
+            { "calEmisGain",         &g_calEmisGain         },   // material emissive (0 = no self-illumination: truth split)
             { "pgiSunTap",           &g_pgiSunTap           },
             { "pgiBlameU",           &g_pgiBlameU           },
             { "pgiBlameV",           &g_pgiBlameV           },
@@ -65820,7 +65845,7 @@ void destroyHostWindow(Renderer* R);
         }
         {   // the VOLUME (7 SH planes + meta, stacked in slices) and its per-cell world tags
             TextureDesc td = {};
-            td.mWidth = kPgiVX; td.mHeight = kPgiVX; td.mDepth = 1; td.mArraySize = 8u * kPgiVZ;
+            td.mWidth = kPgiVX; td.mHeight = kPgiVX; td.mDepth = 1; td.mArraySize = 9u * kPgiVZ;   // planes 0-6 SH, 7 (v, sky vis, -, -), 8 the lanterns' L0 (rgb)
             td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
             td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -65838,7 +65863,7 @@ void destroyHostWindow(Renderer* R);
         }
         {
             TextureDesc td = {};
-            td.mWidth = kPgiG; td.mHeight = kPgiG; td.mDepth = 1; td.mArraySize = 18;   // 16+layer: the probe's sky visibility
+            td.mWidth = kPgiG; td.mHeight = kPgiG; td.mDepth = 1; td.mArraySize = 20;   // 16+layer: the probe's sky visibility, 18+layer: its lanterns' L0 irradiance
             td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
             td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -65950,7 +65975,7 @@ void destroyHostWindow(Renderer* R);
         Texture* camDepth = g_live.pLinearDepth;
         if (!camDepth) { return fail("camera depth"); }
         for (uint32_t i = 0; i < 6; ++i) {
-            DescriptorData d[26] = {};
+            DescriptorData d[29] = {};
             d[0].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiParams);    d[0].ppBuffers  = &g_pgi.cbv[i];
             d[1].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadow);    d[1].ppBuffers  = &g_live.pShadowMaskParamsCbv;
             d[2].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyAO);     d[2].ppTextures = skyAOHeightTexPP();
@@ -65983,8 +66008,17 @@ void destroyHostWindow(Renderer* R);
             d[23].ppTextures = g_live.pSunOcc ? &g_live.pSunOcc : &skyTop;
             d[24].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiBlameOut);  d[24].ppBuffers = &g_pgi.blameBuf;
             d[25].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiMoveOut);   d[25].ppBuffers = &g_pgi.moveBuf;
+            // THE LANTERNS (pgiPoint): the near live lights + the point shadow atlases. Both atlases rest in
+            // SHADER_RESOURCE from passPointLightShadowFaces, which records before pgiFrameRecord. Absent:
+            // stand-ins, and pgiPointGain() publishes the gain 0.
+            d[26].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiLights);
+            d[26].ppBuffers  = g_live.pLightCbv ? &g_live.pLightCbv : &g_pgi.cbv[i];
+            d[27].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadowAtlas);
+            d[27].ppTextures = g_live.pShadowAtlas ? &g_live.pShadowAtlas->pTexture : &skyTop;
+            d[28].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadowAtlasDyn);
+            d[28].ppTextures = g_live.pShadowAtlasDyn ? &g_live.pShadowAtlasDyn->pTexture : &skyTop;
             for (DescriptorData& x : d) { x.mCount = 1; }
-            updateDescriptorSet(R, i, g_pgi.set, 26, d);
+            updateDescriptorSet(R, i, g_pgi.set, 29, d);
         }
         // The receivers: every set whose lit frags take skyAmbFactor (the GI field's three).
         DescriptorData pf = {};
@@ -66601,7 +66635,7 @@ void destroyHostWindow(Renderer* R);
             g_pgi.complete = complete;
             PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[2]);
             std::memset(P, 0, sizeof(PgiParams));
-            P->ambCol = float4(fcbvR[24], fcbvR[25], fcbvR[26], 0.0f);
+            P->ambCol = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());   // w = the lanterns' gain (pgiPoint)
             P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], std::clamp(g_pgiBackMaxPart, 0.0f, 1.0f));   // w = partial probes' back-face limit
             P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));   // w = the sun-map test (pgiSunTap)
             P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], std::clamp(g_pgiBackMax, 0.0f, 1.0f));     // w = complete probes' back-face limit
@@ -66646,7 +66680,7 @@ void destroyHostWindow(Renderer* R);
                     const PgiBall& b1 = g_pgi.pool[k1];
                     PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[5]);
                     std::memset(Q, 0, sizeof(PgiParams));
-                    Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], 0.0f);
+                    Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());   // w = the lanterns (pgiPoint)
                     Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
                     Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
                     Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
@@ -67781,6 +67815,8 @@ void destroyHostWindow(Renderer* R);
                 // The G-buffer views: the colour frags' own isolation ladder (debugParams.x, float 40)
                 // on THIS copy only — 5 albedo, 6 the light factor albedo multiplies, 7 its ambient.
                 gp[40] = g_capFace.dbg;
+                // alphaShadowParams.y: the colour frags shadow the point lights from the atlases directly.
+                gp[125] = (g_capPointShadow > 0.5f) ? 1.0f : 0.0f;
                 capFaceViewProj(&fcbvR[56], g_capFace.pos, g_capFace.face, g_probeFaceVP);
                 std::memcpy(mirrorGeoVP, g_probeFaceVP, 64);
                 std::memcpy(gp, g_probeFaceVP, 64);

@@ -2525,9 +2525,11 @@ float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 
 
 
-float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
+
+float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan)
 {
     vis = 1.0f;
+    lan = f3(0.0f);
     const float4 P2 = gShadowParams.pgiParams2;
     const float4 P3 = gShadowParams.pgiParams3;
     const float VX = P2.y, VZ = P2.z;
@@ -2560,6 +2562,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
     if (m.x < 1.0e-3f) { return f4(0.0f); }
     const float inv = 1.0f / m.x;
     vis = saturate(m.y * inv);
+    lan = lerp( gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(8.0f * VZ + s0)), 0.0f) ,  gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(8.0f * VZ + s1)), 0.0f) , t).rgb * inv;
     float4 q[7];
     UNROLL for (int k = 0; k < 7; ++k) {
         q[k] = lerp( gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)((float)k * VZ + s0)), 0.0f) ,  gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)((float)k * VZ + s1)), 0.0f) , t) * inv;
@@ -2633,7 +2636,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 640 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef = gShadowParams.skyAOGround.y;
@@ -2645,8 +2648,11 @@ float skyOpenness(float ao, float3 worldPosRel)
     return open;
 }
 
+
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
+    const bool fpAO = ao < 0.0f;
+    if (fpAO) { ao = skyAOTerm(N, worldPosRel); }
 
     if (gShadowParams.pgiParams0.x > 0.0f) {
         float below = 0.0f;
@@ -2654,8 +2660,18 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 
 
         float pvis = 1.0f;
+        float3 plan = f3(0.0f);
         if (gShadowParams.pgiParams2.w > 0.5f) {
-            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis);
+            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis, plan);
+
+
+
+
+
+            if (fpAO && pg.a > 0.0f && gShadowParams.skyParams.y > 0.0f) {
+                const float pa = lerp(1.0f, pvis * (0.5f + 0.5f * max(normalize(N).z, 0.0f)), gShadowParams.skyParams.y);
+                ao = lerp(ao, pa, saturate(pg.a));
+            }
 
 
 
@@ -2686,7 +2702,12 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 
                 if (nz < 0.0f) { r = max(r, ((rv > 3.5f) ? pvis : pvis * pvis) * saturate(-2.0f * nz)); }
                 const float t = saturate(r / max(gShadowParams.giDebug.w, 0.01f));
-                pg.rgb *= t * t;
+
+
+
+
+                const float3 keep = min(pg.rgb, plan);
+                pg.rgb = keep + (pg.rgb - keep) * (t * t);
             }
         }
         else {
@@ -2722,6 +2743,11 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
+
+
+
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
+
     return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"

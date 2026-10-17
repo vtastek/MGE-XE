@@ -97,3 +97,19 @@ float fpShadowVisibility(float3 P, float3 N, uint slot)
     vis = lerp(1.0f, vis, saturate(tile.w));   // temporal fade-in for a far reclaim (matches world)
     return vis;
 }
+
+// PROBE CAPTURE VIEWS (the probe oracle's and probe GI's faces, alphaShadowParams.y set on their frame
+// cbuffer): a light set with no shadow-slot lane (distant statics' baked lights, falloff.w = gobo layer)
+// finds its slot by POSITION among the active slots. The main view never asks (it reads the screen mask
+// or nothing), so this loop runs only in captures. 1 = no slot casts for this light.
+float capSlotVisibility(float3 P, float3 N, float3 lightPos)
+{
+    uint bits = gShadowParams.slotBits.x;
+    while (bits != 0u) {
+        const uint s = firstbitlow(bits);
+        bits &= bits - 1u;
+        const float3 dl = gShadowParams.slotPosRad[s].xyz - lightPos;
+        if (dot(dl, dl) < 4.0f) { return fpShadowVisibility(P, N, s); }
+    }
+    return 1.0f;
+}

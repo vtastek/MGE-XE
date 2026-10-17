@@ -42,6 +42,7 @@
 #include "aospecocc.h.fsl"    // aoSpecOcc() — screen-space specular occlusion (GTSO), knob aoSpecOcc
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "gobosample.h.fsl" // fixtureGoboVis() — the baked light's fixture self-shadow (G2)
+#include "fpshadow.h.fsl"   // fpShadowVisibility() — point shadows in the probe capture views
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 #define TERRAIN_VERTS   65
@@ -1199,9 +1200,16 @@ float4 PS_MAIN( VSOutput In )
                 // that these pixels sat at the far plane and the mask was meaningless here.
                 uint slotP1 = (uint)fo.w;
                 // G3: slotless / mirror / goboForceNear -> the fixture gobo (near list = gLightsNear).
-                const bool useSlot = slotP1 != 0u && !inReflect && gLightsNear.lightParams.z < 0.5f;
+                // Probe capture views (alphaShadowParams.y): the atlas directly, as the first-person arms.
+                const bool capSlot = gFrameData.alphaShadowParams.y > 0.5f;
+                const bool useSlot = slotP1 != 0u && (!inReflect || capSlot) && gLightsNear.lightParams.z < 0.5f;
                 if (!useSlot) { att *= fixtureGoboNear(gLightsNear.goboNear[i >> 1u], i, toL); }
-                if (useSlot)   // mirror: gShadowMask is main-view screen space
+                if (useSlot && capSlot)
+                {
+                    att *= goboSlotFade(fpShadowVisibility(In.WorldPos, normalize(normal), slotP1 - 1u),
+                                        gLightsNear.goboNear[i >> 1u], i, toL, In.WorldPos, gLightsNear.lightParams.w);
+                }
+                else if (useSlot)   // mirror: gShadowMask is main-view screen space
                 {
                     // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
                     // belong to whatever is standing in front of us (see shadowreceive.h.fsl).

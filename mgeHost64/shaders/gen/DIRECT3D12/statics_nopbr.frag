@@ -2575,9 +2575,11 @@ float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 
 
 
-float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
+
+float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan)
 {
     vis = 1.0f;
+    lan = f3(0.0f);
     const float4 P2 = gShadowParams.pgiParams2;
     const float4 P3 = gShadowParams.pgiParams3;
     const float VX = P2.y, VZ = P2.z;
@@ -2610,6 +2612,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
     if (m.x < 1.0e-3f) { return f4(0.0f); }
     const float inv = 1.0f / m.x;
     vis = saturate(m.y * inv);
+    lan = lerp( gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(8.0f * VZ + s0)), 0.0f) ,  gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)(8.0f * VZ + s1)), 0.0f) , t).rgb * inv;
     float4 q[7];
     UNROLL for (int k = 0; k < 7; ++k) {
         q[k] = lerp( gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)((float)k * VZ + s0)), 0.0f) ,  gPgiVol.SampleLevel(gSamplerBilinearWrap, float3(uv, (float)((float)k * VZ + s1)), 0.0f) , t) * inv;
@@ -2683,7 +2686,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 640 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef = gShadowParams.skyAOGround.y;
@@ -2695,8 +2698,11 @@ float skyOpenness(float ao, float3 worldPosRel)
     return open;
 }
 
+
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
+    const bool fpAO = ao < 0.0f;
+    if (fpAO) { ao = skyAOTerm(N, worldPosRel); }
 
     if (gShadowParams.pgiParams0.x > 0.0f) {
         float below = 0.0f;
@@ -2704,8 +2710,18 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 
 
         float pvis = 1.0f;
+        float3 plan = f3(0.0f);
         if (gShadowParams.pgiParams2.w > 0.5f) {
-            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis);
+            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis, plan);
+
+
+
+
+
+            if (fpAO && pg.a > 0.0f && gShadowParams.skyParams.y > 0.0f) {
+                const float pa = lerp(1.0f, pvis * (0.5f + 0.5f * max(normalize(N).z, 0.0f)), gShadowParams.skyParams.y);
+                ao = lerp(ao, pa, saturate(pg.a));
+            }
 
 
 
@@ -2736,7 +2752,12 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 
                 if (nz < 0.0f) { r = max(r, ((rv > 3.5f) ? pvis : pvis * pvis) * saturate(-2.0f * nz)); }
                 const float t = saturate(r / max(gShadowParams.giDebug.w, 0.01f));
-                pg.rgb *= t * t;
+
+
+
+
+                const float3 keep = min(pg.rgb, plan);
+                pg.rgb = keep + (pg.rgb - keep) * (t * t);
             }
         }
         else {
@@ -2772,6 +2793,11 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
+
+
+
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
+
     return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 #line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
@@ -3508,6 +3534,104 @@ float goboSlotFade(float sv, float4 g, uint i, float3 toL, float3 worldPosRel, f
     return lerp(sv, fixtureGoboNear(g, i, toL), t);
 }
 #line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+float fpShadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u) { stored = max(stored, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tp, 0).r); }
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+
+
+float fpShadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    float2 p = ap - 0.5f;
+    int2 b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = fpShadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = fpShadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = fpShadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = fpShadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+
+
+
+
+
+float fpShadowVisibility(float3 P, float3 N, uint slot)
+{
+    float4 posRad = gShadowParams.slotPosRad[slot];
+    float4 tile = gShadowParams.slotTile[slot];
+    float rangeK = gShadowParams.maskParams.x;
+    float nearZ = gShadowParams.maskParams.y;
+    float range = rangeK * posRad.w;
+    float farZ = 2.0f * posRad.w;
+
+    float3 ad0 = abs(P - posRad.xyz);
+    float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+    if (ma0 <= nearZ || ma0 >= range) { return 1.0f; }
+
+    uint dynSlot = (gShadowParams.slotBits.y >> slot) & 1u;
+    float uvScale = gShadowParams.slotFlick[slot].z;
+    uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;
+
+
+
+    float3 Ldir = posRad.xyz - P;
+    float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+    float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
+    float texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
+    float3 Poff = P + N * (gShadowParams.biasParams.y * sinT * texelW);
+
+    float3 d = Poff - posRad.xyz;
+    float3 ad = abs(d);
+
+    uint face; float ma; float u; float v;
+    if (ad.x >= ad.y && ad.x >= ad.z) { ma = ad.x; face = d.x > 0.0f ? 0u : 1u;
+                                        u = d.x > 0.0f ? -d.z : d.z; v = -d.y; }
+    else if (ad.y >= ad.z) { ma = ad.y; face = d.y > 0.0f ? 2u : 3u;
+                                        u = d.x; v = d.y > 0.0f ? d.z : -d.z; }
+    else { ma = ad.z; face = d.z > 0.0f ? 4u : 5u;
+                                        u = d.z > 0.0f ? d.x : -d.x; v = -d.y; }
+    if (ma <= nearZ || ma >= range) { return 1.0f; }
+
+    float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+    float thresh = refZ * (1.0f + gShadowParams.maskParams.z)
+                 + gShadowParams.biasParams.x + 1e-6f;
+
+    float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                            tile.y + float(face / 3u) * tile.z);
+    int2 tmin = int2(faceOrg);
+    int2 tmax = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+    float2 fuv = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
+    float2 ap = faceOrg + fuv * tile.z;
+
+    float vis = fpShadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+    vis = lerp(1.0f, vis, saturate(tile.w));
+    return vis;
+}
+
+
+
+
+
+float capSlotVisibility(float3 P, float3 N, float3 lightPos)
+{
+    uint bits = gShadowParams.slotBits.x;
+    while (bits != 0u) {
+        const uint s = firstbitlow(bits);
+        bits &= bits - 1u;
+        const float3 dl = gShadowParams.slotPosRad[s].xyz - lightPos;
+        if (dot(dl, dl) < 4.0f) { return fpShadowVisibility(P, N, s); }
+    }
+    return 1.0f;
+}
+#line 49 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gitint.h.fsl"
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gitint.h.fsl"
 uint giTintCode(float3 originRel)
@@ -3531,7 +3655,7 @@ float3 giTintAlbedo(uint code)
     if (code == 5u) { return float3(a, 0.0f, a); }
     return float3(a, a, 0.0f);
 }
-#line 49 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 50 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
@@ -4943,7 +5067,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 
     return lerp(fogSkyTarget(s, fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir)), behind, fogAir);
 }
-#line 50 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 51 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 
 
 
@@ -4959,16 +5083,16 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD4);
     DATA(float3, WorldNormal, TEXCOORD5);
     DATA(CENTROID(float3), SunLight, TEXCOORD6);
-#line 65
+#line 66
 };
-#line 80 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 81 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 STRUCT(PSOut)
 {
     DATA(float4, Color, SV_Target0);
 
     DATA(uint, Coverage, SV_Coverage);
 
-#line 86
+#line 87
 };
 
 
@@ -4995,7 +5119,7 @@ float4 sampleStaticsParam(uint slot, float2 uv)
     return SampleTex2DArray(gStaticsParamArrays[bucket], gSamplerAnisotropic,
                             float3(uv, (float)layer));
 }
-#line 125 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 float2 staticsParamDims(uint bucket)
 {
     uint w, h, e;
@@ -5010,10 +5134,10 @@ float staticsHeightLvl(uint slot, float2 uv, float lvl)
     uint bucket = slot >> 16u;
     uint layer = slot & 0xFFFFu;
     return  gStaticsParamArrays[bucket].SampleLevel(gSamplerBilinearWrap, float3(uv, (float)layer), lvl) .
-#line 139 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 140 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 a;
 }
-#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 153 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 float2 staticsGradCdblur(uint slot, float2 uv, float2 duvdx, float2 duvdy, float radius)
 {
     const float2 size0 = staticsParamDims(slot >> 16u);
@@ -5075,14 +5199,14 @@ PSOut PS_MAIN( VSOutput In )
 
     float3 tSun, tAmb;
     waterLightTransmit(In.WorldPos, tSun, tAmb);
-#line 224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 225 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     const float3 pbrDPdx = ddx(In.WorldPos);
     const float3 pbrDPdy = ddy(In.WorldPos);
     const float2 pbrDUVdx = ddx(In.Uv);
     const float2 pbrDUVdy = ddy(In.Uv);
 
     float3 nShade = nGeom;
-#line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 259 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     const bool sunPerPixel = (gShadowParams.pbrStatics.z != 0.0f);
     const float sunNdl = sunPerPixel ? saturate(dot(nGeom, -gFrameData.sunDir.xyz)) : 1.0f;
     float3 sunTerm = In.SunLight * sunNdl;
@@ -5104,7 +5228,7 @@ PSOut PS_MAIN( VSOutput In )
 
 
     if (false)
-#line 282 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 283 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
     {
         const uint pslot = staticsParamSlot(bucket, layer);
         pbrLive = (pslot != 0u);
@@ -5240,6 +5364,9 @@ PSOut PS_MAIN( VSOutput In )
                 att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
 
                 att *= fixtureGoboVis(toL, fo.w, lc4.w);
+
+
+                if (gFrameData.alphaShadowParams.y > 0.5f) { att *= capSlotVisibility(In.WorldPos, nGeom, posR.xyz); }
                 float lambert = saturate(dot(N, toL) * invD);
 
 
@@ -5366,7 +5493,7 @@ PSOut PS_MAIN( VSOutput In )
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f); RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     if (dbg == 19u) {
-#line 556 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
+#line 560 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
         const float3 srcCol = pbrLive ? float3(0.06f, 1.00f, 0.18f) : float3(0.10f, 0.10f, 0.11f);
 
 

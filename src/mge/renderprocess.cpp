@@ -185,6 +185,11 @@ namespace {
     // into the [hb] heartbeat as mwstart=.
     double g_presentReturnMs = 0.0;    // engine Present return stamp (0 = none pending)
     double g_pendingMwStart = 0.0;     // this frame's Present→BeginScene(0) gap (ms)
+    // [lowfps] probe: the frame limiter and engine Present durations (notePresentTiming). The last
+    // frame's pair feeds the slow-state blocks; the sums feed the [hb] proc line.
+    double   g_lfPace = 0.0, g_lfPresent = 0.0;
+    double   g_lfPaceSum = 0.0, g_lfPresSum = 0.0, g_lfPresMax = 0.0;
+    unsigned g_lfPresN = 0;
 
     // Frame-ahead observability: last-frame values shipped to the host Stats panel via
     // DevInput each kickoff (bridge.h DevInput frame-ahead fields). Set at the collect
@@ -605,7 +610,11 @@ namespace {
                           && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom) ? 1 : 0;
                 }
             }
-            fg = (GetForegroundWindow() == h) ? 1 : 0;
+            // By owning PID, as the [hb] proc fg does: h is the device's focus window, which need not
+            // be the top-level window Windows reports as foreground (this read 0 all session).
+            DWORD fgPid = 0;
+            GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
+            fg = (fgPid == GetCurrentProcessId()) ? 1 : 0;
             mn = IsIconic(h) ? 1 : 0;
         }
         _snprintf_s(out, n, _TRUNCATE, "hz=%u cover=%d fg=%d min=%d", hz, cover, fg, mn);
@@ -2483,32 +2492,42 @@ namespace {
         const double lfW0 = nowMs();
         waitCopyRetired();   // g_cmd is reused: the previous copy must have executed
         {
-            // SLOW-STATE edges: ENTER after 30 consecutive frames whose wait >= 20 ms, EXIT after 30
-            // under it. Two lines per episode, never per frame. "hostDone" = the share of slow frames
-            // whose host fence had ALREADY passed at the wait's start (-> DXVK's queue, not the host).
-            static unsigned s_slowRun = 0, s_fastRun = 0, s_n = 0, s_hostDone = 0;
+            // SLOW-STATE edges, judged on 60-frame BLOCK MEANS: ENTER when a block's mean copy wait is
+            // >= 10 ms, EXIT when one is under 3 ms. (A run of 30 frames all >= 20 ms never armed on the
+            // 2026-10-17 episode: it averaged 21 ms with frames dipping under 20.) Two lines per
+            // episode. hostDone = slow-block frames whose host fence had ALREADY passed at the wait's
+            // start (-> DXVK's queue, not the host); present / pace = the engine Present and the MGE
+            // frame limiter just before (a Present that blocks for the extra time = presentation).
+            static unsigned s_bn = 0, s_bHost = 0, s_n = 0, s_hostDone = 0;
+            static double   s_bW = 0.0, s_bPres = 0.0, s_bPace = 0.0, s_sum = 0.0, s_pres = 0.0;
             static bool     s_in = false;
-            static double   s_sum = 0.0;
             static std::uint32_t s_enter = 0;
             const double w = nowMs() - lfW0;
             const bool hostDone = lfPendHost != 0 && lfHostNow >= lfPendHost;
-            if (w >= 20.0) { ++s_slowRun; s_fastRun = 0; } else { ++s_fastRun; s_slowRun = 0; }
-            if (s_in) { ++s_n; s_sum += w; if (hostDone) { ++s_hostDone; } }
-            if (!s_in && s_slowRun >= 30) {
-                char disp[96];
-                describeDisplay(disp, sizeof(disp));
-                LOG::logline("!! [lowfps] ENTER frame=%u: copy wait %.1f ms (30 frames >= 20) | host fence %llu / needs %llu (%s)"
-                             " | copy sem %llu / pending %llu | %s",
-                             g_frame, w, (unsigned long long)lfHostNow, (unsigned long long)lfPendHost,
-                             hostDone ? "host DONE -> stuck behind DXVK's queue" : "host NOT done -> waiting on the host",
-                             (unsigned long long)lfCopyNow, (unsigned long long)lfPendCopy, disp);
-                s_in = true; s_enter = g_frame; s_n = 0; s_sum = 0.0; s_hostDone = 0;
-            } else if (s_in && s_fastRun >= 30) {
-                char disp[96];
-                describeDisplay(disp, sizeof(disp));
-                LOG::logline("!! [lowfps] EXIT frame=%u after %u frames: mean copy wait %.1f ms, host already done on %u/%u | %s",
-                             g_frame, g_frame - s_enter, s_n ? s_sum / s_n : 0.0, s_hostDone, s_n, disp);
-                s_in = false;
+            ++s_bn; s_bW += w; s_bPres += g_lfPresent; s_bPace += g_lfPace; if (hostDone) { ++s_bHost; }
+            if (s_bn >= 60) {
+                const double mw = s_bW / s_bn, mp = s_bPres / s_bn, mpace = s_bPace / s_bn;
+                if (s_in) { s_n += s_bn; s_sum += s_bW; s_pres += s_bPres; s_hostDone += s_bHost; }
+                if (!s_in && mw >= 10.0) {
+                    char disp[96];
+                    describeDisplay(disp, sizeof(disp));
+                    LOG::logline("!! [lowfps] ENTER frame=%u: 60-frame mean copy wait %.1f ms, present %.1f ms, pace %.1f ms"
+                                 " | host done on %u/60 (%s) | host fence %llu / needs %llu | copy sem %llu / pending %llu | %s",
+                                 g_frame, mw, mp, mpace, s_bHost,
+                                 (s_bHost * 2u > s_bn) ? "stuck behind DXVK's queue" : "waiting on the host",
+                                 (unsigned long long)lfHostNow, (unsigned long long)lfPendHost,
+                                 (unsigned long long)lfCopyNow, (unsigned long long)lfPendCopy, disp);
+                    s_in = true; s_enter = g_frame; s_n = 0; s_sum = 0.0; s_pres = 0.0; s_hostDone = 0;
+                } else if (s_in && mw < 3.0) {
+                    char disp[96];
+                    describeDisplay(disp, sizeof(disp));
+                    LOG::logline("!! [lowfps] EXIT frame=%u after %u frames: mean copy wait %.1f ms, present %.1f ms,"
+                                 " host already done on %u/%u | now present %.1f ms | %s",
+                                 g_frame, g_frame - s_enter, s_n ? s_sum / s_n : 0.0, s_n ? s_pres / s_n : 0.0,
+                                 s_hostDone, s_n, mp, disp);
+                    s_in = false;
+                }
+                s_bn = 0; s_bHost = 0; s_bW = 0.0; s_bPres = 0.0; s_bPace = 0.0;
             }
         }
         vk.ResetCommandBuffer(g_cmd, 0);
@@ -7541,10 +7560,13 @@ namespace RenderProcess {
                 else                { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "?(err=%d)", -eco); }
                 char dispBuf[96];
                 describeDisplay(dispBuf, sizeof(dispBuf));   // [lowfps] probe: refresh + window mode
-                LOG::logline(">> [hb] proc: ecoqos=%s prio=0x%lx fg=%d | %s",
+                LOG::logline(">> [hb] proc: ecoqos=%s prio=0x%lx fg=%d | %s | present=%.2f max %.2f pace=%.2f ms",
                              ecobuf,
                              (unsigned long)GetPriorityClass(GetCurrentProcess()),
-                             (fgPid && fgPid == GetCurrentProcessId()) ? 1 : 0, dispBuf);
+                             (fgPid && fgPid == GetCurrentProcessId()) ? 1 : 0, dispBuf,
+                             g_lfPresN ? g_lfPresSum / g_lfPresN : 0.0, g_lfPresMax,
+                             g_lfPresN ? g_lfPaceSum / g_lfPresN : 0.0);
+                g_lfPresSum = 0.0; g_lfPaceSum = 0.0; g_lfPresMax = 0.0; g_lfPresN = 0;
             }
             // Host phase split as the CLIENT received it (Tier 1 wire echo). Cross-check against
             // mgeHost64.log's `host split`/`gpu split`: matching numbers prove the x86/x64
@@ -9573,6 +9595,13 @@ namespace RenderProcess {
         // until the next BeginScene(0). A stall breadcrumbed here == wedged in MW itself (or MW
         // paused on focus loss), NOT in our pipeline — the key alt-tab discriminator.
         markMainPhase(MP_MW_FRAME);
+    }
+
+    void notePresentTiming(double paceMs, double presentMs) {
+        g_lfPace = paceMs; g_lfPresent = presentMs;
+        g_lfPaceSum += paceMs; g_lfPresSum += presentMs;
+        g_lfPresMax = (presentMs > g_lfPresMax) ? presentMs : g_lfPresMax;
+        ++g_lfPresN;
     }
 
     void onFrameAheadCollect(IDirect3DDevice9* /*device*/) {

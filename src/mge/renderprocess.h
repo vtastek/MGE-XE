@@ -110,6 +110,11 @@ namespace RenderProcess {
     // average as mwstart=. Its magnitude decides whether a frame-start cut exists.
     void noteEnginePresentReturn();
 
+    // [lowfps] probe: this frame's MGE frame limiter and engine Present durations (ms). Averaged
+    // into the [hb] proc line and the slow-state edge lines: a Present that blocks for the slow
+    // state's extra time names presentation, not the copy.
+    void notePresentTiming(double paceMs, double presentMs);
+
     // Device-reset seam hooks (a backbuffer resolution/mode change: alt-tab fullscreen recovery,
     // window/mode switch, a mod/MWSE-driven resolution change). The proxy Reset calls these around
     // the real D3D9Ex ResetEx:

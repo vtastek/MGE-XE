@@ -511,9 +511,11 @@ float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 // PROBE GI VOLUME (ball placement; pgi.comp.fsl PGI_SPLAT): E/pi at N and the volume's confidence.
 // Trilinear: xy by the wrap sampler (the volume is toroidal), z by hand between two slices of each
 // plane. Premultiplied by validity, divided out here; a = validity x the window-edge fade.
-float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
+// lan = the lanterns' L0 here (E/pi, pgi.comp.fsl pgiPointLight): the sky gate leaves up to that much alone.
+float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan)
 {
     vis = 1.0f;
+    lan = f3(0.0f);
     const float4 P2 = gShadowParams.pgiParams2;
     const float4 P3 = gShadowParams.pgiParams3;
     const float VX = P2.y, VZ = P2.z;
@@ -546,6 +548,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis)
     if (m.x < 1.0e-3f) { return f4(0.0f); }
     const float inv = 1.0f / m.x;
     vis = saturate(m.y * inv);   // the probes' sky visibility here (pgi.comp.fsl slice 16 + layer)
+    lan = lerp(PgiSampleArr(gPgiVol, uv, 8.0f * VZ + s0), PgiSampleArr(gPgiVol, uv, 8.0f * VZ + s1), t).rgb * inv;   // ...and their lanterns' L0
     float4 q[7];
     UNROLL for (int k = 0; k < 7; ++k) {
         q[k] = lerp(PgiSampleArr(gPgiVol, uv, (float)k * VZ + s0), PgiSampleArr(gPgiVol, uv, (float)k * VZ + s1), t) * inv;
@@ -645,8 +648,11 @@ float skyOpenness(float ao, float3 worldPosRel)
     return open;
 }
 
+// ao < 0 = THE FIRST-PERSON ARMS (skyAmbFactorPx): no sky AO of their own, see below.
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
+    const bool fpAO = ao < 0.0f;
+    if (fpAO) { ao = skyAOTerm(N, worldPosRel); }   // the march: the fallback where no probe answers
 #ifndef PGI_COMPUTE
     if (gShadowParams.pgiParams0.x > 0.0f) {
         float below = 0.0f;
@@ -654,8 +660,18 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
         // Ball placement: the splatted volume — probes stand where rays reached, and a point a probe
         // cannot see takes nothing from it, so no column / openness gating is needed.
         float pvis = 1.0f;
+        float3 plan = f3(0.0f);
         if (gShadowParams.pgiParams2.w > 0.5f) {
-            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis);
+            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis, plan);
+            // The arms stand in the passage's open middle, where the probes do: they take the probes'
+            // sky visibility through their own plane (the gate below then passes the probes' light
+            // whole), blended to the march by the volume's confidence. The march cannot see a tunnel's
+            // roof, so alone it lit the arms as under open sky ("first person is lit in the tunnels",
+            // user 2026-10-17).
+            if (fpAO && pg.a > 0.0f && gShadowParams.skyParams.y > 0.0f) {
+                const float pa = lerp(1.0f, pvis * (0.5f + 0.5f * max(normalize(N).z, 0.0f)), gShadowParams.skyParams.y);
+                ao = lerp(ao, pa, saturate(pg.a));
+            }
             // RECEIVER VISIBILITY (knob pgiRecvVis, user 2026-10-15: "directional skyAO should normally
             // cover this"): probes stand in the open middle of a passage and see the sky holes a wall
             // or a tunnel floor does not. This point keeps its own sky visibility's share of theirs —
@@ -686,7 +702,12 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
                 // squared (mode 2): a tunnel's leftover visibility stays shut; mode 4 = linear (A/B).
                 if (nz < 0.0f) { r = max(r, ((rv > 3.5f) ? pvis : pvis * pvis) * saturate(-2.0f * nz)); }
                 const float t  = saturate(r / max(gShadowParams.giDebug.w, 0.01f));
-                pg.rgb *= t * t;   // squared under the knee: open ground (r >= knee) untouched
+                // squared under the knee: open ground (r >= knee) untouched. Only what is NOT the lanterns':
+                // their bounce is local light, not sky seen through a hole the receiver lacks. Up to their
+                // L0 passes whole (where this normal gets less than the lanterns' mean, all of it is theirs),
+                // per channel, so a teal lantern's fill does not carry the far tunnel's warm light in with it.
+                const float3 keep = min(pg.rgb, plan);
+                pg.rgb = keep + (pg.rgb - keep) * (t * t);
             }
         }
         else {
@@ -722,6 +743,11 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 // The MAIN camera's lit fragments: the same factor with the sky-visibility screen term.
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
+#ifndef PGI_COMPUTE
+    // FIRST PERSON (alphaShadowParams.z): the arms are not in the prepass, so the screen term finds
+    // no texel of theirs and its fallback is the march. They take the probes' visibility instead.
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
+#endif
     return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 

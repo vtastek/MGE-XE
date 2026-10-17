@@ -45,6 +45,7 @@
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "gobosample.h.fsl" // fixtureGoboVis() — the baked light's fixture self-shadow (G2)
+#include "fpshadow.h.fsl"   // capSlotVisibility() — point shadows in the probe capture views
 #include "gitint.h.fsl"    // giTintAlbedo() — GI bounce inspection
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
@@ -414,6 +415,9 @@ PSOut PS_MAIN( VSOutput In )
                 att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
                 // The fixture's own cage/bowl, from its gobo — in att, so diffuse AND specular see it.
                 att *= fixtureGoboVis(toL, fo.w, lc4.w);
+                // PROBE CAPTURE VIEWS: the world's point shadow, from the atlas directly. Here a static is
+                // the tunnel's own rock as often as MW's set is, and an unshadowed lantern lit through it.
+                if (gFrameData.alphaShadowParams.y > 0.5f) { att *= capSlotVisibility(In.WorldPos, nGeom, posR.xyz); }
                 float lambert = saturate(dot(N, toL) * invD);
                 // geom_vis (pbr.hlsl): a light behind the REAL surface must not light a bump facing
                 // it. Off the geometric normal, which is what makes it a visibility and not a second

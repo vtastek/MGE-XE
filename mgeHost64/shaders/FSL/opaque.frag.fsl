@@ -442,7 +442,7 @@ float4 PS_MAIN( VSOutput In )
                 // which is a pass, not a branch.
                 // G3: a slotless light (or the mirror, which has no slot mask, or the goboForceNear
                 // oracle) takes its FIXTURE GOBO instead — the cage without the world shadow.
-                const bool useSlot = slotP1 != 0u && !inReflect && gLights.lightParams.z < 0.5f;
+                const bool useSlot = slotP1 != 0u && (!inReflect || gFrameData.alphaShadowParams.y > 0.5f) && gLights.lightParams.z < 0.5f;   // capture views: the atlas directly (below)
                 if (!useSlot) { att *= fixtureGoboNear(gLights.goboNear[i >> 1u], i, toLight); }
                 if (useSlot)
                 {

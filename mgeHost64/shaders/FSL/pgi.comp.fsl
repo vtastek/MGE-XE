@@ -14,6 +14,9 @@
 #define gGiField      gPgiDummy4
 #include "skyamb.h.fsl"
 #include "atmosphere.h.fsl"   // atmosSkyViewUvFromDir — the relight's LIVE sky (pgiSkyLive below)
+#define gShadowAtlas    gPgiShadowAtlas
+#define gShadowAtlasDyn gPgiShadowAtlasDyn
+#include "fpshadow.h.fsl"     // fpShadowVisibility — the point lights' shadows at a hit (pgiPointLight)
 
 #define PGI_FACE_TEX 8u      // texels per face side in the G-buffer
 #define PGI_THREADS  64u     // RELIGHT group size
@@ -256,8 +259,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 #elif defined(PGI_RELIGHT) || defined(PGI_PEEKLIT)
 // ─── RELIGHT: one group per probe; radiance per texel -> SH9 -> convolved planes ─────────────────
 // Reduction lanes per thread: 0-6 the SH9 RGB (27) + back share; 7-9 the MISSING faces' basis weights
-// (9) + the captured faces' radiance x solid angle (rgb); 10 the captured solid angle.
-#define PGI_LANES 11u
+// (9) + the captured faces' radiance x solid angle (rgb); 10 the captured solid angle; 11 .x the LANTERNS'
+// share of that radiance (luma x solid angle).
+#define PGI_LANES 12u
 GroupShared(float4, g_pgiA[PGI_THREADS * PGI_LANES]);
 
 // Height-field sun visibility from an ABSOLUTE point toward S: log-spaced march over the raw TOP map,
@@ -385,6 +389,39 @@ float pgiSunVisibility(float3 P, float3 N, float3 S, bool march)
     return march ? pgiSunVis(P, S) : pgiSunOccVis(P);
 }
 
+// THE LANTERNS (knob pgiPoint = ambCol.w, its gain; 0 = off): the near live point lights at a hit,
+// opaque.frag's own response — 1/(k0 + k1 d + k2 d^2), the tail ramp to the reach, N.L — shadowed from
+// the atlas directly where the light has a slot (the probe captures' own test, fpShadowVisibility). A
+// slotless light is unshadowed (the captures' fixture gobo is not here). Prel is camera-relative, the
+// lights' space. Without it a tunnel lit only by lanterns relit black: the independent truth at the
+// Telvanni root is 0.003 E_ref with lanterns, 0.000 without (2026-10-17).
+float3 pgiPointLight(float3 Prel, float3 N)
+{
+    const float gain = gPgiParams.ambCol.w;
+    if (gain <= 0.0f) { return f3(0.0f); }
+    const uint  nL = min((uint)gPgiLights.lightParams.x, (uint)MAX_POINT_LIGHTS);
+    const float reachK = gPgiLights.lightParams.y;
+    float3 E = f3(0.0f);
+    for (uint i = 0u; i < nL; ++i) {
+        const float4 posR = gPgiLights.lights[i * 3u + 0u];
+        const float3 toL = posR.xyz - Prel;
+        const float  d2 = dot(toL, toL);
+        const float  reach = posR.w * reachK;
+        if (d2 >= reach * reach) { continue; }
+        const float invD = rsqrt(max(d2, 1.0e-8f));
+        const float lambert = saturate(dot(N, toL) * invD);
+        if (lambert <= 0.0f) { continue; }
+        const float  d  = d2 * invD;
+        const float4 fo = gPgiLights.lights[i * 3u + 2u];
+        float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1.0e-4f);
+        att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+        const uint slotP1 = (uint)fo.w;
+        if (slotP1 != 0u) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        E += gPgiLights.lights[i * 3u + 1u].rgb * (lambert * att);
+    }
+    return E * gain;
+}
+
 // MW's sky, as the radiance it hands an open surface: ambCol x the SH1 shape skyAmbFactorAO applies.
 // With the live sky on, the LUT instead (a stolen capture's sky texels, the sun's cone).
 float3 pgiSkyRadiance(float3 d)
@@ -481,7 +518,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         UNROLL for (uint b = 0u; b < 9u; ++b) { amb += float3(fp[3u * b], fp[3u * b + 1u], fp[3u * b + 2u]) * Yn[b]; }
         amb = max(amb, f3(0.0f));
     }
-    const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV) + amb;
+    const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV) + amb
+                   + pgiPointLight(P - gPgiParams.lodEye.xyz, N);
     Write2D(gPgiPeek, outAt, float4(pv.rgb * E, 1.0f));
     RETURN();
 }
@@ -570,6 +608,14 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
             prevC[k] = (prevW > 0.0f) ? LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + k))) / prevW : f4(0.0f);
         }
     }
+    // The lanterns' part of the previous irradiance (slice 18 + layer: their L0, E/pi): a hit's bounce takes
+    // up to that much of it as lantern light, so the lanterns' share survives the multi-bounce.
+    float3 prevEl = f3(0.0f);
+    if (prevW > 0.0f) {
+        const float4 s18 = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(18u + layer)));   // (L0 rgb, valid) x valid
+        prevEl = s18.rgb / max(s18.w, 1.0e-3f);
+    }
+    float3 lanAcc = f3(0.0f);   // the lanterns' radiance x solid angle over the captured faces
     // The world probe (layer 1, column (G-1, G-1)) has faces: its sky stands in for every probe's.
     const bool worldSky = !world && gPgiParams.capMisc.x > 0.5f && gPgiProbes[2u * G * G - 1u].w > 3.5f;   // capMisc.x = knob pgiLiveSky
     if (valid) {
@@ -657,8 +703,10 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
                     amb = max(Ep, f3(0.0f));   // E/pi, the units ambCol x factor is in
                 }
                 // place.y = knob pgiSunGain (test): the sun term's share (1 = as is).
-                const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb;
+                const float3 Elan = pgiPointLight(Prel, N);
+                const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb + Elan;
                 L += (1.0f - skyF) * as.rgb * E;
+                lanAcc += (1.0f - skyF) * as.rgb * (Elan + min(amb, prevEl)) * dom;
             }
             // LIT PREVIEW (pgiDebug 64): the radiance this texel hands the SH — sun with its cascade
             // shadow, the bounce, the sky — beside the G-buffer tile it came from.
@@ -690,6 +738,7 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
     g_pgiA[tid * PGI_LANES + 8u]  = float4(missY[4], missY[5], missY[6], missY[7]);
     g_pgiA[tid * PGI_LANES + 9u]  = float4(missY[8], capL);
     g_pgiA[tid * PGI_LANES + 10u] = float4(capD, visS, visW, skyAll);
+    g_pgiA[tid * PGI_LANES + 11u] = float4(lanAcc, 0.0f);
     g_pgiNear[tid] = nearB;
     GroupMemoryBarrier();
     for (uint s = PGI_THREADS / 2u; s > 0u; s >>= 1u) {
@@ -787,6 +836,19 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
         const int3 at = int3((int)cx, (int)cy, (int)(16u + layer));
         if (trans) { vz = lerp(LoadRWTex3D(gPgiSHOut, at), vz, gPgiParams.capMisc.y); }
         Write3D(gPgiSHOut, at, vz);
+    }
+    if (tid == 10u) {
+        // THE LANTERNS' L0 (slice 18 + layer): their mean radiance over the captured faces = the E/pi a
+        // uniform field of it hands any normal. The receivers' sky gate (pgiRecvVis) leaves up to this much
+        // of the probe's light alone: a lantern's bounce is not sky seen through a hole the receiver lacks,
+        // and gating it by the receiver's sky AO blacked the lantern-lit tunnel out (0.00 of the independent
+        // truth; 0.84-1.53 ungated). Colour kept per channel: a luma share passed the far tunnel's warm
+        // light through with it.
+        const float3 El = (g_pgiA[10].x > 1.0e-6f) ? g_pgiA[11].xyz / g_pgiA[10].x : f3(0.0f);
+        float4 lz = valid ? float4(El, 1.0f) : f4(0.0f);
+        const int3 at = int3((int)cx, (int)cy, (int)(18u + layer));
+        if (trans) { lz = lerp(LoadRWTex3D(gPgiSHOut, at), lz, gPgiParams.capMisc.y); }
+        Write3D(gPgiSHOut, at, lz);
     }
     RETURN();
 }
@@ -1030,6 +1092,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float4 acc[7];
     UNROLL for (uint k = 0u; k < 7u; ++k) { acc[k] = f4(0.0f); }
     float sumW = 0.0f, accV = 0.0f;
+    float4 accL = f4(0.0f);
     float dA = 0.0f, lA = -1.0f;
     if (gPgiParams.capMisc.w > 0.0f) { pgiRepelAnchor(X, R, G, dA, lA); }
     for (uint p = 0u; p < 2u * G * G; ++p) {
@@ -1045,6 +1108,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         }
         sumW += wgt * meta.y;
         accV += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(16u + layer))).x;   // premultiplied like the planes
+        accL += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(18u + layer)));      // the lanterns' L0, likewise
     }
     const float v = saturate(sumW / max(gPgiParams.vol3.w, 1.0e-4f));
     const float s = (sumW > 1.0e-5f) ? v / sumW : 0.0f;
@@ -1056,6 +1120,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     {
         const int3 at = int3(id.xy, 7 * VZ + id.z);
         Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(v, accV * s, 0.0f, 0.0f), alpha));   // y = the probes' sky visibility x v
+    }
+    {
+        const int3 at = int3(id.xy, 8 * VZ + id.z);
+        Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(accL.rgb * s, 0.0f), alpha));   // the lanterns' L0 x v
     }
     Write3D(gPgiVolTag, id, tag);
     RETURN();

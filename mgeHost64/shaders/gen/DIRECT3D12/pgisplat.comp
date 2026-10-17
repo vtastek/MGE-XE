@@ -1385,6 +1385,22 @@ STRUCT(PgiParams)
 #line 60
 };
 
+
+
+
+
+
+
+
+
+
+STRUCT(PgiLightData)
+{
+    float4 lightParams;
+    float4 lights[ 128  * 3];
+#line 75
+};
+
         CBUFFER(PgiParams) gPgiParams :  register(b0,space2);
         CBUFFER(ShadowMaskParams) gPgiShadow :  register(b1,space2);
         Tex2D(float) gPgiSkyAO :  register(t2,space2);
@@ -1411,6 +1427,9 @@ STRUCT(PgiParams)
         CBUFFER(AtmosphereParams) gPgiAtmos :  register(b23,space2);
         Tex2D(float4) gPgiAtmosSky :  register(t24,space2);
         Tex2D(float) gPgiSunOcc :  register(t25,space2);
+        CBUFFER(PgiLightData) gPgiLights :  register(b26,space2);
+        Tex2D(float) gPgiShadowAtlas :  register(t27,space2);
+        Tex2D(float) gPgiShadowAtlasDyn :  register(t28,space2);
 #line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
@@ -1663,7 +1682,7 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 568 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 571 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
@@ -1718,7 +1737,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under =  gPgiShadow .skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 640 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef =  gPgiShadow .skyAOGround.y;
@@ -1730,9 +1749,12 @@ float skyOpenness(float ao, float3 worldPosRel)
     return open;
 }
 
+
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 {
-#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    const bool fpAO = ao < 0.0f;
+    if (fpAO) { ao = skyAOTerm(N, worldPosRel); }
+#line 735 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 
@@ -1744,6 +1766,7 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
+#line 751 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
     return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
 }
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
@@ -2139,6 +2162,105 @@ float2 atmosSkyViewUvFromDir(AtmosphereParams P, float r, float3 dir)
     return atmosSkyViewUv(P, r, clamp(dir.z, -1.0f, 1.0f), lightViewCos);
 }
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+float fpShadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D( gPgiShadowAtlas , NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u) { stored = max(stored, LoadTex2D( gPgiShadowAtlasDyn , NO_SAMPLER, tp, 0).r); }
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+
+
+float fpShadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    float2 p = ap - 0.5f;
+    int2 b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = fpShadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = fpShadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = fpShadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = fpShadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+
+
+
+
+
+float fpShadowVisibility(float3 P, float3 N, uint slot)
+{
+    float4 posRad =  gPgiShadow .slotPosRad[slot];
+    float4 tile =  gPgiShadow .slotTile[slot];
+    float rangeK =  gPgiShadow .maskParams.x;
+    float nearZ =  gPgiShadow .maskParams.y;
+    float range = rangeK * posRad.w;
+    float farZ = 2.0f * posRad.w;
+
+    float3 ad0 = abs(P - posRad.xyz);
+    float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+    if (ma0 <= nearZ || ma0 >= range) { return 1.0f; }
+
+    uint dynSlot = ( gPgiShadow .slotBits.y >> slot) & 1u;
+    float uvScale =  gPgiShadow .slotFlick[slot].z;
+    uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;
+
+
+
+    float3 Ldir = posRad.xyz - P;
+    float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+    float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
+    float texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
+    float3 Poff = P + N * ( gPgiShadow .biasParams.y * sinT * texelW);
+
+    float3 d = Poff - posRad.xyz;
+    float3 ad = abs(d);
+
+    uint face; float ma; float u; float v;
+    if (ad.x >= ad.y && ad.x >= ad.z) { ma = ad.x; face = d.x > 0.0f ? 0u : 1u;
+                                        u = d.x > 0.0f ? -d.z : d.z; v = -d.y; }
+    else if (ad.y >= ad.z) { ma = ad.y; face = d.y > 0.0f ? 2u : 3u;
+                                        u = d.x; v = d.y > 0.0f ? d.z : -d.z; }
+    else { ma = ad.z; face = d.z > 0.0f ? 4u : 5u;
+                                        u = d.z > 0.0f ? d.x : -d.x; v = -d.y; }
+    if (ma <= nearZ || ma >= range) { return 1.0f; }
+
+    float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+    float thresh = refZ * (1.0f +  gPgiShadow .maskParams.z)
+                 +  gPgiShadow .biasParams.x + 1e-6f;
+
+    float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                            tile.y + float(face / 3u) * tile.z);
+    int2 tmin = int2(faceOrg);
+    int2 tmax = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+    float2 fuv = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
+    float2 ap = faceOrg + fuv * tile.z;
+
+    float vis = fpShadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+    vis = lerp(1.0f, vis, saturate(tile.w));
+    return vis;
+}
+
+
+
+
+
+float capSlotVisibility(float3 P, float3 N, float3 lightPos)
+{
+    uint bits =  gPgiShadow .slotBits.x;
+    while (bits != 0u) {
+        const uint s = firstbitlow(bits);
+        bits &= bits - 1u;
+        const float3 dl =  gPgiShadow .slotPosRad[s].xyz - lightPos;
+        if (dot(dl, dl) < 4.0f) { return fpShadowVisibility(P, N, s); }
+    }
+    return 1.0f;
+}
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 
 
 
@@ -2199,7 +2321,7 @@ float3 pgiUnpackR11G11B10(uint v)
     return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
 }
 float pgiGbDist(uint4 g) { return f16tof32(g.w >> 16u); }
-#line 923 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 985 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 float pgiSplatWeight(uint p, float3 X, float R, uint G, out float4 meta)
 {
     meta = f4(0.0f);
@@ -2274,7 +2396,7 @@ float pgiRepel(float dp, float lp, float dA, float lA)
     const float r = (1.0f - lA / lp) * saturate((dp - dA) / max(dp, 1.0f));
     return pow(saturate(1.0f - r), K);
 }
-#line 1008 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1070 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(4, 4, 4)
 void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
@@ -2300,6 +2422,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float4 acc[7];
     UNROLL for (uint k = 0u; k < 7u; ++k) { acc[k] = f4(0.0f); }
     float sumW = 0.0f, accV = 0.0f;
+    float4 accL = f4(0.0f);
     float dA = 0.0f, lA = -1.0f;
     if (gPgiParams.capMisc.w > 0.0f) { pgiRepelAnchor(X, R, G, dA, lA); }
     for (uint p = 0u; p < 2u * G * G; ++p) {
@@ -2315,6 +2438,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         }
         sumW += wgt * meta.y;
         accV += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(16u + layer))).x;
+        accL += wgt * LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(18u + layer)));
     }
     const float v = saturate(sumW / max(gPgiParams.vol3.w, 1.0e-4f));
     const float s = (sumW > 1.0e-5f) ? v / sumW : 0.0f;
@@ -2326,6 +2450,10 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     {
         const int3 at = int3(id.xy, 7 * VZ + id.z);
         Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(v, accV * s, 0.0f, 0.0f), alpha));
+    }
+    {
+        const int3 at = int3(id.xy, 8 * VZ + id.z);
+        Write3D(gPgiVolOut, at, lerp(LoadRWTex3D(gPgiVolOut, at), float4(accL.rgb * s, 0.0f), alpha));
     }
     Write3D(gPgiVolTag, id, tag);
     return;

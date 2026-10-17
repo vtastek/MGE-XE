@@ -59,6 +59,21 @@ STRUCT(PgiParams)
     DATA(float4, skyLive, None);
 };
 
+// POINT LIGHTS for the relight (knob pgiPoint): the renderer's NEAR live list (pLightCbv), read through
+// the leading part of opaque.srt.h's LightData — the same bytes: lightParams (x count, y reach in radii),
+// then per light pos.xyz + radius / colour / k0 k1 k2 + falloff.w = shadow slot + 1.
+#ifndef MAX_POINT_LIGHTS
+#define MAX_POINT_LIGHTS 128   // MUST match opaque.srt.h / IPC::kMaxPointLights
+#endif
+#ifndef POINT_LIGHT_TAIL
+#define POINT_LIGHT_TAIL 0.75f // opaque.srt.h's: the 1 -> 0 ramp to the reach starts here
+#endif
+STRUCT(PgiLightData)
+{
+    DATA(float4, lightParams, None);
+    DATA(float4, lights[MAX_POINT_LIGHTS * 3], None);
+};
+
 BEGIN_SRT(PgiSrtData)
     BEGIN_SRT_SET(PerBatch)
         DECL_CBUFFER  (PerBatch, CBUFFER(PgiParams),        gPgiParams)
@@ -87,5 +102,8 @@ BEGIN_SRT(PgiSrtData)
         DECL_CBUFFER  (PerBatch, CBUFFER(AtmosphereParams), gPgiAtmos)       // = pAtmosParamsCbv
         DECL_TEXTURE  (PerBatch, Tex2D(float4),  gPgiAtmosSky)              // = pAtmosSkyView (mixed field)
         DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiSunOcc)                // = gSunOcc: the long-range sun occlusion
+        DECL_CBUFFER  (PerBatch, CBUFFER(PgiLightData), gPgiLights)         // = pLightCbv (the near live lights)
+        DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiShadowAtlas)           // = pShadowAtlas (point shadows)
+        DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiShadowAtlasDyn)        // = pShadowAtlasDyn
     END_SRT_SET(PerBatch)
 END_SRT(PgiSrtData)
