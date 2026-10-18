@@ -27,6 +27,7 @@
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve itself is never called here)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // mod2xStage() — the near path's twin op, in the scene's domain
+#include "skyamb.h.fsl"     // PGI_IS_EMIS — the probe capture's checkerboard
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched
 // frag signature hangs the GPU; see [[project_forge_shared_frag_vsoutput]]). Unused fields stay
@@ -69,6 +70,10 @@ float4 PS_MAIN( VSOutput In )
     // mwFogAirShareAt, matching applyFog, so this pass and the base pass cannot disagree about how
     // much air ramp a fragment owns at a waterline pixel.
     // Per pixel, matching the base pass's applyFog (fog.h.fsl mwFogFactorAt).
+    // PROBE GI capture (P2): the layer tints BOTH parities — albedo and emitted radiance alike, as it tints
+    // MW's whole composite (a GitD lit window is a white emissive base under an orange MOD layer: without
+    // it the probes took the window's light as white). No fog: the capture's base pixels carry none.
+    if (PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) { RETURN(float4(t, 1.0f)); }
     float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
     RETURN(float4(m, 1.0f));
 }

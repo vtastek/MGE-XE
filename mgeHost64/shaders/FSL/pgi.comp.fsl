@@ -185,10 +185,12 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     const uint  B = res / PGI_FACE_TEX;
     float3 fwd, up, right;
     pgiFaceBasis(face, fwd, up, right);
-    float3 alb = f3(0.0f), nAcc = f3(0.0f), skyC = f3(0.0f);
+    float3 alb = f3(0.0f), nAcc = f3(0.0f), skyC = f3(0.0f), emA = f3(0.0f);
     float  dist = 0.0f;
-    uint   nGeo = 0u, nSky = 0u, nBack = 0u;
+    uint   nGeo = 0u, nSky = 0u, nBack = 0u, nAlb = 0u, nEm = 0u;
     const bool peek = gPgiParams.capMisc.y > 0.5f;
+    // P2 CHECKERBOARD (PGI_CAPTURE_EMIS): odd pixels hold the EMITTED radiance, even ones the albedo.
+    const bool emisCap = gPgiParams.emis.x > 0.5f;
     for (uint j = 0u; j < B; ++j) {
         for (uint i = 0u; i < B; ++i) {
             const int2 p = int2(DispatchThreadID.xy * B + uint2(i, j));
@@ -202,7 +204,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                     const float px2 = ((float)p.x + 0.5f) / (float)res * 2.0f - 1.0f;
                     const float py2 = 1.0f - ((float)p.y + 0.5f) / (float)res * 2.0f;
                     o4.w = qn / (d * qd + zn) * sqrt(1.0f + px2 * px2 + py2 * py2);
-                    if (pc.r > PGI_BACK_SENTINEL && pc.b > PGI_BACK_SENTINEL) { o4.rgb = float3(1.0f, 0.0f, 1.0f); }
+                    // A back face: magenta for the raw view, and w = -2 so PGI_PEEKLIT knows it. The rewrite
+                    // to (1, 0, 1) used to be the ONLY mark, and the lit pass tested for the sentinel's
+                    // (4, 0, 4) — so every back face was relit as a magenta ALBEDO (the purple lanterns and
+                    // windows in the mirror, and the lit peek's "magenta specks"; user 2026-10-17).
+                    if (pc.r > PGI_BACK_SENTINEL && pc.b > PGI_BACK_SENTINEL) { o4 = float4(1.0f, 0.0f, 1.0f, -2.0f); }
                 }
                 Write2D(gPgiPeek, int2(gPgiParams.capMisc.zw) + p, o4);
             }
@@ -216,7 +222,13 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             const float3 col = LoadTex2D(gPgiReflColor, NO_SAMPLER, p, 0).rgb;
             // A BACK FACE (the capture frags' sentinel, culling off): a surface seen from behind —
             // the probe is inside something. Counted; it adds no albedo.
-            if (col.r > PGI_BACK_SENTINEL && col.b > PGI_BACK_SENTINEL) { ++nBack; } else { alb += col; }
+            // An emission pixel's radiance can pass the sentinel's red and blue; its green is 0 only there.
+            const bool emPx = emisCap && ((((uint)p.x) ^ ((uint)p.y)) & 1u) != 0u;
+            // Each parity divides by ITS geometry pixels, back faces included — the old mean's denominator.
+            if (emPx) { ++nEm; } else { ++nAlb; }
+            if (col.r > PGI_BACK_SENTINEL && col.b > PGI_BACK_SENTINEL && (!emPx || col.g <= 0.0f)) { ++nBack; }
+            else if (emPx) { emA += col; }
+            else { alb += col; }
             dist += zv * sqrt(1.0f + fx * fx + fy * fy);
             ++nGeo;
             // Normal: the right and down neighbours, when both continue this surface (view depth
@@ -244,15 +256,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         }
     }
     const float  inv = 1.0f / max((float)nGeo, 1.0f);
+    // The albedo over its own parity's geometry pixels (= nGeo without the checkerboard: bit-identical off).
+    const float  invA = emisCap ? 1.0f / max((float)nAlb, 1.0f) : inv;
     const float3 nW  = nAcc.x * right + nAcc.y * up + nAcc.z * fwd;
     const float  skyFrac = (float)nSky / (float)(B * B);
     uint4 o;
-    o.x = pgiPackUnorm4(float4(alb * inv, skyFrac));
+    o.x = pgiPackUnorm4(float4(alb * invA, skyFrac));
     o.y = pgiPackNormal(nW);
     o.z = (nSky > 0u) ? pgiPackR11G11B10(skyC / (float)nSky) : 0u;
     o.w = min(nGeo, 255u) | (min(nBack, 255u) << 8u)
         | (f32tof16(nGeo > 0u ? min(dist * inv, 60000.0f) : -1.0f) << 16u);
     Write2D(gPgiGBuf, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), o);
+    // The EMISSION lane: mean emitted radiance over the texel's geometry (its emission parity), 0 = none.
+    Write2D(gPgiGBufE, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy),
+            (emisCap && nEm > 0u) ? pgiPackR11G11B10(emA / (float)nEm) : 0u);
     RETURN();
 }
 
@@ -305,25 +322,27 @@ float pgiSunVisMap(float3 P, float3 N)
     int2 dimsI = GetDimensions(gPgiSunDepth, NO_SAMPLER);
     const float2 tile = float2((float)dimsI.x / (float)SUN_CASCADES, (float)dimsI.y);
     const float3 rel = P - gPgiParams.lodEye.xyz;
-    // knob pgiSunTap (sunDir.w): 0 the renderer's offsets + 3 x 3; 1 ONE exact tap, the constant bias
-    // only ("we don't need soft shadows, penumbra here, just accuracy", user 2026-10-15); 2 = 1, and the
-    // long-range map's answer too (min).
+    // knob pgiSunTap (sunDir.w): 0 the renderer's offsets + 3 x 3; 1 ONE exact tap ("we don't need soft
+    // shadows, penumbra here, just accuracy", user 2026-10-15); 2 = 1, and the long-range map's answer too
+    // (min). EVERY mode takes the renderer's normal offset and slope bias: the single tap used to take the
+    // constant bias alone (0) — a binary compare with no lean shadows its own surface, and under a low moon
+    // the probe preview was solid acne (user 2026-10-17, ibomenaanacne).
     const uint tapMode = (uint)(gPgiParams.sunDir.w + 0.5f);
     UNROLL for (int c = 0; c < SUN_CASCADES; ++c) {
-        const float3 p = rel + ((tapMode == 0u) ? N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]) : f3(0.0f));
+        const float3 p = rel + N * (gPgiShadow.sunParams.w * gPgiShadow.sunCascadeTexel[c]);
         float4 q = mul(gPgiShadow.sunViewProj[c], float4(p, 1.0f));
         q.xyz /= q.w;
         if (max(abs(q.x), abs(q.y)) < 0.98f && q.z > 0.0f && q.z < 1.0f) {
             const float2 uv = q.xy * float2(0.5f, -0.5f) + 0.5f;
             const int2 base = int2(((float)c + uv.x) * tile.x, uv.y * tile.y);
             const int2 lo = int2((int)((float)c * tile.x), 0), hi = int2((int)((float)(c + 1) * tile.x) - 1, dimsI.y - 1);
+            const float ref = q.z + gPgiShadow.sunPcf1.x + slopeBias;   // reverse-Z: toward the sun
             if (tapMode != 0u) {
                 const float dS = LoadTex2D(gPgiSunDepth, NO_SAMPLER, clamp(base, lo, hi), 0).r;
-                float v = (dS > q.z + gPgiShadow.sunPcf1.x) ? 0.0f : 1.0f;
+                float v = (dS > ref) ? 0.0f : 1.0f;
                 if (tapMode == 2u) { v = min(v, pgiSunOccVis(P)); }
                 return v;
             }
-            const float ref = q.z + gPgiShadow.sunPcf1.x + slopeBias;   // reverse-Z: toward the sun
             float occ = 0.0f;
             for (int j = -1; j <= 1; ++j) {
                 for (int i = -1; i <= 1; ++i) {
@@ -448,7 +467,7 @@ float3 pgiSkyRadiance(float3 d)
 float3 pgiPeekPos(int2 p, uint R, float3 pos, out bool ok)
 {
     const float4 v = LoadRWTex2D(gPgiPeek, p);
-    ok = v.w > 0.0f && !(v.r > PGI_BACK_SENTINEL && v.b > PGI_BACK_SENTINEL);
+    ok = v.w > 0.0f && !(v.r > PGI_BACK_SENTINEL && v.b > PGI_BACK_SENTINEL && v.g <= 0.0f);   // g: an emission pixel
     const uint f = (uint)p.x / R;
     float3 fwd, up, right;
     pgiFaceBasis(f, fwd, up, right);
@@ -463,13 +482,19 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
     const uint R = (uint)gPgiParams.capTile.z;
+    // WORLD MODE (capTile.w = 1, knob pgiHiRes): the WORLD probe's one row — raw in atlas row 4, relit into
+    // row 5 (pgicube.comp builds the cube from it). capPos / place.x / place.z = its position, slot, faces.
+    const bool worldRow = gPgiParams.capTile.w > 0.5f;
     const uint2 id = DispatchThreadID.xy;
-    if (R == 0u || id.x >= 6u * R || id.y >= 2u * R) { return; }
-    const uint row = id.y / R, face = id.x / R;
-    const int2 outAt = int2((int)id.x, (int)(id.y + 2u * R));
+    if (R == 0u || id.x >= 6u * R || id.y >= (worldRow ? 1u : 2u) * R) { return; }
+    const uint row = worldRow ? 0u : id.y / R, face = id.x / R;
+    const uint inY = worldRow ? 4u * R : 0u;
+    const int2 inAt = int2((int)id.x, (int)(id.y + inY));
+    const int2 outAt = int2((int)id.x, (int)(id.y + (worldRow ? 5u : 2u) * R));
     const uint mask = (uint)((row == 0u) ? gPgiParams.place.z : gPgiParams.place.w);
     if ((mask & (1u << face)) == 0u) { Write2D(gPgiPeek, outAt, f4(0.0f)); return; }
-    const float4 pv = LoadRWTex2D(gPgiPeek, int2(id));
+    const float4 pv = LoadRWTex2D(gPgiPeek, inAt);
+    if (pv.w < -1.5f) { Write2D(gPgiPeek, outAt, float4(0.0f, 0.0f, 0.0f, -2.0f)); return; }   // a back face (the gather's mark)
     if (pv.w <= 0.0f) {   // sky: the radiance it holds, or the live field when that is on
         float3 fwd, up, right;
         pgiFaceBasis(face, fwd, up, right);
@@ -479,14 +504,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         Write2D(gPgiPeek, outAt, float4((gPgiParams.skyLive.x > 0.5f) ? pgiSkyLive(d) : pv.rgb, 1.0f));
         return;
     }
-    if (pv.r > PGI_BACK_SENTINEL && pv.b > PGI_BACK_SENTINEL) { Write2D(gPgiPeek, outAt, float4(0.0f, 0.0f, 0.0f, -2.0f)); return; }
+    if (pv.r > PGI_BACK_SENTINEL && pv.b > PGI_BACK_SENTINEL && pv.g <= 0.0f) { Write2D(gPgiPeek, outAt, float4(0.0f, 0.0f, 0.0f, -2.0f)); return; }
     const float3 pos = (row == 0u) ? gPgiParams.capPos.xyz : gPgiParams.capMisc.xyz;
     bool ok0, okR, okD;
-    const float3 P  = pgiPeekPos(int2(id), R, pos, ok0);
+    const float3 P  = pgiPeekPos(inAt, R, pos, ok0);
     // Neighbours inside the same face (step back at its right / bottom edge).
     const int sx = ((id.x % R) + 1u < R) ? 1 : -1, sy = ((id.y % R) + 1u < R) ? 1 : -1;
-    const float3 Pr = pgiPeekPos(int2(id) + int2(sx, 0), R, pos, okR);
-    const float3 Pd = pgiPeekPos(int2(id) + int2(0, sy), R, pos, okD);
+    const float3 Pr = pgiPeekPos(inAt + int2(sx, 0), R, pos, okR);
+    const float3 Pd = pgiPeekPos(inAt + int2(0, sy), R, pos, okD);
     const float3 d = normalize(P - pos);
     float3 N = -d;
     if (okR && okD) {
@@ -520,7 +545,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     }
     const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV) + amb
                    + pgiPointLight(P - gPgiParams.lodEye.xyz, N);
-    Write2D(gPgiPeek, outAt, float4(pv.rgb * E, 1.0f));
+    // P2 CHECKERBOARD: the albedo and the emission of a pixel pair (this one and its horizontal neighbour,
+    // the other parity) — lit albedo plus what it emits, so the view reads as the relight's radiance.
+    float3 albP = pv.rgb, emP = f3(0.0f);
+    if (gPgiParams.emis.x > 0.5f) {
+        const bool  odd = ((id.x ^ id.y) & 1u) != 0u;
+        const float4 qv = LoadRWTex2D(gPgiPeek, inAt + int2(sx, 0));
+        const bool  qok = qv.w > 0.0f && !(qv.r > PGI_BACK_SENTINEL && qv.b > PGI_BACK_SENTINEL && qv.g <= 0.0f);
+        albP = odd ? (qok ? qv.rgb : f3(0.0f)) : pv.rgb;
+        emP  = odd ? pv.rgb : (qok ? qv.rgb : f3(0.0f));
+    }
+    Write2D(gPgiPeek, outAt, float4(albP * E + emP * gPgiParams.emis.y, 1.0f));
     RETURN();
 }
 #else
@@ -707,6 +742,15 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
                 const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb + Elan;
                 L += (1.0f - skyF) * as.rgb * E;
                 lanAcc += (1.0f - skyF) * as.rgb * (Elan + min(amb, prevEl)) * dom;
+                // EMISSION (pgiEmis, P2): what the hit itself emits — windows, glow maps. Radiance, not lit by
+                // anything, and local light like the lanterns: it rides their L0 past the receiver's sky gate.
+                if (gPgiParams.emis.x > 0.5f) {
+                    const float3 Le = pgiUnpackR11G11B10(LoadRWTex2D(gPgiGBufE,
+                        int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx, (layer * G + cy) * PGI_FACE_TEX + ty)).r)
+                        * ((1.0f - skyF) * gPgiParams.emis.y);
+                    L += Le;
+                    lanAcc += Le * dom;
+                }
             }
             // LIT PREVIEW (pgiDebug 64): the radiance this texel hands the SH — sun with its cascade
             // shadow, the bounce, the sky — beside the G-buffer tile it came from.
@@ -1175,4 +1219,73 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     RETURN();
 }
 #endif   // PGI_SPLAT / PGI_BLAME
+
+#elif defined(PGI_CUBE) || defined(PGI_CUBEMIP)
+// ─── HI-RES WORLD PROBE (knob pgiHiRes): the relit world faces -> a cube (opaque.srt.h gPgiWorldCube) ──
+// THE CUBE'S OWN FACE CONVENTION (the hardware's: +X -X +Y -Y +Z -Z, texel (u, v) down-right), not the
+// capture's (pgiFaceBasis): mip 0 maps each cube texel to a world DIRECTION and reads the capture face that
+// direction falls in. The receivers sample with the same world direction, so the two conventions never
+// have to agree with each other — only each with world space.
+float3 pgiCubeDir(uint f, float2 uv)
+{
+    const float a = uv.x * 2.0f - 1.0f, b = uv.y * 2.0f - 1.0f;
+    float3 d;
+    if (f == 0u)      { d = float3( 1.0f, -b, -a); }
+    else if (f == 1u) { d = float3(-1.0f, -b,  a); }
+    else if (f == 2u) { d = float3( a,  1.0f,  b); }
+    else if (f == 3u) { d = float3( a, -1.0f, -b); }
+    else if (f == 4u) { d = float3( a, -b,  1.0f); }
+    else              { d = float3(-a, -b, -1.0f); }
+    return normalize(d);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    const uint N = (uint)gPgiParams.capTile.z;   // this mip's side
+    const uint3 id = DispatchThreadID;
+    if (id.x >= N || id.y >= N || id.z >= 6u) { return; }
+#if defined(PGI_CUBE)
+    // Mip 0 from the peek atlas's WORLD-LIT row (5): bilinear inside the capture face the direction falls
+    // in (clamped at its edges — the box mips and the sampler's seamless filtering hide the seam).
+    const uint R = (uint)gPgiParams.capTile.x;   // the atlas face side
+    const float3 d = pgiCubeDir(id.z, (float2(id.xy) + 0.5f) / (float)N);
+    const float3 ad = abs(d);
+    uint cf;
+    if (ad.x >= ad.y && ad.x >= ad.z) { cf = (d.x > 0.0f) ? 0u : 1u; }
+    else if (ad.y >= ad.z)            { cf = (d.y > 0.0f) ? 2u : 3u; }
+    else                              { cf = (d.z > 0.0f) ? 4u : 5u; }
+    float3 fwd, up, right;
+    pgiFaceBasis(cf, fwd, up, right);
+    const float k = 1.0f / dot(d, fwd);
+    const float a = dot(d, right) * k, b = dot(d, up) * k;   // the capture face's (2u-1, 1-2v)
+    const float2 t = float2((a * 0.5f + 0.5f) * (float)R - 0.5f, (0.5f - b * 0.5f) * (float)R - 0.5f);
+    const float2 t0 = floor(t), fr = t - t0;
+    // A back face (w = -2 in the lit row) is a HOLE, not black: it is left out of the weights, a = the share
+    // of this texel that had radiance, and the mips below average by it (a window seen from behind takes its
+    // wall's light, not a black or a magenta square).
+    float3 acc = f3(0.0f);
+    float  wa = 0.0f;
+    UNROLL for (int j = 0; j < 2; ++j) {
+        UNROLL for (int i = 0; i < 2; ++i) {
+            const int2 q = clamp(int2(t0) + int2(i, j), int2(0, 0), int2((int)R - 1, (int)R - 1));
+            const float w = ((i == 0) ? 1.0f - fr.x : fr.x) * ((j == 0) ? 1.0f - fr.y : fr.y);
+            const float4 v = LoadRWTex2D(gPgiPeek, int2((int)(cf * R) + q.x, (int)(5u * R) + q.y));
+            if (v.w > -1.5f) { acc += w * v.rgb; wa += w; }
+        }
+    }
+    Write3D(gPgiCubeOut, int3(id), float4(max(acc / max(wa, 1.0e-4f), f3(0.0f)), saturate(wa)));
+#else
+    // Mip k from mip k-1: the 2 x 2 box weighted by coverage (a = how much of it had radiance).
+    const int2 s = int2(id.xy) * 2;
+    const float4 c0 = LoadRWTex3D(gPgiCubeIn, int3(s, (int)id.z)), c1 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(1, 0), (int)id.z));
+    const float4 c2 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(0, 1), (int)id.z)), c3 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(1, 1), (int)id.z));
+    const float a = c0.a + c1.a + c2.a + c3.a;
+    const float3 rgb = (c0.rgb * c0.a + c1.rgb * c1.a + c2.rgb * c2.a + c3.rgb * c3.a) / max(a, 1.0e-4f);
+    Write3D(gPgiCubeOut, int3(id), float4(rgb, a * 0.25f));
+#endif
+    RETURN();
+}
 #endif

@@ -1,0 +1,71 @@
+// mgeHost64 — DoF D1: AUTOFOCUS.  Read dof.srt.h first.
+//
+// ONE group of 8x8. Each thread reads one depth texel on an 8x8 grid spanning the centre window and
+// turns it into dioptres; the group takes a Gaussian-weighted MEAN of the dioptres. Dioptres and not
+// metres because that is the eye's own unit: a pole in front of a far wall pulls the focus to the
+// dioptre midpoint, where both are blurred by the same amount, which is what accommodation does —
+// and a metre mean would be dragged out to the sky by any open texel.
+//
+// Thread 0 then clamps the target into the accommodation range, blends in the MWSE override and eases
+// the eye's focus toward it on the SIM clock: dt = 0 on a menu, so the focus holds on a paused frame.
+//
+// ⚠ ANYTHING NEARER THAN hands.y IS NOT A FOCUS CANDIDATE. The arms carry a constant near-plane depth
+// (MB FP1e B), and a sword swung through the centre would otherwise snap focus to 0.1 m every swing.
+// A window that is all hands keeps last frame's target.
+
+#include "dof.srt.h"
+#include "dofcommon.h.fsl"
+
+GroupShared(float, g_dofWD[64]);   // sum of weight * dioptres
+GroupShared(float, g_dofW[64]);    // sum of weights
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_GroupThreadID(uint3) GTid )
+{
+    INIT_MAIN;
+
+    uint   li        = GTid.y * 8u + GTid.x;
+    float2 delivered = gDofParams.rects.xy;
+    float2 depthRect = gDofParams.rects.zw;
+
+    // The grid point in delivered px: -1..+1 of the window radius about the centre.
+    float2 g   = (float2(GTid.xy) + 0.5f) / 8.0f * 2.0f - 1.0f;
+    float  r   = gDofParams.opts.y * delivered.y;
+    float2 px  = delivered * 0.5f + g * r;
+    int2   q   = dofDepthTexel(px, delivered, depthRect);
+    float  dz  = LoadTex2D(gDofDepth, NO_SAMPLER, q, 0).r;
+    float  D   = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z);
+    float  w   = exp(-2.0f * dot(g, g));
+    // Hands out: nearer than hands.y metres = more than 1/hands.y dioptres.
+    if (D > 1.0f / max(gDofParams.hands.y, 1.0e-3f))
+    {
+        w = 0.0f;
+    }
+    g_dofWD[li] = w * D;
+    g_dofW[li]  = w;
+    GroupMemoryBarrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (li < s)
+        {
+            g_dofWD[li] += g_dofWD[li + s];
+            g_dofW[li]  += g_dofW[li + s];
+        }
+        GroupMemoryBarrier();
+    }
+
+    if (li == 0u)
+    {
+        float4 prev  = gDofFocus[0];
+        bool   fresh = (prev.w != 1.0f) || (gDofParams.hands.w > 0.5f);
+        float  near  = max(gDofParams.eye.y, 0.0f);
+        float  Dt    = (g_dofW[0] > 1.0e-4f) ? (g_dofWD[0] / g_dofW[0]) : (fresh ? 0.0f : prev.y);
+        Dt = clamp(Dt, 0.0f, near);
+        float  ow    = saturate(gDofParams.focus.w);
+        Dt = lerp(Dt, clamp(gDofParams.focus.z, 0.0f, near), ow);
+        float  k     = 1.0f - exp(-max(gDofParams.focus.x, 0.0f) * max(gDofParams.focus.y, 0.0f));
+        float  Df    = fresh ? Dt : (prev.x + (Dt - prev.x) * k);
+        gDofFocus[0] = float4(Df, Dt, g_dofW[0], 1.0f);
+    }
+}

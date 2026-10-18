@@ -216,7 +216,8 @@ float4 PS_MAIN( VSOutput In )
 
     // F12 debug views (lockstep with multimap.frag; alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
@@ -227,7 +228,7 @@ float4 PS_MAIN( VSOutput In )
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
-    if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }
+    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(alb, 1.0f)); }   // P2: not captured (alpha.frag)
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
     if (dbg == 7u) {
         float3 al;

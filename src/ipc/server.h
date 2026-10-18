@@ -12,6 +12,7 @@ namespace IPC {
 		kListDraw, kListSkinned, kListMultiMap, kListLight, kListSky, kListAlpha, kListCaptured,
 		kListFpDraw, kListFpSkinned, kListFpAlpha, kListFpMM,
 		kListUi,   // host-drawn UI: [UiVertexWire][uint16], indices at RenderFrameParameters::uiVertBytes
+		kListPgiEmit, kListPgiEmitMM,   // probe-GI near emitters: DrawItemWire[] / MultiMapDrawWire[]
 		kFrameListCount
 	};
 	struct FrameLists {

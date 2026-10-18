@@ -191,6 +191,11 @@ VSOutput VS_MAIN( VSInput In )
     // taken per pixel in statics.frag.
     Out.Color    = float4(vcol * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz)
                           * waterAmbTransmit(worldPos.xyz) + emissive, In.Color.a);
+    // PROBE GI capture with emission (statics.frag's odd pixels): the emissive ALONE, so the frag can
+    // write the emitted radiance tex x emissive. The even pixels read only the texture.
+    const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (capDbg == PGI_CAPTURE_EMIS)      { Out.Color.rgb = f3(emissive); }
+    if (capDbg == PGI_CAPTURE_EMIS_TEST) { Out.Color.rgb = f3(gShadowParams.sunny16.y); }   // TEST: all emit, m scene units
     // ⚠ THE SUN LANE CARRIES ONE OF TWO THINGS, and `pbrStatics.z` picks which.
     //
     // OFF — the MGE-faithful per-VERTEX product `vcol * sunCol * saturate(dot(nWorld, -sunDir))`.

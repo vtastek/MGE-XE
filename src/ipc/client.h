@@ -79,6 +79,8 @@ namespace IPC {
 		float m_nearFwd[3] = { 0.0f, 1.0f, 0.0f };
 		VecId m_uiList = InvalidVector;
 		std::uint32_t m_uiVertBytes = 0, m_uiIdxBytes = 0;
+		VecId m_pgiEmitList = InvalidVector, m_pgiEmitMMList = InvalidVector;
+		std::uint32_t m_pgiEmitCount = 0, m_pgiEmitBytes = 0, m_pgiEmitMMCount = 0, m_pgiEmitMMBytes = 0;
 		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting,
 		// 1 = semaphore, 2 = event.
 		std::uint32_t m_clientSyncsOnFence = 0;
@@ -479,6 +481,13 @@ namespace IPC {
 		// captured no UI never re-ships a stale list.
 		void setNextUiList(VecId id, std::uint32_t vertBytes, std::uint32_t idxBytes) {
 			m_uiList = id; m_uiVertBytes = vertBytes; m_uiIdxBytes = idxBytes;
+		}
+		// Probe-GI near emitters (bridge.h pgiEmitList): stamped into the NEXT render RPC only,
+		// then cleared, the same contract as the UI list.
+		void setNextPgiEmitters(VecId list, std::uint32_t count, std::uint32_t bytes,
+		                        VecId mmList, std::uint32_t mmCount, std::uint32_t mmBytes) {
+			m_pgiEmitList = list; m_pgiEmitCount = count; m_pgiEmitBytes = bytes;
+			m_pgiEmitMMList = mmList; m_pgiEmitMMCount = mmCount; m_pgiEmitMMBytes = mmBytes;
 		}
 
 		// (eyeNow - bakeEye), the mode-3 park delta the sky payload was pre-cancelled by. The host

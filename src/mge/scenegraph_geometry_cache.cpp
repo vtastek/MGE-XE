@@ -1361,7 +1361,7 @@ namespace MGE::GeometryCache {
                     LOG::logline(">> [emissive] fixture tex=%s emissive=(%.2f,%.2f,%.2f) light=(%.3f,%.3f,%.3f) "
                                  "d=%.1f r=%.1f tol=%.1f area=%.1f grpArea=%.1f pieces=%u "
                                  "gain=(%.2f,%.2f,%.2f) -> draw=(%.2f,%.2f,%.2f) [k_eff %.2f cap %.0f x%.2f] "
-                                 "blend=%u/%u matAlpha=%.2f vCol=%u areaSrc=%s",
+                                 "blend=%u/%u matAlpha=%.2f vCol=%u areaSrc=%s R=%.1f k=(%.4g,%.4g,%.4g)",
                                  e.textureName ? e.textureName : "(none)",
                                  e.matEmissive[0], e.matEmissive[1], e.matEmissive[2],
                                  own->diffuse[0], own->diffuse[1], own->diffuse[2],
@@ -1375,7 +1375,10 @@ namespace MGE::GeometryCache {
                                  e.matDiffuse[3], (unsigned)e.vColSource,
                                  // `bound` means this is a particle sprite measured by its
                                  // silhouette, not by polygons — read k_eff with that in mind.
-                                 areaFromBound ? "bound" : "tri");
+                                 areaFromBound ? "bound" : "tri",
+                                 // The light's reach and falloff: the flux the fixture should carry
+                                 // (devkit emissive-truth.py scores the gain against it).
+                                 own->radius, own->falloff[0], own->falloff[1], own->falloff[2]);
                 }
             }
         }
@@ -5830,6 +5833,45 @@ namespace MGE::GeometryCache {
                          g_gcAccum.detach * kEvictSweepInterval / n,
                          g_gateThisFrame ? " gate=ON" : "", g_gateRadius);
             g_gcAccum = GcAccum{};
+
+            // Probe-GI emissive census (Step 0 of "inject missing emissives"): the near cache's
+            // emitting shapes, which pgi captures never draw (MW's near set is out of them). emitter
+            // = material emissive, emissive-routed vertex colour, or a glow map. fixture = paired
+            // with its own light (the light carries its energy: stays out). Split by world bound
+            // radius (<32 / <96 / <256 / >=256), blend, GitD switch variant, and stale = not visited
+            // in the last 300 frames (out of the frustum since, or an inactive switch child).
+            {
+                uint32_t nEmit = 0, nMat = 0, nVcol = 0, nGlow = 0, nFix = 0, nBlend = 0, nSwitch = 0;
+                uint32_t nStale = 0, nNear = 0, bins[4] = {};
+                for (const auto& kv : g_cache) {
+                    const CachedGeometry& e = kv.second;
+                    if (e.isSkinned || e.isSky || e.isLandscape) { continue; }
+                    const float em = std::max(e.matEmissive[0], std::max(e.matEmissive[1], e.matEmissive[2]));
+                    const bool mat  = em > 0.02f;
+                    const bool vcol = e.hasVertexColor && e.vColSource == 1;
+                    const bool glow = e.glowTextureName != nullptr;
+                    if (!(mat || vcol || glow)) { continue; }
+                    if (e.emissiveGroup != 0) { ++nFix; continue; }
+                    ++nEmit;
+                    if (mat)  { ++nMat; }
+                    if (vcol) { ++nVcol; }
+                    if (glow) { ++nGlow; }
+                    if (e.blendEnable) { ++nBlend; }
+                    if (e.switchOwner) { ++nSwitch; }
+                    if (g_frame - e.lastFrame > 300) { ++nStale; }
+                    const float* w = e.worldTransformD3D;
+                    const float s = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+                    const float r = e.boundsRadius * s;
+                    ++bins[r < 32.0f ? 0 : (r < 96.0f ? 1 : (r < 256.0f ? 2 : 3))];
+                    const float dx = w[12] - g_gateEye[0], dy = w[13] - g_gateEye[1];
+                    if (dx * dx + dy * dy < 8192.0f * 8192.0f) { ++nNear; }
+                }
+                LOG::logline(">> [pgi-emis] near census: %u emitters (mat %u, vcol %u, glow %u; blend %u, "
+                             "switch %u, stale %u, <8192u %u) | r <32: %u, <96: %u, <256: %u, >=256: %u "
+                             "| %u light fixtures excluded | entries=%zu",
+                             nEmit, nMat, nVcol, nGlow, nBlend, nSwitch, nStale, nNear,
+                             bins[0], bins[1], bins[2], bins[3], nFix, g_cache.size());
+            }
         }
 
         if (Configuration.LogDistantPipeline) {

@@ -338,6 +338,7 @@ static int forgeEcoQoSState()
 // cbuffer struct both of them share.
 #include "shaders/FSL/aodepthdown.srt.h"
 #include "stbn_mask.h"          // embedded spatiotemporal blue-noise mask (generated)
+#include "envbrdf_lut.h"        // the specular lobe's split-sum (A, B) table (generated, envbrdf_fit.py)
 #include "shaders/FSL/aoupscale.srt.h"
 // SH2 sky-AO: the top-down world height map's TERRAIN-fill compute SRT (SkyHeightSrtData, PerBatch
 // frequency). Shares the merged ComputeRootSignature. Re-declares the two terrain buffers in its
@@ -430,6 +431,7 @@ static int forgeEcoQoSState()
 // gather off each of the two possible colour sources). One SRT for all three compute passes — DXC
 // strips whichever half a given pass never touches, exactly as bloom's does.
 #include "shaders/FSL/motionblur.srt.h"
+#include "shaders/FSL/dof.srt.h"
 // Fixture gobos (tasks/forge-light-gobo.md G1): GoboResolveSrtData, PerBatch, one instance per bake
 // batch. Shares the merged ComputeRootSignature (1 CBV + 1 SRV + 1 UAV — no rootsig change).
 #include "shaders/FSL/goboresolve.srt.h"
@@ -3061,6 +3063,25 @@ namespace {
         DescriptorSet* pMbSet = nullptr;
         bool           mbReady = false;           // gates the dispatch block
 
+        // DEPTH OF FIELD (tasks/forge-dof.md). Runs after the motion blur, on the delivered image, and
+        // hands the resolve a FOURTH source instance. Same shape as MB-2 and the same non-fatal rule:
+        // any failure leaves dofReady false and the frame is the one it would have been without it.
+        Texture*       pDof = nullptr;             // alloc-sized RGBA16F, the delivered image after the lens
+        Buffer*        pDofParamsCbv = nullptr;    // ONE cbuffer for both passes and all three instances
+        // The eye's focus state: ONE float4 (D_f, D_t, window weight, written). A buffer and not a
+        // 1x1 texture — Forge makes that TEXTURE1D and a Tex2D view of it is silently dead
+        // ([[project_forge_1x1_texture_is_1d]]). Copied into pDofFocusReadback for the heartbeat.
+        Buffer*        pDofFocus = nullptr;
+        Buffer*        pDofFocusReadback = nullptr;
+        Shader*        pDofFocusShader = nullptr;
+        Shader*        pDofCocShader = nullptr;
+        Pipeline*      pDofFocusPipeline = nullptr;
+        Pipeline*      pDofCocPipeline = nullptr;
+        // THREE instances, one pointer apart in gDofColor: [0] pSceneColor (or the MSAA pre-filter's
+        // output), [1] the upscaler's output, [2] the motion blur's output.
+        DescriptorSet* pDofSet = nullptr;
+        bool           dofReady = false;
+
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
 
@@ -3094,6 +3115,11 @@ namespace {
         // mask stacked vertically. Created once, never resized — it is resolution-independent by
         // construction (the shader wraps px & 63).
         Texture*       pStbn = nullptr;
+        // The split-sum environment BRDF table (envbrdf_lut.h, opaque.srt.h gEnvBRDF), 64^2 RG16F.
+        // Created once beside the STBN mask; bound lazily into each lit PerFrame set the first time
+        // that set exists (envBrdfBound), because those sets are created across init and water setup.
+        Texture*       pEnvBrdf = nullptr;
+        DescriptorSet* envBrdfBound[4] = {};
         DescriptorSet* pAOBlurSetHalf = nullptr;     // AOBlurSrtData PerFrame, all-half variant
         bool           aoHalfReady = false;          // every half-res resource/pipeline/set built
         // Which AO texture the LAST renderScene actually wrote and left in SHADER_RESOURCE. The two
@@ -3592,6 +3618,7 @@ namespace {
         // above fail every pixel there. Exactly the reason the FP opaque pair exists.
         Pipeline*      pMultiMapReflectPipeline = nullptr;        // FRONT_FACE_CCW
         Pipeline*      pMultiMapReflectPipelineMirror = nullptr;  // FRONT_FACE_CW
+        Pipeline*      pMultiMapReflectPipelineNone = nullptr;    // CULL_NONE: probe-GI captures
         // Tier 1b Z-prepass: multimap.vert + depthonly_mm.frag (own VSOutput, base-stage alpha
         // test), GEQUAL + depthWrite, 0 RTs. Multi-map COLOUR pipelines flip to CMP_EQUAL + no-write.
         Shader*        pMultiMapDepthShader = nullptr;
@@ -3746,6 +3773,14 @@ namespace {
         Buffer*        pFPMMWorldsBuf = nullptr;            // gBatch: one 64KB world window (FP multi-map)
         DescriptorSet* pPerBatchSetFPMM = nullptr;          // gBatch bound to pFPMMWorldsBuf, 1 instance
         Buffer*        pFPInstanceBufMM = nullptr;          // FP multi-map per-draw instance VB (kMMInstU32)
+        // Probe-GI near emitters (pgiRecordEmitters): OWN world + instance windows, for the FP
+        // windows' reason — every other window is filled earlier in the same command list.
+        Buffer*        pPgiEmitWorldsBuf = nullptr;         // gBatch: one 64KB world window (rigid)
+        DescriptorSet* pPerBatchSetPgiEmit = nullptr;       // gBatch bound to pPgiEmitWorldsBuf
+        Buffer*        pPgiEmitInstanceBuf = nullptr;       // rigid per-draw instance VB (kStaticInstU32)
+        Buffer*        pPgiEmitMMWorldsBuf = nullptr;       // gBatch: one 64KB world window (multi-map)
+        DescriptorSet* pPerBatchSetPgiEmitMM = nullptr;     // gBatch bound to pPgiEmitMMWorldsBuf
+        Buffer*        pPgiEmitInstanceBufMM = nullptr;     // multi-map per-draw instance VB (kMMInstU32)
         Pipeline*      pFPMultiMapPipeline = nullptr;       // multi-map colour, GEQUAL + WRITE, CCW
         Pipeline*      pFPMultiMapPipelineMirror = nullptr; // … FRONT_FACE_CW
 
@@ -3909,6 +3944,10 @@ namespace {
         DescriptorSet* pSkyVisSet = nullptr;         // SkyVisSrtData PerBatch
         bool           skyVisReady = false;
         bool           svmScreenInSR = false;        // resting state after the first dispatch
+        // ...and its EYE texel (1x1, skyvis.comp gSvEye -> opaque.srt.h gSkyVisEye): the same visibility
+        // at the camera, the first-person meshes' sky AO. Same states as pSvmScreen, same dispatch.
+        Texture*       pSvmEye = nullptr;
+        DescriptorSet* svmEyeBoundFP = nullptr;      // the FP PerFrame set it was last bound into
         Texture*       pSunMomentsScratch = nullptr;        // separable-blur ping-pong, ONE TILE (kSunShadowRes²)
         RenderTarget*  pSunMomentsRaw = nullptr;            // sunBlurFused: the caster's target; the blur writes pSunMoments
         bool           sunBlurFused = false;                // the fused pass is live (pipeline + raw atlas + set)
@@ -4654,6 +4693,7 @@ namespace {
            kGpuPhaseStaticsDepth,  // inside Prepass: the distant statics Z-prepass (staticsPrepass)
            kGpuPhaseSunBlur,       // inside ShadowSun: the moments blur alone (fused or two-pass)
            kGpuPhasePgi,           // inside Reflect: probe GI compute (place, relight, splat, balls)
+           kGpuPhaseDof,           // depth of field (autofocus + CoC/gather), after the motion blur
            kGpuPhaseCount };
 
     // MGE_GPU_MARKERS=1: every phase bracket also opens a D3D12 event named after its phase, so an
@@ -4669,7 +4709,7 @@ namespace {
         "ObjVel", "ObjVelFP", "MotionBlur", "AODown", "AOSearch", "AOBlur", "AOUp", "ResolveFilter",
         "HizMip0", "ReLinear", "Apl", "GrassDepth", "GrassColor", "SkyVis", "SkyVisScreen",
         "RippleSim", "FbCopyA", "FbCopyB", "CullCam", "CullScan", "CullSun", "CullGrass", "CullCount",
-        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur", "Pgi"
+        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur", "Pgi", "Dof"
     };
     bool gpuMarkersOn() {
         static const bool on = [] { const char* e = std::getenv("MGE_GPU_MARKERS"); return e && e[0] == '1'; }();
@@ -4690,6 +4730,9 @@ namespace {
     // and this is the instance-buffer entry count.
     constexpr uint32_t kMaxFPDraws   = 128;
     constexpr uint32_t kMaxFPSkinned = 32;
+    // Probe-GI near emitters per list (rigid / multi-map): one gBatch world window each, and the
+    // multi-map instance packs its draw index in 10 bits — both bound it at kBatchSize (1024).
+    constexpr uint32_t kPgiEmitMax   = kBatchSize;
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 1024
     // parts/frame (== the window, no batching). Raised 256 -> 1024 (2026-07-17): glow-windows
@@ -6557,6 +6600,9 @@ namespace {
     float g_pgiCapNear  = 0.0f;    // knob pgiCapNear: 1 = MW's near set drawn into captures too (test: holes in near cells)
     constexpr uint32_t kPgiG = 24, kPgiL = 2, kPgiN = kPgiG * kPgiG * kPgiL;
     constexpr uint32_t kPgiPeekRes = 256;   // PEEK: face side (px), clamped to the mirror's size
+    // HI-RES WORLD PROBE (knob pgiHiRes): the cube's side and mips (128 .. 8), and the pgi set's instances.
+    constexpr uint32_t kPgiCubeRes = 128, kPgiCubeMips = 5;
+    constexpr uint32_t kPgiSetN = 7u + kPgiCubeMips;   // 0-5 as before, 6 world lit, 7.. the cube's mips
     // BALLS (tasks/forge-gi.md "probes placed by shooting balls", phase 1 = placement only, drawn by
     // pgiDebug 32; the field still comes from the columns).
     constexpr uint32_t kPgiBallMax = 512;   // balls per frame (camera + sun), 2 float4 each
@@ -6588,9 +6634,42 @@ namespace {
     inline float pgiPointGain() {
         return (g_live.pLightCbv && g_live.pShadowAtlas && g_live.pShadowAtlasDyn) ? std::max(0.0f, g_pgiPoint) : 0.0f;
     }
+    // knob pgiEmis (tasks/forge-gi.md P2): EMISSION in the probes. The capture becomes the checkerboard
+    // (skyamb.h.fsl PGI_CAPTURE_EMIS: odd pixels the emitted radiance — distant statics' emissive and
+    // their glow layer), the gather splits it into gPgiGBufE, the relight adds it as local light.
+    // pgiEmisGain scales what the relight adds (1 = the renderer's own emission). 0 = off: the capture
+    // stays mode 64 and the probes are bit-identical to before.
+    float g_pgiEmis       = 1.0f;
+    float g_pgiEmisGain   = 1.0f;
+    float g_gitdForce     = 0.0f;   // knob gitdForce (TEST): pins the GitD window signal (timeParams.z); 0 = live
+    // knob pgiEmitNear: the client's near-cache EMITTERS (bridge.h pgiEmitList — GitD window pieces
+    // below the DL bake's size floor, glow-mapped trim; light fixtures excluded) drawn into probe-GI
+    // captures, in or out of MW's frustum. Needs pgiEmis (the emission checkerboard). 0 = off.
+    float g_pgiEmitNear   = 1.0f;
+    const IPC::DrawItemWire*     g_pgiEmitItems   = nullptr;   // this frame's lists (setPgiEmitters)
+    unsigned                     g_pgiEmitCount   = 0;
+    const IPC::MultiMapDrawWire* g_pgiEmitMMItems = nullptr;
+    unsigned                     g_pgiEmitMMCount = 0;
+    inline bool pgiEmisOn() { return g_pgiEmis > 0.5f; }
+    inline float4 pgiEmisLane() { return float4(pgiEmisOn() ? 1.0f : 0.0f, std::max(0.0f, g_pgiEmisGain), 0.0f, 0.0f); }
     float g_pgiSunTap     = 2.0f;     // knob pgiSunTap: the relight's sun-map test (0 renderer offsets + 3x3, 1 one exact tap, 2 = 1 x the long-range map)
     float g_pgiRepel      = 0.0f;     // knob pgiRepel: DARK REPELS LIT exponent in the splat (pgi.comp.fsl pgiRepel; 0 = off). OFF: the leak saves read zero without it once the sun test and view bias were fixed, and it costs +0.14 ms (castle 0.37 -> 0.52 ms gpu pgi); 4 = the tested strength
     float g_pgiRecvKnee  = 0.25f;    // knob pgiRecvKnee: receiver / probe visibility ratio below which it darkens
+    // knob pgiSpecSharp: the PBR environment reads the probe volume through the surface's OWN lobe instead
+    // of as irradiance in the mirror direction (skyamb.h.fsl pgiSpecBands). 0 = the shipped look, where every
+    // shiny surface reflected the field as a roughness-1 one would and read grey; 1 = the lobe (band 0, the
+    // energy, untouched). Limit: SH9 is no sharper than L2, so roughness below ~0.5 all looks alike.
+    float g_pgiSpecSharp = 1.0f;
+    // knob pgiHiRes: the WORLD probe captured at peek resolution, relit, and built into a cube that smooth PBR
+    // surfaces reflect (skyamb.h.fsl pgiHiSpec) — the detail SH9 cannot hold, at the volume's energy and tint.
+    // 0 = off (the SH lobe alone, the shipped look). pgiHiCut = the roughness where the cube hands over to the
+    // SH lobe; pgiHiEvery = frames between re-lights of the cube (the sun moves; a new face always rebuilds).
+    float g_pgiHiRes   = 1.0f;
+    float g_pgiHiCut   = 0.6f;
+    float g_pgiHiEvery = 8.0f;
+    // pgiHiNorm: how much of the volume's energy/tint normalization the cube takes (0 = its radiance as
+    // captured from the world probe's spot — the mirror's truth test against the scene beside it).
+    float g_pgiHiNorm  = 1.0f;
     float g_pgiRecvVis   = 2.0f;    // knob pgiRecvVis: 0 off, 1 receiver sky AO over the probes' visibility, 2 receiver sky AO alone
     float g_pgiKernK     = 2.5f;    // knob pgiKernK: splat kernel radius = this x the pool's merge radius there
                                     // (1 also darkens a tunnel, but the receivers' own sky visibility does it
@@ -6656,12 +6735,15 @@ namespace {
     };
     struct Pgi {
         Texture*       gbuf = nullptr;        // G-buffer atlas, RGBA32_UINT
+        Texture*       gbufE = nullptr;       // ...its EMISSION lane (P2), R32_UINT = packed R11G11B10; rests UAV
         Texture*       sh = nullptr;          // the field, G x G x 16 RGBA16F
         Buffer*        placeBuf = nullptr;    // RW float4 per slot (lo, hi, ix, iy)
         Buffer*        placeRb = nullptr;     // its readback, one lane per frame slot
         Buffer*        probes = nullptr;      // FrameBuf: per probe (abs pos, state)
-        Buffer*        cbv[6] = {};           // per dispatch: 0 place, 1 gather, 2 relight, 3 balls, 4 splat, 5 lit peek
-        DescriptorSet* set = nullptr;         // PgiSrtData PerBatch, 6 instances (one per cbv)
+        // per dispatch: 0 place, 1 gather, 2 relight, 3 balls, 4 splat, 5 lit peek, 6 world lit (pgiHiRes),
+        // 7 the cube's mip 0, 8..11 its mips 1..4 (each instance binds its own gPgiCubeOut / gPgiCubeIn mip)
+        Buffer*        cbv[kPgiSetN] = {};
+        DescriptorSet* set = nullptr;         // PgiSrtData PerBatch, kPgiSetN instances (one per cbv)
         Shader*        sPlace = nullptr; Shader* sGather = nullptr; Shader* sRelight = nullptr;
         Pipeline*      pPlace = nullptr; Pipeline* pGather = nullptr; Pipeline* pRelight = nullptr;
         bool           ready = false, failed = false, active = false, shInSR = false, cleared = false;
@@ -6722,6 +6804,15 @@ namespace {
         bool           capWorld = false;      // this frame's capture is the world probe's
         double         worldT = 0.0;          // s at the last full shot (a slow periodic refresh)
         uint32_t       worldShots = 0;        // heartbeat
+        // HI-RES WORLD PROBE (knob pgiHiRes): its faces at peekRes in the peek atlas (raw row 4, lit row 5),
+        // the faces captured that way, and the cube built from them (opaque.srt.h gPgiWorldCube).
+        uint8_t        worldHiFaces = 0;
+        bool           worldHiNew = false;    // a hi-res face landed since the last cube build
+        Texture*       cube = nullptr;        // RGBA16F kPgiCubeRes^2 x 6, kPgiCubeMips (UAV build, SR read)
+        bool           cubeInSR = false, cubeBuilt = false;
+        uint32_t       cubeTick = 0, cubeBuilds = 0;
+        Shader*        sCube = nullptr; Shader* sCubeMip = nullptr;
+        Pipeline*      pCube = nullptr; Pipeline* pCubeMip = nullptr;
         Pgi() { for (int& s : slotOwner) { s = -1; } }
         PgiColumn      col[kPgiG * kPgiG];
         int            ix0 = 0, iy0 = 0;
@@ -7153,6 +7244,8 @@ namespace {
     constexpr uint32_t kSkyHazeFloat          = kPgiFloat + 16;
     // GI bounce inspection (shadowparams.h.fsl giDebug; gitint.h.fsl).
     constexpr uint32_t kGiDebugFloat          = kSkyHazeFloat + 12;
+    // Probe GI specular (shadowparams.h.fsl pgiSpec; skyamb.h.fsl skyAmbSpecPx).
+    constexpr uint32_t kPgiSpecFloat          = kGiDebugFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -7206,6 +7299,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, giDebug) == kGiDebugFloat * sizeof(float),
                   "kGiDebugFloat does not land on ShadowMaskParams::giDebug");
+    static_assert((kPgiSpecFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, pgiSpec) == kPgiSpecFloat * sizeof(float),
+                  "kPgiSpecFloat does not land on ShadowMaskParams::pgiSpec");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -8661,6 +8758,32 @@ namespace {
     // It is correctness for the metal ladder. It is NOT the answer to "rough ground reads plasticy"
     // — that is the diffuse lobe above, and saying so is most of what this knob is here to settle.
     float    g_pbrSpecMulti   = 1.0f;
+    // pbrEnvLut — WHERE THE SPLIT-SUM (A, B) COMES FROM. 1 = the integrated table of pbrSpecTerms'
+    // own lobe (gEnvBRDF, envbrdf_fit.py); 0 = Karis' mobile fit, which shipped until 2026-10-17 and
+    // is off by up to 0.36 in A against this lobe. It feeds THREE consumers — the ambient specular,
+    // the energy split's deduction, and pbrSpecMulti's E_ss — so the metal ladder was wrong in all
+    // three: a smooth metal kept 0.97 of its environment, a rough-0.4 one 0.78 instead of 0.97, a
+    // rough-1 one 0.45 instead of 0.31 (and the multi-scatter gain divided by the same error).
+    float    g_pbrEnvLut      = 1.0f;
+    // Bind the table into each lit PerFrame set the first time that set exists (a set re-created at
+    // a new address is a new set and gets bound again). True only when EVERY lit set that exists has
+    // it — the lane that lets a shader read gEnvBRDF is published from this, so a set that missed
+    // the bind can never be asked for it (an unbound read is (0,0) = no environment specular).
+    static bool envBrdfEnsureBound() {
+        if (!g_live.pEnvBrdf || !g_live.pRenderer || !g_live.pPerFrameSet) { return false; }
+        DescriptorSet* const sets[4] = { g_live.pPerFrameSet, g_live.pPerFrameSetReflect,
+                                         g_live.pPerFrameSetReflectGeo, g_live.pPerFrameSetFP };
+        DescriptorData d = {};
+        d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gEnvBRDF);
+        d.mCount = 1; d.ppTextures = &g_live.pEnvBrdf;
+        for (uint32_t k = 0; k < 4; ++k) {
+            if (sets[k] && sets[k] != g_live.envBrdfBound[k]) {
+                updateDescriptorSet(g_live.pRenderer, 0, sets[k], 1, &d);
+                g_live.envBrdfBound[k] = sets[k];
+            }
+        }
+        return true;
+    }
     // THE DIELECTRIC F0 BASE — the constant pbrF0 multiplies by b^2.
     //
     // ⚠⚠ 0.25 SHIPPED HERE AND WAS MEASURED WRONG. It was set on the user's call as a deliberately
@@ -10543,6 +10666,14 @@ namespace {
                     sld.ppTexture = &g_live.pSvmScreen;
                     sld.pDesc = &sd;
                     addResource(&sld, nullptr);
+                    // NOT 1x1: Forge creates a texture with mHeight == 1 as TEXTURE1D (Direct3D12.c), and
+                    // the shaders declare it Tex2D/WTex2D — the mismatch dropped every write and read,
+                    // silently, and the eye lane never ran (FP took the open-sky march: "fp is glowing",
+                    // 10-18). Texel (0, 0) is the one used.
+                    sd.mWidth = 4u; sd.mHeight = 4u;
+                    sd.pName = "skyVisEye";
+                    sld.ppTexture = &g_live.pSvmEye;
+                    addResource(&sld, nullptr);
 
                     BufferLoadDesc sp = {};
                     sp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -10566,8 +10697,9 @@ namespace {
                     }
                     DescriptorSetDesc vset = SRT_SET_DESC(SkyVisSrtData, PerBatch, 1, 0);
                     addDescriptorSet(R, &vset, &g_live.pSkyVisSet);
-                    if (g_live.pSvmScreen && g_live.pSkyVisParamsCbv && g_live.pSkyVisPipeline && g_live.pSkyVisSet) {
-                        DescriptorData d[4] = {};
+                    if (g_live.pSvmScreen && g_live.pSvmEye && g_live.pSkyVisParamsCbv && g_live.pSkyVisPipeline
+                        && g_live.pSkyVisSet) {
+                        DescriptorData d[5] = {};
                         d[0].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSkyVisParams);
                         d[0].ppBuffers = &g_live.pSkyVisParamsCbv;
                         d[1].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSvDepth);
@@ -10576,7 +10708,9 @@ namespace {
                         d[2].mCount = 1; d[2].ppTextures = &g_live.pSvmDepth->pTexture;
                         d[3].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSvOut);
                         d[3].mCount = 1; d[3].ppTextures = &g_live.pSvmScreen;
-                        updateDescriptorSet(R, 0, g_live.pSkyVisSet, 4, d);
+                        d[4].mIndex = SRT_RES_IDX(SkyVisSrtData, PerBatch, gSvEye);
+                        d[4].mCount = 1; d[4].ppTextures = &g_live.pSvmEye;
+                        updateDescriptorSet(R, 0, g_live.pSkyVisSet, 5, d);
                         g_live.skyVisReady = true;
                     } else {
                         std::printf("[forge][svm] screen pass pipeline/set FAILED — lit paths keep the march\n");
@@ -12466,6 +12600,13 @@ namespace {
                 addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipeline);
                 mg.pRasterizerState = &mmRasterMirror;
                 addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipelineMirror);
+                // Probe-GI captures draw both sides (multimap.frag flags back faces there), so the
+                // near emitters get a cull-none twin, like pFPOpaquePipelineNone. Optional: null
+                // just leaves near multi-map emitters out of the probes.
+                RasterizerStateDesc mmRasterNone = mmRaster;
+                mmRasterNone.mCullMode = CULL_MODE_NONE;
+                mg.pRasterizerState = &mmRasterNone;
+                addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipelineNone);
                 // FP1e: the FIRST-PERSON multi-map pair, which needs its own PSOs for exactly the
                 // reason the reflect pair does — the FP pass clears depth on bind and runs no MM
                 // Z-prepass, so the colour pair's CMP_EQUAL would fail at EVERY pixel and draw
@@ -13530,7 +13671,9 @@ namespace {
                     // already whichever of them this frame delivered — so "which image" is answered
                     // once, at the LAST pass that rewrote it, rather than by the resolve trying to
                     // reason about two independent flags.
-                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 3, 0);
+                    // ⚠ FOUR SINCE DoF: [3] gResolveSource = pDof (the depth of field ran). Same rule
+                    // one level further down: the DoF read whichever of [0..2] this frame delivered.
+                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 4, 0);
                     addDescriptorSet(R, &rsSet, &g_live.pResolveSet);
 
                     BufferLoadDesc rcb = {};
@@ -16209,6 +16352,42 @@ namespace {
                     LOG::logline("!! [forge][ao] STBN mask addResource FAILED — dither falls back to the 4x4 tile");
                 }
             }
+            // The split-sum environment BRDF table, the same way: embedded, created once, never resized.
+            if (!g_live.pEnvBrdf) {
+                TextureDesc td = {};
+                td.mWidth = kEnvBrdfLutN; td.mHeight = kEnvBrdfLutN; td.mDepth = 1;
+                td.mArraySize = 1; td.mMipLevels = 1;
+                td.mSampleCount = SAMPLE_COUNT_1;
+                td.mFormat = TinyImageFormat_R16G16_SFLOAT;
+                td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                td.pName = "envBrdfLut";
+                TextureLoadDesc tld = {};
+                tld.ppTexture = &g_live.pEnvBrdf;
+                tld.pDesc = &td;
+                addResource(&tld, nullptr);
+                waitForAllResourceLoads();
+                if (g_live.pEnvBrdf) {
+                    TextureUpdateDesc upd = {};
+                    upd.pTexture = g_live.pEnvBrdf;
+                    upd.mBaseMipLevel = 0; upd.mMipLevels = 1;
+                    upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+                    upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    beginUpdateResource(&upd);
+                    {
+                        TextureSubresourceUpdate sub = upd.getSubresourceUpdateDesc(0, 0);
+                        for (uint32_t row = 0; row < sub.mRowCount; ++row) {   // row by row: pitch ≠ packed
+                            std::memcpy(sub.pMappedData + (size_t)row * sub.mDstRowStride,
+                                        kEnvBrdfLutRG16F + (size_t)row * kEnvBrdfLutN * 2u,
+                                        (size_t)kEnvBrdfLutN * 4u);
+                        }
+                    }
+                    endUpdateResource(&upd);
+                    LOG::logline(">> [forge][pbr] env BRDF table %ux%u RG16F uploaded", kEnvBrdfLutN, kEnvBrdfLutN);
+                } else {
+                    LOG::logline("!! [forge][pbr] env BRDF table addResource FAILED — pbrEnvAB keeps the Karis fit");
+                }
+            }
             // AO blur PerFrame set (root index distinct from PerBatch/PerDraw — no rebind collision).
             DescriptorSetDesc abset = SRT_SET_DESC(AOBlurSrtData, PerFrame, 1, 0);
             addDescriptorSet(R, &abset, &g_live.pAOBlurSet);
@@ -16733,6 +16912,131 @@ namespace {
                              g_live.pLinearDepth ? 1 : 0);
             }
 
+            // ─── DEPTH OF FIELD (tasks/forge-dof.md) ──────────────────────────────────────────────
+            // Built HERE, after the motion blur and before the resolve's set instances, for MB-2's
+            // reason one level down: its third instance reads pMotionBlur, and the resolve's FOURTH
+            // reads pDof. Same source gate as the blur — a single-sample, linear, pre-tonemap image
+            // (pSceneColor at 1x, the pre-filter's output at MSAA) — because the lens is an ENERGY
+            // operation ([[feedback_energy_op_takes_the_energy_honest_source]]). Non-fatal throughout.
+            if (g_live.sceneReferred && g_live.pSceneColor
+                && (g_live.sampleCount == 1 || g_live.rfReady) && g_live.pLinearDepth) {
+                TextureDesc od = {};
+                od.mWidth = g_live.allocWidth; od.mHeight = g_live.allocHeight; od.mDepth = 1;
+                od.mArraySize = 1; od.mMipLevels = 1;
+                od.mSampleCount = SAMPLE_COUNT_1;
+                od.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;   // pMotionBlur's units and format
+                od.mStartState = RESOURCE_STATE_SHADER_RESOURCE;     // the resolve samples it at rest
+                od.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                od.pName = "dof";
+                TextureLoadDesc odl = {};
+                odl.ppTexture = &g_live.pDof;
+                odl.pDesc = &od;
+                addResource(&odl, nullptr);
+
+                BufferLoadDesc dcb = {};
+                dcb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                dcb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                dcb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                dcb.mDesc.mSize        = 256;   // a float4x4 + five float4s; 256 B = min CBV
+                dcb.mDesc.pName        = "dofParams";
+                dcb.ppBuffer           = &g_live.pDofParamsCbv;
+                addFrameBuf(&dcb);
+
+                // ONE float4, structured (pgi's float4 RW buffer shape). Its .w starts at 0 = "never
+                // written", which is what makes doffocus snap rather than ease from garbage.
+                BufferLoadDesc dfb = {};
+                dfb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                dfb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                dfb.mDesc.mStructStride = 16;
+                dfb.mDesc.mElementCount = 1;
+                dfb.mDesc.mSize         = 16;
+                dfb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                dfb.mDesc.pName         = "dofFocus";
+                dfb.ppBuffer            = &g_live.pDofFocus;
+                addResource(&dfb, nullptr);
+                // ⚠ NO mDescriptors on the readback (pMbStatsReadback's note: a copy-only buffer that
+                // names a descriptor type kills the host in addBuffer).
+                BufferLoadDesc dfr = {};
+                dfr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                dfr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                dfr.mDesc.mSize        = kRbLane * kFrameSlots;
+                dfr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+                dfr.mDesc.pName        = "dofFocusReadback";
+                dfr.ppBuffer           = &g_live.pDofFocusReadback;
+                addResource(&dfr, nullptr);
+                waitForAllResourceLoads();
+                if (g_live.pDofFocusReadback && fbr(g_live.pDofFocusReadback)) {
+                    std::memset(g_live.pDofFocusReadback->pCpuMappedAddress, 0,
+                                (size_t)(kRbLane * kFrameSlots));
+                }
+
+                ShaderLoadDesc dfs = {};
+                dfs.mComp.pFileName = "doffocus.comp";
+                addShader(R, &dfs, &g_live.pDofFocusShader);
+                ShaderLoadDesc dcs = {};
+                dcs.mComp.pFileName = "dofcoc.comp";
+                addShader(R, &dcs, &g_live.pDofCocShader);
+                if (g_live.pDofFocusShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pDofFocusShader;
+                    addPipeline(R, &pd, &g_live.pDofFocusPipeline);
+                }
+                if (g_live.pDofCocShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pDofCocShader;
+                    addPipeline(R, &pd, &g_live.pDofCocPipeline);
+                }
+                if (g_live.pDof && g_live.pDofParamsCbv && g_live.pDofFocus && g_live.pDofFocusReadback
+                    && g_live.pDofFocusPipeline && g_live.pDofCocPipeline) {
+                    DescriptorSetDesc dset = SRT_SET_DESC(DofSrtData, Persistent, 3, 0);
+                    addDescriptorSet(R, &dset, &g_live.pDofSet);
+                }
+                if (g_live.pDofSet) {
+                    // Every slot bound in every instance (pMbSet's note), mCount = 1 on each texture.
+                    Texture* sceneTex = (g_live.sampleCount == 1) ? g_live.pSceneColor->pTexture
+                                                                  : g_live.pResolveFiltered;
+                    Texture* upsTex   = (g_live.pUpscaler && g_live.pUpscaler->outputTexture())
+                                            ? g_live.pUpscaler->outputTexture() : sceneTex;
+                    Texture* mbTex    = g_live.pMotionBlur ? g_live.pMotionBlur : sceneTex;
+                    DescriptorData d[5] = {};
+                    d[0].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofParams);
+                    d[0].ppBuffers = &g_live.pDofParamsCbv;
+                    d[1].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofDepth);
+                    d[1].mCount = 1; d[1].ppTextures = &g_live.pLinearDepth;
+                    d[2].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofColor);
+                    d[2].mCount = 1; d[2].ppTextures = &sceneTex;
+                    d[3].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofFocus);
+                    d[3].mCount = 1; d[3].ppBuffers = &g_live.pDofFocus;
+                    d[4].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofOut);
+                    d[4].mCount = 1; d[4].ppTextures = &g_live.pDof;
+                    // [0] off the scene, [1] off the upscaler, [2] off the motion blur — chosen per
+                    // frame by INDEX, the same `mbRan ? 2 : (upscaled ? 1 : 0)` the resolve asked.
+                    updateDescriptorSet(R, 0, g_live.pDofSet, 5, d);
+                    d[2].ppTextures = &upsTex;
+                    updateDescriptorSet(R, 1, g_live.pDofSet, 5, d);
+                    d[2].ppTextures = &mbTex;
+                    updateDescriptorSet(R, 2, g_live.pDofSet, 5, d);
+                    g_live.dofReady = true;
+                }
+                if (!g_live.dofReady) {
+                    LOG::logline("!! [forge][dof] depth of field unavailable (out=%d cbv=%d focus=%d"
+                                 " focusPipe=%d cocPipe=%d set=%d) — pass OFF, frame unchanged",
+                                 g_live.pDof ? 1 : 0, g_live.pDofParamsCbv ? 1 : 0,
+                                 g_live.pDofFocus ? 1 : 0, g_live.pDofFocusPipeline ? 1 : 0,
+                                 g_live.pDofCocPipeline ? 1 : 0, g_live.pDofSet ? 1 : 0);
+                } else {
+                    LOG::logline(">> [forge][dof] depth of field ready (target %ux%u RGBA16F)",
+                                 g_live.allocWidth, g_live.allocHeight);
+                }
+            } else {
+                LOG::logline("!! [forge][dof] depth of field NOT BUILT (sceneReferred=%d sceneColor=%d"
+                             " samples=%u rf=%d depth=%d)",
+                             g_live.sceneReferred ? 1 : 0, g_live.pSceneColor ? 1 : 0,
+                             g_live.sampleCount, g_live.rfReady ? 1 : 0, g_live.pLinearDepth ? 1 : 0);
+            }
+
             // Custom resolve (step 4): the MSAA colour as a Tex2DMS SRV + its params cbuffer. Bound
             // ONCE — neither resource is ever recreated without rebuilding this path, and the live
             // knobs ride the cbuffer contents, not the descriptor. Guarded on pSceneColor for the same
@@ -16817,6 +17121,17 @@ namespace {
                     if (g_live.sampleCount == 1) { d[1].ppTextures = &g_live.pMotionBlur; }
                     else                         { d[3].ppTextures = &g_live.pMotionBlur; }
                     updateDescriptorSet(R, 2, g_live.pResolveSet, rsN, d);
+                }
+                // ...and INSTANCE 3: the DEPTH OF FIELD's output. The last word over all three
+                // above, for instance 2's reason: it read whichever of them this frame delivered.
+                // The same slot rule too (gResolveSource at 1x, gResolveFiltered above). d[1]/d[3]
+                // are reset first, since instance 2 may have pointed one of them at pMotionBlur.
+                if (g_live.pDof) {
+                    d[1].ppTextures = &g_live.pSceneColor->pTexture;
+                    d[3].ppTextures = &rfTex;
+                    if (g_live.sampleCount == 1) { d[1].ppTextures = &g_live.pDof; }
+                    else                         { d[3].ppTextures = &g_live.pDof; }
+                    updateDescriptorSet(R, 3, g_live.pResolveSet, rsN, d);
                 }
                 if (!bloomTex) {
                     std::printf("[forge][bloom] no fallback texture for gBloomTex — resolve set bound"
@@ -17577,6 +17892,50 @@ namespace {
             } else {
                 g_live.pPerFrameSetFP = nullptr;   // single skip gate for the pass
                 std::printf("[forge] FP pass resource alloc FAILED — FP pass disabled\n");
+            }
+        }
+
+        // Probe-GI near emitters (pgiRecordEmitters): own world windows (full kBatchBytes CBVs, like
+        // every gBatch binding) + instance VBs for kPgiEmitMax draws each. Any failure leaves the
+        // sets null and the emitters simply stay out of the captures.
+        {
+            auto addBuf = [&](uint64_t size, DescriptorType type, const char* name, Buffer** out) {
+                BufferLoadDesc d = {};
+                d.mDesc.mDescriptors = type;
+                d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                d.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                d.mDesc.mSize = size;
+                d.mDesc.pName = name;
+                d.pData = nullptr;
+                d.ppBuffer = out;
+                addFrameBuf(&d);
+            };
+            addBuf(kBatchBytes, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "pgiEmitWorldsCbv", &g_live.pPgiEmitWorldsBuf);
+            addBuf((uint64_t)kPgiEmitMax * kStaticInstU32 * sizeof(uint32_t), DESCRIPTOR_TYPE_VERTEX_BUFFER,
+                   "instanceVBPgiEmit", &g_live.pPgiEmitInstanceBuf);
+            addBuf(kBatchBytes, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "pgiEmitMMWorldsCbv", &g_live.pPgiEmitMMWorldsBuf);
+            addBuf((uint64_t)kPgiEmitMax * kMMInstU32 * sizeof(uint32_t), DESCRIPTOR_TYPE_VERTEX_BUFFER,
+                   "instanceVBPgiEmitMM", &g_live.pPgiEmitInstanceBufMM);
+            waitForAllResourceLoads();
+            if (g_live.pPgiEmitWorldsBuf && g_live.pPgiEmitInstanceBuf
+                && g_live.pPgiEmitMMWorldsBuf && g_live.pPgiEmitInstanceBufMM) {
+                DescriptorSetDesc d0 = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &d0, &g_live.pPerBatchSetPgiEmit);
+                DescriptorSetDesc d1 = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &d1, &g_live.pPerBatchSetPgiEmitMM);
+                if (g_live.pPerBatchSetPgiEmit && g_live.pPerBatchSetPgiEmitMM) {
+                    DescriptorData bw = {};
+                    bw.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                    bw.ppBuffers = &g_live.pPgiEmitWorldsBuf;
+                    updateDescriptorSet(R, 0, g_live.pPerBatchSetPgiEmit, 1, &bw);
+                    DescriptorData bm = {};
+                    bm.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                    bm.ppBuffers = &g_live.pPgiEmitMMWorldsBuf;
+                    updateDescriptorSet(R, 0, g_live.pPerBatchSetPgiEmitMM, 1, &bm);
+                }
+            }
+            if (!g_live.pPerBatchSetPgiEmit || !g_live.pPerBatchSetPgiEmitMM) {
+                LOG::logline("!! [pgi-emis] near-emitter resources FAILED — near emitters stay out of the probes");
             }
         }
 
@@ -20707,6 +21066,26 @@ namespace {
     bool     g_mbObjectOnly = true;
     bool     g_lastRfRan = false;   // did the resolve's compute pre-filter run? (mb= names it)
     bool     g_lastMbRan = false;
+
+    // ── DEPTH OF FIELD (tasks/forge-dof.md) — the EYE model, Knu's v12 made physical ──────────────
+    // ⚠ SHIPS OFF until the gather (D2) lands: D0/D1 only measures (the CoC view, the focus line on
+    // the heartbeat), and `dofEnable=1` with `dofDebug=0` is a byte-identical copy of the frame.
+    bool     g_dofEnable     = false;
+    uint32_t g_dofDebug      = 0u;      // 0 off | 1 the CoC view (orange far, blue near, green < 1 px)
+    float    g_dofPupilMm    = 6.0f;    // pupil DIAMETER, mm (Knu: 6). The blur is linear in it.
+    float    g_dofAccomDpt   = 10.0f;   // accommodation range, dioptres: the near point is 1/this m
+    float    g_dofFocusRate  = 4.0f;    // 1/s: how fast the eye re-focuses (sim clock; holds paused)
+    float    g_dofWindow     = 0.03f;   // autofocus window radius, fraction of the delivered height
+    float    g_dofMaxPx      = 24.0f;   // CoC RADIUS clamp, delivered px
+    float    g_dofHandsNearM = 0.568f;  // no blur nearer than this (Knu's savemyhands)...
+    float    g_dofHandsFarM  = 0.781f;  // ...full blur from here; the autofocus ignores anything nearer
+    float    g_dofDebugPx    = 4.0f;    // the CoC view's full-scale tint, px of radius
+    // OVERRIDE (MWSE, D5): a focus distance in metres and its weight. 0 m = none.
+    float    g_dofOvrDistM   = 0.0f;
+    float    g_dofOvrWeight  = 0.0f;
+    bool     g_lastDofRan    = false;
+    bool     g_dofSnap       = true;    // the next dispatch snaps D_f to the target (set by every build)
+    float    g_lastDofPxPerRad = 0.0f;  // for the heartbeat: the px-per-radian the CoC ran at
     // What the pass actually used, for the heartbeat's bracket. The K it RAN at, not the knob: the
     // knob is clamped to [kMbTileKMin, kMbTileKMax] and a line reporting the unclamped value would
     // describe a configuration that never existed.
@@ -24488,6 +24867,10 @@ namespace {
             { "dlOwnOff",           &g_dlOwnOff           },
             { "debugForce",         &g_debugForce         },
             { "sunShadowStrength",  &g_sunShadowStrength  },
+            { "sunShadowBias",      &g_sunShadowBias      },   // MSM depth bias (world u)
+            { "sunShadowNormalOff", &g_sunShadowNormalOff },   // normal offset (texels)
+            { "sunPcfBias",         &g_sunPcfBias         },   // near-cascade PCF constant bias (world u)
+            { "sunPcfSlopeBias",    &g_sunPcfSlopeBias    },   // near-cascade PCF slope bias (world u x tan)
             { "sunStaticsCullNone", &g_sunStaticsCullNone },
             { "dumpBurst",          &g_dumpBurst          },
             { "dumpBurstX",         &g_dumpBurstX         },
@@ -24703,6 +25086,7 @@ namespace {
             { "pbrSpecAA",           &g_pbrSpecAA           },
             { "pbrSpecAAClamp",      &g_pbrSpecAAClamp      },
             { "pbrSpecMulti",        &g_pbrSpecMulti        },
+            { "pbrEnvLut",           &g_pbrEnvLut           },
             { "pbrSpecBase",         &g_pbrSpecBase         },
             { "terrainTexBias",      &g_terrainTexBias      },
             { "terrainCut",          &g_terrainCut          },
@@ -24839,6 +25223,11 @@ namespace {
             { "pgiKernK",            &g_pgiKernK            },
             { "pgiRecvVis",          &g_pgiRecvVis          },
             { "pgiRecvKnee",         &g_pgiRecvKnee         },
+            { "pgiSpecSharp",        &g_pgiSpecSharp        },
+            { "pgiHiRes",            &g_pgiHiRes            },
+            { "pgiHiCut",            &g_pgiHiCut            },
+            { "pgiHiEvery",          &g_pgiHiEvery          },
+            { "pgiHiNorm",           &g_pgiHiNorm           },
             { "pgiBlame",            &g_pgiBlame            },
             { "pgiNudge",            &g_pgiNudge            },
             { "pgiNudgeMargin",      &g_pgiNudgeMargin      },
@@ -24847,6 +25236,10 @@ namespace {
             { "pgiNudgeKeep",        &g_pgiNudgeKeep        },
             { "pgiRepel",            &g_pgiRepel            },
             { "pgiPoint",            &g_pgiPoint            },
+            { "pgiEmis",             &g_pgiEmis             },
+            { "pgiEmisGain",         &g_pgiEmisGain         },
+            { "pgiEmitNear",         &g_pgiEmitNear         },
+            { "gitdForce",           &g_gitdForce           },
             { "calEmisGain",         &g_calEmisGain         },   // material emissive (0 = no self-illumination: truth split)
             { "pgiSunTap",           &g_pgiSunTap           },
             { "pgiBlameU",           &g_pgiBlameU           },
@@ -24948,6 +25341,15 @@ namespace {
             { "mbTileJitter",        &g_mbTileJitter        },
             { "mbMinPx",             &g_mbMinPx             },
             { "mbSoftZ",             &g_mbSoftZ             },
+            // DoF (tasks/forge-dof.md): the eye model's numbers, env-armed for unattended A/Bs.
+            { "dofPupilMm",          &g_dofPupilMm          },
+            { "dofAccomDpt",         &g_dofAccomDpt         },
+            { "dofFocusRate",        &g_dofFocusRate        },
+            { "dofWindow",           &g_dofWindow           },
+            { "dofMaxPx",            &g_dofMaxPx            },
+            { "dofDebugPx",          &g_dofDebugPx          },
+            { "dofOvrDistM",         &g_dofOvrDistM         },
+            { "dofOvrWeight",        &g_dofOvrWeight        },
             // THE EXPOSURE SETPOINT. Env-armed together because the question they answer is a
             // whole-run one — *"daytime noon is a bit dark, and I can't really tweak it"* —
             // and the harness runs minimized, where the panel cannot be reached at all. The
@@ -25071,6 +25473,8 @@ namespace {
             // which is verification step 1 and the first thing to try when bisecting anything
             // post-upscale.
             { "mbEnable",            &g_mbEnable            },
+            // DoF's master switch. Ships OFF until the gather lands (D2).
+            { "dofEnable",           &g_dofEnable           },
             // MB-2d. The A/B is a LOOK question and a COST question at once — object-only removes the
             // camera smear AND most of the gather's work — so it has to be reachable from a minimized
             // run, like every other arm in this table.
@@ -25283,6 +25687,7 @@ namespace {
             { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
             { "mbMaxTaps", &g_mbMaxTaps, 64u },
             { "mbDebug",   &g_mbDebug,   4u },
+            { "dofDebug",  &g_dofDebug,  1u },
             // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
             { "mbBgMode",  &g_mbBgMode,  2u },
             // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 RETIRED (runs 4), 4 cdblur; frame 0 cotangent,
@@ -26717,6 +27122,30 @@ namespace {
                     &g_mbDebug, 0u, 4u, 1u);
           t.flush(); }
 
+        // -- Tab: Depth of field (tasks/forge-dof.md) -- right after the motion blur, where it runs.
+        // An EYE: the blur is pupil x dioptre error, so the numbers below are an eye's, not a lens's.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Depth of field";
+          t.checkbox("DoF enable (D0: no blur yet — identity, or the CoC view below)", &g_dofEnable);
+          t.sliderU("DEBUG: 0 off | 1 CoC view (orange far, blue near, green = under 1 px)",
+                    &g_dofDebug, 0u, 1u, 1u);
+          t.sliderF("  CoC view full-scale (px of radius)", &g_dofDebugPx, 0.5f, 32.0f, 0.5f);
+          t.sliderF("Pupil diameter (mm; 2 bright noon .. 8 dark) — blur is linear in it",
+                    &g_dofPupilMm, 0.5f, 12.0f, 0.1f);
+          t.sliderF("Accommodation (dioptres; near point = 1/this m; lower = presbyopia)",
+                    &g_dofAccomDpt, 0.0f, 20.0f, 0.5f);
+          t.sliderF("Focus speed (1/s; sim clock — holds on a paused frame)",
+                    &g_dofFocusRate, 0.1f, 30.0f, 0.1f);
+          t.sliderF("Autofocus window (fraction of screen height, radius)",
+                    &g_dofWindow, 0.005f, 0.25f, 0.005f);
+          t.sliderF("Max CoC radius (px)", &g_dofMaxPx, 1.0f, 64.0f, 1.0f);
+          t.sliderF("Sharp hands: no blur nearer than (m)", &g_dofHandsNearM, 0.0f, 2.0f, 0.01f);
+          t.sliderF("  ...full blur from (m); also the autofocus' nearest candidate",
+                    &g_dofHandsFarM, 0.0f, 3.0f, 0.01f);
+          t.sliderF("Override focus (m; 0 = none) — what MWSE will drive",
+                    &g_dofOvrDistM, 0.0f, 200.0f, 0.1f);
+          t.sliderF("  \\- override weight", &g_dofOvrWeight, 0.0f, 1.0f, 0.01f);
+          t.flush(); }
+
         // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
         // Its own tab beside "Resolve (MSAA)" and "Exposure (adaptation)", on the same split those
         // two follow: Resolve owns the FILTER, Exposure owns LEVEL, Tonemap owns SHAPE, and this owns
@@ -26961,6 +27390,8 @@ namespace {
                     &g_pbrSpecAAClamp, 0.0f, 0.5f, 0.01f);
           t.sliderF("SPECULAR multi-scatter (Turquin) — scales WITH F0: ~+1% dielectric, +122% metal",
                     &g_pbrSpecMulti, 0.0f, 1.0f, 0.05f);
+          t.sliderF("ENV BRDF: 1 = the lobe's integrated table, 0 = Karis fit (old; metals off by up to 0.36)",
+                    &g_pbrEnvLut, 0.0f, 1.0f, 1.0f);
           t.sliderF("DIELECTRIC F0 base x b^2 (0.06 = median tex at a correct RATIO; 0.16 = Disney 0.04; 0.04 = DX9)",
                     &g_pbrSpecBase, 0.0f, 0.4f, 0.01f);
           t.sliderU("  gradient: 0 cd (DX9) | 1 cdbs | 2 bspline | 3 retired (=4) | 4 cdblur (soft, no ghost)",
@@ -27881,7 +28312,14 @@ namespace {
           t.sliderF("Probe GI: a probe's change (new face) blends in over (s)", &g_pgiFade, 0.0f, 4.0f, 0.25f, "%.2f");
           t.sliderF("Probe GI: face rank cost (columns; 0 = finish near probes first)", &g_pgiFaceRank, 0.0f, 4.0f, 0.25f, "%.2f");
           t.sliderF("Probe GI: multi-bounce (hits lit by the probe's own field; 0 = sky only)", &g_pgiBounce, 0.0f, 1.0f, 1.0f, "%.0f");
-          t.sliderF("Probe GI DEBUG (bits: 1 probe spheres, 2 receiver probe-share tint, 4 what the near probe sees, 8 peek full-res, 16 peek distance, 32 ball pool, 64 near probes LIT)", &g_pgiDebug, 0.0f, 127.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI DEBUG (bits: 1 probe spheres, 2 receiver probe-share tint, 4 what the near probe sees, 8 peek full-res, 16 peek distance, 32 ball pool, 64 near probes LIT, 128 with 8: the hi-res WORLD probe lit/raw)", &g_pgiDebug, 0.0f, 255.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI SPECULAR: PBR env through its own lobe (0 = irradiance in the mirror dir, grey; 1 = the lobe)",
+                    &g_pgiSpecSharp, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Probe GI HI-RES world probe: smooth surfaces reflect its cube (0 = off, the SH lobe alone)",
+                    &g_pgiHiRes, 0.0f, 1.0f, 0.05f);
+          t.sliderF("  roughness where the cube hands over to the SH lobe", &g_pgiHiCut, 0.1f, 1.0f, 0.05f);
+          t.sliderF("  frames between cube re-lights", &g_pgiHiEvery, 1.0f, 120.0f, 1.0f, "%.0f");
+          t.sliderF("  energy/tint normalization by the volume (0 = raw cube: the mirror truth test)", &g_pgiHiNorm, 0.0f, 1.0f, 0.05f);
           t.sliderF("Probe GI BLAME the crosshair (1 = rank the probes lighting the point under it: log [pgi-blame], worst = MAGENTA ball, next four ORANGE; view with DEBUG 33)", &g_pgiBlame, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI NUDGE (1 = a probe inside geometry, red, is moved through its nearest back face and recaptured)", &g_pgiNudge, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI nudge margin past the back face (u)", &g_pgiNudgeMargin, 0.0f, 128.0f, 4.0f, "%.0f");
@@ -33386,6 +33824,16 @@ void destroyHostWindow(Renderer* R);
         g_uiIdxBytes  = blob ? idxBytes  : 0u;
     }
 
+    void setPgiEmitters(const void* blob, unsigned count, unsigned bytes,
+                        const void* mmBlob, unsigned mmCount, unsigned mmBytes) {
+        const unsigned n  = blob   ? std::min(count,   bytes   / (unsigned)sizeof(IPC::DrawItemWire))     : 0u;
+        const unsigned nm = mmBlob ? std::min(mmCount, mmBytes / (unsigned)sizeof(IPC::MultiMapDrawWire)) : 0u;
+        g_pgiEmitItems   = n  ? (const IPC::DrawItemWire*)blob       : nullptr;
+        g_pgiEmitCount   = n;
+        g_pgiEmitMMItems = nm ? (const IPC::MultiMapDrawWire*)mmBlob : nullptr;
+        g_pgiEmitMMCount = nm;
+    }
+
     void setWeather(const IPC::WeatherWire& w) {
         const Atmosphere::Live prev = Atmosphere::live();
         Atmosphere::setWeather(w);
@@ -34837,6 +35285,7 @@ void destroyHostWindow(Renderer* R);
         uint32_t        multiMapBytes;
     };
     void reflRecordNear(const ReflNearInput& in);                           // IR3 reflected near scene
+    void pgiRecordEmitters();                                               // probe-GI near emitters (captures)
     void heroWriteUvOffsets(float* fd, double simT);                        // Phase 3 hero UV anim (defined w/ hero globals)
     // WV2: reflect-geo CPU CULL (build mirror-about-water matrix + clip plane, write pReflectFrameCbvGeo,
     // cull into the reflection rings). Runs PRE-beginCmd (hoisted off the record phase, like the main
@@ -35103,7 +35552,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseCullCount, "cull count" }, { kGpuPhaseCullScatter, "cull scatter" },
             { kGpuPhaseSkySnap, "sky snapshot" }, { kGpuPhaseWaterRefr, "water refract copy" },
             { kGpuPhaseStaticsDepth, "statics depth" },
-            { kGpuPhaseSunBlur, "sun blur" }, { kGpuPhasePgi, "pgi" },
+            { kGpuPhaseSunBlur, "sun blur" }, { kGpuPhasePgi, "pgi" }, { kGpuPhaseDof, "dof" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -38605,6 +39054,23 @@ void destroyHostWindow(Renderer* R);
                 g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
                 g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0; g_simLiveFrames = 0;
             }
+            // DoF: what the EYE is doing, as numbers. The focus lane is a settled frame's (one late).
+            // `sky r` is the CoC radius the sky gets at this focus — the deep-focus check in one
+            // number: focused past ~10 m it must be about a pixel or less.
+            if (g_lastDofRan && g_live.pDofFocusReadback && fbr(g_live.pDofFocusReadback)) {
+                const float* df = (const float*)rbLane(g_live.pDofFocusReadback);
+                const double Df = (double)df[0], Dt = (double)df[1];
+                const double pupilM = (double)std::max(0.0f, g_dofPupilMm) * 0.001;
+                LOG::logline(">> [forge-hb] dof: focus=%.2f m (%.3f dpt) target=%.2f m (%.3f dpt)"
+                             " win=%.2f valid=%d | pupil=%.1fmm accom=%.1fdpt (near %.2f m)"
+                             " pxPerRad=%.0f sky r=%.2f px | dbg=%u ovr=%.1fm x%.2f",
+                             Df > 1.0e-6 ? 1.0 / Df : 1.0e9, Df, Dt > 1.0e-6 ? 1.0 / Dt : 1.0e9, Dt,
+                             (double)df[2], df[3] == 1.0f ? 1 : 0,
+                             (double)g_dofPupilMm, (double)g_dofAccomDpt,
+                             g_dofAccomDpt > 0.0f ? 1.0 / (double)g_dofAccomDpt : 1.0e9,
+                             (double)g_lastDofPxPerRad, 0.5 * pupilM * Df * (double)g_lastDofPxPerRad,
+                             g_dofDebug, (double)g_dofOvrDistM, (double)g_dofOvrWeight);
+            }
             if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
                 LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
                              "dBake=(%+.3f, %+.3f, %+.3f) rect=%ux%u out=%ux%u",
@@ -39088,7 +39554,7 @@ void destroyHostWindow(Renderer* R);
             LOG::logline(">> [forge-hb] sun: blur=%.2f (%s) actorDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseSunBlur], g_live.sunBlurFused ? "fused" : "two-pass",
                          g_lastSunActorDraws);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s tiles=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s tiles=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) dof=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -39161,6 +39627,9 @@ void destroyHostWindow(Renderer* R);
                          // it should approach the floor's early-out cost; the budget context is that
                          // the whole MB-1 producer costs 0.030 ms.
                          g_lastGpuPhaseMs[kGpuPhaseMotionBlur], mbText,
+                         // dof=<ms>(on|off|NOT BUILT) — tasks/forge-dof.md. `off` = no dispatch.
+                         g_lastGpuPhaseMs[kGpuPhaseDof],
+                         !g_live.dofReady ? "NOT BUILT" : (g_lastDofRan ? "on" : "off"),
                          // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
                          // (checkbox off, not scene-referred, or the pyramid failed to build), which is
                          // the distinction worth logging: a 0.00 with L7 would be a timing problem,
@@ -39265,7 +39734,7 @@ void destroyHostWindow(Renderer* R);
                     kGpuPhaseMotionVec,  kGpuPhaseObjVel,     kGpuPhaseWater,
                     kGpuPhaseColorGlow,  kGpuPhaseColorAlpha, kGpuPhaseVolFog,
                     kGpuPhaseColorFP,    kGpuPhaseApl,        kGpuPhaseUpscale,
-                    kGpuPhaseResolveFilter, kGpuPhaseMotionBlur, kGpuPhaseBloom,
+                    kGpuPhaseResolveFilter, kGpuPhaseMotionBlur, kGpuPhaseDof, kGpuPhaseBloom,
                     kGpuPhaseResolve,
                     // Bracketed since they landed and printed nowhere: the bare Release-1 arm read
                     // 1.3-1.75 ms UNBRACKETED on the RTX box, gone with svm=0,ripSimOn=0.
@@ -39324,6 +39793,7 @@ void destroyHostWindow(Renderer* R);
                     { kGpuPhaseColorAlpha, "alpha" }, { kGpuPhaseVolFog, "volfog" },
                     { kGpuPhaseColorFP, "fp" },    { kGpuPhaseApl, "apl" },
                     { kGpuPhaseResolveFilter, "rfilter" }, { kGpuPhaseMotionBlur, "mb" },
+                    { kGpuPhaseDof, "dof" },
                     { kGpuPhaseBloom, "bloom" },   { kGpuPhaseResolve, "resolve" },
                     { kGpuPhasePgi, "pgi" },
                 };
@@ -40367,6 +40837,9 @@ void destroyHostWindow(Renderer* R);
             // position, so a town does not switch on as one block. Free ride: no wire growth
             // (lighting[35] was an unused tail slot) and no cbuffer growth (timeParams.z was 0).
             fd[82] = lighting[35];
+            // TEST (knob gitdForce): pin the signal, e.g. 12 = every window lit — the probe GI emission
+            // check (P2) on a daytime recording. 0 = the client's value.
+            if (g_gitdForce != 0.0f) { fd[82] = g_gitdForce; }
         }
 
         // ═══ MB-2c: IS THE GAME PAUSED? — ONE DEFINITION, FOR THE WHOLE FRAME ═══════════════════
@@ -43077,7 +43550,7 @@ void destroyHostWindow(Renderer* R);
             mp[kPbrShade2Float + 0] = std::max(0.0f, g_pbrSpecBase);
             mp[kPbrShade2Float + 1] = std::max(0.0f, g_pbrSpecAAClamp);
             mp[kPbrShade2Float + 2] = std::max(0.0f, g_pbrEnergySplit);
-            mp[kPbrShade2Float + 3] = 0.0f;
+            mp[kPbrShade2Float + 3] = (g_pbrEnvLut > 0.5f && envBrdfEnsureBound()) ? 1.0f : 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
@@ -44891,6 +45364,12 @@ void destroyHostWindow(Renderer* R);
             // g_reflGeoReady (the cull ran + rings valid this frame).
             gpuPhaseBegin(kGpuPhaseReflGeo);
             if (g_reflGeoReady) { dlReflectRecordGeo(); }
+            // Probe-GI near emitters (knob pgiEmitNear): after the DL statics and their layers, so
+            // they overwrite any DL proxy under them. Rides the emission checkerboard (pgiEmis), so
+            // pgiEmis 0 stays the pre-emission probes exactly.
+            if (probeFace && g_capFace.pgi && g_reflFrameReady && pgiEmisOn() && g_pgiEmitNear > 0.5f) {
+                pgiRecordEmitters();
+            }
             // IR3: ...then the NEAR scene, over both. Gated on g_reflFrameReady (the mirror matrix +
             // clip plane were written this frame) rather than g_reflGeoReady, which additionally
             // requires distant land — an interior has none, and an interior is the case that needs
@@ -45992,6 +46471,14 @@ void destroyHostWindow(Renderer* R);
                         e[9] = peekOk ? (float)g_pgi.peekRes : 0.0f;
                         e[10] = (peekOk && ((int)g_pgiDebug & 16)) ? 1.0f : 0.0f;
                         e[11] = ((int)g_pgiDebug & 64) ? 1.0f : 0.0f;   // LIT: relit radiance (the peek: its relit rows)
+                        // pgiDebug 128 (with 8): the HI-RES WORLD probe's rows instead — top its RELIT faces
+                        // (atlas row 5, what the cube is built from: the view adds 2 to the row for lit),
+                        // below them the raw capture (row 4).
+                        if (((int)g_pgiDebug & 128) && g_pgi.worldHiFaces) {
+                            e[6]  = (l == 0u) ? 3.0f : 4.0f;
+                            e[7]  = (float)g_pgi.worldHiFaces;
+                            e[11] = (l == 0u) ? 1.0f : 0.0f;
+                        }
                     }
                     // The two rows' rect in output uv, for the metering to skip (apl.srt.h excl).
                     g_aplExcl[0] = 0.0f; g_aplExcl[1] = 0.0f;
@@ -49877,6 +50364,131 @@ void destroyHostWindow(Renderer* R);
         }
         g_lastMbRan = mbRan;
 
+        // ===================== DEPTH OF FIELD (tasks/forge-dof.md) ================================
+        // After the motion blur, on whichever image this frame delivered (instance = the resolve's
+        // own `mbRan ? 2 : (upscaled ? 1 : 0)`), before bloom — which keeps reading the raw scene, for
+        // MB-2's reason: a lens spill and a defocus are separable, and bloom off a blurred frame
+        // loses the punch of a point light.
+        bool dofRan = false;
+        const bool dofEligible = shaderResolve && g_live.dofReady && g_dofEnable
+                              && deliveredW > 0u && deliveredH > 0u
+                              && (g_live.sampleCount == 1 || rfRunning);
+        if (dofEligible) {
+            sceneColorToSR();   // the MB block's hoist; idempotent, and MB may not have run
+
+            float invVP[16];
+            bool  vpOk = invert4x4(rzViewProj, invVP);
+            // PX PER RADIAN at the screen centre, from the frame's own matrix: two rays through
+            // NDC (0,0) and (0,1) on the near plane give tan(half the vertical FOV); half the delivered
+            // height over it is px per radian. No FOV knob to keep in step with MW's.
+            float pxPerRad = 0.0f;
+            if (vpOk) {
+                auto unproj = [&](float x, float y, float z, float o[3]) {
+                    const float c[4] = { x, y, z, 1.0f };
+                    float p[4] = {};
+                    for (int j = 0; j < 4; ++j) {
+                        for (int i = 0; i < 4; ++i) { p[j] += c[i] * invVP[i * 4 + j]; }
+                    }
+                    const float w = (std::fabs(p[3]) > 1.0e-12f) ? p[3] : 1.0e-12f;
+                    o[0] = p[0] / w; o[1] = p[1] / w; o[2] = p[2] / w;
+                };
+                float a[3], b[3];
+                unproj(0.0f, 0.0f, 1.0f, a);
+                unproj(0.0f, 1.0f, 1.0f, b);
+                const float la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+                if (la > 1.0e-9f) {
+                    const float ax = a[0] / la, ay = a[1] / la, az = a[2] / la;
+                    const float along = b[0] * ax + b[1] * ay + b[2] * az;
+                    const float px = b[0] - along * ax, py = b[1] - along * ay, pz = b[2] - along * az;
+                    const float across = std::sqrt(px * px + py * py + pz * pz);
+                    if (along > 1.0e-9f && across > 1.0e-9f) {
+                        pxPerRad = 0.5f * (float)deliveredH / (across / along);
+                    }
+                }
+            }
+            if (!vpOk || pxPerRad <= 0.0f) {
+                for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }
+                pxPerRad = 0.0f;   // a zero CoC everywhere: the view reads all green, never garbage
+            }
+            g_lastDofPxPerRad = pxPerRad;
+
+            if (fbr(g_live.pDofParamsCbv)) {
+                float* dp = (float*)fbw(g_live.pDofParamsCbv);
+                // Reserved lanes first, then the written ones (MB-2 step 0's rule). opts.w = dp[35].
+                dp[35] = 0.0f;
+                std::memcpy(dp, invVP, 16 * sizeof(float));
+                dp[16] = (float)deliveredW;   dp[17] = (float)deliveredH;
+                dp[18] = (float)g_live.width; dp[19] = (float)g_live.height;
+                dp[20] = std::max(0.0f, g_dofPupilMm) * 0.001f;
+                dp[21] = std::max(0.0f, g_dofAccomDpt);
+                dp[22] = pxPerRad;
+                dp[23] = std::max(0.5f, g_dofMaxPx);
+                dp[24] = g_simDt;
+                dp[25] = std::max(0.0f, g_dofFocusRate);
+                dp[26] = (g_dofOvrDistM > 0.0f) ? (1.0f / g_dofOvrDistM) : 0.0f;
+                dp[27] = (g_dofOvrDistM > 0.0f) ? std::max(0.0f, std::min(1.0f, g_dofOvrWeight)) : 0.0f;
+                dp[28] = std::max(0.0f, g_dofHandsNearM);
+                dp[29] = std::max(dp[28] + 1.0e-3f, g_dofHandsFarM);
+                dp[30] = kMwUnitMetres;
+                dp[31] = g_dofSnap ? 1.0f : 0.0f;
+                dp[32] = (float)std::min(g_dofDebug, 1u);
+                dp[33] = std::max(0.001f, std::min(0.5f, g_dofWindow));
+                dp[34] = std::max(0.5f, g_dofDebugPx);
+            }
+            g_dofSnap = false;
+
+            const uint32_t dofInst = mbRan ? 2u : (upscaled ? 1u : 0u);
+            gpuPhaseBegin(kGpuPhaseDof);
+            cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.7f, 0.9f, "DEPTH OF FIELD (focus + coc)");
+            {
+                TextureBarrier tb = { g_live.pDof, RESOURCE_STATE_SHADER_RESOURCE,
+                                      RESOURCE_STATE_UNORDERED_ACCESS };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            // (1) AUTOFOCUS: one group; writes gDofFocus[0].
+            cmdBindPipeline(g_live.pCmd, g_live.pDofFocusPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, dofInst, g_live.pDofSet);
+            cmdDispatch(g_live.pCmd, 1, 1, 1);
+            {
+                BufferBarrier bb = {};
+                bb.pBuffer = g_live.pDofFocus;
+                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            }
+            // (2) CoC: per delivered pixel; reads gDofFocus[0], writes pDof.
+            cmdBindPipeline(g_live.pCmd, g_live.pDofCocPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, dofInst, g_live.pDofSet);
+            cmdDispatch(g_live.pCmd, (deliveredW + 7u) / 8u, (deliveredH + 7u) / 8u, 1);
+            {
+                TextureBarrier tb = { g_live.pDof, RESOURCE_STATE_UNORDERED_ACCESS,
+                                      RESOURCE_STATE_SHADER_RESOURCE };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            gpuPhaseEnd(kGpuPhaseDof);
+
+            // The focus state to the readback, ONE FRAME LATE (pMbStatsReadback's arrangement),
+            // outside the phase bracket like every instrument.
+            if (g_live.pDofFocusReadback) {
+                BufferBarrier bb = {};
+                bb.pBuffer = g_live.pDofFocus;
+                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                    g_live.pDofFocusReadback->mDx.pResource, rbLaneOff(),
+                    g_live.pDofFocus->mDx.pResource, 0, 16);
+                bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            }
+            dofRan = true;
+        } else if (!g_dofEnable) {
+            g_dofSnap = true;   // re-enabling starts from the target, not from a focus long stale
+        }
+        g_lastDofRan = dofRan;
+
         // ===================== BLOOM (tasks/forge-postprocess.md step 4) =========================
         // Bright things spill light into their surroundings, in scene-referred linear space. Runs HERE
         // — after every pass that writes pSceneColor (colour, water, glow, sorted alpha, volfog, first
@@ -50200,7 +50812,9 @@ void destroyHostWindow(Renderer* R);
             // resolve the UN-blurred image on every upscaled frame — a bug that is invisible at 1x
             // (where `upscaled` is false and the ternary falls through to 2 anyway) and appears only
             // once DLSS is armed, which is precisely the shape M1 4b's rect bugs had.
-            cmdBindDescriptorSet(g_live.pCmd, mbRan ? 2u : (upscaled ? 1u : 0u), g_live.pResolveSet);
+            // ⚠ AND SINCE DoF, INSTANCE 3 — pDof — WINS OVER ALL THREE, for the same reason.
+            cmdBindDescriptorSet(g_live.pCmd, dofRan ? 3u : (mbRan ? 2u : (upscaled ? 1u : 0u)),
+                                 g_live.pResolveSet);
             cmdDraw(g_live.pCmd, 3, 0);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             cmdEndDebugMarker(g_live.pCmd);
@@ -50875,6 +51489,36 @@ void destroyHostWindow(Renderer* R);
                              ? ">> [forge][mb] shaders hot-reloaded (mbtilemax + mbcoveru + mbcoverv"
                                " + mbgather)"
                              : "!! [forge][mb] hot-reload FAILED — motion blur DISABLED (dxil missing on disk?)");
+            LOG::flush();
+        }
+
+        // DoF: the same rebuild on the same trigger. Failure = dofReady false, the frame unchanged.
+        if (g_live.pDofFocusShader || g_live.pDofCocShader) {
+            if (g_live.pDofCocPipeline)   { removePipeline(R, g_live.pDofCocPipeline);   g_live.pDofCocPipeline = nullptr; }
+            if (g_live.pDofCocShader)     { removeShader(R, g_live.pDofCocShader);       g_live.pDofCocShader = nullptr; }
+            if (g_live.pDofFocusPipeline) { removePipeline(R, g_live.pDofFocusPipeline); g_live.pDofFocusPipeline = nullptr; }
+            if (g_live.pDofFocusShader)   { removeShader(R, g_live.pDofFocusShader);     g_live.pDofFocusShader = nullptr; }
+            ShaderLoadDesc dfs = {};
+            dfs.mComp.pFileName = "doffocus.comp";
+            addShader(R, &dfs, &g_live.pDofFocusShader);
+            ShaderLoadDesc dcs = {};
+            dcs.mComp.pFileName = "dofcoc.comp";
+            addShader(R, &dcs, &g_live.pDofCocShader);
+            if (g_live.pDofFocusShader && g_live.pDofCocShader) {
+                PipelineDesc pf = {};
+                pf.mType = PIPELINE_TYPE_COMPUTE;
+                pf.mComputeDesc.pShaderProgram = g_live.pDofFocusShader;
+                addPipeline(R, &pf, &g_live.pDofFocusPipeline);
+                PipelineDesc pc = {};
+                pc.mType = PIPELINE_TYPE_COMPUTE;
+                pc.mComputeDesc.pShaderProgram = g_live.pDofCocShader;
+                addPipeline(R, &pc, &g_live.pDofCocPipeline);
+            }
+            g_live.dofReady = g_live.pDof && g_live.pDofSet && g_live.pDofFocusPipeline
+                           && g_live.pDofCocPipeline;
+            LOG::logline(g_live.dofReady
+                             ? ">> [forge][dof] shaders hot-reloaded (doffocus + dofcoc)"
+                             : "!! [forge][dof] hot-reload FAILED — depth of field DISABLED");
             LOG::flush();
         }
 
@@ -52617,7 +53261,9 @@ void destroyHostWindow(Renderer* R);
     // placement origin before the instance scale. Read straight out of static_meshes' per-subset AABB,
     // which the parse used to skip. G7's crush fold needs it: the whole card must swing by ONE angle
     // about its base, and that angle is set by where the TIP is, not by where each vertex is.
-    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; float centre[3]; float topZ; uint8_t type; };
+    // emits: what the model emits (bit0 vertex emissive, bit1 ADD glow layer, bit2 GitD lit-window
+    // subset). Filled by loadDistantStatics; the probe-GI emissive census reads it.
+    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; float centre[3]; float topZ; uint8_t type; uint8_t emits; };
 
     Buffer*   g_pStaticsVB       = nullptr;   // mega per-vertex (GPU_ONLY, stride 20)
     Buffer*   g_pStaticsIB       = nullptr;   // mega 16-bit index (GPU_ONLY)
@@ -52645,9 +53291,11 @@ void destroyHostWindow(Renderer* R);
     // GitD lit-window multi-map layers: DESTCOLOR/ZERO (multiply), depth EQUAL test / no write.
     Shader*   g_pStaticsLayerShader   = nullptr;
     Pipeline* g_pStaticsLayerPipeline = nullptr;
+    Pipeline* g_pStaticsLayerPipelineNone = nullptr;   // ...culling off: the probe-GI capture (P2: a lit window's tint)
     // ...and the ADDITIVE glow-map layer: ONE/ONE, depth EQUAL test / no write.
     Shader*   g_pStaticsAddShader     = nullptr;
     Pipeline* g_pStaticsAddPipeline   = nullptr;
+    Pipeline* g_pStaticsAddPipelineNone = nullptr;   // ...culling off: the probe-GI capture (both sides, P2 glow)
     // SUN shadow: DL statics drawn from the sun ortho VP into the MSM moments map (statics.vert +
     // sunshadow_statics.frag → RGBA16_UNORM). Same vertex layout as g_pStaticsPipeline; front = CCW.
     // (kSunShadowRes / g_sunShadowRange / g_drawSunShadow declared early near the atlas constants.)
@@ -56470,6 +57118,16 @@ void destroyHostWindow(Renderer* R);
                 if (!g_pStaticsLayerPipeline) {
                     std::printf("[forge][dl] addPipeline(statics layer) FAILED — lit-window layers off\n");
                 }
+                // The probe-GI capture's twin (pgiEmis, P2), culling off like the capture's statics: a GitD
+                // lit window is a WHITE emissive base under an orange MOD layer, so without this pass the
+                // probes took its light as white. Non-fatal.
+                RasterizerStateDesc rsM2 = rsM;
+                rsM2.mCullMode = CULL_MODE_NONE;
+                g.pRasterizerState = &rsM2;
+                addPipeline(R, &pd, &g_pStaticsLayerPipelineNone);
+                if (!g_pStaticsLayerPipelineNone) {
+                    std::printf("[forge][dl] addPipeline(statics layer NONE) FAILED — probe captures take lit windows untinted\n");
+                }
             }
 
             // ...and the ADDITIVE (glow-map) layer: same geometry/depth rules, blend ONE/ONE. MW
@@ -56503,6 +57161,16 @@ void destroyHostWindow(Renderer* R);
                 addPipeline(R, &pd, &g_pStaticsAddPipeline);
                 if (!g_pStaticsAddPipeline) {
                     std::printf("[forge][dl] addPipeline(statics add) FAILED — lit-window glow off\n");
+                }
+                // The probe-GI capture's twin (knob pgiEmis, tasks/forge-gi.md P2): the capture draws the
+                // statics with culling off (dlPickStaticsPipeline), so its glow layer must too — EQUAL
+                // lands it on whichever side the base drew. Non-fatal: captures then carry no glow layer.
+                RasterizerStateDesc rsA3 = rsA2;
+                rsA3.mCullMode = CULL_MODE_NONE;
+                g.pRasterizerState = &rsA3;
+                addPipeline(R, &pd, &g_pStaticsAddPipelineNone);
+                if (!g_pStaticsAddPipelineNone) {
+                    std::printf("[forge][dl] addPipeline(statics add NONE) FAILED — probe captures carry no glow layer\n");
                 }
             }
         }
@@ -56560,7 +57228,7 @@ void destroyHostWindow(Renderer* R);
             uint8_t  stype   = *(p + 4 + 4 + 12);                       // StaticType (dlformat.h)
             p += 4 + 4 + 12 + 1;                          // numSubsets + radius + center + type
             StaticsDefCPU def; def.firstSubset = (uint32_t)g_staticsSubsets.size(); def.numSubsets = numSubsets;
-            def.radius = sradius; def.type = stype; def.topZ = 0.0f;
+            def.radius = sradius; def.type = stype; def.topZ = 0.0f; def.emits = 0;
             def.centre[0] = scentre[0]; def.centre[1] = scentre[1]; def.centre[2] = scentre[2];
             for (uint32_t ss = 0; ss < numSubsets; ++ss) {
                 if (p + 44 > end) { p = end; break; }
@@ -56590,6 +57258,11 @@ void destroyHostWindow(Renderer* R);
                 // bits3-4 = multi-map layer op: 0 none, 1 MOD, 2 MOD2X, 3 ADD. Mirrors the near
                 // path's FFE reconstruction (MODULATE dark / MODULATE2X detail / ADD glow).
                 const uint32_t layerOp = (texFlags >> 3) & 0x3u;
+                for (int v = 0; v < verts; ++v) {
+                    if (vbSrc[(size_t)v * 20 + 11] != 0) { def.emits |= 0x1u; break; }   // Normal.w = emissive
+                }
+                if (layerOp == 3u) { def.emits |= 0x2u; }
+                if (nightOnly)     { def.emits |= 0x4u; }
                 uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
                 if (p + pathsize > end) { p = end; break; }
                 // texname -> path RELATIVE to statics\textures\, lowercased, .dds. The LOD library
@@ -59745,10 +60418,15 @@ void destroyHostWindow(Renderer* R);
         std::unordered_map<uint64_t, uint32_t>& cellMap = g_liveGridIndex;
         cellMap.clear();
         cellMap.reserve(4096);
+        // Probe-GI emissive census: emitting placements by bound radius, against the capture's
+        // pgiCapMinR cut (small statics stay out of captures). Bins: <32, <minR, <256, >=256.
+        uint32_t emCensus[4] = {}, emKind[3] = {}, emCut = 0;
+        const float emMinR = std::max(0.0f, g_pgiCapMinR);
         const uint8_t* rec = &g_usageData[g_ws0Off];
         for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
             float pos[3]; std::memcpy(pos, rec + 6, 12);
             GpuCullInstance gi = GpuCullInstance{};
+            uint8_t emitBits = 0;
             bool isGrass = false;
             uint8_t instType = (uint8_t)DL_STATIC_AUTO;
             {
@@ -59796,6 +60474,7 @@ void destroyHostWindow(Renderer* R);
                     gi.posZ = mc[0]*w[2] + mc[1]*w[6] + mc[2]*w[10] + w[14];
                     gi.firstSubset = def.firstSubset; gi.numSubsets = def.numSubsets;
                     instType = def.type;
+                    emitBits = def.emits;
                     float tierR = (def.type == DL_STATIC_BUILDING) ? gi.effR * 2.0f : gi.effR;
                     switch (def.type) {
                         // G1: grass leaves this array entirely (see the partition note above) and is
@@ -59821,6 +60500,12 @@ void destroyHostWindow(Renderer* R);
             const uint32_t ci_inst = (uint32_t)g_cullInst.size();
             g_cullInst.push_back(gi);
             g_cullInstType.push_back(instType);
+            if (emitBits != 0 && gi.rangeEndIdx != 0xFFFFFFFFu) {
+                const float r = gi.effR;
+                ++emCensus[r < 32.0f ? 0 : (r < emMinR ? 1 : (r < 256.0f ? 2 : 3))];
+                if (r < emMinR) { ++emCut; }
+                for (int k = 0; k < 3; ++k) { if (emitBits & (1u << k)) { ++emKind[k]; } }
+            }
 
             // Grid cell from the ORIGIN, not the bound centre: kLiveGridCell IS one MW cell at the same
             // origin, and MW files a reference under the cell its POSITION falls in — so origin-keying
@@ -59886,6 +60571,16 @@ void destroyHostWindow(Renderer* R);
         LOG::logline(">> [forge][grass] %u placements over %u subsets (%.1f%% of ws0), statics lane now %zu",
                      g_grassInstCount, g_grassSubsetCount,
                      g_ws0Count ? (100.0 * g_grassInstCount / g_ws0Count) : 0.0, g_cullInst.size());
+        {
+            uint32_t emDefs = 0;
+            for (const StaticsDefCPU& d : g_staticsDefs) { if (d.emits) { ++emDefs; } }
+            LOG::logline(">> [pgi-emis] DL census: %u of %zu models emit; %u placements emit "
+                         "(vertex %u, add-glow %u, lit-window %u) | effR <32: %u, <%.0f: %u, <256: %u, >=256: %u "
+                         "| %u under pgiCapMinR (out of captures)",
+                         emDefs, g_staticsDefs.size(),
+                         emCensus[0] + emCensus[1] + emCensus[2] + emCensus[3], emKind[0], emKind[1], emKind[2],
+                         emCensus[0], emMinR, emCensus[1], emCensus[2], emCensus[3], emCut);
+        }
 
         std::printf("[forge][dl] live grid: %zu cells over %u placements\n", g_liveGrid.size(), g_ws0Count);
         std::printf("[forge][dl] visgroups: %u groups, %u gated instances\n",
@@ -63717,7 +64412,20 @@ void destroyHostWindow(Renderer* R);
         // neighbour on one surface, tight enough that the next surface back never qualifies.
         mp[kSkyVisFloat + 1] = 0.02f;
         mp[kSkyVisFloat + 2] = 16.0f;
-        mp[kSkyVisFloat + 3] = 0.0f;
+        // w: the first-person meshes may read the EYE texel (skyamb.h.fsl skyAOTermEye) — armed, and
+        // bound into the FP set (a set re-created at a new address is bound again). Never set for a
+        // set that missed the bind, so an unbound gSkyVisEye is never read.
+        float eyeOn = 0.0f;
+        if (skyVisArmed() && g_live.pSvmEye && g_live.pPerFrameSetFP && g_live.pRenderer) {
+            if (g_live.svmEyeBoundFP != g_live.pPerFrameSetFP) {
+                DescriptorData d = {};
+                d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyVisEye);
+                d.mCount = 1; d.ppTextures = &g_live.pSvmEye;
+                updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSetFP, 1, &d);
+                g_live.svmEyeBoundFP = g_live.pPerFrameSetFP;            }
+            eyeOn = 1.0f;
+        }
+        mp[kSkyVisFloat + 3] = eyeOn;
         // The floor, in the MW family's units: decoded like any authored colour, the ambient CAL
         // gain, then m. Published every frame; interiors never read it (AO strength is 0 there).
         float g[3] = { std::max(0.0f, std::min(g_skyAOFloorAmb, 1.0f)), 0.0f, 0.0f };
@@ -63802,6 +64510,10 @@ void destroyHostWindow(Renderer* R);
             mp[kGiDebugFloat + 1] = std::clamp(g_giTintLevel, 0.0f, 1.0f);
             mp[kGiDebugFloat + 2] = std::clamp(std::round(g_pgiRecvVis), 0.0f, 4.0f);   // 3 = debug view of the gate's inputs, 4 = mode 2 with a LINEAR underside rule   // probe GI: receiver / probe sky visibility share (skyamb.h.fsl)
             mp[kGiDebugFloat + 3] = std::clamp(g_pgiRecvKnee, 0.01f, 1.0f);   // ... and its knee
+            mp[kPgiSpecFloat + 0] = std::clamp(g_pgiSpecSharp, 0.0f, 1.0f);   // PBR env through its own lobe (skyAmbSpecPx)
+            mp[kPgiSpecFloat + 1] = 0.0f;
+            mp[kPgiSpecFloat + 2] = 0.0f;
+            mp[kPgiSpecFloat + 3] = 0.0f;
             mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 1] = std::clamp(g_giOpenRef, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 2] = std::clamp(g_giUnderGain, 0.0f, 4.0f);
@@ -63905,19 +64617,25 @@ void destroyHostWindow(Renderer* R);
         }
 
         cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, "SKY-VISIBILITY SCREEN");
-        TextureBarrier tb = {};
-        tb.pTexture = g_live.pSvmScreen;
+        // The screen texture and its eye texel move together (one dispatch writes both).
+        TextureBarrier tb[2] = {};
+        tb[0].pTexture = g_live.pSvmScreen;
+        tb[1].pTexture = g_live.pSvmEye;
         if (g_live.svmScreenInSR) {
-            tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-            tb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            for (TextureBarrier& b : tb) {
+                b.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                b.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
         }
         cmdBindPipeline(g_live.pCmd, g_live.pSkyVisPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyVisSet);
         cmdDispatch(g_live.pCmd, (hw + 7u) / 8u, (hh + 7u) / 8u, 1);
-        tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-        tb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        for (TextureBarrier& b : tb) {
+            b.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            b.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+        }
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
         g_live.svmScreenInSR = true;
         cmdEndDebugMarker(g_live.pCmd);
     }
@@ -65761,12 +66479,17 @@ void destroyHostWindow(Renderer* R);
     // renderer's own ambient at each hit, projected to convolved SH9. Receivers: skyamb.h.fsl.
     void pgiTeardown(Renderer* R) {
         if (g_pgi.set) { removeDescriptorSet(R, g_pgi.set); g_pgi.set = nullptr; }
-        Pipeline** pp[7] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit, &g_pgi.pBlame };
-        Shader**   ss[7] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit, &g_pgi.sBlame };
-        for (int i = 0; i < 7; ++i) {
+        Pipeline** pp[9] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit, &g_pgi.pBlame,
+                             &g_pgi.pCube, &g_pgi.pCubeMip };
+        Shader**   ss[9] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit, &g_pgi.sBlame,
+                             &g_pgi.sCube, &g_pgi.sCubeMip };
+        for (int i = 0; i < 9; ++i) {
             if (*pp[i]) { removePipeline(R, *pp[i]); *pp[i] = nullptr; }
             if (*ss[i]) { removeShader(R, *ss[i]); *ss[i] = nullptr; }
         }
+        if (g_pgi.cube) { removeResource(g_pgi.cube); g_pgi.cube = nullptr; }
+        g_pgi.cubeInSR = g_pgi.cubeBuilt = false;
+        g_pgi.worldHiFaces = 0; g_pgi.worldHiNew = false;
         if (g_pgi.vol)    { removeResource(g_pgi.vol);    g_pgi.vol = nullptr; }
         if (g_pgi.volTag) { removeResource(g_pgi.volTag); g_pgi.volTag = nullptr; }
         g_pgi.volLive = g_pgi.volInit = g_pgi.volInSR = false;
@@ -65784,6 +66507,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pgi.shRb)     { removeResource(g_pgi.shRb);     g_pgi.shRb = nullptr; }
         g_pgi.pool.clear();
         if (g_pgi.gbuf) { removeResource(g_pgi.gbuf); g_pgi.gbuf = nullptr; }
+        if (g_pgi.gbufE) { removeResource(g_pgi.gbufE); g_pgi.gbufE = nullptr; }
         if (g_pgi.peek) { removeResource(g_pgi.peek); g_pgi.peek = nullptr; }
         if (g_pgi.lit)  { removeResource(g_pgi.lit);  g_pgi.lit = nullptr; }
         if (g_pgi.sh)   { removeResource(g_pgi.sh);   g_pgi.sh = nullptr; }
@@ -65801,11 +66525,13 @@ void destroyHostWindow(Renderer* R);
             LOG::logline("!! [pgi] %s FAILED — probe GI disabled", what);
             pgiTeardown(R); g_pgi.failed = true; return false;
         };
-        const char* files[7] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp", "pgiballs.comp", "pgisplat.comp",
-                                 "pgipeeklit.comp", "pgiblame.comp" };
-        Shader**   ss[7] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit, &g_pgi.sBlame };
-        Pipeline** pp[7] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit, &g_pgi.pBlame };
-        for (int i = 0; i < 7; ++i) {
+        const char* files[9] = { "pgiplace.comp", "pgigather.comp", "pgirelight.comp", "pgiballs.comp", "pgisplat.comp",
+                                 "pgipeeklit.comp", "pgiblame.comp", "pgicube.comp", "pgicubemip.comp" };
+        Shader**   ss[9] = { &g_pgi.sPlace, &g_pgi.sGather, &g_pgi.sRelight, &g_pgi.sBalls, &g_pgi.sSplat, &g_pgi.sPeekLit, &g_pgi.sBlame,
+                             &g_pgi.sCube, &g_pgi.sCubeMip };
+        Pipeline** pp[9] = { &g_pgi.pPlace, &g_pgi.pGather, &g_pgi.pRelight, &g_pgi.pBalls, &g_pgi.pSplat, &g_pgi.pPeekLit, &g_pgi.pBlame,
+                             &g_pgi.pCube, &g_pgi.pCubeMip };
+        for (int i = 0; i < 9; ++i) {
             ShaderLoadDesc sd = {}; sd.mComp.pFileName = files[i];
             addShader(R, &sd, ss[i]);
             if (!*ss[i]) { return fail(files[i]); }
@@ -65824,6 +66550,12 @@ void destroyHostWindow(Renderer* R);
             td.pName = "pgiGBuf";
             TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.gbuf; tl.pDesc = &td;
             addResource(&tl, nullptr);
+            TextureDesc tde = td;
+            tde.mFormat = TinyImageFormat_R32_UINT;
+            tde.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE;   // compute only: never leaves UAV
+            tde.pName = "pgiGBufE";
+            TextureLoadDesc tle = {}; tle.ppTexture = &g_pgi.gbufE; tle.pDesc = &tde;
+            addResource(&tle, nullptr);
             TextureDesc tdl = td;
             tdl.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             tdl.pName = "pgiLit";
@@ -65833,14 +66565,26 @@ void destroyHostWindow(Renderer* R);
         {
             g_pgi.peekRes = std::max(8u, std::min(kPgiPeekRes, reflectSize()) / 8u * 8u);
             TextureDesc td = {};
-            // rows 0-1 the two peeked probes' raw captures, rows 2-3 the same relit (PGI_PEEKLIT)
-            td.mWidth = 6u * g_pgi.peekRes; td.mHeight = 4u * g_pgi.peekRes; td.mDepth = 1; td.mArraySize = 1;
+            // rows 0-1 the two peeked probes' raw captures, rows 2-3 the same relit (PGI_PEEKLIT);
+            // rows 4-5 the WORLD probe's, raw and relit (pgiHiRes: the cube is built from row 5)
+            td.mWidth = 6u * g_pgi.peekRes; td.mHeight = 6u * g_pgi.peekRes; td.mDepth = 1; td.mArraySize = 1;
             td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
             td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
             td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
             td.pName = "pgiPeek";
             TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.peek; tl.pDesc = &td;
+            addResource(&tl, nullptr);
+        }
+        {   // the HI-RES WORLD PROBE's cube (pgiHiRes): written per mip as a 2D array, sampled as a cube
+            TextureDesc td = {};
+            td.mWidth = kPgiCubeRes; td.mHeight = kPgiCubeRes; td.mDepth = 1; td.mArraySize = 6;
+            td.mMipLevels = kPgiCubeMips; td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE_CUBE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "pgiWorldCube";
+            TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.cube; tl.pDesc = &td;
             addResource(&tl, nullptr);
         }
         {   // the VOLUME (7 SH planes + meta, stacked in slices) and its per-cell world tags
@@ -65943,7 +66687,7 @@ void destroyHostWindow(Renderer* R);
             b.ppBuffer            = &g_pgi.probes;
             addFrameBuf(&b);
         }
-        for (uint32_t i = 0; i < 6; ++i) {
+        for (uint32_t i = 0; i < kPgiSetN; ++i) {
             char name[32];
             std::snprintf(name, sizeof(name), "pgiParams%u", i);
             BufferLoadDesc pb = {};
@@ -65956,15 +66700,15 @@ void destroyHostWindow(Renderer* R);
             addFrameBuf(&pb);
         }
         waitForAllResourceLoads();
-        if (!g_pgi.gbuf || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
-            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.blameBuf || !g_pgi.blameRb || !g_pgi.moveBuf || !g_pgi.moveRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit) { return fail("resource alloc"); }
+        if (!g_pgi.gbuf || !g_pgi.gbufE || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
+            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.blameBuf || !g_pgi.blameRb || !g_pgi.moveBuf || !g_pgi.moveRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit || !g_pgi.cube) { return fail("resource alloc"); }
         for (Buffer* b : g_pgi.cbv) { if (!b) { return fail("cbuffer alloc"); } }
         // "No read yet": NaN everywhere, so a lane never written matches no column.
         std::memset(g_pgi.placeRb->pCpuMappedAddress, 0xFF, (size_t)(kPgiPlaceLane * kFrameSlots));
         std::memset(g_pgi.ballRb->pCpuMappedAddress, 0, (size_t)(kPgiBallLane * kFrameSlots));   // type 0 = no ball
         std::memset(g_pgi.moveRb->pCpuMappedAddress, 0, (size_t)(kPgiMoveLane * kFrameSlots));   // no verdicts
 
-        DescriptorSetDesc dsd = SRT_SET_DESC(PgiSrtData, PerBatch, 6, 0);
+        DescriptorSetDesc dsd = SRT_SET_DESC(PgiSrtData, PerBatch, kPgiSetN, 0);
         addDescriptorSet(R, &dsd, &g_pgi.set);
         if (!g_pgi.set) { return fail("addDescriptorSet"); }
         Texture* skyTop = g_live.pSkyHeight->pTexture;
@@ -65974,8 +66718,8 @@ void destroyHostWindow(Renderer* R);
         Texture* sunDepth = g_live.pSunMomentsDepth ? g_live.pSunMomentsDepth->pTexture : g_live.pLinearDepth;
         Texture* camDepth = g_live.pLinearDepth;
         if (!camDepth) { return fail("camera depth"); }
-        for (uint32_t i = 0; i < 6; ++i) {
-            DescriptorData d[29] = {};
+        for (uint32_t i = 0; i < kPgiSetN; ++i) {
+            DescriptorData d[32] = {};
             d[0].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiParams);    d[0].ppBuffers  = &g_pgi.cbv[i];
             d[1].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadow);    d[1].ppBuffers  = &g_live.pShadowMaskParamsCbv;
             d[2].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyAO);     d[2].ppTextures = skyAOHeightTexPP();
@@ -66017,8 +66761,15 @@ void destroyHostWindow(Renderer* R);
             d[27].ppTextures = g_live.pShadowAtlas ? &g_live.pShadowAtlas->pTexture : &skyTop;
             d[28].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiShadowAtlasDyn);
             d[28].ppTextures = g_live.pShadowAtlasDyn ? &g_live.pShadowAtlasDyn->pTexture : &skyTop;
+            d[29].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGBufE);     d[29].ppTextures = &g_pgi.gbufE;
+            // The cube: instance 7 + k writes mip k and reads mip k - 1 (mip 0's build reads the atlas);
+            // every other instance binds mip 0 for both and never touches it.
+            d[30].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCubeOut);   d[30].ppTextures = &g_pgi.cube;
+            d[30].mUAVMipSlice = (uint16_t)((i >= 7u) ? i - 7u : 0u);
+            d[31].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCubeIn);    d[31].ppTextures = &g_pgi.cube;
+            d[31].mUAVMipSlice = (uint16_t)((i >= 8u) ? i - 8u : 0u);
             for (DescriptorData& x : d) { x.mCount = 1; }
-            updateDescriptorSet(R, i, g_pgi.set, 29, d);
+            updateDescriptorSet(R, i, g_pgi.set, 32, d);
         }
         // The receivers: every set whose lit frags take skyAmbFactor (the GI field's three).
         DescriptorData pf = {};
@@ -66029,6 +66780,11 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
         pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiVol);
         pf.ppTextures = &g_pgi.vol;
+        if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
+        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+        if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
+        pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiWorldCube);   // read only once pgiSpec.y > 0
+        pf.ppTextures = &g_pgi.cube;
         if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
         if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
@@ -66415,7 +67171,11 @@ void destroyHostWindow(Renderer* R);
             g_capFace.active = true; g_capFace.pgi = true;
             g_capFace.pos[0] = g_pgi.worldP[0]; g_capFace.pos[1] = g_pgi.worldP[1]; g_capFace.pos[2] = g_pgi.worldP[2];
             g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-            g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
+            // HI-RES (pgiHiRes): the world probe's faces at peek resolution — the gather keeps the full face
+            // in the atlas's row 4 for the cube, and still reduces it to the 8x8 tile the SH needs. Never on a
+            // STOLEN frame: the steal only checked that a pgiCapRes corner of the water's mirror was unsampled.
+            g_capFace.res = (g_pgiHiRes > 0.0f && !steal) ? g_pgi.peekRes
+                                                          : std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
             g_capFace.steal = steal;
             if (steal) { ++g_pgi.steals; }
             return;
@@ -66508,20 +67268,26 @@ void destroyHostWindow(Renderer* R);
         const uint32_t s = g_pgi.capSlot, l = g_pgi.capLayer, f = g_pgi.capFace;
         PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[1]);
         std::memset(P, 0, sizeof(PgiParams));
+        P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
         P->capPos  = float4(g_capFace.pos[0], g_capFace.pos[1], g_capFace.pos[2], (float)f);
         P->capTile = float4((float)((s % kPgiG) * 48u + f * 8u), (float)((l * kPgiG + s / kPgiG) * 8u),
                             (float)g_capFace.res, kProbeNear);
         const uint32_t pr = g_pgi.peekRow & 1u;
-        P->capMisc = float4(kProbeFar, g_pgi.peekThis ? 1.0f : 0.0f, (float)(f * g_pgi.peekRes), (float)(pr * g_pgi.peekRes));
+        // The WORLD probe at peek resolution (pgiHiRes) keeps its raw face too, in the atlas's row 4.
+        const bool worldHi = g_pgi.capWorld && g_capFace.res == g_pgi.peekRes && g_pgiHiRes > 0.0f;
+        P->capMisc = float4(kProbeFar, (g_pgi.peekThis || worldHi) ? 1.0f : 0.0f, (float)(f * g_pgi.peekRes),
+                            (float)((worldHi ? 4u : pr) * g_pgi.peekRes));
         P->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
         if (g_pgi.peekThis) { pgiPeekState(false); g_pgi.peekMask[pr] |= (uint8_t)(1u << f); }
+        if (worldHi) { pgiPeekState(false); g_pgi.worldHiFaces |= (uint8_t)(1u << f); g_pgi.worldHiNew = true; }
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "PGI gather");
         cmdBindPipeline(g_live.pCmd, g_pgi.pGather);
         cmdBindDescriptorSet(g_live.pCmd, 1, g_pgi.set);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
-        TextureBarrier tb = {};
-        tb.pTexture = g_pgi.gbuf; tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        TextureBarrier tb[2] = {};   // the G-buffer and its emission lane (P2)
+        tb[0].pTexture = g_pgi.gbuf; tb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb[0].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+        tb[1] = tb[0]; tb[1].pTexture = g_pgi.gbufE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
         cmdEndDebugMarker(g_live.pCmd);
         ++g_pgi.captures;
         if (g_pgi.capWorld) {
@@ -66558,6 +67324,7 @@ void destroyHostWindow(Renderer* R);
         {
             PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[0]);
             std::memset(P, 0, sizeof(PgiParams));
+            P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
             P->grid  = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
             P->place = float4((float)g_pgi.ix0, (float)g_pgi.iy0, 0.0f, 0.0f);
             P->terrain = float4((float)g_terrainGridMinX, (float)g_terrainGridMinY,
@@ -66635,6 +67402,7 @@ void destroyHostWindow(Renderer* R);
             g_pgi.complete = complete;
             PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[2]);
             std::memset(P, 0, sizeof(PgiParams));
+            P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
             P->ambCol = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());   // w = the lanterns' gain (pgiPoint)
             P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], std::clamp(g_pgiBackMaxPart, 0.0f, 1.0f));   // w = partial probes' back-face limit
             P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));   // w = the sun-map test (pgiSunTap)
@@ -66680,6 +67448,7 @@ void destroyHostWindow(Renderer* R);
                     const PgiBall& b1 = g_pgi.pool[k1];
                     PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[5]);
                     std::memset(Q, 0, sizeof(PgiParams));
+                    Q->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
                     Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());   // w = the lanterns (pgiPoint)
                     Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
                     Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
@@ -66695,6 +67464,64 @@ void destroyHostWindow(Renderer* R);
                     cmdBindDescriptorSet(cmd, 5, g_pgi.set);
                     cmdDispatch(cmd, (6u * g_pgi.peekRes + 7u) / 8u, (2u * g_pgi.peekRes + 7u) / 8u, 1);
                 }
+            }
+            // HI-RES WORLD PROBE (pgiHiRes): once all six faces are in at peek resolution, relight them with the
+            // relight's own terms (PEEKLIT, world mode: atlas row 4 -> 5), then build the cube from row 5 and
+            // box its mips. Every pgiHiEvery frames (the sun moves), and at once when a new face lands.
+            if (g_pgi.ballMode && g_pgiHiRes > 0.0f && g_pgi.pPeekLit && g_pgi.pCube && g_pgi.pCubeMip
+                && g_pgi.worldHiFaces == 0x3Fu && g_pgi.worldFaces == 0x3Fu
+                && (g_pgi.worldHiNew || ++g_pgi.cubeTick >= (uint32_t)std::max(1.0f, g_pgiHiEvery))) {
+                g_pgi.cubeTick = 0;
+                g_pgi.worldHiNew = false;
+                cmdBeginDebugMarker(cmd, 0.9f, 0.7f, 0.3f, "PGI world cube");
+                TextureBarrier ub = {};
+                ub.pTexture = g_pgi.sh; ub.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; ub.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &ub, 0, nullptr);
+                pgiPeekState(false);
+                const uint32_t R = g_pgi.peekRes;
+                {
+                    PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[6]);
+                    std::memset(Q, 0, sizeof(PgiParams));
+                    Q->emis    = pgiEmisLane();
+                    Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());
+                    Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
+                    Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
+                    Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+                    Q->capPos  = float4(g_pgi.worldP[0], g_pgi.worldP[1], g_pgi.worldP[2], 0.0f);
+                    Q->capTile = float4(0.0f, 0.0f, (float)R, 1.0f);   // w = 1: world mode
+                    Q->place   = float4((float)kPgiWorldSlot, 0.0f, (float)g_pgi.worldHiFaces, 0.0f);
+                    const bool skyLiveW = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+                    Q->skyLive = float4(skyLiveW ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);
+                    cmdBindPipeline(cmd, g_pgi.pPeekLit);
+                    cmdBindDescriptorSet(cmd, 6, g_pgi.set);
+                    cmdDispatch(cmd, (6u * R + 7u) / 8u, (R + 7u) / 8u, 1);
+                }
+                TextureBarrier pb = {};
+                pb.pTexture = g_pgi.peek; pb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; pb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &pb, 0, nullptr);
+                TextureBarrier cb = {};
+                cb.pTexture = g_pgi.cube;
+                cb.mCurrentState = g_pgi.cubeInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
+                cb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
+                for (uint32_t k = 0; k < kPgiCubeMips; ++k) {
+                    const uint32_t n = std::max(1u, kPgiCubeRes >> k);
+                    PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[7u + k]);
+                    std::memset(Q, 0, sizeof(PgiParams));
+                    Q->capTile = float4((float)R, 0.0f, (float)n, 0.0f);   // x = the atlas face, z = this mip's side
+                    cmdBindPipeline(cmd, (k == 0u) ? g_pgi.pCube : g_pgi.pCubeMip);
+                    cmdBindDescriptorSet(cmd, 7u + k, g_pgi.set);
+                    cmdDispatch(cmd, (n + 7u) / 8u, (n + 7u) / 8u, 6);
+                    cb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; cb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);   // mip k is mip k + 1's input
+                }
+                cb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; cb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
+                g_pgi.cubeInSR = true;
+                g_pgi.cubeBuilt = true;
+                ++g_pgi.cubeBuilds;
+                cmdEndDebugMarker(cmd);
             }
             // SPLAT (ball mode): the relit probes -> the volume, while the SH is still a UAV.
             if (g_pgi.ballMode && g_pgi.pSplat) {
@@ -66714,6 +67541,7 @@ void destroyHostWindow(Renderer* R);
                 g_pgi.volPhase = (g_pgi.volPhase + 1u) % period;
                 PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[4]);
                 std::memset(Q, 0, sizeof(PgiParams));
+                Q->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
                 Q->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
                 Q->grid   = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
                 Q->vol    = float4((float)g_pgi.volO[0], (float)g_pgi.volO[1], (float)g_pgi.volO[2], std::max(16.0f, g_pgiVoxel));
@@ -66793,6 +67621,7 @@ void destroyHostWindow(Renderer* R);
             const uint32_t nSun = std::min((uint32_t)std::max(0.0f, g_pgiBallsSun), kPgiBallMax - nCam);
             PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[3]);
             std::memset(P, 0, sizeof(PgiParams));
+            P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
             P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
             P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], 0.0f);
             P->balls  = float4((float)nCam, (float)nSun, (float)(++g_pgi.ballSeed), 48.0f);
@@ -66877,11 +67706,13 @@ void destroyHostWindow(Renderer* R);
                 uint32_t nRej = 0;
                 for (const PgiBall& b : g_pgi.pool) { if (b.rej) { ++nRej; } }
                 LOG::logline(">> [pgi] balls: pool %zu (camera %u, sun %u, zenith %u) | rejected %u, nudged %u gave up %u | joined %u merged %u evicted %u (cumulative) | sun map %s | gpu pgi %.3f ms"
-                             " | world faces %02x pend %02x shots %u at (%.0f,%.0f,%.0f)",
+                             " | world faces %02x pend %02x shots %u at (%.0f,%.0f,%.0f) | hi-res faces %02x cube builds %u %s",
                              g_pgi.pool.size(), byType[1], byType[2], byType[3], nRej, g_pgi.nudged, g_pgi.nudgeGaveUp, g_pgi.ballIn, g_pgi.ballMerged,
                              g_pgi.ballEvicted, g_pgiSunVPValid ? "yes" : "no", (double)g_lastGpuPhaseMs[kGpuPhasePgi],
                              (unsigned)g_pgi.worldFaces, (unsigned)g_pgi.worldPend, g_pgi.worldShots,
-                             (double)g_pgi.worldP[0], (double)g_pgi.worldP[1], (double)g_pgi.worldP[2]);
+                             (double)g_pgi.worldP[0], (double)g_pgi.worldP[1], (double)g_pgi.worldP[2],
+                             (unsigned)g_pgi.worldHiFaces, g_pgi.cubeBuilds,
+                             (g_pgi.cubeBuilt && g_pgi.cubeInSR) ? "LIVE" : "not built");
             }
             // The 4 x 4 columns around the camera: each probe's height and state (D done, . not),
             // against the eye's own height — where a receiver's probes stand is the whole question
@@ -66926,6 +67757,13 @@ void destroyHostWindow(Renderer* R);
         // The WORLD PROBE's share in the old model (skyamb.h.fsl pgiWorldFactor); its slot's validity
         // fades it in, so 0 until a first face exists.
         mp[kPgiFloat + 15] = (on && g_pgi.ballMode && g_pgi.worldFaces) ? std::clamp(g_pgiWorld, 0.0f, 1.0f) : 0.0f;
+        // HI-RES WORLD PROBE (skyamb.h.fsl pgiHiSpec): y = strength — 0 until the cube is built and resting
+        // readable, so an unbuilt or mid-build cube is never sampled; z = the roughness cut; w = its last mip.
+        const bool cubeOn = on && g_pgi.ballMode && g_pgi.volLive && g_pgi.cubeBuilt && g_pgi.cubeInSR;
+        mp[kPgiSpecFloat + 1] = cubeOn ? std::clamp(g_pgiHiRes, 0.0f, 1.0f) : 0.0f;
+        mp[kPgiSpecFloat + 2] = std::clamp(g_pgiHiCut, 0.1f, 1.0f);
+        mp[kPgiSpecFloat + 3] = std::clamp(g_pgiHiNorm, 0.0f, 1.0f);   // skyamb.h.fsl PGI_CUBE_LASTMIP = kPgiCubeMips - 1
+        static_assert(kPgiCubeMips == 5u, "skyamb.h.fsl PGI_CUBE_LASTMIP is 4");
     }
 
     void renderSunShadow() {
@@ -67400,9 +68238,137 @@ void destroyHostWindow(Renderer* R);
             } else {
                 cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
                                    g_pStaticsArgsRingRefl, 0, nullptr, 0);
+                // PROBE GI EMISSION (pgiEmis, P2): the LAYER passes, in the main record's order. MULTIPLY first
+                // — it tints both parities (a GitD lit window is a white emissive base under an orange MOD
+                // layer; without it the probes' window light was white, user 2026-10-17) — then the GLOW
+                // (ADD) layer, which statics_add.frag writes onto the emission pixels only. Same args, VB
+                // and sets as the main record's CPU arm; each layer vert keeps only its own subsets.
+                if (g_capFace.active && g_capFace.pgi && pgiEmisOn() && g_staticsLayerPasses) {
+                    if (g_pStaticsLayerPipelineNone) {
+                        cmdBindPipeline(g_live.pCmd, g_pStaticsLayerPipelineNone);
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
+                                           g_pStaticsArgsRingRefl, 0, nullptr, 0);
+                    }
+                    if (g_pStaticsAddPipelineNone) {
+                        cmdBindPipeline(g_live.pCmd, g_pStaticsAddPipelineNone);
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
+                                           g_pStaticsArgsRingRefl, 0, nullptr, 0);
+                    }
+                }
             }
         }
         cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // PROBE-GI NEAR EMITTERS (tasks/forge-gi.md "Inject missing emissives"): the client's list of
+    // near-cache emitting shapes (setPgiEmitters), drawn into a probe-GI capture after the distant
+    // statics and their layers. The capture's own depth test is the occlusion — a window behind a
+    // wall stays behind it — and a G-buffer target is OVERWRITTEN, not accumulated, so a shape that
+    // also has a DL proxy under it is not counted twice. Cull-none PSOs (the frags flag back faces,
+    // as for every capture draw). Fills its OWN windows (the FP windows' reason: every other window
+    // was filled earlier in this command list). Arena + own-VB rigid parts; dynamic-morph parts
+    // (ring VBs) are skipped.
+    void pgiRecordEmitters() {
+        static uint32_t s_drawn = 0, s_drawnMM = 0, s_skip = 0, s_calls = 0;
+        if (!g_live.pPerBatchSetPgiEmit || !g_live.pPerBatchSetPgiEmitMM) { return; }
+        cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.6f, 0.2f, "PGI near emitters");
+        uint32_t drawn = 0, drawnMM = 0, skip = 0;
+        const uint32_t vStride = (uint32_t)sizeof(IPC::GeomVertexWire);
+        const uint32_t iStride = (uint32_t)(kStaticInstU32 * sizeof(uint32_t));
+
+        // --- rigid (DrawItemWire[]) ---
+        if (g_pgiEmitItems && g_pgiEmitCount && g_live.pFPOpaquePipelineNone) {
+            const uint32_t n = std::min<uint32_t>(g_pgiEmitCount, kPgiEmitMax);
+            cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipelineNone);   // pipeline FIRST, then sets
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetPgiEmit);
+            for (uint32_t k = 0; k < n; ++k) {
+                const IPC::DrawItemWire& it = g_pgiEmitItems[k];
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++skip; continue; }
+                HostMesh& m = g_meshes[slot];
+                if (m.skinned || m.multimap) { ++skip; continue; }
+                if (!m.inArena && (!m.vb || !m.ib || m.dynamic)) { ++skip; continue; }
+                Buffer* meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                Buffer* meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                if (!meshVb || !meshIb) { ++skip; continue; }
+                const uint32_t idx = drawn;
+                uint8_t* wdst = (uint8_t*)fbwRange(g_live.pPgiEmitWorldsBuf, (uint64_t)idx * 64, 64);
+                std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
+                uint32_t* inst = (uint32_t*)fbwRange(g_live.pPgiEmitInstanceBuf, (uint64_t)idx * kStaticInstU32 * 4, kStaticInstU32 * 4);
+                uint32_t* e = inst + (size_t)idx * kStaticInstU32;
+                float* fe = (float*)e;
+                e[0] = idx;   // DrawIndex -> gBatch.worlds[idx]
+                e[1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
+                fe[2]  = it.matDiffuse[0];  fe[3]  = it.matDiffuse[1];  fe[4]  = it.matDiffuse[2];
+                fe[5]  = it.matAmbient[0];  fe[6]  = it.matAmbient[1];  fe[7]  = it.matAmbient[2];
+                fe[8]  = it.matEmissive[0]; fe[9]  = it.matEmissive[1]; fe[10] = it.matEmissive[2];
+                e[11]  = 0;   // no terrain decal
+                fe[12] = it.emissiveGain[0]; fe[13] = it.emissiveGain[1]; fe[14] = it.emissiveGain[2];
+                e[15]  = pbrParamSlotFor(it.paramTexIndex);
+                const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                Buffer*  vbs[2]     = { meshVb, g_live.pPgiEmitInstanceBuf };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                ++drawn;
+            }
+        }
+
+        // --- multi-map (MultiMapDrawWire[]) — GitD windows with their dark/detail/glow stages ---
+        if (g_pgiEmitMMItems && g_pgiEmitMMCount && g_live.pMultiMapReflectPipelineNone) {
+            const uint32_t n = std::min<uint32_t>(g_pgiEmitMMCount, kPgiEmitMax);
+            cmdBindPipeline(g_live.pCmd, g_live.pMultiMapReflectPipelineNone);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetPgiEmitMM);
+            for (uint32_t k = 0; k < n; ++k) {
+                const IPC::MultiMapDrawWire& it = g_pgiEmitMMItems[k];
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++skip; continue; }
+                HostMesh& mm = g_meshes[slot];
+                if (!mm.multimap || !mm.vb || !mm.ib) { ++skip; continue; }
+                const uint32_t idx = drawnMM;
+                uint8_t* mdst = (uint8_t*)fbwRange(g_live.pPgiEmitMMWorldsBuf, (uint64_t)idx * 64, 64);
+                std::memcpy(mdst + (size_t)idx * 64, it.world, 64);
+                uint32_t* minst = (uint32_t*)fbwRange(g_live.pPgiEmitInstanceBufMM, (uint64_t)idx * kMMInstU32 * 4, kMMInstU32 * 4);
+                uint32_t* e = minst + (size_t)idx * kMMInstU32;
+                const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
+                float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
+                const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
+                const uint32_t vcs  = it.vColSource & 0x3u;
+                const uint32_t uvId = mm.uvKeys ? uvAnimIdFor(mm) : 0u;
+                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
+                e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
+                float* fe = (float*)e;
+                fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
+                fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
+                fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+                fe[14] = it.matAlpha;
+                fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
+                Buffer*  vbs[2]     = { mm.vb, g_live.pPgiEmitInstanceBufMM };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);
+                ++drawnMM;
+            }
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+
+        s_drawn += drawn; s_drawnMM += drawnMM; s_skip += skip;
+        if (++s_calls >= 300) {
+            LOG::logline(">> [pgi-emis] captures drew near emitters: %.1f rigid + %.1f multi-map per capture "
+                         "(%.1f skipped) over %u captures; list now %u + %u",
+                         (double)s_drawn / s_calls, (double)s_drawnMM / s_calls, (double)s_skip / s_calls,
+                         s_calls, g_pgiEmitCount, g_pgiEmitMMCount);
+            s_drawn = s_drawnMM = s_skip = s_calls = 0;
+        }
     }
 
     // IR3: record the reflected NEAR scene (opaque + skinned + multi-map) into the still-bound
@@ -67815,6 +68781,9 @@ void destroyHostWindow(Renderer* R);
                 // The G-buffer views: the colour frags' own isolation ladder (debugParams.x, float 40)
                 // on THIS copy only — 5 albedo, 6 the light factor albedo multiplies, 7 its ambient.
                 gp[40] = g_capFace.dbg;
+                // ...the probe GI's checkerboard variant with emission (pgiEmis; the oracle keeps 64).
+                // pgiEmis 2 = TEST (66): every distant static emits its texture.
+                if (g_capFace.pgi && g_capFace.dbg == 64.0f && pgiEmisOn()) { gp[40] = (g_pgiEmis > 1.5f) ? 66.0f : 65.0f; }
                 // alphaShadowParams.y: the colour frags shadow the point lights from the atlases directly.
                 gp[125] = (g_capPointShadow > 0.5f) ? 1.0f : 0.0f;
                 capFaceViewProj(&fcbvR[56], g_capFace.pos, g_capFace.face, g_probeFaceVP);
@@ -68774,6 +69743,14 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pMultiMapPipelineMirror) { removePipeline(R, g_live.pMultiMapPipelineMirror); }
         if (g_live.pMultiMapReflectPipeline)       { removePipeline(R, g_live.pMultiMapReflectPipeline); }
         if (g_live.pMultiMapReflectPipelineMirror) { removePipeline(R, g_live.pMultiMapReflectPipelineMirror); }
+        if (g_live.pMultiMapReflectPipelineNone)   { removePipeline(R, g_live.pMultiMapReflectPipelineNone); }
+        // Probe-GI near emitters.
+        if (g_live.pPerBatchSetPgiEmit)     { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmit); }
+        if (g_live.pPerBatchSetPgiEmitMM)   { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmitMM); }
+        if (g_live.pPgiEmitWorldsBuf)       { removeFrameBuf(g_live.pPgiEmitWorldsBuf); }
+        if (g_live.pPgiEmitInstanceBuf)     { removeFrameBuf(g_live.pPgiEmitInstanceBuf); }
+        if (g_live.pPgiEmitMMWorldsBuf)     { removeFrameBuf(g_live.pPgiEmitMMWorldsBuf); }
+        if (g_live.pPgiEmitInstanceBufMM)   { removeFrameBuf(g_live.pPgiEmitInstanceBufMM); }
         if (g_live.pMultiMapPrepassPipeline)       { removePipeline(R, g_live.pMultiMapPrepassPipeline); }
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
         if (g_live.pMultiMapShadowPipeline)            { removePipeline(R, g_live.pMultiMapShadowPipeline); }
@@ -68905,6 +69882,8 @@ void destroyHostWindow(Renderer* R);
         if (g_pStaticsVB)       { removeResource(g_pStaticsVB);       g_pStaticsVB = nullptr; }
         if (g_pStaticsIB)       { removeResource(g_pStaticsIB);       g_pStaticsIB = nullptr; }
         if (g_pStaticsAddPipeline) { removePipeline(R, g_pStaticsAddPipeline); g_pStaticsAddPipeline = nullptr; }
+        if (g_pStaticsAddPipelineNone) { removePipeline(R, g_pStaticsAddPipelineNone); g_pStaticsAddPipelineNone = nullptr; }
+        if (g_pStaticsLayerPipelineNone) { removePipeline(R, g_pStaticsLayerPipelineNone); g_pStaticsLayerPipelineNone = nullptr; }
         if (g_pStaticsAddShader) { removeShader(R, g_pStaticsAddShader); g_pStaticsAddShader = nullptr; }
         if (g_pStaticsLayerPipeline) { removePipeline(R, g_pStaticsLayerPipeline); g_pStaticsLayerPipeline = nullptr; }
         if (g_pStaticsLayerShader) { removeShader(R, g_pStaticsLayerShader); g_pStaticsLayerShader = nullptr; }
@@ -69171,6 +70150,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSkyVisShader)        { removeShader(R, g_live.pSkyVisShader); g_live.pSkyVisShader = nullptr; }
         if (g_live.pSkyVisParamsCbv)     { removeFrameBuf(g_live.pSkyVisParamsCbv); g_live.pSkyVisParamsCbv = nullptr; }
         if (g_live.pSvmScreen)           { removeResource(g_live.pSvmScreen); g_live.pSvmScreen = nullptr; }
+        if (g_live.pSvmEye)              { removeResource(g_live.pSvmEye); g_live.pSvmEye = nullptr; }
+        g_live.svmEyeBoundFP = nullptr;
         for (uint32_t d = 0; d < 32; ++d) {
             if (g_live.pSvmFrameCbv[d]) { removeFrameBuf(g_live.pSvmFrameCbv[d]); g_live.pSvmFrameCbv[d] = nullptr; }
             if (g_live.pSvmCullCbv[d])  { removeFrameBuf(g_live.pSvmCullCbv[d]);  g_live.pSvmCullCbv[d]  = nullptr; }
@@ -69196,6 +70177,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pLinearDepthHalf)  { removeResource(g_live.pLinearDepthHalf); }
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pStbn)           { removeResource(g_live.pStbn); g_live.pStbn = nullptr; }
+        if (g_live.pEnvBrdf)        { removeResource(g_live.pEnvBrdf); g_live.pEnvBrdf = nullptr; }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
         if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
         if (g_live.pMvSet)          { removeDescriptorSet(R, g_live.pMvSet); }
@@ -69361,6 +70343,20 @@ void destroyHostWindow(Renderer* R);
         g_mbVelFrozen = false;
         g_simHeld = false;
         g_mbHeldFrames = 0;
+        // DoF. Same order: set, pipelines, shaders, resources. The rebuilt focus buffer starts at
+        // .w = 0, and g_dofSnap makes the first dispatch snap to the target anyway.
+        if (g_live.pDofSet)             { removeDescriptorSet(R, g_live.pDofSet);        g_live.pDofSet = nullptr; }
+        if (g_live.pDofCocPipeline)     { removePipeline(R, g_live.pDofCocPipeline);     g_live.pDofCocPipeline = nullptr; }
+        if (g_live.pDofFocusPipeline)   { removePipeline(R, g_live.pDofFocusPipeline);   g_live.pDofFocusPipeline = nullptr; }
+        if (g_live.pDofCocShader)       { removeShader(R, g_live.pDofCocShader);         g_live.pDofCocShader = nullptr; }
+        if (g_live.pDofFocusShader)     { removeShader(R, g_live.pDofFocusShader);       g_live.pDofFocusShader = nullptr; }
+        if (g_live.pDofFocusReadback)   { removeResource(g_live.pDofFocusReadback);      g_live.pDofFocusReadback = nullptr; }
+        if (g_live.pDofFocus)           { removeResource(g_live.pDofFocus);              g_live.pDofFocus = nullptr; }
+        if (g_live.pDofParamsCbv)       { removeFrameBuf(g_live.pDofParamsCbv);          g_live.pDofParamsCbv = nullptr; }
+        if (g_live.pDof)                { removeResource(g_live.pDof);                   g_live.pDof = nullptr; }
+        g_live.dofReady = false;
+        g_lastDofRan = false;
+        g_dofSnap = true;
         if (g_live.pAOParamsCbv)    { removeFrameBuf(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }

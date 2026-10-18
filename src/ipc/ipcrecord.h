@@ -19,7 +19,9 @@
 namespace IPC {
 	namespace Rec {
 		static constexpr std::uint32_t kMagic = 0x4345524Du;   // 'MREC'
-		static constexpr std::uint32_t kMaxBlobs = 12;
+		// >= kFrameListCount (server.cpp static_asserts it): the reader REJECTS a record with more
+		// blobs than this, so a frame list added without raising it records fine and replays nothing.
+		static constexpr std::uint32_t kMaxBlobs = 16;
 
 		struct Blob { const void* ptr; std::uint32_t bytes; };
 

@@ -1,0 +1,38 @@
+// mgeHost64 — DoF shared maths. A plain header that declares NO resources, which is the condition
+// under which sharing between shaders is free ([[project_forge_srt_one_per_header]]). dof.srt.h has
+// the model.
+#pragma once
+
+// The depth texel that stands for delivered pixel p (mbVelocityTexel's mapping: same normalised
+// position, clamped into the depth rect).
+int2 dofDepthTexel(float2 deliveredPx, float2 deliveredRect, float2 depthRect)
+{
+    float2 n = (deliveredPx + f2(0.5f)) / max(deliveredRect, f2(1.0f));
+    int2   q = int2(n * depthRect);
+    return clamp(q, int2(0, 0), int2(depthRect) - int2(1, 1));
+}
+
+// DIOPTRES (1/m) of the surface at depth texel q, from the RADIAL distance. The sky (device depth 0,
+// reverse-Z far) is 0 dioptres: infinity, which is what an eye looking at the sky focuses on.
+float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit)
+{
+    if (dz <= 0.0f)
+    {
+        return 0.0f;
+    }
+    float2 uv = (float2(q) + 0.5f) / depthRect;
+    float4 p4 = mul(invVP, float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
+    float  d  = length(p4.xyz / p4.w) * metresPerUnit;
+    return 1.0f / max(d, 1.0e-3f);
+}
+
+// SIGNED CoC RADIUS in delivered px: + far of the focus plane, - near. Knu's model: theta = pupil *
+// (D_f - D), halved for a radius, through px-per-radian. The sharp-hands ramp zeroes it inside
+// `hands.x` metres (D > 1/hands.x), as Knu's savemyhands did.
+float dofCocPx(float D, float Df, float4 eye, float2 hands)
+{
+    float c    = 0.5f * eye.x * (Df - D) * eye.z;
+    float dist = 1.0f / max(D, 1.0e-6f);
+    c *= smoothstep(hands.x, hands.y, dist);
+    return clamp(c, -eye.w, eye.w);
+}

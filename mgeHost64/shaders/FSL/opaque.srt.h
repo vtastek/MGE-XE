@@ -730,6 +730,23 @@ BEGIN_SRT_NO_AB(SrtData)
         DECL_TEXTURE(PerFrame, Tex2DArray(float4), gPgiVol)
         // ...and the LIT preview (pgiDebug 64): the relit radiance per G-buffer texel (pgi.srt.h gPgiLit).
         DECL_TEXTURE(PerFrame, Tex2D(float4), gPgiLitView)
+        // THE SPLIT-SUM ENVIRONMENT BRDF of pbrSpecTerms' lobe: 64^2 RG16F (A, B), indexed by
+        // (sqrt(NoV), roughness) — pbrmaterial.h.fsl pbrEnvAB, generated into envbrdf_lut.h by
+        // envbrdf_fit.py. Created once, bound to the four lit PerFrame sets (main, both mirrors, FP).
+        // Read only when gShadowParams.pbrShade2.w > 0, which the host publishes only once it is
+        // bound everywhere. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float2), gEnvBRDF)
+        // HI-RES WORLD PROBE (knob pgiHiRes; pgi.comp.fsl PGI_CUBE): the world probe's relit faces as a
+        // 128^2 RGBA16F cube, box mips. skyamb.h.fsl pgiHiSpec samples it for smooth PBR surfaces, scaled
+        // by the volume's SH over the world probe's own (energy + tint stay the volume's). Read only when
+        // gShadowParams.pgiSpec.y > 0, published once the cube is built and resting SHADER_RESOURCE.
+        // Bound with gPgiVol (main, mirror geo, FP). Appended last.
+        DECL_TEXTURE(PerFrame, TexCube(float4), gPgiWorldCube)
+        // THE EYE'S SKY VISIBILITY (skyvis.comp's 1x1 eye texel): (vis, -1, coverage, 1) at the camera,
+        // from the K sky-direction maps. The FIRST-PERSON meshes' sky AO (skyamb.h.fsl skyAOTermEye) —
+        // they are in no prepass, so gSkyVisScreen never holds them. Bound to the FP set only; read only
+        // when gShadowParams.skyVis.w > 0, which the host publishes once it is bound and armed. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyVisEye)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

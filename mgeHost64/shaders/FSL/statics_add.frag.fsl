@@ -18,6 +18,7 @@
 #include "tonemap.h.fsl"    // the curve + its inverse
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored GLOW map (step 6a)
+#include "skyamb.h.fsl"     // PGI_CAPTURE_EMIS, pgiCapEmisPx() — the probe capture's checkerboard
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched
 // frag signature hangs the GPU; see [[project_forge_shared_frag_vsoutput]]).
@@ -54,5 +55,10 @@ float4 PS_MAIN( VSOutput In )
     // Per pixel, like the base pass's applyFog now is — an interpolated factor here against a per-pixel
     // one there would put the layer and its surface on two different fogs (fog.h.fsl mwFogFactorAt).
     // SUNNY 16: a glow map is MW-authored light — m (gShadowParams.sunny16.y, exactly 1 when off).
+    // PROBE GI capture (P2): the glow is EMITTED radiance, so it lands on the odd (emission) pixels only
+    // and adds nothing to the albedo ones; no fog — the capture's base pixels carry none either.
+    if (PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
+        RETURN(float4(pgiCapEmisPx(In.Position.xy) ? liftInPass(tex.rgb) * gShadowParams.sunny16.y : f3(0.0f), 0.0f));
+    }
     RETURN(float4(liftInPass(tex.rgb) * gShadowParams.sunny16.y * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
 }

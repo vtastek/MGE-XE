@@ -33,6 +33,68 @@
 #define SKYVIS_WATER_COS_CRIT  0.6612f
 #define SKYVIS_SNELL_BLEND     32.0f
 
+// THE VISIBILITY AT ONE CAMERA-RELATIVE POINT: (vis, coverage). vis = the plain average over the maps
+// that hold p of the wide filtered compare; coverage = the share of the maps whose box holds it (the
+// caller hands the rest to the march). Shared by the per-pixel pass and the EYE texel below.
+float2 svVisAt(float3 p)
+{
+    int   K    = (int)gSkyVisParams.params.x;
+    float res  = gSkyVisParams.params.y;
+    float bias = gSkyVisParams.params.z;
+    int   R    = (int)gSkyVisParams.params.w;
+    float n    = float(2 * R + 1);
+    float norm = 1.0f / (n * n);
+    float sumL = 0.0f, cov = 0.0f, covW = 0.0f;
+    // 0 above the surface (and in a cell with no water), 1 once SKYVIS_SNELL_BLEND below it.
+    float under = (gSkyVisParams.params2.z > 0.5f)
+                      ? saturate((gSkyVisParams.params2.y - p.z) / SKYVIS_SNELL_BLEND) : 0.0f;
+    for (int i = 0; i < K; ++i)
+    {
+        float4 c0 = gSkyVisParams.tiles[i * 4 + 0];
+        float4 c1 = gSkyVisParams.tiles[i * 4 + 1];
+        float4 c2 = gSkyVisParams.tiles[i * 4 + 2];
+        float3 r  = p - gSkyVisParams.tiles[i * 4 + 3].xyz;
+        float3 clip = float3(dot(r, c0.xyz) + c0.w, dot(r, c1.xyz) + c1.w, dot(r, c2.xyz) + c2.w);
+        // Fade a map out over its outer sixteenth rather than stepping at the box edge.
+        float2 ae = abs(clip.xy);
+        float  inside = saturate((1.0f - max(ae.x, ae.y)) * 16.0f);
+        if (inside <= 0.0f) { continue; }
+        float  ref = clip.z + bias;
+        float2 tc  = (clip.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f)) * res - 0.5f;
+        float2 b   = floor(tc);
+        float2 fr  = tc - b;
+        float  acc = 0.0f;
+        for (int gy = 0; gy <= R; ++gy)
+        {
+            for (int gx = 0; gx <= R; ++gx)
+            {
+                // The 2x2 block whose top-left texel is t0; gathered at its shared corner.
+                float2 t0 = b - float(R) + float2(float(2 * gx), float(2 * gy));
+                float4 g  = GatherRedTex2D(gSvMaps, gSamplerPointClamp, float3((t0 + 1.0f) / res, float(i)));
+                // Reverse-Z: a stored depth GREATER than the reference is nearer the sky.
+                float4 lit = step(g, f4(ref));
+                // Summed tap weights per texel: 1-f on the first, f on the last, 1 between.
+                int    jx = 2 * gx, jy = 2 * gy;
+                float  wx0 = (jx == 0) ? 1.0f - fr.x : 1.0f;
+                float  wx1 = (jx + 1 == 2 * R + 1) ? fr.x : 1.0f;
+                float  wy0 = (jy == 0) ? 1.0f - fr.y : 1.0f;
+                float  wy1 = (jy + 1 == 2 * R + 1) ? fr.y : 1.0f;
+                // Gather order: w (0,0), z (1,0), x (0,1), y (1,1).
+                acc += lit.w * wx0 * wy0 + lit.z * wx1 * wy0 + lit.x * wx0 * wy1 + lit.y * wx1 * wy1;
+            }
+        }
+        // The window weight scales this map's share of the AVERAGE only. Coverage stays
+        // geometric: it says how much of the answer the maps own versus the frag's march, and
+        // a submerged point covered by every map is fully covered, window or not.
+        float wWin = lerp(1.0f, (gSkyVisParams.tiles[i * 4 + 3].w >= SKYVIS_WATER_COS_CRIT) ? 1.0f : 0.0f,
+                          under);
+        sumL += acc * norm * inside * wWin;
+        covW += inside * wWin;
+        cov  += inside;
+    }
+    return float2((covW > 1.0e-4f) ? sumL / covW : 1.0f, cov / max(float(K), 1.0f));
+}
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
@@ -40,7 +102,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     INIT_MAIN;
     int2   h    = int2(DispatchThreadID.xy);
     float4 dims = gSkyVisParams.dims;
-    // RETURN() on its own line: fsl.py rewrites it line by line (see skyheight.comp.fsl).
+    // THE EYE TEXEL (gSvEye -> opaque.srt.h gSkyVisEye): the same visibility at the CAMERA, for the
+    // first-person meshes. They are in no prepass, so this screen texture never holds them, and the
+    // height-map march they fell back to hands a roofed point back to OPEN sky (its overhang
+    // correction leaves the roof to GTAO, which the arms do not get either): "fp is glowing" in a
+    // covered corner (user 2026-10-17). The arms span under a metre around the eye; one value is the
+    // low-frequency answer. (vis, -1, coverage, 1): distance -1, like a texel with no surface.
+    if (h.x == 0 && h.y == 0)
+    {
+        float2 e = svVisAt(f3(0.0f));
+        Write2D(gSvEye, int2(0, 0), float4(e.x, -1.0f, e.y, 1.0f));
+    }    // RETURN() on its own line: fsl.py rewrites it line by line (see skyheight.comp.fsl).
     if (h.x >= (int)dims.z || h.y >= (int)dims.w)
     {
         RETURN();
@@ -58,68 +130,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         o.y = dist;
         if (dist < gSkyVisParams.params2.x)
         {
-            int   K    = (int)gSkyVisParams.params.x;
-            float res  = gSkyVisParams.params.y;
-            float bias = gSkyVisParams.params.z;
-            int   R    = (int)gSkyVisParams.params.w;
-            float n    = float(2 * R + 1);
-            float norm = 1.0f / (n * n);
-            float sumL = 0.0f, cov = 0.0f, covW = 0.0f;
-            // 0 above the surface (and in a cell with no water), 1 once SKYVIS_SNELL_BLEND below it.
-            float under = (gSkyVisParams.params2.z > 0.5f)
-                              ? saturate((gSkyVisParams.params2.y - p.z) / SKYVIS_SNELL_BLEND) : 0.0f;
-            for (int i = 0; i < K; ++i)
-            {
-                float4 c0 = gSkyVisParams.tiles[i * 4 + 0];
-                float4 c1 = gSkyVisParams.tiles[i * 4 + 1];
-                float4 c2 = gSkyVisParams.tiles[i * 4 + 2];
-                float3 r  = p - gSkyVisParams.tiles[i * 4 + 3].xyz;
-                float3 clip = float3(dot(r, c0.xyz) + c0.w, dot(r, c1.xyz) + c1.w, dot(r, c2.xyz) + c2.w);
-                // Fade a map out over its outer sixteenth rather than stepping at the box edge.
-                float2 ae = abs(clip.xy);
-                float  inside = saturate((1.0f - max(ae.x, ae.y)) * 16.0f);
-                if (inside <= 0.0f) { continue; }
-                float  ref = clip.z + bias;
-                float2 tc  = (clip.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f)) * res - 0.5f;
-                float2 b   = floor(tc);
-                float2 fr  = tc - b;
-                float  acc = 0.0f;
-                for (int gy = 0; gy <= R; ++gy)
-                {
-                    for (int gx = 0; gx <= R; ++gx)
-                    {
-                        // The 2x2 block whose top-left texel is t0; gathered at its shared corner.
-                        float2 t0 = b - float(R) + float2(float(2 * gx), float(2 * gy));
-                        float4 g  = GatherRedTex2D(gSvMaps, gSamplerPointClamp, float3((t0 + 1.0f) / res, float(i)));
-                        // Reverse-Z: a stored depth GREATER than the reference is nearer the sky.
-                        float4 lit = step(g, f4(ref));
-                        // Summed tap weights per texel: 1-f on the first, f on the last, 1 between.
-                        int    jx = 2 * gx, jy = 2 * gy;
-                        float  wx0 = (jx == 0) ? 1.0f - fr.x : 1.0f;
-                        float  wx1 = (jx + 1 == 2 * R + 1) ? fr.x : 1.0f;
-                        float  wy0 = (jy == 0) ? 1.0f - fr.y : 1.0f;
-                        float  wy1 = (jy + 1 == 2 * R + 1) ? fr.y : 1.0f;
-                        // Gather order: w (0,0), z (1,0), x (0,1), y (1,1).
-                        acc += lit.w * wx0 * wy0 + lit.z * wx1 * wy0 + lit.x * wx0 * wy1 + lit.y * wx1 * wy1;
-                    }
-                }
-                // The window weight scales this map's share of the AVERAGE only. Coverage stays
-                // geometric: it says how much of the answer the maps own versus the frag's march, and
-                // a submerged point covered by every map is fully covered, window or not.
-                float wWin = lerp(1.0f, (gSkyVisParams.tiles[i * 4 + 3].w >= SKYVIS_WATER_COS_CRIT) ? 1.0f : 0.0f,
-                                  under);
-                sumL += acc * norm * inside * wWin;
-                covW += inside * wWin;
-                cov  += inside;
-            }
-            o.x = (covW > 1.0e-4f) ? sumL / covW : 1.0f;
-            o.z = cov / max(float(K), 1.0f);
+            float2 vc = svVisAt(p);
+            o.x = vc.x;
+            o.z = vc.y;
             // DIAGNOSTIC (params2.w = k + 1): replace (vis, coverage) by map k's STORED depth at this
             // point's texel and the point's own REFERENCE depth (bias included), both reverse-Z map
             // units (x 2*depthHalf = world units, larger = nearer the sky). Read by terrain mode 30.
             if (gSkyVisParams.params2.w >= 1.0f)
             {
                 int    dk = (int)gSkyVisParams.params2.w - 1;
+                float  res = gSkyVisParams.params.y;
                 float4 d0 = gSkyVisParams.tiles[dk * 4 + 0];
                 float4 d1 = gSkyVisParams.tiles[dk * 4 + 1];
                 float4 d2 = gSkyVisParams.tiles[dk * 4 + 2];

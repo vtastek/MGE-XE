@@ -233,7 +233,8 @@ PSOut PS_MAIN( VSOutput In )
 
     // F12 distance grayscale parity with statics.frag / distantland.frag / opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
@@ -246,7 +247,7 @@ PSOut PS_MAIN( VSOutput In )
     // ground is the surface these modes were just wired onto. With grass left out, mode 6 outdoors
     // showed pure lighting on the terrain with fully-textured blades standing all over it — which
     // reads as "grass is still on MW's path" and is the exact wrong answer this view exists to give.
-    if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out); }
+    if (dbg == 5u) { Out.Color = pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(tex.rgb, 1.0f); RETURN(Out); }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     // Ambient here is grass.vert's In.Color, which already carries the root-AO darkening — so this
     // is also the view that shows that term on its own.

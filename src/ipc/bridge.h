@@ -704,6 +704,19 @@ namespace IPC {
         IN VecId         uiList;
         IN std::uint32_t uiVertBytes;
         IN std::uint32_t uiIdxBytes;
+
+        // PROBE-GI NEAR EMITTERS (tasks/forge-gi.md "Inject missing emissives"): the near cache's
+        // emitting shapes (material emissive / glow map; light fixtures excluded) within reach of
+        // the eye, in or out of MW's frustum, drawn ONLY into probe-GI captures. Same wire formats
+        // as the world lists: DrawItemWire[] and MultiMapDrawWire[] (eye-relative like them).
+        // Count 0 = none. Appended at the very end (replay copies min(size) — older recordings
+        // replay with these zeroed).
+        IN VecId         pgiEmitList;
+        IN std::uint32_t pgiEmitCount;
+        IN std::uint32_t pgiEmitBytes;
+        IN VecId         pgiEmitMMList;
+        IN std::uint32_t pgiEmitMMCount;
+        IN std::uint32_t pgiEmitMMBytes;
     };
 
     // M1b geometry upload. blob = a byte VecId holding partCount packed parts

@@ -262,6 +262,10 @@ float4 PS_MAIN( VSOutput In )
     float albScale   = gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier (BASE stage)
     float3 c   = lit;
     float3 alb = float3(1.0f, 1.0f, 1.0f);        // texture-only product (debug mode 5 albedo view)
+    // PROBE GI capture with emission (P2): the EMITTED part of `c` on its own — the base's emissive addend
+    // through the modulating stages, plus the glow (ADD) maps, which then stay out of the albedo.
+    const bool pgiEmisMode = PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f));
+    float3 emAcc = float3(0.0f, 0.0f, 0.0f);
     float  baseA = 1.0f;
     for (uint s = 0u; s < 4u; ++s)
     {
@@ -284,10 +288,12 @@ float4 PS_MAIN( VSOutput In )
         // The emissive gain lands only on CLIPPED texels (scenecolor.h.fsl), applied HERE and not
         // after the loop: the base texel is in hand, and the later MOD/MOD2X/ADD stages then
         // modulate the corrected emissive exactly as they modulate the rest of lit.
-        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b; } // BASE (MOD x DIFFUSE)
-        else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }          // MOD
-        else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; }   // MOD2X
-        else               { c += t.rgb * gShadowParams.sunny16.y; alb += t.rgb; }   // ADD: a glow map, MW family (SUNNY 16)
+        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b;
+                             if (pgiEmisMode) { emAcc = b * (emis + expandExposedEmissiveDelta(emis, b, 1.0f)); } } // BASE (MOD x DIFFUSE)
+        else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; emAcc *= t.rgb; }          // MOD
+        else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; emAcc *= m; }   // MOD2X
+        else               { c += t.rgb * gShadowParams.sunny16.y;   // ADD: a glow map, MW family (SUNNY 16)
+                             if (pgiEmisMode) { emAcc += t.rgb * gShadowParams.sunny16.y; } else { alb += t.rgb; } }
     }
 
     // Alpha test on the BASE stage (other stages keep-prev alpha; irrelevant to coverage).
@@ -304,7 +310,8 @@ float4 PS_MAIN( VSOutput In )
     c = applyFog(c, In.WorldPos, In.Position.xy);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
@@ -319,8 +326,7 @@ float4 PS_MAIN( VSOutput In )
         // and the view showing that honestly rather than inventing one.
         RETURN(float4(aoAmbientTermProxy(aoSample.a, aoFlags), 1.0f));
     }
-    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN
-    if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }                            // mode 5: albedo only (texture product)
+    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN    if (dbg == 5u) { RETURN(float4(pgiEmisPx ? emAcc : alb, 1.0f)); }        // mode 5: albedo only (texture product); P2 odd: emission
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                           // mode 6: lit only (lighting, no texture)
     if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)
         float3 al;

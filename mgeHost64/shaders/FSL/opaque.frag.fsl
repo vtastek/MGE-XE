@@ -654,7 +654,7 @@ float4 PS_MAIN( VSOutput In )
         // so the two cannot drift apart. L1 is blurry by nature — right for rough surfaces, soft for
         // polished ones — which is the honest limit of reflecting a probe that has no sharper term.
         const float3 R = reflect(-pbrV, pbrNb);
-        float3 env = gFrameData.ambCol.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
+        float3 env = gFrameData.ambCol.rgb * skyAmbSpecPx(R, pbrRough, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
         if ((aoFlags & 64u) != 0u && aoValid) { env *= aoSpecOcc(aoSample, pbrNb, R, pbrRough); }   // GTSO: the reflected cone vs the open one
         else if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
@@ -693,7 +693,8 @@ float4 PS_MAIN( VSOutput In )
     // views (5 albedo / 6 lit / 7 ambient) output one shading component so surfaces Forge does NOT
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
@@ -712,8 +713,9 @@ float4 PS_MAIN( VSOutput In )
         RETURN(float4(aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags), 1.0f));
     }
     if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN
-    if (dbg == 29u) {   // mode 29: the sky AO factor the ambient applies (skyAOTermPx), white = open sky
-        const float skyV = skyAOTermPx(In.Normal, In.WorldPos, In.Position.xy);
+    if (dbg == 29u) {   // mode 29: the sky AO factor the ambient applies, white = open sky
+        // (first person: the eye texel, skyAOTermEye — the screen term holds no texel of theirs)
+        const float skyV = isFP ? skyAOTermEye(In.Normal, In.WorldPos) : skyAOTermPx(In.Normal, In.WorldPos, In.Position.xy);
         RETURN(float4(skyV, skyV, skyV, 1.0f));
     }
     if (dbg == 27u) {   // mode 27: the PBR SPECULAR, alone — the term nothing could see
@@ -733,6 +735,8 @@ float4 PS_MAIN( VSOutput In )
         // as the distant statics are; a probe in a hollow under it saw through it, unflagged.
         const float bs = dot(cross(pbrDPdx, pbrDPdy), In.Normal);
         if (pgiCap && In.AlphaRef <= 0.0f && bs * PGI_BACK_SIGN > 0.0f) { RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f)); }
+        // P2 EMISSION (odd pixels): the emissive addend exactly as `c` takes it above.
+        if (pgiEmisPx) { RETURN(float4(albedo.rgb * (emis + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f)), 1.0f)); }
         RETURN(float4(albedo.rgb, 1.0f));
     }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                            // mode 6: lit only (lighting, no texture)

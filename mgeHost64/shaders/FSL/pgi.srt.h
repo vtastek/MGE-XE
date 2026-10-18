@@ -57,6 +57,9 @@ STRUCT(PgiParams)
     // the clouds' mean cover included). x = 1 on (knob pgiSkyLive), y = native -> scene scale
     // (gSkyView.radiance.w), z = the camera's radius in the medium (gSkyView.sunDirW.w).
     DATA(float4, skyLive, None);
+    // EMISSION (knob pgiEmis, P2): x = 1 the capture is the checkerboard (PGI_CAPTURE_EMIS: even pixels
+    // albedo, odd the emitted radiance) and the gather splits it; RELIGHT: x = 1 add gPgiGBufE, y = gain.
+    DATA(float4, emis, None);
 };
 
 // POINT LIGHTS for the relight (knob pgiPoint): the renderer's NEAR live list (pLightCbv), read through
@@ -105,5 +108,10 @@ BEGIN_SRT(PgiSrtData)
         DECL_CBUFFER  (PerBatch, CBUFFER(PgiLightData), gPgiLights)         // = pLightCbv (the near live lights)
         DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiShadowAtlas)           // = pShadowAtlas (point shadows)
         DECL_TEXTURE  (PerBatch, Tex2D(float),   gPgiShadowAtlasDyn)        // = pShadowAtlasDyn
+        DECL_RWTEXTURE(PerBatch, RWTex2D(uint),  gPgiGBufE)                 // G-buffer EMISSION lane (R11G11B10 packed), gPgiGBuf's layout
+        // HI-RES WORLD PROBE (knob pgiHiRes): the cube's mip this dispatch writes, and the one it reads
+        // (the mip above; mip 0's build reads the peek atlas's world-lit row instead). Per set instance.
+        DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiCubeOut)
+        DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiCubeIn)
     END_SRT_SET(PerBatch)
 END_SRT(PgiSrtData)

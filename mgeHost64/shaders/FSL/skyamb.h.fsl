@@ -422,6 +422,16 @@ float skyLateralOpen(float3 worldAbs, float R)
 // F12 albedo view (5) showed magenta everywhere (user, 2026-10-15). Set only on the capture's
 // FrameData copy (host g_capFace.dbg); never in kDebugModeNames.
 #define PGI_CAPTURE_DBG 64u   // a captured texel whose red exceeds this was a back face (4, 0, 4)
+// ...and the probe GI's own variant of it (knob pgiEmis, tasks/forge-gi.md P2): a CHECKERBOARD, even
+// pixels the albedo, odd pixels the EMITTED radiance (the lit part that is not base texture — emissive,
+// glow layers). The target has no lane to spare and a second pass would double the capture; the gather
+// averages the two parities apart. The probe oracle keeps 64: its faces are read texel by texel.
+#define PGI_CAPTURE_EMIS 65u
+// TEST (pgiEmis 2): the same capture with EVERY distant static emitting its texture (statics.vert emissive
+// 1) — the emission path end to end on a scene with no glow of its own.
+#define PGI_CAPTURE_EMIS_TEST 66u
+#define PGI_IS_EMIS(d) ((d) == PGI_CAPTURE_EMIS || (d) == PGI_CAPTURE_EMIS_TEST)
+bool pgiCapEmisPx(float2 pos) { return ((((uint)pos.x) ^ ((uint)pos.y)) & 1u) != 0u; }
 
 #ifndef PGI_COMPUTE
 // PROBE GI (pgi.srt.h): E/pi at N from the probe field — the same units ambCol x factor has — and the
@@ -512,10 +522,15 @@ float4 pgiIrradiance(float3 N, float3 worldAbs, out float below)
 // Trilinear: xy by the wrap sampler (the volume is toroidal), z by hand between two slices of each
 // plane. Premultiplied by validity, divided out here; a = validity x the window-edge fade.
 // lan = the lanterns' L0 here (E/pi, pgi.comp.fsl pgiPointLight): the sky gate leaves up to that much alone.
-float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan)
+// bw = per-BAND weights on the stored (cosine-convolved) SH: (1,1,1) is irradiance, which every diffuse
+// receiver wants; pgiSpecBands hands the specular lookup its own lobe instead (skyAmbSpecPx).
+// eIrr = the same coefficients as plain irradiance (bw = 1): smooth and positive, the normalization pgiHiSpec
+// needs (a separate loop, so E's own arithmetic is untouched and callers that drop it compile it away).
+float4 pgiVolIrradianceW(float3 N, float3 worldAbs, out float vis, out float3 lan, float3 bw, out float3 eIrr)
 {
     vis = 1.0f;
     lan = f3(0.0f);
+    eIrr = f3(0.0f);
     const float4 P2 = gShadowParams.pgiParams2;
     const float4 P3 = gShadowParams.pgiParams3;
     const float VX = P2.y, VZ = P2.z;
@@ -554,16 +569,109 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan
         q[k] = lerp(PgiSampleArr(gPgiVol, uv, (float)k * VZ + s0), PgiSampleArr(gPgiVol, uv, (float)k * VZ + s1), t) * inv;
     }
     const float3 n = normalize(N);
-    const float Y[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
-                         1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
-                         1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float Y[9] = { bw.x * 0.282095f, bw.y * 0.488603f * n.y, bw.y * 0.488603f * n.z, bw.y * 0.488603f * n.x,
+                         bw.z * 1.092548f * n.x * n.y, bw.z * 1.092548f * n.y * n.z, bw.z * 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         bw.z * 1.092548f * n.x * n.z, bw.z * 0.546274f * (n.x * n.x - n.y * n.y) };
     const float f[28] = { q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w,
                           q[2].x, q[2].y, q[2].z, q[2].w, q[3].x, q[3].y, q[3].z, q[3].w,
                           q[4].x, q[4].y, q[4].z, q[4].w, q[5].x, q[5].y, q[5].z, q[5].w,
                           q[6].x, q[6].y, q[6].z, q[6].w };
     float3 E = f3(0.0f);
     UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
+    const float Yi[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
+                          1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                          1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    float3 Ei = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) { Ei += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Yi[b]; }
+    eIrr = max(Ei, f3(0.0f));
     return float4(max(E, f3(0.0f)), saturate(m.x) * edge);
+}
+float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan)
+{
+    float3 eIrr;
+    return pgiVolIrradianceW(N, worldAbs, vis, lan, f3(1.0f), eIrr);
+}
+
+// THE SPECULAR LOBE ON THE PROBES' SH (knob pgiSpecSharp, gShadowParams.pgiSpec.x).
+//
+// The volume stores IRRADIANCE: radiance convolved with the cosine lobe, i.e. band 1 x 2/3, band 2 x 1/4
+// (E/pi units). Looked up in the MIRROR direction that is the environment as a roughness-1 surface sees
+// it, whatever the surface — a polished sphere reflected the field's mean with three quarters of its
+// band-2 contrast gone, which reads GREY (user 2026-10-17, "shiny spheres ... looks gray from SH").
+// These weights undo the cosine and apply this surface's lobe instead: GGX at alpha = rough^2 as a
+// Phong lobe of exponent s = 2/alpha^2 - 2, whose SH attenuation is exp(-l^2 / 2s) (Ramamoorthi &
+// Hanrahan), floored at the cosine's own value so roughness 1 is irradiance EXACTLY. Band 0 is never
+// touched: the mean — the energy — stays the field's; only direction and tint come back.
+// ⚠ NINE COEFFICIENTS HOLD NOTHING SHARPER THAN AN L2 LOBE: below roughness ~0.5 every surface looks
+// about equally sharp (the mirror's weights 1.5 / 4 are reached by then). A mirror IMAGE is a different
+// source (the reflection pass, or prefiltered probe cubes). Ringing past a bright sky is clamped at 0
+// in the evaluation; k blends the deconvolution in (0 = irradiance, the shipped look).
+float3 pgiSpecBands(float rough, float k)
+{
+    const float a2 = max(rough * rough * rough * rough, 1.0e-4f);
+    const float s  = max(2.0f / a2 - 2.0f, 1.0e-3f);
+    const float b1 = max(exp(-0.5f / s), 2.0f / 3.0f) * 1.5f;
+    const float b2 = max(exp(-2.0f / s), 0.25f) * 4.0f;
+    return float3(1.0f, lerp(1.0f, b1, k), lerp(1.0f, b2, k));
+}
+
+// HI-RES WORLD PROBE (knob pgiHiRes; pgi.comp.fsl PGI_CUBE). The world probe's SH through band weights bw
+// (its slot: column (G-1, G-1), layer 1 — pgiWorldFactor's fetch), E/pi; valid = its validity.
+float3 pgiWorldE(float3 N, float3 bw, out float valid)
+{
+    const float  G  = gShadowParams.pgiParams0.w;
+    const float  c  = (G - 0.5f) / G;
+    const float3 uv = float3(c, c, 0.0f);
+    const float4 m  = gPgiSH.SampleLevel(gSamplerPointClamp, uv + float3(0.0f, 0.0f, 15.0f), 0.0f);
+    valid = m.y;
+    if (m.y < 1.0e-3f) { return f3(0.0f); }
+    float4 q[7];
+    UNROLL for (int k = 0; k < 7; ++k) {
+        q[k] = gPgiSH.SampleLevel(gSamplerPointClamp, uv + float3(0.0f, 0.0f, 7.0f + (float)k), 0.0f) / m.y;
+    }
+    const float3 n = normalize(N);
+    const float Y[9] = { bw.x * 0.282095f, bw.y * 0.488603f * n.y, bw.y * 0.488603f * n.z, bw.y * 0.488603f * n.x,
+                         bw.z * 1.092548f * n.x * n.y, bw.z * 1.092548f * n.y * n.z, bw.z * 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         bw.z * 1.092548f * n.x * n.z, bw.z * 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float f[28] = { q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w,
+                          q[2].x, q[2].y, q[2].z, q[2].w, q[3].x, q[3].y, q[3].z, q[3].w,
+                          q[4].x, q[4].y, q[4].z, q[4].w, q[5].x, q[5].y, q[5].z, q[5].w,
+                          q[6].x, q[6].y, q[6].z, q[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
+    return max(E, f3(0.0f));
+}
+
+// A smooth surface's environment from the world probe's CUBE — the detail nine coefficients cannot hold —
+// with the volume's ENERGY AND TINT: the cube at R is scaled per channel by (the volume's irradiance here) /
+// (the world probe's own irradiance), both at R. Open ground near the world probe: ratio ~1, the cube as
+// captured. A tunnel: the volume is dark, so is its reflection — the world probe's bright outside never
+// leaks in. Roughness past the cut (pgiSpec.z) is the SH lobe alone; the cube's mips span 0..cut.
+// ⚠ THE RATIO IS TAKEN ON IRRADIANCE (eIrr), NOT ON THE SHARPENED LOBE. The cube already carries the
+// detail; the ratio only has to carry energy and tint, and the sharpened lobe rings toward zero past a
+// bright horizon — per channel that drew a RAINBOW band along the reflected horizon (2026-10-17: gone
+// with pgiSpecSharp 0, i.e. with smooth SH on both sides). Irradiance is smooth and positive.
+// pgiSpec.y = strength (published 0 until the cube is built and resting readable), w = its last mip.
+#define PGI_CUBE_LASTMIP 4.0f   // forgerender.cpp kPgiCubeMips - 1
+float3 pgiHiSpec(float3 R, float rough, float3 E, float3 eIrr)
+{
+    const float4 H = gShadowParams.pgiSpec;
+    if (H.y <= 0.0f) { return E; }
+    const float cut = max(H.z, 0.05f);
+    const float w = H.y * saturate(1.0f - rough / cut);
+    if (w <= 0.0f) { return E; }
+    float valid;
+    const float3 Ew = pgiWorldE(R, f3(1.0f), valid);
+    if (valid < 1.0e-3f) { return E; }
+    // a = the texel's coverage (a back face is a hole, pgi.comp.fsl PGI_CUBE): filled from two mips up.
+    const float  lod = saturate(rough / cut) * PGI_CUBE_LASTMIP;
+    const float4 L0  = SampleLvlTexCube(gPgiWorldCube, gSamplerTrilinearClamp, R, lod);
+    const float3 L   = (L0.a >= 0.999f) ? L0.rgb
+                     : lerp(SampleLvlTexCube(gPgiWorldCube, gSamplerTrilinearClamp, R, lod + 2.0f).rgb, L0.rgb, saturate(L0.a));
+    // H.w = how much of the normalization applies (knob pgiHiNorm; 0 = the cube's radiance as captured — the
+    // truth test for a mirror: does it match the scene beside it?).
+    const float3 ratio = lerp(f3(1.0f), min(eIrr / max(Ew, f3(1.0e-4f)), f3(8.0f)), saturate(H.w));
+    return lerp(E, L * ratio, w * saturate(valid));
 }
 #endif
 
@@ -648,11 +756,38 @@ float skyOpenness(float ao, float3 worldPosRel)
     return open;
 }
 
+// THE FIRST-PERSON MESHES' sky AO: the sky-direction maps' answer AT THE CAMERA (skyvis.comp's eye
+// texel), combined with the march exactly as skyAOTermPx combines a screen texel. They are in no
+// prepass, so the screen term never holds them, and the march alone hands a ROOFED point back to open
+// sky — its overhang correction leaves the roof to GTAO, which the arms do not get either. That lit
+// the arms as under open sky in a covered corner ("fp is glowing", user 2026-10-17). The arms span
+// under a metre around the eye: one value for all of them is the low-frequency answer.
+float skyAOTermEye(float3 N, float3 worldPosRel)
+{
+#ifndef PGI_COMPUTE
+    const float strength = gShadowParams.skyParams.y;
+    if (strength > 0.0f && gShadowParams.skyVis.x > 0.0f && gShadowParams.skyVis.w > 0.5f)
+    {
+        const float4 e = LoadTex2D(gSkyVisEye, NO_SAMPLER, int2(0, 0), 0);
+        const float  v = lerp(1.0f, e.x, strength);
+        // e.x is already the average over the maps that DO hold the camera, so a partial coverage only
+        // says it is near their boxes' edge. Blending by it (as the screen term does) handed most of
+        // the answer back to the march, which reads a roofed spot as open: deep in a tunnel the maps
+        // said < 0.2 and the arms still lit as under the sky (ibotelmuthadaglow, 10-17). A quarter of
+        // the maps is enough to trust it; below that, fade to the march.
+        return lerp(skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz), v, saturate(e.z * 4.0f));
+    }
+#endif
+    return skyAOTerm(N, worldPosRel);
+}
+
 // ao < 0 = THE FIRST-PERSON ARMS (skyAmbFactorPx): no sky AO of their own, see below.
-float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+// bw = the probe volume's band weights (pgiSpecBands); (1,1,1) for every diffuse receiver.
+// hiRough >= 0 = a SPECULAR lookup of that roughness: the world probe's cube may refine it (pgiHiSpec).
+float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
 {
     const bool fpAO = ao < 0.0f;
-    if (fpAO) { ao = skyAOTerm(N, worldPosRel); }   // the march: the fallback where no probe answers
+    if (fpAO) { ao = skyAOTermEye(N, worldPosRel); }   // the eye's maps answer: the fallback where no probe answers
 #ifndef PGI_COMPUTE
     if (gShadowParams.pgiParams0.x > 0.0f) {
         float below = 0.0f;
@@ -662,13 +797,19 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
         float pvis = 1.0f;
         float3 plan = f3(0.0f);
         if (gShadowParams.pgiParams2.w > 0.5f) {
-            pg = pgiVolIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, pvis, plan);
+            float3 eIrr;   // the same lookup as irradiance (pgiHiSpec's normalization; dropped elsewhere)
+            pg = pgiVolIrradianceW(N, worldPosRel + gFrameData.lodEye.xyz, pvis, plan, bw, eIrr);
             // The arms stand in the passage's open middle, where the probes do: they take the probes'
             // sky visibility through their own plane (the gate below then passes the probes' light
             // whole), blended to the march by the volume's confidence. The march cannot see a tunnel's
             // roof, so alone it lit the arms as under open sky ("first person is lit in the tunnels",
             // user 2026-10-17).
-            if (fpAO && pg.a > 0.0f && gShadowParams.skyParams.y > 0.0f) {
+            // ...but only while their own AO is the MARCH. With the eye texel (skyAOTermEye) it is the
+            // maps' measurement at the camera, which does see a roof: it then goes through the gate below
+            // like any receiver's. Overriding it with the probes' visibility passed the volume's light
+            // whole to the arms while the walls beside them were gated dark ("fp is glowing", 10-17).
+            const bool eyeAO = gShadowParams.skyVis.w > 0.5f && gShadowParams.skyVis.x > 0.0f;
+            if (fpAO && !eyeAO && pg.a > 0.0f && gShadowParams.skyParams.y > 0.0f) {
                 const float pa = lerp(1.0f, pvis * (0.5f + 0.5f * max(normalize(N).z, 0.0f)), gShadowParams.skyParams.y);
                 ao = lerp(ao, pa, saturate(pg.a));
             }
@@ -701,14 +842,17 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
                 float r = saturate((ao + 0.003f) / (pv * (0.5f + 0.5f * max(nz, 0.0f)) + 0.003f));   // a tunnel's probes see ~5% sky: a small epsilon
                 // squared (mode 2): a tunnel's leftover visibility stays shut; mode 4 = linear (A/B).
                 if (nz < 0.0f) { r = max(r, ((rv > 3.5f) ? pvis : pvis * pvis) * saturate(-2.0f * nz)); }
-                const float t  = saturate(r / max(gShadowParams.giDebug.w, 0.01f));
-                // squared under the knee: open ground (r >= knee) untouched. Only what is NOT the lanterns':
+                const float t  = saturate(r / max(gShadowParams.giDebug.w, 0.01f));                // squared under the knee: open ground (r >= knee) untouched. Only what is NOT the lanterns':
                 // their bounce is local light, not sky seen through a hole the receiver lacks. Up to their
                 // L0 passes whole (where this normal gets less than the lanterns' mean, all of it is theirs),
                 // per channel, so a teal lantern's fill does not carry the far tunnel's warm light in with it.
                 const float3 keep = min(pg.rgb, plan);
                 pg.rgb = keep + (pg.rgb - keep) * (t * t);
+                const float3 keepI = min(eIrr, plan);   // the irradiance through the same gate
+                eIrr = keepI + (eIrr - keepI) * (t * t);
             }
+            // After the gates: the cube takes the energy the gated volume measured, not the probe's.
+            if (hiRough >= 0.0f && pg.a > 0.0f) { pg.rgb = pgiHiSpec(N, hiRough, pg.rgb, eIrr); }
         }
         else {
             pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, below);
@@ -734,6 +878,10 @@ float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
 #endif
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
+float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
+{
+    return skyAmbFactorAOpW(N, ao, worldPosRel, f3(1.0f), -1.0f);
+}
 
 float3 skyAmbFactor(float3 N, float3 worldPosRel)
 {
@@ -749,6 +897,21 @@ float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
     if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
 #endif
     return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
+}
+
+// The SPECULAR environment of a PBR surface: skyAmbFactorPx at the mirror direction R, with the probe
+// volume read through this surface's lobe (pgiSpecBands). ONE path, no branch on the strength: at 0 the
+// weights are exactly (1,1,1) and x * 1.0 is exact, so it IS skyAmbFactorPx bit for bit — a branch here
+// inlined the whole probe lookup twice (+27% opaque.frag) for a difference of nothing.
+float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
+{
+#ifndef PGI_COMPUTE
+    const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
+    return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#else
+    return skyAmbFactorPx(R, worldPosRel, svPos);
+#endif
 }
 
 #endif // SKY_AMB_H

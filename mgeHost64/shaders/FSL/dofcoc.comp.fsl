@@ -1,0 +1,52 @@
+// mgeHost64 — DoF D0: the CIRCLE OF CONFUSION, and the pass the bokeh gather will replace.
+// Read dof.srt.h first.
+//
+// opts.x = 0: the delivered image UNCHANGED (fp16 load -> store is exact), so `dofEnable` with no
+// gather yet is a byte-identical frame plus the cost of the plumbing.
+// opts.x = 1: THE CoC VIEW, for judging the eye model before anything blurs:
+//   green  = in focus (radius < 0.5 px, i.e. a blur under one pixel wide — "sharp" on this screen)
+//   orange = FAR of the focus plane, blue = NEAR, saturating at opts.z px of radius
+// The tint multiplies the pixel's own luminance, so it stays readable under any exposure (the
+// resolve exposes and tonemaps this like the frame, which is what broke the absolute-colour debug
+// views of the FP glow hunt).
+
+#include "dof.srt.h"
+#include "dofcommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2   p         = int2(DispatchThreadID.xy);
+    float2 delivered = gDofParams.rects.xy;
+    float2 depthRect = gDofParams.rects.zw;
+    int2   deliverN  = int2(delivered);
+    if (p.x >= deliverN.x || p.y >= deliverN.y)
+    {
+        RETURN();
+    }
+
+    float4 centre = LoadTex2D(gDofColor, NO_SAMPLER, p, 0);
+    float4 outv   = centre;
+
+    if (gDofParams.opts.x > 0.5f)
+    {
+        int2  q   = dofDepthTexel(float2(p), delivered, depthRect);
+        float dz  = LoadTex2D(gDofDepth, NO_SAMPLER, q, 0).r;
+        float D   = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z);
+        float Df  = gDofFocus[0].x;
+        float c   = dofCocPx(D, Df, gDofParams.eye, gDofParams.hands.xy);
+        float lum = dot(centre.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+        float a   = saturate(abs(c) / max(gDofParams.opts.z, 1.0e-3f));
+        float3 tint = (c > 0.0f) ? float3(1.0f, 0.55f, 0.15f) : float3(0.15f, 0.45f, 1.0f);
+        float3 col  = lerp(f3(1.0f), tint, a);
+        if (abs(c) < 0.5f)
+        {
+            col = float3(0.55f, 1.0f, 0.55f);
+        }
+        outv = float4(lum * col, centre.a);
+    }
+    Write2D(gDofOut, p, outv);
+}

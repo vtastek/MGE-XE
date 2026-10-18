@@ -644,7 +644,16 @@ namespace IPC {
 		if (params.uiList != InvalidVector) {
 			list(kListUi, params.uiList, params.uiVertBytes + params.uiIdxBytes);
 		}
+		// Probe-GI near emitters: gated on the COUNTS, not the ids (bridge.h pgiEmitList).
+		if (params.pgiEmitCount && params.pgiEmitList != InvalidVector) {
+			list(kListPgiEmit, params.pgiEmitList, params.pgiEmitBytes);
+		}
+		if (params.pgiEmitMMCount && params.pgiEmitMMList != InvalidVector) {
+			list(kListPgiEmitMM, params.pgiEmitMMList, params.pgiEmitMMBytes);
+		}
 
+		static_assert(kFrameListCount <= Rec::kMaxBlobs,
+			"a RenderFrame record carries every frame list; the replay reader rejects more than kMaxBlobs");
 		if (Rec::active()) {
 			Rec::Blob blobs[kFrameListCount];
 			for (unsigned i = 0; i < kFrameListCount; ++i) {
@@ -769,6 +778,11 @@ namespace IPC {
 				const std::uint32_t uiVert = (std::min)(params.uiVertBytes, uiBytes);
 				ForgeRender::setUiList(L.ptr[kListUi], uiVert, uiBytes - uiVert);
 			}
+			// Probe-GI near emitters: a list with no blob (older recording, empty frame) is count 0.
+			ForgeRender::setPgiEmitters(L.ptr[kListPgiEmit], L.ptr[kListPgiEmit] ? params.pgiEmitCount : 0u,
+				L.bytes[kListPgiEmit],
+				L.ptr[kListPgiEmitMM], L.ptr[kListPgiEmitMM] ? params.pgiEmitMMCount : 0u,
+				L.bytes[kListPgiEmitMM]);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting,
 				L.ptr[kListDraw], params.drawCount, L.bytes[kListDraw],
 				L.ptr[kListSkinned], params.skinnedCount, L.bytes[kListSkinned],

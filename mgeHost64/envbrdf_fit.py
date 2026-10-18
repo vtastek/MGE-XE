@@ -1,0 +1,145 @@
+"""
+The split-sum environment BRDF (A, B) of the SHIPPED specular lobe: integrated truth, the old
+analytic fit against it, and the LUT the shaders now read (envbrdf_lut.h -> opaque.srt.h gEnvBRDF).
+
+pbrSpecTerms is GGX (no 1/pi) x height-correlated Smith, alpha^2 = rough^4 at the callers. Its
+directional albedo at F0 is f0*A + B with
+    A = E[(1 - Fc) * Gvis],  B = E[Fc * Gvis],   Gvis = V * 4 * NoL * VoH / NoH,  Fc = (1 - VoH)^5
+under GGX importance sampling of H (the standard DFG integral; the 1/pi of the project's
+convention cancels against the missing 1/pi on D, see furnace.py). A + B is E_ss at F0 = 1, which
+is what pbrSpecMulti divides by.
+
+CHECKS ITSELF: at rough 1, NoV 1 the lobe is D = 1, V = 0.5/(NoL + 1), so E_ss = 1 - ln 2 = 0.3069
+in closed form; and furnace.py's independent hemisphere quadrature gives 0.4356 at rough 0.9 /
+NoV 0.9. Both are printed against this integrator.
+
+WHY A LUT AND NOT A BETTER FIT: Karis' mobile fit (the old pbrEnvAB) is off by up to 0.36 in A and
+0.08 in B against this lobe; 30-term polynomials in (rough, 1 - NoV) still leave 0.03 at low
+roughness and grazing, where the Fresnel edge is steep. A 64^2 RG16F table is exact to the
+interpolation error printed below and costs one bilinear fetch.
+
+Usage:
+  python3 mgeHost64/envbrdf_fit.py                  # old fit vs truth table + self-checks
+  python3 mgeHost64/envbrdf_fit.py --header [N] [S] # write mgeHost64/envbrdf_lut.h (N^2 texels, S samples)
+"""
+import math, os, struct, sys
+
+
+def pbrEnvAB(NoV, rough):   # the OLD fit, transcribed from pbrmaterial.h.fsl (pbrEnvABFit)
+    c0 = (-1.0, -0.0275, -0.572, 0.022); c1 = (1.0, 0.0425, 1.04, -0.04)
+    r = [rough * c0[i] + c1[i] for i in range(4)]
+    a004 = min(r[0] * r[0], 2.0 ** (-9.28 * NoV)) * r[0] + r[1]
+    return -1.04 * a004 + r[2], 1.04 * a004 + r[3]
+
+
+def radinv(i):
+    i = ((i << 16) | (i >> 16)) & 0xffffffff
+    i = ((i & 0x55555555) << 1) | ((i & 0xaaaaaaaa) >> 1)
+    i = ((i & 0x33333333) << 2) | ((i & 0xcccccccc) >> 2)
+    i = ((i & 0x0f0f0f0f) << 4) | ((i & 0xf0f0f0f0) >> 4)
+    i = ((i & 0x00ff00ff) << 8) | ((i & 0xff00ff00) >> 8)
+    return i / 4294967296.0
+
+
+_ham = {}
+
+
+def true_ab(NoV, rough, n=2048):
+    if n not in _ham:
+        _ham[n] = [((i + 0.5) / n, radinv(i)) for i in range(n)]
+    rough = max(rough, 0.05)          # pbrRoughness' floor
+    a2 = rough ** 4
+    NoV = max(NoV, 1e-4)
+    V = (math.sqrt(max(0.0, 1.0 - NoV * NoV)), 0.0, NoV)
+    A = B = 0.0
+    for u1, u2 in _ham[n]:
+        ct = math.sqrt((1.0 - u1) / (1.0 + (a2 - 1.0) * u1))
+        st = math.sqrt(max(0.0, 1.0 - ct * ct)); ph = 2.0 * math.pi * u2
+        H = (st * math.cos(ph), st * math.sin(ph), ct)
+        VoH = V[0] * H[0] + V[2] * H[2]
+        L = (2 * VoH * H[0] - V[0], 2 * VoH * H[1], 2 * VoH * H[2] - V[2])
+        NoL = L[2]
+        if NoL <= 0.0 or VoH <= 0.0:
+            continue
+        NoH = H[2]
+        lv = NoL * math.sqrt((-NoV * a2 + NoV) * NoV + a2)
+        ll = NoV * math.sqrt((-NoL * a2 + NoL) * NoL + a2)
+        Vis = 0.5 / max(lv + ll, 1e-9)
+        g = Vis * 4.0 * NoL * VoH / NoH
+        fc = (1.0 - VoH) ** 5
+        A += (1.0 - fc) * g; B += fc * g
+    return A / n, B / n
+
+
+# The LUT: texel (i, j) holds (A, B) at NoV = (i/(N-1))^2, rough = j/(N-1); the shader maps
+# uv = (float2(sqrt(NoV), rough) * (N-1) + 0.5) / N so a bilinear fetch interpolates between exactly
+# these nodes. SQRT on NoV because the mirror-Fresnel edge at grazing is the steep part: linear
+# nodes left |dB| 0.047 in the first cell, sqrt puts eight nodes under NoV 0.016 instead of one.
+def build_lut(N, S):
+    return [[true_ab((i / (N - 1)) ** 2, j / (N - 1), S) for i in range(N)] for j in range(N)]
+
+
+def lut_fetch(lut, NoV, rough):
+    N = len(lut)
+    x = math.sqrt(min(max(NoV, 0.0), 1.0)) * (N - 1); y = min(max(rough, 0.0), 1.0) * (N - 1)
+    i = min(int(x), N - 2); j = min(int(y), N - 2); fx = x - i; fy = y - j
+    h = lambda v: struct.unpack("<e", struct.pack("<e", v))[0]   # the RG16F the GPU stores
+    out = []
+    for c in range(2):
+        a = h(lut[j][i][c]) * (1 - fx) + h(lut[j][i + 1][c]) * fx
+        b = h(lut[j + 1][i][c]) * (1 - fx) + h(lut[j + 1][i + 1][c]) * fx
+        out.append(a * (1 - fy) + b * fy)
+    return out
+
+
+def write_header(path, N, S):
+    lut = build_lut(N, S)
+    worst = [0.0, 0.0, None]
+    for j in range(N - 1):            # check at the cell CENTRES, where interpolation is weakest
+        for i in range(N - 1):
+            v = ((i + 0.5) / (N - 1)) ** 2; r = (j + 0.5) / (N - 1)
+            ta, tb = true_ab(v, r, S); fa, fb = lut_fetch(lut, v, r)
+            if abs(fa - ta) > worst[0]: worst[0] = abs(fa - ta); worst[2] = (v, r)
+            worst[1] = max(worst[1], abs(fb - tb))
+    words = []
+    for row in lut:
+        for a, b in row:
+            words.append(struct.unpack("<H", struct.pack("<e", a))[0])
+            words.append(struct.unpack("<H", struct.pack("<e", b))[0])
+    with open(path, "w", newline="\n") as f:
+        f.write("// GENERATED by mgeHost64/envbrdf_fit.py --header %d %d — do not edit.\n" % (N, S))
+        f.write("// The split-sum environment BRDF (A, B) of pbrSpecTerms' lobe (GGX x height-correlated\n")
+        f.write("// Smith, alpha^2 = rough^4), RG16F, row j = rough j/(N-1), column i = NoV (i/(N-1))^2.\n")
+        f.write("// Bilinear error at the cell centres: |dA| %.4f (at NoV %.3f rough %.3f), |dB| %.4f.\n"
+                % (worst[0], worst[2][0], worst[2][1], worst[1]))
+        f.write("#pragma once\n#include <cstdint>\n")
+        f.write("constexpr uint32_t kEnvBrdfLutN = %du;\n" % N)
+        f.write("static const uint16_t kEnvBrdfLutRG16F[%d] = {\n" % len(words))
+        for k in range(0, len(words), 16):
+            f.write("    " + ", ".join("0x%04x" % w for w in words[k:k + 16]) + ",\n")
+        f.write("};\n")
+    print("wrote %s: %dx%d, %d samples; bilinear |dA| %.4f at %s, |dB| %.4f"
+          % (path, N, N, S, worst[0], worst[2], worst[1]))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--header":
+        N = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+        S = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
+        write_header(os.path.join(os.path.dirname(os.path.abspath(__file__)), "envbrdf_lut.h"), N, S)
+        sys.exit(0)
+    a, b = true_ab(1.0, 1.0)
+    print("self-check: E_ss(rough 1, NoV 1) = %.4f, closed form 1 - ln 2 = %.4f" % (a + b, 1 - math.log(2)))
+    a, b = true_ab(0.9, 0.9)
+    print("self-check: E_ss(rough 0.9, NoV 0.9) = %.4f, furnace.py quadrature 0.4356" % (a + b))
+    nov = [0.05, 0.1, 0.2, 0.35, 0.5, 0.7, 0.9, 1.0]
+    rs = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    print("rough  NoV   A_true  A_fit   dA     B_true  B_fit   dB     Ess_true Ess_fit")
+    worstA = worstB = 0.0
+    for r in rs:
+        for v in nov:
+            ta, tb = true_ab(v, r); fa, fb = pbrEnvAB(v, max(r, 0.05))
+            worstA = max(worstA, abs(fa - ta)); worstB = max(worstB, abs(fb - tb))
+            print("%.1f   %.2f  %.4f  %.4f %+.4f  %.4f  %.4f %+.4f  %.4f   %.4f"
+                  % (r, v, ta, fa, fa - ta, tb, fb, fb - tb, ta + tb, fa + fb))
+    print("old fit: worst |dA| %.4f  worst |dB| %.4f" % (worstA, worstB))

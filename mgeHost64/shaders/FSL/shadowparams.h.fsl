@@ -1021,7 +1021,10 @@ STRUCT(ShadowMaskParams)
     //   y = SPECULAR AA variance clamp, the most the lobe may be widened in alpha^2 units. Without
     //       it a silhouette texel, where the interpolated normal swings through 90 degrees in one
     //       pixel, would be told it is a mirror-flat surface made of noise.
-    //   zw = spare.
+    //   z = ENERGY SPLIT strength (pbrKdEnergy).
+    //   w = ENV BRDF SOURCE: 1 = the integrated table of this lobe (gEnvBRDF), 0 = Karis' mobile fit,
+    //       which is off by up to 0.36 in A against it (pbrmaterial.h.fsl pbrEnvAB). The host
+    //       publishes 0 when the table failed to upload, so an unbound gEnvBRDF is never read.
     DATA(float4,   pbrShade2,        None);
     // SUNNY 16 — THE TWO UNIT FAMILIES (tasks/forge-sunny16.md P1). The host has already folded both
     // scales into every lane it owns (sun, ambient, fog, light colours, glow sprites, the emissive
@@ -1041,7 +1044,9 @@ STRUCT(ShadowMaskParams)
     //   x = K, the map count; 0 = NOT ARMED (maps absent, not all drawn, or the screen pass did not
     //       run this frame), and every lit path takes the height-map march exactly as before.
     //   y, z = the distance match: a screen texel serves a fragment iff |its distance - the
-    //       fragment's| <= y * distance + z (relative, world units).   w = spare
+    //       fragment's| <= y * distance + z (relative, world units).
+    //   w = 1: the EYE texel (opaque.srt.h gSkyVisEye) is bound into the first-person set and written
+    //       this frame — the arms' sky AO (skyamb.h.fsl skyAOTermEye); 0 = they take the march.
     DATA(float4,   skyVis,           None);
     // SKY-AO FLOOR (skyamb.h.fsl skyAmbFactorAO): the fill a sealed spot keeps. A tunnel's sky AO is
     // ~0, and with no floor its ambient went PITCH BLACK — the servo then chased that black up and
@@ -1101,4 +1106,10 @@ STRUCT(ShadowMaskParams)
     // GI BOUNCE INSPECTION (gitint.h.fsl): x = share of objects painted a pure colour (0 = off),
     // y = the painted albedo; z = probe GI's receiver sky-visibility share (knob pgiRecvVis); w = its knee (pgiRecvKnee).
     DATA(float4,   giDebug,          None);
+    // PROBE GI SPECULAR (skyamb.h.fsl skyAmbSpecPx / pgiSpecBands): x = how far the PBR environment
+    // lookup trades the volume's cosine-convolved SH for the surface's own lobe (knob pgiSpecSharp;
+    // 0 = irradiance in the mirror direction, the shipped look). HI-RES WORLD CUBE (skyamb.h.fsl
+    // pgiHiSpec): y = its strength (0 until built and readable), z = the roughness cut, w = how much of
+    // the volume's energy/tint normalization it takes (knob pgiHiNorm). Appended last.
+    DATA(float4,   pgiSpec,          None);
 };

@@ -1088,6 +1088,16 @@
 #include "mbgather.comp.fsl"
 #end
 
+// DEPTH OF FIELD (tasks/forge-dof.md): the eye's autofocus, then the CoC pass (D0: identity or the
+// CoC view; the bokeh gather lands in its place).
+#comp doffocus.comp
+#include "doffocus.comp.fsl"
+#end
+
+#comp dofcoc.comp
+#include "dofcoc.comp.fsl"
+#end
+
 // FIXTURE GOBOS (tasks/forge-light-gobo.md G1). gobobake draws each light fixture's own mesh into six
 // cube faces from its AttachLight (statics vertex layout, the whole model->clip transform in the
 // instance rows, so no frame cbuffer); goboresolve folds each fixture's faces into one octahedral
@@ -1141,5 +1151,16 @@
 // ...and the LIT PEEK (debug, pgiDebug 8|64): the peeked captures relit at full resolution.
 #comp pgipeeklit.comp
 #define PGI_PEEKLIT 1
+#include "pgi.comp.fsl"
+#end
+
+// ...and the HI-RES WORLD PROBE (knob pgiHiRes): its relit faces -> the cube's mip 0, then the box mips.
+#comp pgicube.comp
+#define PGI_CUBE 1
+#include "pgi.comp.fsl"
+#end
+
+#comp pgicubemip.comp
+#define PGI_CUBEMIP 1
 #include "pgi.comp.fsl"
 #end

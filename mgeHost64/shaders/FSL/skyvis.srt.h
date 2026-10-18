@@ -28,5 +28,8 @@ BEGIN_SRT(SkyVisSrtData)
         DECL_TEXTURE  (PerBatch, Tex2D(float),          gSvDepth)   // = pLinearDepth (device depth)
         DECL_TEXTURE  (PerBatch, Tex2DArray(float),     gSvMaps)    // = pSvmDepth
         DECL_RWTEXTURE(PerBatch, WTex2D(float4),        gSvOut)     // (vis, distance, coverage, 0)
+        // 1x1: the same visibility at the CAMERA, (vis, -1, coverage, 1) — the first-person meshes'
+        // (skyvis.comp's eye texel; read as opaque.srt.h gSkyVisEye). Appended last.
+        DECL_RWTEXTURE(PerBatch, WTex2D(float4),        gSvEye)
     END_SRT_SET(PerBatch)
 END_SRT(SkyVisSrtData)

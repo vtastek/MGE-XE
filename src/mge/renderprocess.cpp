@@ -648,6 +648,8 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpSkinnedVec;     // persistent per-frame FP skinned draw-list vec (FP1a)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpAlphaVec;       // persistent per-frame FP alpha draw-list vec (FP1c)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpMultiMapVec;    // persistent per-frame FP multi-map draw-list vec (FP1e)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_pgiEmitVec;       // probe-GI near emitters, DrawItemWire[]
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_pgiEmitMMVec;     // probe-GI near emitters, MultiMapDrawWire[]
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     // [geomflush] batch shape (setWindowCapture): parts/bytes appended while the post-load window
@@ -894,6 +896,8 @@ namespace {
     std::vector<std::uint8_t>                 g_fpSkinnedScratch;   // packed FP [SkinnedDrawWire][palette]* this frame (FP1a)
     std::vector<std::uint8_t>                 g_fpAlphaScratch;     // packed FP AlphaDrawWire[] this frame (FP1c, back-to-front)
     std::vector<std::uint8_t>                 g_fpMultiMapScratch;  // packed FP MultiMapDrawWire[] this frame (FP1e)
+    std::vector<std::uint8_t>                 g_pgiEmitScratch;     // probe-GI near emitters: DrawItemWire[] this frame
+    std::vector<std::uint8_t>                 g_pgiEmitMMScratch;   // ...and MultiMapDrawWire[]
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
     std::vector<IPC::LightGoboWire>           g_lightGoboScratch;   // G3: the parallel gobo side array
@@ -2491,49 +2495,72 @@ namespace {
         }
         const double lfW0 = nowMs();
         waitCopyRetired();   // g_cmd is reused: the previous copy must have executed
+        const double lfW1 = nowMs();
+        // The PREVIOUS call's split (this call's is only known at its end). The 2026-10-17 evening
+        // episode spent 36 ms/frame inside "record" with this wait under 10 ms, so the probe never
+        // armed: it now also arms on the whole non-wait copy time and names its parts.
+        static double s_lfPrevCopy = 0.0, s_lfPrevSem = 0.0, s_lfPrevCmds = 0.0;
         {
-            // SLOW-STATE edges, judged on 60-frame BLOCK MEANS: ENTER when a block's mean copy wait is
-            // >= 10 ms, EXIT when one is under 3 ms. (A run of 30 frames all >= 20 ms never armed on the
-            // 2026-10-17 episode: it averaged 21 ms with frames dipping under 20.) Two lines per
-            // episode. hostDone = slow-block frames whose host fence had ALREADY passed at the wait's
-            // start (-> DXVK's queue, not the host); present / pace = the engine Present and the MGE
-            // frame limiter just before (a Present that blocks for the extra time = presentation).
+            // SLOW-STATE edges, judged on 60-frame BLOCK MEANS: ENTER when a block's mean copy wait OR
+            // mean non-wait copy time is >= 10 ms, EXIT when both are under 3 ms. (A run of 30 frames
+            // all >= 20 ms never armed on the 2026-10-17 episode: it averaged 21 ms with frames dipping
+            // under 20.) Two lines per episode. hostDone = slow-block frames whose host fence had
+            // ALREADY passed at the wait's start (-> DXVK's queue, not the host); present / pace = the
+            // engine Present and the MGE frame limiter just before (a Present that blocks for the
+            // extra time = presentation). sem / cmds = the semaphore reads above / the command
+            // recording below, the two other parts of "record".
             static unsigned s_bn = 0, s_bHost = 0, s_n = 0, s_hostDone = 0;
             static double   s_bW = 0.0, s_bPres = 0.0, s_bPace = 0.0, s_sum = 0.0, s_pres = 0.0;
+            static double   s_bC = 0.0, s_bS = 0.0, s_bK = 0.0, s_sumC = 0.0, s_sumS = 0.0, s_sumK = 0.0;
             static bool     s_in = false;
             static std::uint32_t s_enter = 0;
-            const double w = nowMs() - lfW0;
+            const double w = lfW1 - lfW0;
             const bool hostDone = lfPendHost != 0 && lfHostNow >= lfPendHost;
             ++s_bn; s_bW += w; s_bPres += g_lfPresent; s_bPace += g_lfPace; if (hostDone) { ++s_bHost; }
+            s_bC += s_lfPrevCopy; s_bS += s_lfPrevSem; s_bK += s_lfPrevCmds;
             if (s_bn >= 60) {
                 const double mw = s_bW / s_bn, mp = s_bPres / s_bn, mpace = s_bPace / s_bn;
-                if (s_in) { s_n += s_bn; s_sum += s_bW; s_pres += s_bPres; s_hostDone += s_bHost; }
-                if (!s_in && mw >= 10.0) {
+                const double mc = s_bC / s_bn, ms = s_bS / s_bn, mk = s_bK / s_bn;
+                if (s_in) {
+                    s_n += s_bn; s_sum += s_bW; s_pres += s_bPres; s_hostDone += s_bHost;
+                    s_sumC += s_bC; s_sumS += s_bS; s_sumK += s_bK;
+                }
+                if (!s_in && (mw >= 10.0 || mc >= 10.0)) {
                     char disp[96];
                     describeDisplay(disp, sizeof(disp));
                     LOG::logline("!! [lowfps] ENTER frame=%u: 60-frame mean copy wait %.1f ms, present %.1f ms, pace %.1f ms"
+                                 " | non-wait copy %.1f ms (sem %.1f wait %.1f cmds %.1f)"
                                  " | host done on %u/60 (%s) | host fence %llu / needs %llu | copy sem %llu / pending %llu | %s",
-                                 g_frame, mw, mp, mpace, s_bHost,
+                                 g_frame, mw, mp, mpace, mc, ms, mw, mk, s_bHost,
                                  (s_bHost * 2u > s_bn) ? "stuck behind DXVK's queue" : "waiting on the host",
                                  (unsigned long long)lfHostNow, (unsigned long long)lfPendHost,
                                  (unsigned long long)lfCopyNow, (unsigned long long)lfPendCopy, disp);
                     s_in = true; s_enter = g_frame; s_n = 0; s_sum = 0.0; s_pres = 0.0; s_hostDone = 0;
-                } else if (s_in && mw < 3.0) {
+                    s_sumC = 0.0; s_sumS = 0.0; s_sumK = 0.0;
+                } else if (s_in && mw < 3.0 && mc < 3.0) {
                     char disp[96];
                     describeDisplay(disp, sizeof(disp));
                     LOG::logline("!! [lowfps] EXIT frame=%u after %u frames: mean copy wait %.1f ms, present %.1f ms,"
+                                 " non-wait copy %.1f ms (sem %.1f cmds %.1f),"
                                  " host already done on %u/%u | now present %.1f ms | %s",
                                  g_frame, g_frame - s_enter, s_n ? s_sum / s_n : 0.0, s_n ? s_pres / s_n : 0.0,
+                                 s_n ? s_sumC / s_n : 0.0, s_n ? s_sumS / s_n : 0.0, s_n ? s_sumK / s_n : 0.0,
                                  s_hostDone, s_n, mp, disp);
                     s_in = false;
                 }
                 s_bn = 0; s_bHost = 0; s_bW = 0.0; s_bPres = 0.0; s_bPace = 0.0;
+                s_bC = 0.0; s_bS = 0.0; s_bK = 0.0;
             }
         }
+        // Each Vulkan call of the record timed alone (one nowMs per call, ~free): the [rtcopy] spike line
+        // names the call that blocked.
+        const double lfK0 = nowMs();
         vk.ResetCommandBuffer(g_cmd, 0);
+        const double lfK1 = nowMs();
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vk.BeginCommandBuffer(g_cmd, &bi);
+        const double lfK2 = nowMs();
 
         const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
@@ -2568,8 +2595,10 @@ namespace {
         toRest.newLayout     = g_dstLayout;
         vk.CmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                               0, 0, nullptr, 0, nullptr, 1, &toRest);
+        const double lfK3 = nowMs();
 
         vk.EndCommandBuffer(g_cmd);
+        const double lfK4 = nowMs();
 
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
         si.commandBufferCount = 1;
@@ -2676,10 +2705,15 @@ namespace {
         // same way and reported as its own column.
         const double evWait = tcRecord - tcEv0;
         const double nonWait = total - (tcEnd - tcSubmit) - evWait;
+        s_lfPrevCopy = nonWait; s_lfPrevSem = lfW0 - tcFlush; s_lfPrevCmds = tcEv0 - lfK0;
         if (nonWait > 3.0) {
-            LOG::logline(">> [rtcopy] spike nonWait=%.2fms total=%.2f | flush=%.2f record=%.2f evwait=%.2f lock=%.2f submit=%.2f wait=%.2f",
-                         nonWait, total, tcFlush - tc0, tcEv0 - tcFlush, evWait, tcLocked - tcRecord,
-                         tcSubmit - tcLocked, tcEnd - tcSubmit);
+            LOG::logline(">> [rtcopy] spike nonWait=%.2fms total=%.2f | flush=%.2f record=%.2f"
+                         " (sem=%.2f retire=%.2f probe=%.2f reset=%.2f begin=%.2f cmds=%.2f end=%.2f si=%.2f)"
+                         " evwait=%.2f lock=%.2f submit=%.2f wait=%.2f",
+                         nonWait, total, tcFlush - tc0, tcEv0 - tcFlush,
+                         lfW0 - tcFlush, lfW1 - lfW0, lfK0 - lfW1, lfK1 - lfK0, lfK2 - lfK1, lfK3 - lfK2,
+                         lfK4 - lfK3, tcEv0 - lfK4,
+                         evWait, tcLocked - tcRecord, tcSubmit - tcLocked, tcEnd - tcSubmit);
         }
         return r == VK_SUCCESS;
     }
@@ -2780,6 +2814,16 @@ namespace {
             LOG::logline("!! [seam] FP multi-map draw-list vec alloc failed — FP multi-map (FP1e) disabled");
         } else {
             g_fpMultiMapVec.emplace(std::move(*fmv));
+        }
+        // Probe-GI near emitters: two 1-chunk vecs, capped at kMaxPgiEmit items each (well under
+        // one chunk in either wire format). Drawn only into probe-GI captures.
+        auto pev = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        auto pmv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!pev || !pmv) {
+            LOG::logline("!! [seam] probe-GI emitter vec alloc failed — near emitters stay out of the probes");
+        } else {
+            g_pgiEmitVec.emplace(std::move(*pev));
+            g_pgiEmitMMVec.emplace(std::move(*pmv));
         }
 
         // AT3 captured-alpha geometry vec: one 1-chunk (1MB) vec carrying [captured verts][captured
@@ -6746,6 +6790,93 @@ namespace {
         }
         return (fpDraws + fpSkinned) > 0;
     }
+
+    // ── PROBE-GI NEAR EMITTERS (tasks/forge-gi.md "Inject missing emissives") ─────────────────
+    // Probe captures draw the distant-land statics, terrain and grass, never MW's near set (it is
+    // only what MW's CAMERA frustum holds, so probes changed as the camera turned). The near cache's
+    // emitting shapes are the hole that leaves: the Step 0 census (Old Ebonheart, lit windows) found
+    // ~200 per city, 84% under r 96 — GitD window pieces below the DL bake's own size floor, which
+    // exist ONLY in the near set. This list ships them every frame, in or out of the frustum, from
+    // the cache (filled distance-gated, not frustum-gated), for the host to draw into captures alone.
+    //   emitter = material emissive > 0.02, emissive-routed vertex colour, or a glow map;
+    //   OUT: light fixtures (emissiveGroup != 0 — their light carries the energy), skinned, sky,
+    //        land, first person, the player, inactive switch children (suppressedFrame, the GitD
+    //        day/night trap), blended single-map statics (no opaque reading of a sprite), and
+    //        anything beyond kPgiEmitRange of the eye.
+    // Blended MULTI-MAP parts (Route C GitD glass) ship as opaque: a window pane on its wall, which
+    // is what a probe should see. MGE_PGI_EMIT=0 is the kill switch (nothing shipped).
+    constexpr std::uint32_t kMaxPgiEmit   = 1024;      // per list; the host's world window is 1024
+    constexpr float         kPgiEmitRange = 8192.0f;   // horizontal, from the eye
+    std::vector<std::uint32_t> g_pgiEmitKeys;          // membership, rebuilt every 30 frames
+    std::uint64_t              g_pgiEmitKeysFrame = 0;
+
+    bool pgiEmitOn() {
+        static const bool on = [] {
+            const char* e = std::getenv("MGE_PGI_EMIT");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
+    void buildPgiEmitters() {
+        MGE_ZoneScopedN("build:pgiEmit");
+        g_pgiEmitScratch.clear();
+        g_pgiEmitMMScratch.clear();
+        if (!pgiEmitOn() || !g_pgiEmitVec || !g_pgiEmitMMVec) { return; }
+        if (!MWBridge::get()->IsExterior()) { return; }   // probe GI is exterior-only today
+
+        const auto& cacheMap = MGE::GeometryCache::cache();
+        const auto cacheFrame = MGE::GeometryCache::currentFrame();
+        if (g_pgiEmitKeys.empty() || cacheFrame - g_pgiEmitKeysFrame >= 30 || cacheFrame < g_pgiEmitKeysFrame) {
+            g_pgiEmitKeys.clear();
+            for (const auto& kv : cacheMap) {
+                const auto& e = kv.second;
+                if (e.isSkinned || e.isSky || e.isLandscape || e.isFP) { continue; }
+                const float em = std::max(e.matEmissive[0], std::max(e.matEmissive[1], e.matEmissive[2]));
+                const bool emits = em > 0.02f || (e.hasVertexColor && e.vColSource == 1)
+                                || e.glowTextureName != nullptr;
+                if (!emits || e.emissiveGroup != 0) { continue; }
+                g_pgiEmitKeys.push_back(kv.first);
+            }
+            g_pgiEmitKeysFrame = cacheFrame;
+        }
+
+        struct Skips { std::uint32_t gone, suppressed, noslot, far, blend, cap, player; };
+        Skips skip = {};
+        std::uint32_t nStatic = 0, nMM = 0;
+        const float ex = DistantLand::eyePos.x, ey = DistantLand::eyePos.y;
+        for (std::uint32_t key : g_pgiEmitKeys) {
+            auto cit = cacheMap.find(key);
+            if (cit == cacheMap.end()) { ++skip.gone; continue; }
+            const auto& e = cit->second;
+            if (e.suppressedFrame == cacheFrame) { ++skip.suppressed; continue; }
+            if (isPlayerOwned(e)) { ++skip.player; continue; }
+            const float dx = e.worldTransformD3D[12] - ex, dy = e.worldTransformD3D[13] - ey;
+            if (dx * dx + dy * dy > kPgiEmitRange * kPgiEmitRange) { ++skip.far; continue; }
+            auto ks = g_keySlot.find(key);
+            if (ks == g_keySlot.end()) { ++skip.noslot; continue; }   // never uploaded
+            // The dispatch's own classification (buildGeometryDrawLists / buildFPFrame).
+            const bool isMM = e.d3dTexture && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+            if (isMM) {
+                if (nMM >= kMaxPgiEmit) { ++skip.cap; continue; }
+                emitMultiMapDraw(ks->second, e, nMM, g_pgiEmitMMScratch, false);
+            } else {
+                if (e.blendEnable) { ++skip.blend; continue; }
+                if (!e.d3dTexture && e.isPickRoot) { ++skip.gone; continue; }   // collision proxy
+                if (nStatic >= kMaxPgiEmit) { ++skip.cap; continue; }
+                emitStaticDraw(ks->second, e, nStatic, g_pgiEmitScratch);
+            }
+        }
+
+        static std::uint64_t s_lastLog = 0;
+        if (cacheFrame - s_lastLog >= 300) {
+            s_lastLog = cacheFrame;
+            LOG::logline(">> [pgi-emis] near list: %zu keys -> static %u mm %u | skip: suppressed %u, "
+                         "far %u, noslot %u, blend %u, cap %u, player %u, gone %u",
+                         g_pgiEmitKeys.size(), nStatic, nMM, skip.suppressed, skip.far, skip.noslot,
+                         skip.blend, skip.cap, skip.player, skip.gone);
+        }
+    }
 }
 
 namespace RenderProcess {
@@ -7877,6 +8008,7 @@ namespace RenderProcess {
             // this frame's FP walk) ship in the same flush the pass draws from.
             markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
+            buildPgiEmitters();        // probe-GI near emitters (captures only), beside the FP lists
             prefetchGridTextures();    // budgeted against this frame's first sights, so before streaming
             streamPendingTextures();   // after every resolver of the frame has queued its first sights
         }
@@ -8177,6 +8309,21 @@ namespace RenderProcess {
                 fpFrame.mmCount = fpMMDraws;
                 fpFrame.mmBytes = (std::uint32_t)g_fpMultiMapScratch.size();
             }
+        }
+
+        // Probe-GI near emitters (buildPgiEmitters): assigned here with the other lists, stamped
+        // into this kick by setNextPgiEmitters below. A failed assign drops that list this frame.
+        IPC::VecId    pgiEmitId = IPC::InvalidVector, pgiEmitMMId = IPC::InvalidVector;
+        std::uint32_t pgiEmitN = 0, pgiEmitMMN = 0;
+        if (g_pgiEmitVec && !g_pgiEmitScratch.empty()
+            && g_pgiEmitVec->assign_bytes(g_pgiEmitScratch.data(), (std::uint32_t)g_pgiEmitScratch.size())) {
+            pgiEmitId = g_pgiEmitVec->id();
+            pgiEmitN  = (std::uint32_t)(g_pgiEmitScratch.size() / sizeof(IPC::DrawItemWire));
+        }
+        if (g_pgiEmitMMVec && !g_pgiEmitMMScratch.empty()
+            && g_pgiEmitMMVec->assign_bytes(g_pgiEmitMMScratch.data(), (std::uint32_t)g_pgiEmitMMScratch.size())) {
+            pgiEmitMMId = g_pgiEmitMMVec->id();
+            pgiEmitMMN  = (std::uint32_t)(g_pgiEmitMMScratch.size() / sizeof(IPC::MultiMapDrawWire));
         }
 
         // AT3 captured-alpha: ship the geometry buildGeometryDrawLists left in the scratch
@@ -9051,6 +9198,9 @@ namespace RenderProcess {
         // parked fire, otherwise a fresh one — built and fired in the same frame, the two agree.
         const NearCellsSnap nc = parkFired ? g_park.nearCells : snapNearCells();
         g_client->setNextNearCells(nc.x, nc.y, nc.mask, nc.reach, nc.refsVersion, nc.fwd);
+        g_client->setNextPgiEmitters(pgiEmitId, pgiEmitN, pgiEmitN ? (std::uint32_t)g_pgiEmitScratch.size() : 0u,
+                                     pgiEmitMMId, pgiEmitMMN,
+                                     pgiEmitMMN ? (std::uint32_t)g_pgiEmitMMScratch.size() : 0u);
 
         // Async kickoff: copy the frame params into shared memory and start the host, then
         // RETURN — the host renders while MW's frame-N work continues. All the pointer args
@@ -9169,6 +9319,7 @@ namespace RenderProcess {
             skyCount = buildSkyDrawList();
             markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
+            buildPgiEmitters();        // probe-GI near emitters (captures only), beside the FP lists
             prefetchGridTextures();    // same place as the serial kickoff (see its comment)
             streamPendingTextures();   // worker-side, like the resolvers above (see its comment)
         }
@@ -11211,6 +11362,8 @@ namespace RenderProcess {
         g_fpSkinnedVec.reset();
         g_fpAlphaVec.reset();
         g_fpMultiMapVec.reset();
+        g_pgiEmitVec.reset();
+        g_pgiEmitMMVec.reset();
         g_texVec.reset();
         g_texStreamVec.reset();
         g_pendingBlob.clear();
@@ -11237,6 +11390,10 @@ namespace RenderProcess {
         g_fpAlphaScratch.shrink_to_fit();
         g_fpMultiMapScratch.clear();
         g_fpMultiMapScratch.shrink_to_fit();
+        g_pgiEmitScratch.clear();
+        g_pgiEmitScratch.shrink_to_fit();
+        g_pgiEmitMMScratch.clear();
+        g_pgiEmitMMScratch.shrink_to_fit();
         g_texPendingEntries.clear();
         g_texPendingEntries.shrink_to_fit();
         g_texPendingBytes = 0;

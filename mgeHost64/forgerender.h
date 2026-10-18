@@ -141,6 +141,10 @@ namespace ForgeRender {
     // Host-drawn UI (tasks/forge-host-ui.md P1): this frame's [UiVertexWire][uint16] list, a view into
     // IPC memory valid for the next renderScene. Null / 0 = no host UI this frame.
     void setUiList(const void* blob, unsigned vertBytes, unsigned idxBytes);
+    // Probe-GI near emitters (bridge.h pgiEmitList): DrawItemWire[] + MultiMapDrawWire[], views into
+    // IPC memory valid for the next renderScene, drawn only into probe-GI captures. Null / 0 = none.
+    void setPgiEmitters(const void* blob, unsigned count, unsigned bytes,
+                        const void* mmBlob, unsigned mmCount, unsigned mmBytes);
 
     // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
     // built successfully in init(). False ⇒ renderScene returns false and the seam

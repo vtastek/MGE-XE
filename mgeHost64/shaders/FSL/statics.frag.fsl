@@ -490,7 +490,7 @@ PSOut PS_MAIN( VSOutput In )
         const float3 R = reflect(-pbrV, nShade);
         // ...and through the same water column as that ambient (tAmb == statics.vert's
         // waterAmbTransmit; opaque.frag's pbrTAmb does the same for the near mesh).
-        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactorPx(R, In.WorldPos, In.Position.xy) * tAmb;
+        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbSpecPx(R, pbrRough, In.WorldPos, In.Position.xy) * tAmb;
         result += (f0 * pbrSpecA + pbrSpecB) + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
         // MULTIPLE-SCATTERING SPECULAR, as the DIFFERENCE from the line above (W32 gobo rule).
         if (gShadowParams.pbrShade.w > 0.0f)
@@ -515,7 +515,8 @@ PSOut PS_MAIN( VSOutput In )
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG);   // the probe capture: mode 5 + the back-face flag
+    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance
     if (pgiCap) { dbg = 5u; }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
@@ -539,6 +540,8 @@ PSOut PS_MAIN( VSOutput In )
         const float bs = dot(cross(ddx(In.WorldPos), ddy(In.WorldPos)), In.WorldNormal);
         // Nor for BLENDED ones (0x20): two-sided by intent as well — they showed magenta in the peek.
         if (pgiCap && (In.Flags & 0x22u) == 0u && bs * PGI_BACK_SIGN > 0.0f) { Out.Color = float4(4.0f, 0.0f, 4.0f, 1.0f); RETURN(Out); }
+        // P2 EMISSION (odd pixels): statics.vert hands this mode the emissive ALONE in Color.
+        if (pgiEmisPx) { Out.Color = float4(tex.rgb * In.Color.rgb, 1.0f); RETURN(Out); }
         Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out);
     }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }

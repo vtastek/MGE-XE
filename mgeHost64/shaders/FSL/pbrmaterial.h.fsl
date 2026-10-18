@@ -395,15 +395,36 @@ float2 pbrSpecTerms(float3 N, float3 L, float3 V, float NoL, float NoV, float al
 // Karis' analytic fit of the split-sum environment BRDF (as used by the live DX9 lighting.hlsl, with
 // its scale/bias in the original order): the fraction of an environment the lobe reflects, as F0*A + B.
 // SPLIT so the raw (A, B) pair is reachable on its own: A + B is the lobe's directional albedo at
-// F0 = 1, which is exactly the E_ss that the multiple-scatter compensation below needs. Same
-// expression tree, only named — pbrEnvBRDF is unchanged term for term.
-float2 pbrEnvAB(float NoV, float rough)
+// F0 = 1, which is exactly the E_ss that the multiple-scatter compensation below needs.
+//
+// ⚠ IT IS NOT A FIT OF THIS LOBE. Integrated against pbrSpecTerms (mgeHost64/envbrdf_fit.py) it is
+// off by up to 0.36 in A and 0.08 in B: a smooth metal at normal incidence reflects 0.97 of its
+// environment instead of 1.0, a rough-0.4 one 0.78 instead of 0.97, a rough-1 one 0.45 instead of
+// 0.31 — and pbrSpecMulti divides by the same wrong E_ss. Dielectrics barely see A (it rides F0);
+// they see B, the grazing sheen. Kept, behind pbrShade2.w = 0, as the A/B arm.
+float2 pbrEnvABFit(float NoV, float rough)
 {
     const float4 c0 = float4(-1.0f, -0.0275f, -0.572f, 0.022f);
     const float4 c1 = float4(1.0f, 0.0425f, 1.04f, -0.04f);
     const float4 r  = rough * c0 + c1;
     const float a004 = min(r.x * r.x, exp2(-9.28f * NoV)) * r.x + r.y;
     return float2(-1.04f, 1.04f) * a004 + r.zw;
+}
+// THE LOBE'S OWN (A, B): a 64^2 RG16F table of the integral (opaque.srt.h gEnvBRDF, generated into
+// envbrdf_lut.h by envbrdf_fit.py). Indexed by sqrt(NoV) — the grazing Fresnel edge is the steep
+// part — and roughness, node-centred so the bilinear fetch interpolates between the integrated
+// nodes exactly. pbrShade2.w = 0 (or no table: the host publishes 0) takes the old fit, so the arm
+// off is the shader that shipped before it.
+#define ENV_BRDF_LUT_N 64.0f
+float2 pbrEnvAB(float NoV, float rough)
+{
+    if (gShadowParams.pbrShade2.w > 0.5f)
+    {
+        const float2 uv = (float2(sqrt(saturate(NoV)), saturate(rough)) * (ENV_BRDF_LUT_N - 1.0f) + 0.5f)
+                          / ENV_BRDF_LUT_N;
+        return SampleLvlTex2D(gEnvBRDF, gSamplerBilinearClamp, uv, 0).rg;
+    }
+    return pbrEnvABFit(NoV, rough);
 }
 float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
 {
