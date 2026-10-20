@@ -1,8 +1,8 @@
 // mgeHost64 — DoF: the CIRCLE OF CONFUSION, per pixel and per tile. Read dof.srt.h first.
 //
 // One 16x16 group = one TILE. Every thread writes its pixel's SIGNED CoC radius (+ far, - near) to
-// gDofCoc; the group reduces max |CoC| into gDofTile, which doftile spreads over the neighbourhood
-// and the blur passes take as their kernel radius.
+// gDofCoc; the group reduces max |CoC| and max near radius (-CoC) into gDofTile, which doftile spreads
+// over the neighbourhood and the blur passes take as their kernel radius and near radius field.
 //
 // ⚠ NO EARLY RETURN: every thread reaches the barriers. Threads past the delivered rect (the edge
 // tiles) take part with |CoC| 0 and write nothing.
@@ -10,7 +10,33 @@
 #include "dof.srt.h"
 #include "dofcommon.h.fsl"
 
-GroupShared(float, g_dofTileMax[256]);
+GroupShared(float2, g_dofTileMax[256]);
+
+// Px p's signed CoC radius from its own depth (with the target cap, dof.srt.h `look`).
+float dofCocAt(int2 p, float2 delivered, float2 depthRect)
+{
+    int2  q  = dofDepthTexel(float2(p), delivered, depthRect);
+    float dz = LoadTex2D(gDofDepth, NO_SAMPLER, q, 0).r;
+    float D  = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z,
+                          gDofParams.look.yzw, gDofParams.arms.x);
+    float c  = dofCocPx(D, gDofFocus[0].x, gDofParams.eye, gDofParams.hands.xy);
+    float ct = dofCocPx(D, gDofFocus[0].y, gDofParams.eye, gDofParams.hands.xy);
+    // The near field follows the focus, arms and world alike (dof.srt.h `arms`).
+    if (c < 0.0f)
+    {
+        c  *= 1.0f - smoothstep(gDofParams.arms.z, gDofParams.arms.y, gDofFocus[0].x);
+    }
+    if (ct < 0.0f)
+    {
+        ct *= 1.0f - smoothstep(gDofParams.arms.z, gDofParams.arms.y, gDofFocus[0].y);
+    }
+    if (gDofParams.look.x > 0.5f)
+    {
+        // Never blurrier than where the focus is heading.
+        c = (abs(ct) < abs(c)) ? ct : c;
+    }
+    return c;
+}
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(16, 16, 1)
@@ -28,20 +54,24 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
     float c = 0.0f;
     if (inside)
     {
-        int2  q  = dofDepthTexel(float2(p), delivered, depthRect);
-        float dz = LoadTex2D(gDofDepth, NO_SAMPLER, q, 0).r;
-        float D  = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z,
-                              gDofParams.look.yzw);
-        c = dofCocPx(D, gDofFocus[0].x, gDofParams.eye, gDofParams.hands.xy);
-        if (gDofParams.look.x > 0.5f)
+        c = dofCocAt(p, delivered, depthRect);
+        // NEAR EDGES GROW ONE PX. An anti-aliased near silhouette's edge pixels hold part of the near
+        // object's colour over the depth of what is behind it, so they fell in neither layer: kept
+        // sharp by the main one and seen through the near layer's fringe — a crisp line around the
+        // blurred first-person arms (user, 10-20). A nearer 4-neighbour's CoC claims them.
+        for (int k = 0; k < 4; ++k)
         {
-            // Never blurrier than where the focus is heading (dof.srt.h `look`).
-            float ct = dofCocPx(D, gDofFocus[0].y, gDofParams.eye, gDofParams.hands.xy);
-            c = (abs(ct) < abs(c)) ? ct : c;
+            int2 o = (k == 0) ? int2(-1, 0) : (k == 1) ? int2(1, 0) : (k == 2) ? int2(0, -1) : int2(0, 1);
+            int2 n = clamp(p + o, int2(0, 0), deliverN - int2(1, 1));
+            float cn = dofCocAt(n, delivered, depthRect);
+            if (cn < c && dofNearMask(cn) > 0.0f)
+            {
+                c = cn;
+            }
         }
         Write2D(gDofCoc, p, c);
     }
-    g_dofTileMax[li] = abs(c);
+    g_dofTileMax[li] = float2(abs(c), max(-c, 0.0f));
     GroupMemoryBarrier();
     for (uint s = 128u; s > 0u; s >>= 1u)
     {

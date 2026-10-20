@@ -11,7 +11,8 @@
 //   doffocus.comp   ONE group of 8x8     -> gDofFocus[0]          autofocus: centre-window dioptres, eased
 //   dofcoc.comp     16x16 = one TILE     -> gDofCoc, gDofTile     signed CoC per px, max |CoC| per tile
 //   doftile.comp    one thread per tile  -> gDofTileNb            max over +-k tiles (the near reach)
-//   dofblurh.comp   one thread per px    -> gDofRe, gDofIm        the disc kernel's rows (complex)
+//   dofblurh.comp   one thread per px    -> gDofRe, gDofIm, gDofNear(S)  the disc kernel's rows
+//                                                                  (complex), and the near layer's (D5)
 //   dofblurv.comp   one thread per px    -> gDofOut               columns, recombine; the CoC view
 // D2 (tasks/forge-dof.md "D2 design"): FULL RES, the kernel radius per tile, and every sample weighted
 // by whether its own CoC reaches the pixel (scatter-as-gather), which is what keeps in-focus edges
@@ -61,6 +62,19 @@ STRUCT(DofParams)
     //     to the bake eye, so while moving the eye sits a frame's motion away — measured from the
     //     origin, near distances and the px-per-radian came out wrong (blur surging while walking).
     DATA(float4, look, None);
+    // x = THE ARMS' DIOPTRES (1 / their distance, m). The first-person pass stamps the near plane, 1.0,
+    // into the depth (objvelocity.frag MB-1e) — not their distance, which the arm camera's own
+    // near/far does not share with the world's — so every stamped texel reads as this instead.
+    // Without it the arms sat at the near plane: the full CoC clamp at any focus.
+    // y/z = THE NEAR FIELD FOLLOWS THE FOCUS, dioptres: everything in FRONT of the focus (CoC < 0,
+    //     the arms among it) is sharp while the focus is nearer than 1/y m and takes its full
+    //     (physical) blur once the focus is past 1/z m, smoothstep between. Not the eye: in the model
+    //     the arms are ~1.8 dpt from ANY focus a world surface gives, so they were equally blurred
+    //     looking at a door or the horizon (user: "same amount of blur on FP"). In play the arms are
+    //     expected sharp, blurring only on a look 200 m+ out — and the near world must match them
+    //     (user: "they should match"), so the rule is the near field's, not the arms'. The far field
+    //     (behind the focus) keeps the eye. w unused.
+    DATA(float4, arms, None);
 };
 
 BEGIN_SRT(DofSrtData)
@@ -79,9 +93,10 @@ BEGIN_SRT(DofSrtData)
         // are the one hardware group the bloom pyramid already requires.
         // Signed CoC RADIUS, delivered px, + far / - near (dofCocPx), at the delivered rect.
         DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofCoc)
-        // max |CoC| per 16x16 tile, and that max over +-k tiles: the kernel radius of every px in it.
-        DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofTile)
-        DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofTileNb)
+        // Per 16x16 tile, x = max |CoC| and y = max NEAR radius (max -CoC); then over +-k tiles: x is the
+        // kernel radius of every px in it, y the near layer's loop reach (dofcommon "THE NEAR LAYER").
+        DECL_RWTEXTURE(Persistent, RWTex2D(float2), gDofTile)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float2), gDofTileNb)
         // The horizontal pass's complex response, per kernel component (Re/Im = component 0, Re1/Im1 =
         // component 1): Re and Im of the PREMULTIPLIED rgba (every weight hits all four channels,
         // motionblur.srt.h's rule), and of the weight itself (W = Re0, Im0, Re1, Im1), all normalised
@@ -93,6 +108,12 @@ BEGIN_SRT(DofSrtData)
         DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofRe1)
         DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofIm1)
         DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofW)
+        // D5's NEAR LAYER rows: the sum of the row's near splats, (sum g m rgb, sum g m) — the masked
+        // near colour (premultiplied by its coverage) and the coverage — and their coverage-weighted
+        // mean sigma, px. Written for EVERY delivered px (0 where no near field reaches), so the
+        // vertical pass never reads a stale row.
+        DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofNear)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofNearS)
         // pDof, the delivered image after the lens. Its own target, for motionblur.srt.h's reason.
         DECL_RWTEXTURE(Persistent, WTex2D(float4), gDofOut)
     END_SRT_SET(Persistent)

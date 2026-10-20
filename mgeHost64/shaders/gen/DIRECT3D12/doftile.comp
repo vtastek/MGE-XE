@@ -974,9 +974,9 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 1102 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
-#line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
+#line 8 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dof.srt.h"
-#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dof.srt.h"
+#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dof.srt.h"
 STRUCT(DofParams)
 {
 
@@ -1010,7 +1010,9 @@ STRUCT(DofParams)
 
 
     float4 look;
-#line 64
+#line 77 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dof.srt.h"
+    float4 arms;
+#line 78
 };
 
         CBUFFER(DofParams) gDofParams :  register(b0,space0);
@@ -1028,8 +1030,9 @@ STRUCT(DofParams)
 
         RWTex2D(float) gDofCoc :  register(u4,space0);
 
-        RWTex2D(float) gDofTile :  register(u5,space0);
-        RWTex2D(float) gDofTileNb :  register(u6,space0);
+
+        RWTex2D(float2) gDofTile :  register(u5,space0);
+        RWTex2D(float2) gDofTileNb :  register(u6,space0);
 
 
 
@@ -1042,8 +1045,14 @@ STRUCT(DofParams)
         RWTex2D(float4) gDofIm1 :  register(u10,space0);
         RWTex2D(float4) gDofW :  register(u11,space0);
 
-        WTex2D(float4) gDofOut :  register(u12,space0);
-#line 8 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
+
+
+
+        RWTex2D(float4) gDofNear :  register(u12,space0);
+        RWTex2D(float) gDofNearS :  register(u13,space0);
+
+        WTex2D(float4) gDofOut :  register(u14,space0);
+#line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dofcommon.h.fsl"
 #line 8 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dofcommon.h.fsl"
 int2 dofDepthTexel(float2 deliveredPx, float2 deliveredRect, float2 depthRect)
@@ -1057,11 +1066,17 @@ int2 dofDepthTexel(float2 deliveredPx, float2 deliveredRect, float2 depthRect)
 
 
 
-float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit, float3 eye)
+
+float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit, float3 eye,
+                 float armD)
 {
     if (dz <= 0.0f)
     {
         return 0.0f;
+    }
+    if (dz >= 1.0f)
+    {
+        return armD;
     }
     float2 uv = (float2(q) + 0.5f) / depthRect;
     float4 p4 = mul(invVP, float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
@@ -1079,7 +1094,7 @@ float dofCocPx(float D, float Df, float4 eye, float2 hands)
     c *= smoothstep(hands.x, hands.y, dist);
     return clamp(c, -eye.w, eye.w);
 }
-#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dofcommon.h.fsl"
+#line 62 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dofcommon.h.fsl"
 float2 dofKernelTap(float i, float R, float2 ab)
 {
     float x =  1.227f  * i / R;
@@ -1096,7 +1111,32 @@ float dofCoverage(float cs, float cp, float d)
     float eff = (cs > cp) ? min(abs(cs), abs(cp)) : abs(cs);
     return saturate(eff - d + 0.5f);
 }
-#line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
+#line 97 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/dofcommon.h.fsl"
+float dofNearMask(float c)
+{
+    return saturate(-c - 0.5f);
+}
+
+
+
+float dofNearSplat(float x, float sg)
+{
+    return exp(-0.5f * x * x / (sg * sg)) / max(2.5066283f * sg, 1.0f);
+}
+
+
+
+
+float dofMainCoverage(float cs, float cp, float d)
+{
+    if (cp < 0.0f)
+    {
+        float eff = (cs < cp) ? abs(cs) : abs(cp);
+        return saturate(eff - d + 0.5f);
+    }
+    return dofCoverage(cs, cp, d);
+}
+#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/doftile.comp.fsl"
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(8, 8, 1)
@@ -1111,7 +1151,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         return;
     }
     int k = int(gDofParams.opts.w);
-    float m = 0.0f;
+    float2 m = f2(0.0f);
     for (int j = -k; j <= k; ++j)
     {
         for (int i = -k; i <= k; ++i)
@@ -1121,11 +1161,15 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             {
 
 
-                float v = LoadRWTex2D(gDofTile, u);
+                float2 v = LoadRWTex2D(gDofTile, u);
                 float reach = float( 16  * max(max(abs(i), abs(j)) - 1, 0));
-                if (v > reach)
+                if (v.x > reach)
                 {
-                    m = max(m, v);
+                    m.x = max(m.x, v.x);
+                }
+                if (v.y * ( 0.5f  *  2.5f ) > reach)
+                {
+                    m.y = max(m.y, v.y);
                 }
             }
         }

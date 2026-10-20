@@ -3086,13 +3086,15 @@ namespace {
         Buffer*        pDofFocusReadback = nullptr;
         // D2's intermediates (dof.srt.h), all alloc- or tile-sized, all RESTING in UNORDERED_ACCESS.
         Texture*       pDofCoc = nullptr;          // R16F signed CoC radius, delivered px
-        Texture*       pDofTile = nullptr;         // R16F max |CoC| per 16x16 tile...
+        Texture*       pDofTile = nullptr;         // RG16F max |CoC|, max near radius per 16x16 tile...
         Texture*       pDofTileNb = nullptr;       // ...and over the +-k neighbourhood: the kernel radius
         Texture*       pDofRe = nullptr;           // RGBA16F the H pass's complex response, Re...
         Texture*       pDofIm = nullptr;           // ...Im (kernel component 0)...
         Texture*       pDofRe1 = nullptr;          // ...component 1's Re...
         Texture*       pDofIm1 = nullptr;          // ...and Im...
         Texture*       pDofW = nullptr;            // ...and RGBA16F both weights (Re0, Im0, Re1, Im1)
+        Texture*       pDofNear = nullptr;         // RGBA16F the near layer's rows (D5: masked rgb, coverage)...
+        Texture*       pDofNearS = nullptr;        // ...and R16F their mean splat sigma, px
         // The five passes, in dispatch order, one shader + pipeline each, indexed by kDofPass*.
         enum { kDofPassFocus, kDofPassCoc, kDofPassTile, kDofPassBlurH, kDofPassBlurV, kDofPassCount };
         static constexpr const char* kDofPassNames[kDofPassCount] = {
@@ -17072,8 +17074,8 @@ namespace {
                 const uint32_t dofTilesH = (g_live.allocHeight + 15u) / 16u;
                 addDofSurface(&g_live.pDofCoc,    g_live.allocWidth, g_live.allocHeight,
                               TinyImageFormat_R16_SFLOAT, "dofCoc");
-                addDofSurface(&g_live.pDofTile,   dofTilesW, dofTilesH, TinyImageFormat_R16_SFLOAT, "dofTile");
-                addDofSurface(&g_live.pDofTileNb, dofTilesW, dofTilesH, TinyImageFormat_R16_SFLOAT, "dofTileNb");
+                addDofSurface(&g_live.pDofTile,   dofTilesW, dofTilesH, TinyImageFormat_R16G16_SFLOAT, "dofTile");
+                addDofSurface(&g_live.pDofTileNb, dofTilesW, dofTilesH, TinyImageFormat_R16G16_SFLOAT, "dofTileNb");
                 addDofSurface(&g_live.pDofRe,     g_live.allocWidth, g_live.allocHeight,
                               TinyImageFormat_R16G16B16A16_SFLOAT, "dofRe");
                 addDofSurface(&g_live.pDofIm,     g_live.allocWidth, g_live.allocHeight,
@@ -17084,6 +17086,10 @@ namespace {
                               TinyImageFormat_R16G16B16A16_SFLOAT, "dofIm1");
                 addDofSurface(&g_live.pDofW,      g_live.allocWidth, g_live.allocHeight,
                               TinyImageFormat_R16G16B16A16_SFLOAT, "dofW");
+                addDofSurface(&g_live.pDofNear,   g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16G16B16A16_SFLOAT, "dofNear");
+                addDofSurface(&g_live.pDofNearS,  g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16_SFLOAT, "dofNearS");
 
                 BufferLoadDesc dcb = {};
                 dcb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -17125,7 +17131,7 @@ namespace {
                 const bool dofPipesOk = dofAddPipelines(R);
                 const bool dofSurfOk  = g_live.pDofCoc && g_live.pDofTile && g_live.pDofTileNb
                                      && g_live.pDofRe && g_live.pDofIm && g_live.pDofRe1
-                                     && g_live.pDofIm1 && g_live.pDofW;
+                                     && g_live.pDofIm1 && g_live.pDofW && g_live.pDofNear && g_live.pDofNearS;
                 if (g_live.pDof && g_live.pDofParamsCbv && g_live.pDofFocus && g_live.pDofFocusReadback
                     && dofPipesOk && dofSurfOk) {
                     DescriptorSetDesc dset = SRT_SET_DESC(DofSrtData, Persistent, 3, 0);
@@ -17138,7 +17144,7 @@ namespace {
                     Texture* upsTex   = (g_live.pUpscaler && g_live.pUpscaler->outputTexture())
                                             ? g_live.pUpscaler->outputTexture() : sceneTex;
                     Texture* mbTex    = g_live.pMotionBlur ? g_live.pMotionBlur : sceneTex;
-                    DescriptorData d[13] = {};
+                    DescriptorData d[15] = {};
                     d[0].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofParams);
                     d[0].ppBuffers = &g_live.pDofParamsCbv;
                     d[1].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofDepth);
@@ -17165,13 +17171,17 @@ namespace {
                     d[11].mCount = 1; d[11].ppTextures = &g_live.pDofRe1;
                     d[12].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofIm1);
                     d[12].mCount = 1; d[12].ppTextures = &g_live.pDofIm1;
+                    d[13].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofNear);
+                    d[13].mCount = 1; d[13].ppTextures = &g_live.pDofNear;
+                    d[14].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofNearS);
+                    d[14].mCount = 1; d[14].ppTextures = &g_live.pDofNearS;
                     // [0] off the scene, [1] off the upscaler, [2] off the motion blur — chosen per
                     // frame by INDEX, the same `mbRan ? 2 : (upscaled ? 1 : 0)` the resolve asked.
-                    updateDescriptorSet(R, 0, g_live.pDofSet, 13, d);
+                    updateDescriptorSet(R, 0, g_live.pDofSet, 15, d);
                     d[2].ppTextures = &upsTex;
-                    updateDescriptorSet(R, 1, g_live.pDofSet, 13, d);
+                    updateDescriptorSet(R, 1, g_live.pDofSet, 15, d);
                     d[2].ppTextures = &mbTex;
-                    updateDescriptorSet(R, 2, g_live.pDofSet, 13, d);
+                    updateDescriptorSet(R, 2, g_live.pDofSet, 15, d);
                     g_live.dofReady = true;
                 }
                 // The bloom's DoF-source prefilter instance (kBloomSetDof): pDof as the scene texture,
@@ -21241,14 +21251,14 @@ namespace {
     // ── DEPTH OF FIELD (tasks/forge-dof.md) — the EYE model, Knu's v12 made physical ──────────────
     // ⚠ SHIPS OFF until the gather (D2) lands: D0/D1 only measures (the CoC view, the focus line on
     // the heartbeat), and `dofEnable=1` with `dofDebug=0` is a byte-identical copy of the frame.
-    bool     g_dofEnable     = false;
-    bool     g_dofTargetCap  = false;   // cap each pixel's blur at the focus TARGET's (dof.srt.h `look`)
+    bool     g_dofEnable     = true;
+    bool     g_dofTargetCap  = true;   // cap each pixel's blur at the focus TARGET's (dof.srt.h `look`)
     uint32_t g_dofDebug      = 0u;      // 0 the blur | 1 the CoC view (orange far, blue near, green < 1 px) | 2 identity
     float    g_dofPupilMm    = 6.0f;    // pupil DIAMETER, mm (Knu: 6). The blur is linear in it.
     // DYNAMIC PUPIL (tasks/forge-dof.md): the pupil follows the exposure servo's adapting luminance
     // instead of g_dofPupilMm — the eye's own 2..7 mm response mapped onto [min, max]. Off until it has
     // been seen in play. 16 mm = the user's upper size (10-18); 4 keeps the eye's ~4:1 range.
-    bool     g_dofPupilAuto  = false;
+    bool     g_dofPupilAuto  = true;
     float    g_dofPupilMinMm = 4.0f;
     float    g_dofPupilMaxMm = 16.0f;
     float    g_dofPupilNowMm = -1.0f;   // the eased dynamic pupil (-1 = snap on the next frame)
@@ -21256,8 +21266,16 @@ namespace {
     float    g_dofFocusRate  = 4.0f;    // 1/s: how fast the eye re-focuses (sim clock; holds paused)
     float    g_dofWindow     = 0.03f;   // autofocus window radius, fraction of the delivered height
     float    g_dofMaxPx      = 24.0f;   // CoC RADIUS clamp, delivered px
-    float    g_dofHandsNearM = 0.568f;  // no blur nearer than this (Knu's savemyhands)...
-    float    g_dofHandsFarM  = 0.781f;  // ...full blur from here; the autofocus ignores anything nearer
+    float    g_dofHandsNearM = 0.0f;    // no blur nearer than this (Knu's savemyhands, 0.568; off)...
+    float    g_dofHandsFarM  = 0.0f;    // ...full blur from here (0.781); the autofocus ignores anything nearer
+    // THE ARMS' DISTANCE, m. The FP pass stamps the near plane into the depth, not the arms' own
+    // distance (dof.srt.h `arms`); every stamped texel is taken to be this far from the eye.
+    float    g_dofArmM       = 0.55f;
+    // THE NEAR FIELD FOLLOWS THE FOCUS, arms and world alike: everything in front of the focus is
+    // sharp while it is nearer than SharpM, at its full blur once it is past BlurM (dof.srt.h `arms`).
+    // Play wants the arms sharp, blurring only on a look 200 m+ out, and the near world matching.
+    float    g_dofNearSharpM  = 100.0f;
+    float    g_dofNearBlurM   = 250.0f;
     float    g_dofDebugPx    = 4.0f;    // the CoC view's full-scale tint, px of radius
     // OVERRIDE (MWSE, D5): a focus distance in metres and its weight. 0 m = none.
     float    g_dofOvrDistM   = 0.0f;
@@ -25566,6 +25584,9 @@ namespace {
             { "dofFocusRate",        &g_dofFocusRate        },
             { "dofWindow",           &g_dofWindow           },
             { "dofMaxPx",            &g_dofMaxPx            },
+            { "dofArmM",             &g_dofArmM             },
+            { "dofNearSharpM",        &g_dofNearSharpM        },
+            { "dofNearBlurM",         &g_dofNearBlurM         },
             { "dofDebugPx",          &g_dofDebugPx          },
             { "dofOvrDistM",         &g_dofOvrDistM         },
             { "dofOvrWeight",        &g_dofOvrWeight        },
@@ -27366,6 +27387,9 @@ namespace {
           t.sliderF("Autofocus window (fraction of screen height, radius)",
                     &g_dofWindow, 0.005f, 0.25f, 0.005f);
           t.sliderF("Max CoC radius (px)", &g_dofMaxPx, 1.0f, 64.0f, 1.0f);
+          t.sliderF("First-person arms: their distance (m)", &g_dofArmM, 0.1f, 2.0f, 0.01f);
+          t.sliderF("Near field: sharp while the focus is nearer than (m)", &g_dofNearSharpM, 1.0f, 1000.0f, 1.0f);
+          t.sliderF("  \\- full blur once the focus is past (m)", &g_dofNearBlurM, 1.0f, 2000.0f, 1.0f);
           t.sliderF("Sharp hands: no blur nearer than (m)", &g_dofHandsNearM, 0.0f, 2.0f, 0.01f);
           t.sliderF("  ...full blur from (m); also the autofocus' nearest candidate",
                     &g_dofHandsFarM, 0.0f, 3.0f, 0.01f);
@@ -50733,10 +50757,18 @@ void destroyHostWindow(Renderer* R);
                 dp[32] = (float)std::min(g_dofDebug, 2u);
                 dp[33] = std::max(0.001f, std::min(0.5f, g_dofWindow));
                 dp[34] = std::max(0.5f, g_dofDebugPx);
-                // k: how many 16 px tiles the largest CoC can reach across (doftile's neighbourhood).
-                dp[35] = std::ceil(std::max(0.5f, g_dofMaxPx) / 16.0f);
+                // k: how many 16 px tiles the largest CoC can reach across (doftile's neighbourhood) —
+                // the near layer's Gaussian tail, 1.25x the radius (dofcommon DOF_NEAR_*), the farthest.
+                dp[35] = std::ceil(1.25f * std::max(0.5f, g_dofMaxPx) / 16.0f);
                 dp[36] = g_dofTargetCap ? 1.0f : 0.0f;
                 dp[37] = eyeRel[0]; dp[38] = eyeRel[1]; dp[39] = eyeRel[2];
+                dp[40] = 1.0f / std::max(0.05f, g_dofArmM);
+                {
+                    const float sharpM = std::max(0.1f, g_dofNearSharpM);
+                    dp[41] = 1.0f / sharpM;
+                    dp[42] = 1.0f / std::max(sharpM * 1.001f, g_dofNearBlurM);
+                }
+                dp[43] = 0.0f;
             }
             g_dofSnap = false;
 
@@ -71082,7 +71114,7 @@ void destroyHostWindow(Renderer* R);
         dofRemovePipelines(R);
         for (Texture** t : { &g_live.pDofCoc, &g_live.pDofTile, &g_live.pDofTileNb,
                              &g_live.pDofRe, &g_live.pDofIm, &g_live.pDofRe1, &g_live.pDofIm1,
-                             &g_live.pDofW }) {
+                             &g_live.pDofW, &g_live.pDofNear, &g_live.pDofNearS }) {
             if (*t) { removeResource(*t); *t = nullptr; }
         }
         if (g_live.pDofFocusReadback)   { removeResource(g_live.pDofFocusReadback);      g_live.pDofFocusReadback = nullptr; }

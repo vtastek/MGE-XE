@@ -1,10 +1,11 @@
 // mgeHost64 — DoF D2: the disc kernel's HORIZONTAL pass. Read dof.srt.h first.
 //
-// Per pixel, the tile's radius R (gDofTileNb). A sharp tile (R < 0.5) writes nothing. Otherwise
+// Per pixel, the tile's radius R (gDofTileNb .x). A sharp tile (R < 0.5) writes no main row. Otherwise
 // 2*ceil(R)+1 taps along the row, each weighted by BOTH components' complex taps F0/F1(i, R) and by its
 // own COVERAGE of this pixel (dofCoverage: scatter-as-gather). The sums are divided by component 0's
 // envelope sum — one scale for both, so they stay comparable — which depends on R alone, so values
-// stay at the scale of the input and an HDR row fits in fp16.
+// stay at the scale of the input and an HDR row fits in fp16. Near samples are masked out of these
+// and splatted into gDofNear/S instead (dofcommon "THE NEAR LAYER"), which every px writes.
 
 #include "dof.srt.h"
 #include "dofcommon.h.fsl"
@@ -21,13 +22,22 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     {
         RETURN();
     }
-    float R = LoadRWTex2D(gDofTileNb, p / DOF_TILE);
-    if (R < 0.5f)
+    float2 Rt     = LoadRWTex2D(gDofTileNb, p / DOF_TILE);
+    float  R      = Rt.x;
+    bool   mainOn = R >= 0.5f;
+    bool   nearOn = Rt.y >= 0.5f;   // dofNearMask is 0 under 0.5 px
+    if (!mainOn && !nearOn)
     {
+        // The near row is written everywhere: the vertical pass's splats read past the tiles the
+        // main kernel reaches.
+        Write2D(gDofNear,  p, f4(0.0f));
+        Write2D(gDofNearS, p, 0.0f);
         RETURN();
     }
     float  Rk  = max(R, 1.0f);
-    int    n   = int(ceil(R));
+    int    nM  = mainOn ? int(ceil(R)) : -1;
+    int    nN  = nearOn ? int(ceil(DOF_NEAR_TAPS * DOF_NEAR_SIGMA * Rt.y)) : -1;
+    int    n   = max(nM, nN);
     float  cp  = LoadRWTex2D(gDofCoc, p);
     float4 re0 = f4(0.0f);
     float4 im0 = f4(0.0f);
@@ -35,18 +45,34 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float4 im1 = f4(0.0f);
     float4 wc  = f4(0.0f);
     float  env = 0.0f;
+    float4 nr  = f4(0.0f);
+    float  ns  = 0.0f;
     for (int i = -n; i <= n; ++i)
     {
-        float2 F0 = dofKernelTap(float(i), Rk, DOF_K0.xy);
-        float2 F1 = dofKernelTap(float(i), Rk, DOF_K1.xy);
-        float  x  = DOF_KEDGE * float(i) / Rk;
-        env += exp(-DOF_K0.x * x * x);
         int2  s  = int2(clamp(p.x + i, 0, deliverN.x - 1), p.y);
         float cs = LoadRWTex2D(gDofCoc, s);
-        float w  = dofCoverage(cs, cp, abs(float(i)));
-        if (w > 0.0f)
+        float ms = dofNearMask(cs);
+        float w  = 0.0f;
+        float2 F0 = f2(0.0f);
+        float2 F1 = f2(0.0f);
+        if (abs(i) <= nM)
         {
-            float4 col = LoadTex2D(gDofColor, NO_SAMPLER, s, 0) * w;
+            F0 = dofKernelTap(float(i), Rk, DOF_K0.xy);
+            F1 = dofKernelTap(float(i), Rk, DOF_K1.xy);
+            float x = DOF_KEDGE * float(i) / Rk;
+            env += exp(-DOF_K0.x * x * x);
+            // The near samples are the near layer's, not the main layer's.
+            w = dofMainCoverage(cs, cp, abs(float(i))) * (1.0f - ms);
+        }
+        // This sample's own splat onto p (dofcommon "THE NEAR LAYER").
+        float sg = DOF_NEAR_SIGMA * max(-cs, 0.5f);
+        float g  = (ms > 0.0f && abs(i) <= nN) ? ms * dofNearSplat(float(i), sg) : 0.0f;
+        if (w > 0.0f || g > 0.0f)
+        {
+            float4 col = LoadTex2D(gDofColor, NO_SAMPLER, s, 0);
+            nr += g * float4(col.rgb, 1.0f);
+            ns += g * sg;
+            col *= w;
             re0 += F0.x * col;
             im0 += F0.y * col;
             re1 += F1.x * col;
@@ -54,10 +80,15 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             wc  += float4(F0, F1) * w;
         }
     }
-    float inv = 1.0f / max(env, 1.0e-6f);
-    Write2D(gDofRe,  p, re0 * inv);
-    Write2D(gDofIm,  p, im0 * inv);
-    Write2D(gDofRe1, p, re1 * inv);
-    Write2D(gDofIm1, p, im1 * inv);
-    Write2D(gDofW,   p, wc * inv);
+    if (mainOn)
+    {
+        float inv = 1.0f / max(env, 1.0e-6f);
+        Write2D(gDofRe,  p, re0 * inv);
+        Write2D(gDofIm,  p, im0 * inv);
+        Write2D(gDofRe1, p, re1 * inv);
+        Write2D(gDofIm1, p, im1 * inv);
+        Write2D(gDofW,   p, wc * inv);
+    }
+    Write2D(gDofNear,  p, nr);
+    Write2D(gDofNearS, p, nr.w > 1.0e-6f ? ns / nr.w : 0.0f);
 }

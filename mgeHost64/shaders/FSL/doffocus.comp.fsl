@@ -9,8 +9,9 @@
 // Thread 0 then clamps the target into the accommodation range, blends in the MWSE override and eases
 // the eye's focus toward it on the SIM clock: dt = 0 on a menu, so the focus holds on a paused frame.
 //
-// ⚠ ANYTHING NEARER THAN hands.y IS NOT A FOCUS CANDIDATE. The arms carry a constant near-plane depth
-// (MB FP1e B), and a sword swung through the centre would otherwise snap focus to 0.1 m every swing.
+// ⚠ THE ARMS ARE NOT A FOCUS CANDIDATE, and neither is anything nearer than hands.y. The arms carry a
+// constant near-plane depth (MB-1e), and a sword swung through the centre would otherwise snap focus
+// to 0.1 m every swing — which it did the moment the sharp-hands range was set to 0.
 // A window that is all hands keeps last frame's target.
 
 #include "dof.srt.h"
@@ -36,10 +37,11 @@ void CS_MAIN( SV_GroupThreadID(uint3) GTid )
     int2   q   = dofDepthTexel(px, delivered, depthRect);
     float  dz  = LoadTex2D(gDofDepth, NO_SAMPLER, q, 0).r;
     float  D   = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z,
-                               gDofParams.look.yzw);
+                               gDofParams.look.yzw, gDofParams.arms.x);
     float  w   = exp(-2.0f * dot(g, g));
-    // Hands out: nearer than hands.y metres = more than 1/hands.y dioptres.
-    if (D > 1.0f / max(gDofParams.hands.y, 1.0e-3f))
+    // Hands out: the first-person stamp (dofDioptre), and anything nearer than hands.y metres = more
+    // than 1/hands.y dioptres.
+    if (dz >= 1.0f || D > 1.0f / max(gDofParams.hands.y, 1.0e-3f))
     {
         w = 0.0f;
     }

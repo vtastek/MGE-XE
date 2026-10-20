@@ -16,11 +16,17 @@ int2 dofDepthTexel(float2 deliveredPx, float2 deliveredRect, float2 depthRect)
 // depth 0, reverse-Z far) is 0 dioptres: infinity, which is what an eye looking at the sky focuses on.
 // ⚠ `eye` IS NOT THE ORIGIN WHILE MOVING: a park fire's matrix is relative to the BAKE eye (the payload
 // was packed a frame earlier), so the real eye sits a frame's motion off it (dof.srt.h `look.yzw`).
-float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit, float3 eye)
+// ⚠ 1.0 IS THE FIRST-PERSON STAMP, not a surface: the arms, at armD dioptres (dof.srt.h `arms`).
+float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit, float3 eye,
+                 float armD)
 {
     if (dz <= 0.0f)
     {
         return 0.0f;
+    }
+    if (dz >= 1.0f)
+    {
+        return armD;
     }
     float2 uv = (float2(q) + 0.5f) / depthRect;
     float4 p4 = mul(invVP, float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
@@ -68,4 +74,47 @@ float dofCoverage(float cs, float cp, float d)
 {
     float eff = (cs > cp) ? min(abs(cs), abs(cp)) : abs(cs);
     return saturate(eff - d + 0.5f);
+}
+
+// ── THE NEAR LAYER (D5) ────────────────────────────────────────────────────────────────────────
+// The near field does not go through the disc gather. Scatter-as-gather coverage is a 2D test
+// (|cs| > sqrt(i^2 + j^2)) and the separable passes can only apply it per axis: the vertical pass saw
+// a row's CENTRE CoC, so a near sample's diagonal reach was dropped (a cross-shaped, stepped bleed),
+// and the normalised gather made the bleed opaque up to its reach and then cut (user: "near bleed is
+// not as smooth"). Instead the near samples are MASKED out of the main layer and SPLATTED on their
+// own: each as a normalised Gaussian of ITS OWN size (sigma = DOF_NEAR_SIGMA x its radius), mask and
+// colour together, so the coverage a is the sum of the splats — 1 inside a near object, 0.5 on its
+// silhouette, fading smoothly outside — and out = main (1 - a) + near.
+// A Gaussian is separable per sample; the horizontal pass also keeps each row's coverage-weighted
+// mean sigma (gDofNearS), which the vertical pass splats that row with.
+// ⚠ NOT ONE SIGMA FOR THE NEIGHBOURHOOD: the first cut used the tile max, and the first-person arms
+// (24 px) smeared every near-ish sample around them to sigma 12 (user: "looks blurry all the time").
+// The tile max (doftile .y) only sizes the loops.
+#define DOF_NEAR_SIGMA  0.5f     // sigma per px of near CoC radius
+#define DOF_NEAR_TAPS   2.5f     // taps out to this many sigma (doftile reaches as far)
+
+// How much a sample with signed CoC c belongs to the near layer: none in focus, all from 1.5 px.
+float dofNearMask(float c)
+{
+    return saturate(-c - 0.5f);
+}
+
+// A 1D Gaussian splat of sigma sg at offset x, normalised to sum 1 over the integer taps (the
+// continuous normaliser, floored at 1 for the sub-pixel sigmas whose tap 0 is all of it).
+float dofNearSplat(float x, float sg)
+{
+    return exp(-0.5f * x * x / (sg * sg)) / max(2.5066283f * sg, 1.0f);
+}
+
+// The main layer's coverage. A pixel that is itself in the near field takes everything behind it
+// within its OWN radius: the background seen through its blurred, half-transparent fringe (the near
+// samples themselves are masked out by the caller).
+float dofMainCoverage(float cs, float cp, float d)
+{
+    if (cp < 0.0f)
+    {
+        float eff = (cs < cp) ? abs(cs) : abs(cp);
+        return saturate(eff - d + 0.5f);
+    }
+    return dofCoverage(cs, cp, d);
 }

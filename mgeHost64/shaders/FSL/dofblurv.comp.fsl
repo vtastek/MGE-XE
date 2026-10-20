@@ -12,6 +12,8 @@
 // ([[project_nan_survives_zero_multiply]]). The coverage of such a row is 0 for |j| >= 1 by
 // construction: every CoC in a sharp tile's neighbourhood is under 0.5 px.
 //
+// Then the NEAR LAYER (gDofNear/S, dofcommon "THE NEAR LAYER"): its column splats, composited over.
+//
 // opts.x: 0 the blur, 1 the CoC view (dofcoc's old arm, moved here), 2 the identity.
 
 #include "dof.srt.h"
@@ -56,11 +58,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     }
     else
     {
-        float R = LoadRWTex2D(gDofTileNb, p / DOF_TILE);
+        float R = LoadRWTex2D(gDofTileNb, p / DOF_TILE).x;
         if (R >= 0.5f)
         {
             float  Rk = max(R, 1.0f);
             int    n  = int(ceil(R));
+            // A row centred on a near px carries the background seen through that px's fringe: only a
+            // near px takes it. Any other px leaves near content to the near layer.
+            float  mp = dofNearMask(cp);
             float4 re0 = f4(0.0f);
             float4 im0 = f4(0.0f);
             float4 re1 = f4(0.0f);
@@ -70,7 +75,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             {
                 int2  s  = int2(p.x, clamp(p.y + j, 0, deliverN.y - 1));
                 float cs = LoadRWTex2D(gDofCoc, s);
-                float w  = dofCoverage(cs, cp, abs(float(j)));
+                float w  = dofMainCoverage(cs, cp, abs(float(j))) * lerp(1.0f - dofNearMask(cs), 1.0f, mp);
                 if (w > 0.0f)
                 {
                     float2 F0 = dofKernelTap(float(j), Rk, DOF_K0.xy) * w;
@@ -96,6 +101,27 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 // under zero.
                 outv = max(num / den, f4(0.0f));
             }
+        }
+
+        // THE NEAR LAYER over it (dofcommon "THE NEAR LAYER"): each row's near splat sum, splatted
+        // down the column at that row's own sigma. gDofNear/S are written everywhere.
+        float RnMax = LoadRWTex2D(gDofTileNb, p / DOF_TILE).y;
+        if (RnMax >= 0.5f)
+        {
+            int    nN = int(ceil(DOF_NEAR_TAPS * DOF_NEAR_SIGMA * RnMax));
+            float4 nr = f4(0.0f);
+            for (int j = -nN; j <= nN; ++j)
+            {
+                int2   s  = int2(p.x, clamp(p.y + j, 0, deliverN.y - 1));
+                float4 hr = LoadRWTex2D(gDofNear, s);
+                if (hr.w > 1.0e-6f)
+                {
+                    nr += dofNearSplat(float(j), max(LoadRWTex2D(gDofNearS, s), 0.25f)) * hr;
+                }
+            }
+            // Overlapping splats of different sizes can sum past 1: keep the colour, cap the cover.
+            nr = (nr.w > 1.0f) ? nr / nr.w : nr;
+            outv = float4(outv.rgb * (1.0f - nr.w) + max(nr.rgb, f3(0.0f)), outv.a);
         }
     }
     Write2D(gDofOut, p, outv);

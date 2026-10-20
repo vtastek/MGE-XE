@@ -2,7 +2,8 @@
 //
 // One thread per 16x16 tile: the max |CoC| over +-k tiles (opts.w = ceil(max CoC / 16)). That is the
 // kernel radius of every pixel in the tile, so a CoC that reaches over a tile edge (a near object's
-// bleed) is gathered by the tile it lands in. Tiles past the delivered rect are skipped.
+// bleed) is gathered by the tile it lands in. .y does the same for the near radius, reaching
+// DOF_NEAR_TAPS sigma (the near layer's Gaussian tail). Tiles past the delivered rect are skipped.
 
 #include "dof.srt.h"
 #include "dofcommon.h.fsl"
@@ -20,7 +21,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         RETURN();
     }
     int   k = int(gDofParams.opts.w);
-    float m = 0.0f;
+    float2 m = f2(0.0f);
     for (int j = -k; j <= k; ++j)
     {
         for (int i = -k; i <= k; ++i)
@@ -30,11 +31,15 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             {
                 // Only a CoC that can REACH this tile counts: the nearest px of tile u is
                 // 16 * (max(|i|,|j|) - 1) px away, so the far ring of a 3 px blur costs nothing.
-                float v     = LoadRWTex2D(gDofTile, u);
-                float reach = float(DOF_TILE * max(max(abs(i), abs(j)) - 1, 0));
-                if (v > reach)
+                float2 v     = LoadRWTex2D(gDofTile, u);
+                float  reach = float(DOF_TILE * max(max(abs(i), abs(j)) - 1, 0));
+                if (v.x > reach)
                 {
-                    m = max(m, v);
+                    m.x = max(m.x, v.x);
+                }
+                if (v.y * (DOF_NEAR_SIGMA * DOF_NEAR_TAPS) > reach)
+                {
+                    m.y = max(m.y, v.y);
                 }
             }
         }
