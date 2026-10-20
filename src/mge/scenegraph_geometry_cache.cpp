@@ -4971,7 +4971,12 @@ namespace MGE::GeometryCache {
                 static float    s_lastT = 0.0f;
                 static uint32_t s_still = kOffViewLiveFrames;
                 const float t = bodyAnim ? *(const float*)(bodyAnim + 0x58) : 0.0f;
-                if (bodyAnim && t != s_lastT) { s_still = 0; } else if (s_still < kOffViewLiveFrames) { ++s_still; }
+                // MENU MODE pauses every clock, the mod's included: a stopped clock there is the pause,
+                // not "no mod", so the body keeps its last state (its shadow vanished in menus, user
+                // 2026-10-20). Only a stop outside a menu counts toward switching it off.
+                const bool paused = mwBridge->IsMenu();
+                if (bodyAnim && t != s_lastT) { s_still = 0; }
+                else if (!paused && s_still < kOffViewLiveFrames) { ++s_still; }
                 s_lastT = t;
                 const bool live = s_fp2Body && !is3rd && s_still < kOffViewLiveFrames;
                 if (live != g_offViewBodyLive) {

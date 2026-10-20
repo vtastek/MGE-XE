@@ -2715,9 +2715,12 @@ float sunShadowVisibilityMode(float3 worldPosRel, float3 N, int cheap)
                                              worldPosRel, bias, slopeBias, cheap);
         occlusion = lerp(occlusion, occNext, t);
     }
-#line 488 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
-    float lbr = gShadowParams.sunParams.z;
-    occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
+#line 493 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+    if (cheap != 0 || gShadowParams.sunPcf1.z <= 0.5f)
+    {
+        float lbr = gShadowParams.sunParams.z;
+        occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
+    }
 
     if (t > 0.0f && toMap) { occlusion = lerp(occlusion, mapOcc, t); }
 

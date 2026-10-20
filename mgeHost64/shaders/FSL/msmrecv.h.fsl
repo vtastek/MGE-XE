@@ -485,8 +485,16 @@ float sunShadowVisibilityMode(float3 worldPosRel, float3 N, int cheap)
     // MOMENT QUADRATURE and the map has no quadrature. Amplifying the map instead would put a step of
     // exactly 1/(1-lbr) at the outer edge of the band, where the same fragment is answered by the map
     // alone a texel later.
-    float lbr = gShadowParams.sunParams.z;
-    occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
+    // ⚠ MSM ONLY. PCSS's occlusion is a true fraction of binary taps — nothing to correct — and the
+    // ~9x amplification (lbr 0.891) turned a pixel 11% of whose taps hit into a FULL shadow: every
+    // shadow grew by nearly its whole PCF radius and its penumbra became a hard edge ("shadows are
+    // blobby", "I look like the creeper from minecraft", user 2026-10-20). It rode the PCSS path from
+    // the day PCSS replaced MSM on hard surfaces.
+    if (cheap != 0 || gShadowParams.sunPcf1.z <= 0.5f)
+    {
+        float lbr = gShadowParams.sunParams.z;
+        occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
+    }
 
     if (t > 0.0f && toMap) { occlusion = lerp(occlusion, mapOcc, t); }
 

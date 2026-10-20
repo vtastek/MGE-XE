@@ -5030,9 +5030,11 @@ namespace {
     // The physically honest number for the sun is ~0.009 (0.53 degrees of angular diameter); that is
     // under one texel over any gap in a Morrowind cell, i.e. invisibly hard, so this is exaggerated
     // like every game's sun.
-    float              g_sunPcssSpread   = 0.06f;
+    // 0.06 -> 0.03 and the floor 1.2 -> 0.5 texels (user's eye, 2026-10-20), once the MSM light-bleeding
+    // amplification stopped riding the PCSS result (msmrecv.h.fsl) — it had been dilating every shadow.
+    float              g_sunPcssSpread   = 0.03f;
     float              g_sunPcssSearch   = 8.0f;  // blocker-search radius in TEXELS
-    float              g_sunPcfMinRadius = 1.2f;  // TEXELS — contact hardness floor
+    float              g_sunPcfMinRadius = 0.5f;  // TEXELS — contact hardness floor
     float              g_sunPcfMaxRadius = 3.9f; // TEXELS — past this SUN_PCF_TAPS breaks into rings
     // Disc-rotation noise (shadowparams.h.fsl sunNoise): 0 white world hash (the old look), 1 pixel
     // IGN static, 2 pixel IGN per frame, 3 auto = 2 under a temporal upscaler, else 1. The white hash
