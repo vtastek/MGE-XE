@@ -189,6 +189,14 @@ namespace IPC {
     constexpr std::uint32_t kDrawPortalMember = 0x10;
     constexpr std::uint32_t kDrawPortalAny    = kDrawPortalMask | kDrawPortalHull | kDrawPortalMember;
 
+    // FP2 OFF-VIEW (tasks/forge-first-person.md): a part of the HIDDEN 1st-person body — the
+    // player's 3rd-person body, posed in 1st person by an MWSE mod. Drawn into the shadow casters
+    // and the reflections only, never the main view (its camera sits inside that body's head).
+    // The client emits these LAST on each list, so every main-view walk can fill their slots and
+    // skip the draw without moving any other part's slot. One bit per list:
+    // kDrawOffView (casterFlags), kSkinFlagOffView (blendFlags), kMMDrawFlagOffView (drawFlags).
+    constexpr std::uint32_t kDrawOffView      = 0x20;
+
     // M1c per-frame draw item: which uploaded mesh (slot) to draw, with its current
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The
@@ -403,6 +411,7 @@ namespace IPC {
     //                        (refreshAnimatedMaterial), so the host can simply watch it fall.
     constexpr std::uint32_t kSkinFlagAlphaTest = 1u << 2;
     constexpr std::uint32_t kSkinFlagAlphaAnim = 1u << 3;
+    constexpr std::uint32_t kSkinFlagOffView   = 1u << 4;   // FP2: casters + reflections only (see kDrawOffView)
 
     // M-Skinning per-frame draw item: which uploaded skinned mesh (slot) to draw, the
     // part's bone count, and its mirror flag (left-side parts reuse the right mesh via a
@@ -489,6 +498,7 @@ namespace IPC {
     // to hide in (its address mode is PER STAGE, packed into the stage words), so the bit rides
     // drawFlags instead; the host relays it into the multimap instance Meta word.
     constexpr std::uint32_t kMMDrawFlagEnchantGlow = 2u;   // drawFlags bit1
+    constexpr std::uint32_t kMMDrawFlagOffView     = 4u;   // drawFlags bit2 — FP2, see kDrawOffView
 
     // Per-stage word packers (client builds, host/shader unpack).
     constexpr std::uint32_t kMMOpBase  = 0u;

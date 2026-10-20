@@ -73,6 +73,13 @@ namespace MGE::GeometryCache {
         // bypasses the ROOT's own app-cull flag (FP1b forces it culled to suppress
         // MW's own arm draws while the capture must keep running).
         bool              g_walkingFP = false;
+        // FP2: set while walking the hidden 1st-person body (onFrameReady, after the FP walk). Every
+        // shape visited is stamped offViewFrame and listed in g_offViewBodyKeys, in walk order.
+        bool                  g_walkingOffViewBody = false;
+        std::vector<uint32_t> g_offViewBodyKeys;
+        // The body is LIVE (posed by an MWSE mod) this frame: its own AnimationData clock moved within
+        // the last kOffViewLiveFrames. Decided in the FP0 block, read by the body walk.
+        bool                  g_offViewBodyLive = false;
         // FP particle systems (torch flame, enchant sparks) met during the FP walk. NiParticles
         // reach visitGeometry (they ARE NiTriBasedGeom in MW RTTI) but capture only as degenerate
         // particle-center meshes; collected here instead so buildFPParticleQuads can billboard
@@ -494,6 +501,7 @@ namespace MGE::GeometryCache {
         std::unordered_map<uint32_t, CachedGeometry>                    g_parked;
         std::unordered_map<uint32_t, NI::Pointer<NI::TriBasedGeometry>> g_parkedRefs;
         float     g_parkEye[3]            = {};
+        uint32_t  g_parkResighted         = 0;   // parked keys re-captured while parked (the player)
         std::vector<uint32_t> g_parkDropped;   // receipt: keys the last restore released
 
         constexpr float kParkRestoreDist  = 12288.0f;   // 1.5 cells: "the same exterior"
@@ -3231,6 +3239,21 @@ namespace MGE::GeometryCache {
                 }
                 if (g_windowCaptureBudget > 0) --g_windowCaptureBudget;
                 MGE_ZoneScopedN("GeomCache:capture");   // first sight only: separates capture from traversal
+                // A PARKED key seen again is live outside the parked exterior: the 3rd-person player
+                // (WorldObjectRoot, no cell) is parked on the way in and re-captured inside under the
+                // same shape addresses. Two copies of one key broke the way out: purgeAll queued this
+                // copy's key, restoreParked put the parked copy back, and the drain then released the
+                // shared slot under it — a "captured" entry with no slot, never re-shipped (the body
+                // gone after an exit). Keep one copy: drop the parked one. Not an eviction — the
+                // slot it held is this capture's (g_keySlot), and g_geomRefs takes the pin below.
+                if (!g_parked.empty()) {
+                    auto pit = g_parked.find(key);
+                    if (pit != g_parked.end()) {
+                        g_parked.erase(pit);
+                        g_parkedRefs.erase(key);
+                        ++g_parkResighted;
+                    }
+                }
                 auto& e = g_cache[key];
                 ++g_captureTotal;   // the ONE first-sight insertion point (walk + ensureLive)
                 // Take the engine reference the moment the key enters the cache. `geom` is provably
@@ -3256,6 +3279,7 @@ namespace MGE::GeometryCache {
                 { MGE_ZoneScopedN("GeomCache:cap.world"); captureWorld(e, geom); }  // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
+                if (g_walkingOffViewBody) { e.offViewFrame = g_frame; g_offViewBodyKeys.push_back(key); }
                 e.homeInteriorCell = g_captureInteriorCell;         // cell-grid eviction home tag
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
@@ -3296,6 +3320,7 @@ namespace MGE::GeometryCache {
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
+                if (g_walkingOffViewBody) { e.offViewFrame = g_frame; g_offViewBodyKeys.push_back(key); }
                 e.homeInteriorCell = g_captureInteriorCell;         // cell-grid eviction home tag
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
@@ -4826,6 +4851,25 @@ namespace MGE::GeometryCache {
         }
     }
 
+    static void fp2ProbeSample(NI::AVObject* root, bool is3rd, const char* anim);   // FP2 A0 probe, beside stampSuppressed
+
+    // The player's 3rd-person BODY AnimationData (actorNode == the body's scene node), or null.
+    // NOT MobileActor::getAnimationData (vtable +0xCC): in 1st person that returns the ARMS' data
+    // (probe 2026-10-19: actorNode != the body, timing ~206 s). The body's hangs off the player
+    // REFERENCE (MACP +0x14) as its Animation attachment: Reference::attachments @0x44, each
+    // {type @0, next @4, data @8}, type 0 = Animation (TES3Reference.h, TES3Attachment.h,
+    // Reference::getAttachedAnimationData).
+    static const char* playerBodyAnimData() {
+        const DWORD macp = MWBridge::get()->getPlayerMACP();
+        if (!macp) return nullptr;
+        const char* ref = *(const char* const*)(macp + 0x14);
+        const char* a = ref ? *(const char* const*)(ref + 0x44) : nullptr;
+        for (int guard = 0; a && guard < 32; ++guard, a = *(const char* const*)(a + 0x4)) {
+            if (*(const uint32_t*)a == 0u) return *(const char* const*)(a + 0x8);
+        }
+        return nullptr;
+    }
+
     void onFrameReady(void* dataHandler, const float* gateEye, float gateRadius, bool liveDrawBuild) {
         if (!g_device || !dataHandler) return;
         if (!Configuration.UseSceneGraphSnapshot) return;
@@ -4913,9 +4957,34 @@ namespace MGE::GeometryCache {
             // cache is still empty) — a phantom event in a log whose whole job is to mark real ones.
             static int s_was3rd = -1;
             const bool is3rd = mwBridge->is3rdPerson();
+            const char* bodyAnim = playerBodyAnimData();
+            // FP2 liveness: in 1st person MW leaves the body's clock at 0 and its bones still
+            // (A0 probe); an MWSE mod posing it (tools/mwse-dev-mods/FPBodyPose) moves timing[0]
+            // every frame. Live = it moved within the last few frames. No mod, no clock, no body:
+            // exactly the FP0 behaviour below. MGE_FP2_BODY=0 turns the whole feature off.
+            {
+                static const bool s_fp2Body = [] {
+                    const char* v = std::getenv("MGE_FP2_BODY");
+                    return !(v && v[0] == '0');
+                }();
+                constexpr uint32_t kOffViewLiveFrames = 8;
+                static float    s_lastT = 0.0f;
+                static uint32_t s_still = kOffViewLiveFrames;
+                const float t = bodyAnim ? *(const float*)(bodyAnim + 0x58) : 0.0f;
+                if (bodyAnim && t != s_lastT) { s_still = 0; } else if (s_still < kOffViewLiveFrames) { ++s_still; }
+                s_lastT = t;
+                const bool live = s_fp2Body && !is3rd && s_still < kOffViewLiveFrames;
+                if (live != g_offViewBodyLive) {
+                    LOG::logline("[fp2] 1st-person body %s (frame %llu)",
+                                 live ? "LIVE: shadows + reflections" : "off", (unsigned long long)g_frame);
+                }
+                g_offViewBodyLive = live;
+            }
             if (!is3rd) {
-                const uint32_t stamped =
-                    markSubtreeSuppressed(mwBridge->getPlayer3rdPersonNode());
+                // Suppressed unless live; a live body is walked and shipped off-view instead (after
+                // the FP walk). Stamping it here as well would drop it at every emit path.
+                const uint32_t stamped = g_offViewBodyLive ? 0u
+                    : markSubtreeSuppressed(mwBridge->getPlayer3rdPersonNode());
                 if (s_was3rd == 1) {
                     LOG::logline("[fp0] POV switch -> 1st person (frame %llu): stamped %u body entries suppressed",
                                  (unsigned long long)g_frame, stamped);
@@ -4924,10 +4993,23 @@ namespace MGE::GeometryCache {
                 LOG::logline("[fp0] POV switch -> 3rd person (frame %llu)", (unsigned long long)g_frame);
             }
             s_was3rd = is3rd ? 1 : 0;
-            // Park-lag correction (3rd person only — in 1st the body is suppressed above and
-            // never emitted, and the arms ride their own baked arm-camera bundle). One walk of
-            // the body subtree per frame, sharing the node the POV check just fetched.
-            if (is3rd) {
+            // FP2 A0 probe (MGE_FP2_PROBE=1): does MW keep animating the 3rd-person skeleton while
+            // 1st person hides it? FP2 (player shadow + reflection in 1st person) draws that body, so
+            // a frozen skeleton would cast a statue's shadow. Logs, per 120 frames and per POV, the
+            // largest per-frame move of a few limb bones RELATIVE to the body root (turning and
+            // walking move the root, not this), so idle breathing alone reads non-zero if it animates.
+            static const bool s_fp2Probe = [] {
+                const char* v = std::getenv("MGE_FP2_PROBE");
+                return v && v[0] == '1';
+            }();
+            if (s_fp2Probe) {
+                fp2ProbeSample(mwBridge->getPlayer3rdPersonNode(), is3rd, bodyAnim);
+            }
+            // Park-lag correction: everything the camera is welded to. In 3rd person that is the
+            // body; in 1st person the body too while it is live (off-view, but its shadow and its
+            // reflection follow the camera exactly as the visible body would). The arms ride their
+            // own baked arm-camera bundle. One walk of the body subtree per frame.
+            if (is3rd || g_offViewBodyLive) {
                 markSubtreePlayer(mwBridge->getPlayer3rdPersonNode());
             }
         }
@@ -5241,6 +5323,23 @@ namespace MGE::GeometryCache {
             // ourselves against the arm camera. P0 just logs counts + sample positions so we
             // can confirm the vertex space (local-vs-world) and sizes before wiring to the host.
             buildFPParticleQuads();
+        }
+
+        // FP2 OFF-VIEW BODY: in 1st person, while an MWSE mod poses the hidden 3rd-person body
+        // (g_offViewBodyLive, decided in the FP0 block), walk it so its shapes are captured and
+        // their palettes refreshed this frame, exactly as the visible body is in 3rd person. The
+        // engine app-culls only the ROOT, so the bypass is top-only (children keep their own cull
+        // state, which picks the drawn/sheathed weapon variant just as on the arm walk).
+        // inCharacter: the whole subtree is the player's body. The stamps it leaves (offViewFrame +
+        // g_offViewBodyKeys) are what route these shapes to the casters and the reflections only.
+        g_offViewBodyKeys.clear();
+        if (g_offViewBodyLive && RenderProcess::forgeOwnsFrame()) {
+            if (NI::Node* body = MWBridge::get()->getPlayer3rdPersonNode()) {
+                MGE_ZoneScopedN("GeomCache:walkOffViewBody");
+                g_walkingOffViewBody = true;
+                walk(body, /*inCharacter*/true, /*bypassCull*/true);
+                g_walkingOffViewBody = false;
+            }
         }
 
         // FP1b: while the host FP pass owns the arms, force MW's arm-scene ROOT appCulled
@@ -5959,6 +6058,10 @@ namespace MGE::GeometryCache {
         return g_fpKeys;
     }
 
+    const std::vector<uint32_t>& offViewBodyKeys() {
+        return g_offViewBodyKeys;
+    }
+
     uint32_t framesSinceEvictSweep() {
         return (uint32_t)(g_frame - g_lastSweepFrame);
     }
@@ -6321,6 +6424,7 @@ namespace MGE::GeometryCache {
             it = g_cache.erase(it);
         }
         g_parkEye[0] = eye[0]; g_parkEye[1] = eye[1]; g_parkEye[2] = eye[2];
+        g_parkResighted = 0;
         LOG::logline(">> [park] parked=%u groups=%u at (%.0f,%.0f,%.0f)", (unsigned)g_parked.size(),
                      (unsigned)g_parkedGroups.size(), eye[0], eye[1], eye[2]);
         return (uint32_t)g_parked.size();
@@ -6391,8 +6495,9 @@ namespace MGE::GeometryCache {
         // Re-arm so the window's cache=/captures= baseline is the restored cache. With the grid
         // already resident it captures ~nothing, and its forced sweeps rebuild the caster sets.
         armPostLoadWalk();
-        LOG::logline(">> [park] restored=%u released=%u (dist=%.0f vtBad=%u disabled=%u depthCap=%u)",
-                     restored, dropped, dist, climb.vtBad, climb.disabled, climb.depthCap);
+        LOG::logline(">> [park] restored=%u released=%u resighted=%u (dist=%.0f vtBad=%u disabled=%u depthCap=%u)",
+                     restored, dropped, g_parkResighted, dist, climb.vtBad, climb.disabled, climb.depthCap);
+        g_parkResighted = 0;
         return restored;
     }
 
@@ -6551,6 +6656,75 @@ namespace MGE::GeometryCache {
     // FP0: recursive stamp over a live subtree, deliberately IGNORING appCulled (the
     // caller marks a subtree the engine just culled). Stamps only entries that already
     // exist in the cache — no capture, no NI data derefs beyond the child arrays.
+    // FP2 A0 probe helpers. Re-finds the bones by name every sample instead of keeping pointers: an
+    // equipment change rebuilds body parts under the skeleton, and a diagnostic must not be the
+    // thing that dereferences a freed node.
+    static NI::AVObject* findNodeNamed(NI::AVObject* av, const char* name, int depth = 0) {
+        if (!av || depth > 64) return nullptr;
+        const char* n = av->getName();
+        if (n && _stricmp(n, name) == 0) return av;
+        if (!av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return nullptr;
+        auto* node = static_cast<NI::Node*>(av);
+        const auto count = node->children.getEndIndex();
+        for (size_t i = 0; i < count; ++i) {
+            if (auto* hit = findNodeNamed(node->children.at(i).get(), name, depth + 1)) return hit;
+        }
+        return nullptr;
+    }
+
+    static void fp2ProbeSample(NI::AVObject* root, bool is3rd, const char* anim) {
+        static const char* const kBones[] = { "Bip01 L Hand", "Bip01 R Hand", "Bip01 L Foot", "Bip01 Head" };
+        constexpr int kN = sizeof(kBones) / sizeof(kBones[0]);
+        static float    s_prev[kN][3] = {};
+        static bool     s_have[kN] = {};
+        static float    s_maxMove[kN] = {};
+        static uint32_t s_found = 0, s_frames = 0;
+        static int      s_pov = -1;
+        const int pov = is3rd ? 3 : 1;
+        if (pov != s_pov) {   // a POV switch starts a fresh window: never mix the two in one line
+            s_pov = pov;
+            std::memset(s_have, 0, sizeof(s_have));
+            std::memset(s_maxMove, 0, sizeof(s_maxMove));
+            s_found = s_frames = 0;
+        }
+        if (!root) return;
+        const NI::Point3& rt = root->worldTransform.translation;
+        for (int b = 0; b < kN; ++b) {
+            NI::AVObject* bone = findNodeNamed(root, kBones[b]);
+            if (!bone) { s_have[b] = false; continue; }
+            ++s_found;
+            const NI::Point3& t = bone->worldTransform.translation;
+            const float rel[3] = { t.x - rt.x, t.y - rt.y, t.z - rt.z };
+            if (s_have[b]) {
+                const float dx = rel[0] - s_prev[b][0], dy = rel[1] - s_prev[b][1], dz = rel[2] - s_prev[b][2];
+                s_maxMove[b] = std::max(s_maxMove[b], std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+            std::memcpy(s_prev[b], rel, sizeof(rel));
+            s_have[b] = true;
+        }
+        // MW's per-layer animation clocks (AnimationData::timing[3] @0x58, TES3AnimationData.h): if
+        // they advance in 1st person while the bones stay put, only the keyframe APPLY stopped, and
+        // FP2 can evaluate the keyframe manager (@0x2C0) at those times itself, as driveHeadMorphs does.
+        static float s_t0[3] = {};
+        float t[3] = {};
+        int   animIs3p = -1;   // -1 = no attachment
+        if (anim) {
+            std::memcpy(t, anim + 0x58, sizeof(t));
+            animIs3p = (*(const void* const*)anim == (const void*)root) ? 1 : 0;
+        }
+        if (s_frames == 0) { std::memcpy(s_t0, t, sizeof(t)); }
+        if (++s_frames >= 120) {
+            LOG::logline("[fp2-probe] pov=%d frames=%u bonesFound=%u maxMove/frame (u): LHand=%.3f RHand=%.3f LFoot=%.3f Head=%.3f rootCulled=%d"
+                         " | anim=%p is3pBody=%d mgr=%p timing %.3f,%.3f,%.3f -> %.3f,%.3f,%.3f",
+                         pov, s_frames, s_found, s_maxMove[0], s_maxMove[1], s_maxMove[2], s_maxMove[3],
+                         root->getAppCulled() ? 1 : 0,
+                         (const void*)anim, animIs3p, anim ? *(const void* const*)(anim + 0x2C0) : nullptr,
+                         s_t0[0], s_t0[1], s_t0[2], t[0], t[1], t[2]);
+            std::memset(s_maxMove, 0, sizeof(s_maxMove));
+            s_found = s_frames = 0;
+        }
+    }
+
     static uint32_t stampSuppressed(NI::AVObject* av) {
         if (!av) return 0;
         if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {

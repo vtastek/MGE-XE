@@ -1,0 +1,43 @@
+// mgeHost64 — DoF: the TILE NEIGHBOURHOOD max. Read dof.srt.h first.
+//
+// One thread per 16x16 tile: the max |CoC| over +-k tiles (opts.w = ceil(max CoC / 16)). That is the
+// kernel radius of every pixel in the tile, so a CoC that reaches over a tile edge (a near object's
+// bleed) is gathered by the tile it lands in. Tiles past the delivered rect are skipped.
+
+#include "dof.srt.h"
+#include "dofcommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 t      = int2(DispatchThreadID.xy);
+    int2 tilesN = (int2(gDofParams.rects.xy) + int2(DOF_TILE - 1, DOF_TILE - 1)) / DOF_TILE;
+    if (t.x >= tilesN.x || t.y >= tilesN.y)
+    {
+        RETURN();
+    }
+    int   k = int(gDofParams.opts.w);
+    float m = 0.0f;
+    for (int j = -k; j <= k; ++j)
+    {
+        for (int i = -k; i <= k; ++i)
+        {
+            int2 u = t + int2(i, j);
+            if (u.x >= 0 && u.y >= 0 && u.x < tilesN.x && u.y < tilesN.y)
+            {
+                // Only a CoC that can REACH this tile counts: the nearest px of tile u is
+                // 16 * (max(|i|,|j|) - 1) px away, so the far ring of a 3 px blur costs nothing.
+                float v     = LoadRWTex2D(gDofTile, u);
+                float reach = float(DOF_TILE * max(max(abs(i), abs(j)) - 1, 0));
+                if (v > reach)
+                {
+                    m = max(m, v);
+                }
+            }
+        }
+    }
+    Write2D(gDofTileNb, t, m);
+}

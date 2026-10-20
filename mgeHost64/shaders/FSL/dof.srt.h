@@ -7,10 +7,15 @@
 // In pixels that is theta * (px per radian), so nothing here is tuned per resolution or per FOV.
 // Deep focus is not a setting, it falls out: focus 10 m and the sky is 0.1 dpt off.
 //
-// ── TWO PASSES, BOTH COMPUTE (F8 hot-reload, and no late-Z trap — motionblur.srt.h) ──────────────
-//   doffocus.comp   ONE group of 8x8    -> gDofFocus[0]   autofocus: centre-window dioptres, eased
-//   dofcoc.comp     one thread per px   -> gDofOut        D0: the frame unchanged, or the CoC view
-// The bokeh gather (D2) replaces dofcoc's identity arm; the plumbing does not move.
+// ── FIVE PASSES, ALL COMPUTE (F8 hot-reload, and no late-Z trap — motionblur.srt.h) ─────────────
+//   doffocus.comp   ONE group of 8x8     -> gDofFocus[0]          autofocus: centre-window dioptres, eased
+//   dofcoc.comp     16x16 = one TILE     -> gDofCoc, gDofTile     signed CoC per px, max |CoC| per tile
+//   doftile.comp    one thread per tile  -> gDofTileNb            max over +-k tiles (the near reach)
+//   dofblurh.comp   one thread per px    -> gDofRe, gDofIm        the disc kernel's rows (complex)
+//   dofblurv.comp   one thread per px    -> gDofOut               columns, recombine; the CoC view
+// D2 (tasks/forge-dof.md "D2 design"): FULL RES, the kernel radius per tile, and every sample weighted
+// by whether its own CoC reaches the pixel (scatter-as-gather), which is what keeps in-focus edges
+// from haloing and lets the near field bleed.
 //
 // ⚠ THE FOCUS STATE IS A 1-ELEMENT BUFFER, NOT A 1x1 TEXTURE. Forge makes an mHeight == 1 texture
 // TEXTURE1D, and a Tex2D/WTex2D view of it reads 0 and drops writes with no error — the trap that
@@ -42,10 +47,20 @@ STRUCT(DofParams)
     //       the first-person arms sit inside it). Also the autofocus ignores anything nearer than y.
     // z = metres per MW unit.  w = RESET: 1 snaps D_f to the target (first frame after a build).
     DATA(float4, hands, None);
-    // x = DEBUG mode: 0 off (the identity), 1 the CoC view (far orange, near blue, green = < 1 px).
+    // x = DEBUG mode: 0 the blur, 1 the CoC view (far orange, near blue, green = < 1 px),
+    //     2 the identity (D0's copy: the plumbing with no lens).
     // y = the autofocus WINDOW radius, as a fraction of the delivered height.
-    // z = the CoC view's full-scale tint, in px of radius.  w reserved (cleared by the host).
+    // z = the CoC view's full-scale tint, in px of radius.
+    // w = k, the TILE NEIGHBOURHOOD radius in tiles = ceil(max CoC / 16): how far a CoC can reach.
     DATA(float4, opts, None);
+    // x = TARGET CAP (1 on): no pixel is blurred more than the focus TARGET would blur it, so a refocus
+    //     only ever eases blur IN — what the eye just turned to is sharp at once, what it left blurs
+    //     at the focus rate. Off = the eased focus alone (the image passes through a blurrier state
+    //     than either end on a near -> far look).
+    // yzw = THE EYE in invViewProj's space (MW units). Not the origin: a park fire's matrix is relative
+    //     to the bake eye, so while moving the eye sits a frame's motion away — measured from the
+    //     origin, near distances and the px-per-radian came out wrong (blur surging while walking).
+    DATA(float4, look, None);
 };
 
 BEGIN_SRT(DofSrtData)
@@ -59,6 +74,25 @@ BEGIN_SRT(DofSrtData)
         DECL_TEXTURE (Persistent, Tex2D(float4), gDofColor)
         // [0] = (D_f the eye's focus now, D_t the target, the window's weight sum, 1 = written).
         DECL_RWBUFFER(Persistent, RWBuffer(float4), gDofFocus)
+        // ─── D2's intermediates: all RW_TEXTURE, all REST in UNORDERED_ACCESS, sequenced by plain UAV
+        // barriers (bloom.srt.h / motionblur.srt.h's tile pyramid). R16F and RGBA16F typed UAV loads
+        // are the one hardware group the bloom pyramid already requires.
+        // Signed CoC RADIUS, delivered px, + far / - near (dofCocPx), at the delivered rect.
+        DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofCoc)
+        // max |CoC| per 16x16 tile, and that max over +-k tiles: the kernel radius of every px in it.
+        DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofTile)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float),  gDofTileNb)
+        // The horizontal pass's complex response, per kernel component (Re/Im = component 0, Re1/Im1 =
+        // component 1): Re and Im of the PREMULTIPLIED rgba (every weight hits all four channels,
+        // motionblur.srt.h's rule), and of the weight itself (W = Re0, Im0, Re1, Im1), all normalised
+        // by component 0's envelope sum so an HDR row stays inside fp16.
+        // ⚠ Rows in a SHARP tile are not written; the vertical pass skips them by coverage, never
+        // reads them.
+        DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofRe)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofIm)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofRe1)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofIm1)
+        DECL_RWTEXTURE(Persistent, RWTex2D(float4), gDofW)
         // pDof, the delivered image after the lens. Its own target, for motionblur.srt.h's reason.
         DECL_RWTEXTURE(Persistent, WTex2D(float4), gDofOut)
     END_SRT_SET(Persistent)

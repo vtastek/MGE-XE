@@ -12,9 +12,11 @@ int2 dofDepthTexel(float2 deliveredPx, float2 deliveredRect, float2 depthRect)
     return clamp(q, int2(0, 0), int2(depthRect) - int2(1, 1));
 }
 
-// DIOPTRES (1/m) of the surface at depth texel q, from the RADIAL distance. The sky (device depth 0,
-// reverse-Z far) is 0 dioptres: infinity, which is what an eye looking at the sky focuses on.
-float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit)
+// DIOPTRES (1/m) of the surface at depth texel q, from the RADIAL distance to `eye`. The sky (device
+// depth 0, reverse-Z far) is 0 dioptres: infinity, which is what an eye looking at the sky focuses on.
+// ⚠ `eye` IS NOT THE ORIGIN WHILE MOVING: a park fire's matrix is relative to the BAKE eye (the payload
+// was packed a frame earlier), so the real eye sits a frame's motion off it (dof.srt.h `look.yzw`).
+float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metresPerUnit, float3 eye)
 {
     if (dz <= 0.0f)
     {
@@ -22,7 +24,7 @@ float dofDioptre(float4x4 invVP, int2 q, float2 depthRect, float dz, float metre
     }
     float2 uv = (float2(q) + 0.5f) / depthRect;
     float4 p4 = mul(invVP, float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
-    float  d  = length(p4.xyz / p4.w) * metresPerUnit;
+    float  d  = length(p4.xyz / p4.w - eye) * metresPerUnit;
     return 1.0f / max(d, 1.0e-3f);
 }
 
@@ -35,4 +37,35 @@ float dofCocPx(float D, float Df, float4 eye, float2 hands)
     float dist = 1.0f / max(D, 1.0e-6f);
     c *= smoothstep(hands.x, hands.y, dist);
     return clamp(c, -eye.w, eye.w);
+}
+
+// ── THE DISC KERNEL (D4: two components) ───────────────────────────────────────────────────────
+// Niemitalo's complex Gaussians (Garcia's circular separable convolution). Per component c,
+// f(x) f(y) = exp((-a + ib)(x^2 + y^2)), so sum_c A_c Re + B_c Im is EXACTLY radial. A disc's hard edge
+// fitted by a few smooth radial ripples rings (Gibbs): a bright rim inside, a NEGATIVE dip outside —
+// and the separable taps cover a SQUARE, whose corners (r up to 1.41 x edge) sit in that dip. One
+// component dipped to -30% of the centre weight: the dark square halo around candle bokeh (user,
+// 10-18). Two: -8%, negative mass 5.4% -> 1.1%, and a flatter disc (inner min/max 0.54 -> 0.86).
+// Edge (first zero) at r = 1.227 kernel units, mapped to the CoC radius. Each float4 = (a, b, A, B).
+#define DOF_K0      float4(0.886528f, 5.268909f, 0.411259f, -0.548794f)
+#define DOF_K1      float4(1.960518f, 1.558213f, 0.513282f,  4.561110f)
+#define DOF_KEDGE   1.227f
+#define DOF_TILE    16
+
+// Component (a, b)'s complex tap weight for an offset of i px under kernel radius R px.
+float2 dofKernelTap(float i, float R, float2 ab)
+{
+    float x  = DOF_KEDGE * i / R;
+    float x2 = x * x;
+    float e  = exp(-ab.x * x2);
+    return e * float2(cos(ab.y * x2), sin(ab.y * x2));
+}
+
+// SCATTER-AS-GATHER COVERAGE of a sample with signed CoC cs, d px away, for a pixel with signed CoC
+// cp (+ far, - near). A sample FARTHER than the pixel (cs > cp) is clamped to the pixel's own radius:
+// the background cannot spread over what is in front of it. Half a px of soft edge.
+float dofCoverage(float cs, float cp, float d)
+{
+    float eff = (cs > cp) ? min(abs(cs), abs(cp)) : abs(cs);
+    return saturate(eff - d + 0.5f);
 }

@@ -2443,6 +2443,14 @@ namespace {
     // looks like "the glow is the wrong width" rather than like an indexing bug.
     inline uint32_t bloomSetDown(uint32_t dstMip) { return dstMip; }                    // 1..6
     inline uint32_t bloomSetUp(uint32_t dstMip)   { return kBloomMipCount + dstMip; }   // 7..12
+    // ...and ONE MORE past them: the prefilter reading the DEPTH OF FIELD's output (pDof, single
+    // sample, the delivered rect) through the _sc1 variant, used on the frames the DoF ran. A defocus
+    // and a glare are both convolutions and commute, so the glow of a defocused frame is the glow of
+    // the defocused image. Built from the RAW scene instead, the k = 0.5 lerp in resolve.frag put half
+    // a sharp frame back over the blur (D2, 2026-10-18: a 6.8 px CoC read as ~3 px). Written by the
+    // DoF build block, which runs after this set exists; it shares instance 0's cbuffer because only
+    // one of the two prefilters runs in a frame.
+    constexpr uint32_t kBloomSetDof = kBloomSetCount;
 
     // MB-2: the TILE SIZE's range, and the smaller number is what the two tile surfaces are SIZED
     // from. K is a live knob (it is simultaneously the dilation's granularity and the maximum blur
@@ -3003,6 +3011,9 @@ namespace {
         Shader*        pBloomDownShader = nullptr;         // bloomdown.comp ([1,3,3,1] tent)
         Shader*        pBloomUpShader = nullptr;           // bloomup.comp (tent + lerp accumulate)
         Pipeline*      pBloomPrefilterPipeline = nullptr;
+        Shader*        pBloomPrefilterDofShader = nullptr;   // bloomprefilter_sc1.comp, reading pDof
+        Pipeline*      pBloomPrefilterDofPipeline = nullptr;
+        bool           bloomDofReady = false;                // instance kBloomSetDof written
         Pipeline*      pBloomDownPipeline = nullptr;
         Pipeline*      pBloomUpPipeline = nullptr;
         bool           bloomReady = false;                 // gates the dispatch block
@@ -3073,10 +3084,21 @@ namespace {
         // ([[project_forge_1x1_texture_is_1d]]). Copied into pDofFocusReadback for the heartbeat.
         Buffer*        pDofFocus = nullptr;
         Buffer*        pDofFocusReadback = nullptr;
-        Shader*        pDofFocusShader = nullptr;
-        Shader*        pDofCocShader = nullptr;
-        Pipeline*      pDofFocusPipeline = nullptr;
-        Pipeline*      pDofCocPipeline = nullptr;
+        // D2's intermediates (dof.srt.h), all alloc- or tile-sized, all RESTING in UNORDERED_ACCESS.
+        Texture*       pDofCoc = nullptr;          // R16F signed CoC radius, delivered px
+        Texture*       pDofTile = nullptr;         // R16F max |CoC| per 16x16 tile...
+        Texture*       pDofTileNb = nullptr;       // ...and over the +-k neighbourhood: the kernel radius
+        Texture*       pDofRe = nullptr;           // RGBA16F the H pass's complex response, Re...
+        Texture*       pDofIm = nullptr;           // ...Im (kernel component 0)...
+        Texture*       pDofRe1 = nullptr;          // ...component 1's Re...
+        Texture*       pDofIm1 = nullptr;          // ...and Im...
+        Texture*       pDofW = nullptr;            // ...and RGBA16F both weights (Re0, Im0, Re1, Im1)
+        // The five passes, in dispatch order, one shader + pipeline each, indexed by kDofPass*.
+        enum { kDofPassFocus, kDofPassCoc, kDofPassTile, kDofPassBlurH, kDofPassBlurV, kDofPassCount };
+        static constexpr const char* kDofPassNames[kDofPassCount] = {
+            "doffocus.comp", "dofcoc.comp", "doftile.comp", "dofblurh.comp", "dofblurv.comp" };
+        Shader*        pDofShaders[kDofPassCount] = {};
+        Pipeline*      pDofPipelines[kDofPassCount] = {};
         // THREE instances, one pointer apart in gDofColor: [0] pSceneColor (or the MSAA pre-filter's
         // output), [1] the upscaler's output, [2] the motion blur's output.
         DescriptorSet* pDofSet = nullptr;
@@ -4112,6 +4134,31 @@ namespace {
         Buffer*        pIndirectArgs = nullptr;
     };
     LiveRenderer g_live;
+
+    // The DoF's five compute pipelines: torn down, and (re)built from disk. Shared by the build, the
+    // F8 hot-reload and the teardown, so the list of passes lives in kDofPassNames alone.
+    void dofRemovePipelines(Renderer* R) {
+        for (int i = 0; i < LiveRenderer::kDofPassCount; ++i) {
+            if (g_live.pDofPipelines[i]) { removePipeline(R, g_live.pDofPipelines[i]); g_live.pDofPipelines[i] = nullptr; }
+            if (g_live.pDofShaders[i])   { removeShader(R, g_live.pDofShaders[i]);     g_live.pDofShaders[i] = nullptr; }
+        }
+    }
+    bool dofAddPipelines(Renderer* R) {
+        bool ok = true;
+        for (int i = 0; i < LiveRenderer::kDofPassCount; ++i) {
+            ShaderLoadDesc sd = {};
+            sd.mComp.pFileName = LiveRenderer::kDofPassNames[i];
+            addShader(R, &sd, &g_live.pDofShaders[i]);
+            if (g_live.pDofShaders[i]) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pDofShaders[i];
+                addPipeline(R, &pd, &g_live.pDofPipelines[i]);
+            }
+            ok = ok && g_live.pDofPipelines[i];
+        }
+        return ok;
+    }
 
     // Every slot's Hi-Z prologue objects exist. The prologue runs only if both slots have them.
     bool hizObjectsReady() {
@@ -6602,7 +6649,14 @@ namespace {
     constexpr uint32_t kPgiPeekRes = 256;   // PEEK: face side (px), clamped to the mirror's size
     // HI-RES WORLD PROBE (knob pgiHiRes): the cube's side and mips (128 .. 8), and the pgi set's instances.
     constexpr uint32_t kPgiCubeRes = 128, kPgiCubeMips = 5;
-    constexpr uint32_t kPgiSetN = 7u + kPgiCubeMips;   // 0-5 as before, 6 world lit, 7.. the cube's mips
+    // H2 NEAR PROBES (knob pgiHiNear): the kPgiNear pool probes nearest the camera, each shot at peek
+    // resolution into its own atlas rows (raw 6 + 2j, lit 7 + 2j) and its own cube (gPgiNearCube0/1).
+    constexpr uint32_t kPgiNear = 2;
+    constexpr uint32_t kPgiNearLitInst = 7u + kPgiCubeMips;              // near j's relight: instance 12 + j
+    constexpr uint32_t kPgiNearMipInst = kPgiNearLitInst + kPgiNear;     // near j's mip k: 14 + j * mips + k
+    constexpr uint32_t kPgiPeekRows = 6u + 2u * kPgiNear;                // the peek atlas's rows of faces
+    // 0-5 as before, 6 world lit, 7.. the world cube's mips, then the near probes' relights and cube mips.
+    constexpr uint32_t kPgiSetN = kPgiNearMipInst + kPgiNear * kPgiCubeMips;
     // BALLS (tasks/forge-gi.md "probes placed by shooting balls", phase 1 = placement only, drawn by
     // pgiDebug 32; the field still comes from the columns).
     constexpr uint32_t kPgiBallMax = 512;   // balls per frame (camera + sun), 2 float4 each
@@ -6670,6 +6724,12 @@ namespace {
     // pgiHiNorm: how much of the volume's energy/tint normalization the cube takes (0 = its radiance as
     // captured from the world probe's spot — the mirror's truth test against the scene beside it).
     float g_pgiHiNorm  = 1.0f;
+    // knob pgiHiNear (H2, default 1 = on; 0 = off): the two pool probes nearest the camera get cubes of their own
+    // (skyamb.h.fsl pgiNearSpec), parallax-corrected by a sphere whose radius each cube carries per direction;
+    // they win over the world cube near themselves. pgiNearReach = the distance (u) from a near probe at which a
+    // receiver stops taking any of it.
+    float g_pgiHiNear     = 1.0f;
+    float g_pgiNearReach  = 768.0f;
     float g_pgiRecvVis   = 2.0f;    // knob pgiRecvVis: 0 off, 1 receiver sky AO over the probes' visibility, 2 receiver sky AO alone
     float g_pgiKernK     = 2.5f;    // knob pgiKernK: splat kernel radius = this x the pool's merge radius there
                                     // (1 also darkens a tunnel, but the receivers' own sky visibility does it
@@ -6813,6 +6873,17 @@ namespace {
         uint32_t       cubeTick = 0, cubeBuilds = 0;
         Shader*        sCube = nullptr; Shader* sCubeMip = nullptr;
         Pipeline*      pCube = nullptr; Pipeline* pCubeMip = nullptr;
+        // H2 NEAR PROBES (knob pgiHiNear): which pool slot each holds (-1 none), where it was shot, the
+        // faces still to shoot / shot at peek resolution, and its cube (atlas rows 6 + 2j raw, 7 + 2j lit).
+        struct Near {
+            int       slot = -1;
+            float     p[3] = {};
+            uint8_t   pend = 0, hiFaces = 0;
+            bool      hiNew = false, cubeBuilt = false, cubeInSR = false;
+            uint32_t  tick = 0, builds = 0, shots = 0;
+            Texture*  cube = nullptr;
+        } nearP[kPgiNear];
+        int            capNear = -1;          // this frame's capture is near probe j's
         Pgi() { for (int& s : slotOwner) { s = -1; } }
         PgiColumn      col[kPgiG * kPgiG];
         int            ix0 = 0, iy0 = 0;
@@ -7246,6 +7317,8 @@ namespace {
     constexpr uint32_t kGiDebugFloat          = kSkyHazeFloat + 12;
     // Probe GI specular (shadowparams.h.fsl pgiSpec; skyamb.h.fsl skyAmbSpecPx).
     constexpr uint32_t kPgiSpecFloat          = kGiDebugFloat + 4;
+    // H2 near probes (shadowparams.h.fsl pgiNear0, pgiNear1, pgiNearP; skyamb.h.fsl pgiNearOne).
+    constexpr uint32_t kPgiNearFloat          = kPgiSpecFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -7303,6 +7376,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, pgiSpec) == kPgiSpecFloat * sizeof(float),
                   "kPgiSpecFloat does not land on ShadowMaskParams::pgiSpec");
+    static_assert((kPgiNearFloat + 12) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
+    static_assert(offsetof(ShadowMaskParams, pgiNear0) == kPgiNearFloat * sizeof(float),
+                  "kPgiNearFloat does not land on ShadowMaskParams::pgiNear0");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -13982,6 +14059,18 @@ namespace {
             ShaderLoadDesc bup = {};
             bup.mComp.pFileName = "bloomup.comp";
             addShader(R, &bup, &g_live.pBloomUpShader);
+            // The DoF-source prefilter (kBloomSetDof): always _sc1, pDof is single-sample.
+            {
+                ShaderLoadDesc bpd = {};
+                bpd.mComp.pFileName = "bloomprefilter_sc1.comp";
+                addShader(R, &bpd, &g_live.pBloomPrefilterDofShader);
+                if (g_live.pBloomPrefilterDofShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pBloomPrefilterDofShader;
+                    addPipeline(R, &pd, &g_live.pBloomPrefilterDofPipeline);
+                }
+            }
             if (g_live.pBloomPrefilterShader) {
                 PipelineDesc pd = {};
                 pd.mType = PIPELINE_TYPE_COMPUTE;
@@ -14011,7 +14100,7 @@ namespace {
             if (g_live.pBloomMips && bloomCbvsOk
                 && g_live.pBloomPrefilterPipeline && g_live.pBloomDownPipeline
                 && g_live.pBloomUpPipeline) {
-                DescriptorSetDesc bset = SRT_SET_DESC(BloomSrtData, Persistent, kBloomSetCount, 0);
+                DescriptorSetDesc bset = SRT_SET_DESC(BloomSrtData, Persistent, kBloomSetCount + 1, 0);
                 addDescriptorSet(R, &bset, &g_live.pBloomSet);
             }
             if (g_live.pBloomSet) {
@@ -16933,11 +17022,47 @@ namespace {
                 odl.pDesc = &od;
                 addResource(&odl, nullptr);
 
+                // D2's intermediates. RW_TEXTURE only and START in UNORDERED_ACCESS, where they stay:
+                // every read is a UAV load one dispatch after the write, sequenced by UAV barriers.
+                // ⚠ The tile surfaces are at least 2 texels tall: a height-1 Forge texture is
+                // TEXTURE1D and a 2D view of it is silently dead ([[project_forge_1x1_texture_is_1d]]).
+                auto addDofSurface = [&](Texture** pp, uint32_t w, uint32_t h, TinyImageFormat fmt,
+                                         const char* name) {
+                    TextureDesc td = {};
+                    td.mWidth = w; td.mHeight = std::max(2u, h); td.mDepth = 1;
+                    td.mArraySize = 1; td.mMipLevels = 1;
+                    td.mSampleCount = SAMPLE_COUNT_1;
+                    td.mFormat = fmt;
+                    td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    td.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE;
+                    td.pName = name;
+                    TextureLoadDesc tl = {};
+                    tl.ppTexture = pp;
+                    tl.pDesc = &td;
+                    addResource(&tl, nullptr);
+                };
+                const uint32_t dofTilesW = (g_live.allocWidth  + 15u) / 16u;
+                const uint32_t dofTilesH = (g_live.allocHeight + 15u) / 16u;
+                addDofSurface(&g_live.pDofCoc,    g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16_SFLOAT, "dofCoc");
+                addDofSurface(&g_live.pDofTile,   dofTilesW, dofTilesH, TinyImageFormat_R16_SFLOAT, "dofTile");
+                addDofSurface(&g_live.pDofTileNb, dofTilesW, dofTilesH, TinyImageFormat_R16_SFLOAT, "dofTileNb");
+                addDofSurface(&g_live.pDofRe,     g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16G16B16A16_SFLOAT, "dofRe");
+                addDofSurface(&g_live.pDofIm,     g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16G16B16A16_SFLOAT, "dofIm");
+                addDofSurface(&g_live.pDofRe1,    g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16G16B16A16_SFLOAT, "dofRe1");
+                addDofSurface(&g_live.pDofIm1,    g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16G16B16A16_SFLOAT, "dofIm1");
+                addDofSurface(&g_live.pDofW,      g_live.allocWidth, g_live.allocHeight,
+                              TinyImageFormat_R16G16B16A16_SFLOAT, "dofW");
+
                 BufferLoadDesc dcb = {};
                 dcb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
                 dcb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
                 dcb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                dcb.mDesc.mSize        = 256;   // a float4x4 + five float4s; 256 B = min CBV
+                dcb.mDesc.mSize        = 256;   // a float4x4 + six float4s; 256 B = min CBV
                 dcb.mDesc.pName        = "dofParams";
                 dcb.ppBuffer           = &g_live.pDofParamsCbv;
                 addFrameBuf(&dcb);
@@ -16970,26 +17095,12 @@ namespace {
                                 (size_t)(kRbLane * kFrameSlots));
                 }
 
-                ShaderLoadDesc dfs = {};
-                dfs.mComp.pFileName = "doffocus.comp";
-                addShader(R, &dfs, &g_live.pDofFocusShader);
-                ShaderLoadDesc dcs = {};
-                dcs.mComp.pFileName = "dofcoc.comp";
-                addShader(R, &dcs, &g_live.pDofCocShader);
-                if (g_live.pDofFocusShader) {
-                    PipelineDesc pd = {};
-                    pd.mType = PIPELINE_TYPE_COMPUTE;
-                    pd.mComputeDesc.pShaderProgram = g_live.pDofFocusShader;
-                    addPipeline(R, &pd, &g_live.pDofFocusPipeline);
-                }
-                if (g_live.pDofCocShader) {
-                    PipelineDesc pd = {};
-                    pd.mType = PIPELINE_TYPE_COMPUTE;
-                    pd.mComputeDesc.pShaderProgram = g_live.pDofCocShader;
-                    addPipeline(R, &pd, &g_live.pDofCocPipeline);
-                }
+                const bool dofPipesOk = dofAddPipelines(R);
+                const bool dofSurfOk  = g_live.pDofCoc && g_live.pDofTile && g_live.pDofTileNb
+                                     && g_live.pDofRe && g_live.pDofIm && g_live.pDofRe1
+                                     && g_live.pDofIm1 && g_live.pDofW;
                 if (g_live.pDof && g_live.pDofParamsCbv && g_live.pDofFocus && g_live.pDofFocusReadback
-                    && g_live.pDofFocusPipeline && g_live.pDofCocPipeline) {
+                    && dofPipesOk && dofSurfOk) {
                     DescriptorSetDesc dset = SRT_SET_DESC(DofSrtData, Persistent, 3, 0);
                     addDescriptorSet(R, &dset, &g_live.pDofSet);
                 }
@@ -17000,7 +17111,7 @@ namespace {
                     Texture* upsTex   = (g_live.pUpscaler && g_live.pUpscaler->outputTexture())
                                             ? g_live.pUpscaler->outputTexture() : sceneTex;
                     Texture* mbTex    = g_live.pMotionBlur ? g_live.pMotionBlur : sceneTex;
-                    DescriptorData d[5] = {};
+                    DescriptorData d[13] = {};
                     d[0].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofParams);
                     d[0].ppBuffers = &g_live.pDofParamsCbv;
                     d[1].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofDepth);
@@ -17011,21 +17122,54 @@ namespace {
                     d[3].mCount = 1; d[3].ppBuffers = &g_live.pDofFocus;
                     d[4].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofOut);
                     d[4].mCount = 1; d[4].ppTextures = &g_live.pDof;
+                    d[5].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofCoc);
+                    d[5].mCount = 1; d[5].ppTextures = &g_live.pDofCoc;
+                    d[6].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofTile);
+                    d[6].mCount = 1; d[6].ppTextures = &g_live.pDofTile;
+                    d[7].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofTileNb);
+                    d[7].mCount = 1; d[7].ppTextures = &g_live.pDofTileNb;
+                    d[8].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofRe);
+                    d[8].mCount = 1; d[8].ppTextures = &g_live.pDofRe;
+                    d[9].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofIm);
+                    d[9].mCount = 1; d[9].ppTextures = &g_live.pDofIm;
+                    d[10].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofW);
+                    d[10].mCount = 1; d[10].ppTextures = &g_live.pDofW;
+                    d[11].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofRe1);
+                    d[11].mCount = 1; d[11].ppTextures = &g_live.pDofRe1;
+                    d[12].mIndex = SRT_RES_IDX(DofSrtData, Persistent, gDofIm1);
+                    d[12].mCount = 1; d[12].ppTextures = &g_live.pDofIm1;
                     // [0] off the scene, [1] off the upscaler, [2] off the motion blur — chosen per
                     // frame by INDEX, the same `mbRan ? 2 : (upscaled ? 1 : 0)` the resolve asked.
-                    updateDescriptorSet(R, 0, g_live.pDofSet, 5, d);
+                    updateDescriptorSet(R, 0, g_live.pDofSet, 13, d);
                     d[2].ppTextures = &upsTex;
-                    updateDescriptorSet(R, 1, g_live.pDofSet, 5, d);
+                    updateDescriptorSet(R, 1, g_live.pDofSet, 13, d);
                     d[2].ppTextures = &mbTex;
-                    updateDescriptorSet(R, 2, g_live.pDofSet, 5, d);
+                    updateDescriptorSet(R, 2, g_live.pDofSet, 13, d);
                     g_live.dofReady = true;
+                }
+                // The bloom's DoF-source prefilter instance (kBloomSetDof): pDof as the scene texture,
+                // otherwise instance 0's bindings exactly. Without it the DoF still runs and bloom
+                // keeps reading the raw scene (diluting the defocus — see kBloomSetDof).
+                if (g_live.dofReady && g_live.pBloomSet && g_live.pBloomPrefilterDofPipeline
+                    && g_live.pBloomParamsCbv[0] && g_live.pBloomMips) {
+                    DescriptorData bd[4] = {};
+                    bd[0].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomParams);
+                    bd[0].ppBuffers = &g_live.pBloomParamsCbv[0];
+                    bd[1].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomSceneTex);
+                    bd[1].mCount = 1; bd[1].ppTextures = &g_live.pDof;
+                    bd[2].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomSrc);
+                    bd[2].mCount = 1; bd[2].ppTextures = &g_live.pBloomMips; bd[2].mUAVMipSlice = 0;
+                    bd[3].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomDst);
+                    bd[3].mCount = 1; bd[3].ppTextures = &g_live.pBloomMips; bd[3].mUAVMipSlice = 0;
+                    updateDescriptorSet(R, kBloomSetDof, g_live.pBloomSet, 4, bd);
+                    g_live.bloomDofReady = true;
                 }
                 if (!g_live.dofReady) {
                     LOG::logline("!! [forge][dof] depth of field unavailable (out=%d cbv=%d focus=%d"
-                                 " focusPipe=%d cocPipe=%d set=%d) — pass OFF, frame unchanged",
+                                 " pipes=%d surfaces=%d set=%d) — pass OFF, frame unchanged",
                                  g_live.pDof ? 1 : 0, g_live.pDofParamsCbv ? 1 : 0,
-                                 g_live.pDofFocus ? 1 : 0, g_live.pDofFocusPipeline ? 1 : 0,
-                                 g_live.pDofCocPipeline ? 1 : 0, g_live.pDofSet ? 1 : 0);
+                                 g_live.pDofFocus ? 1 : 0, dofPipesOk ? 1 : 0,
+                                 dofSurfOk ? 1 : 0, g_live.pDofSet ? 1 : 0);
                 } else {
                     LOG::logline(">> [forge][dof] depth of field ready (target %ux%u RGBA16F)",
                                  g_live.allocWidth, g_live.allocHeight);
@@ -21071,8 +21215,16 @@ namespace {
     // ⚠ SHIPS OFF until the gather (D2) lands: D0/D1 only measures (the CoC view, the focus line on
     // the heartbeat), and `dofEnable=1` with `dofDebug=0` is a byte-identical copy of the frame.
     bool     g_dofEnable     = false;
-    uint32_t g_dofDebug      = 0u;      // 0 off | 1 the CoC view (orange far, blue near, green < 1 px)
+    bool     g_dofTargetCap  = false;   // cap each pixel's blur at the focus TARGET's (dof.srt.h `look`)
+    uint32_t g_dofDebug      = 0u;      // 0 the blur | 1 the CoC view (orange far, blue near, green < 1 px) | 2 identity
     float    g_dofPupilMm    = 6.0f;    // pupil DIAMETER, mm (Knu: 6). The blur is linear in it.
+    // DYNAMIC PUPIL (tasks/forge-dof.md): the pupil follows the exposure servo's adapting luminance
+    // instead of g_dofPupilMm — the eye's own 2..7 mm response mapped onto [min, max]. Off until it has
+    // been seen in play. 16 mm = the user's upper size (10-18); 4 keeps the eye's ~4:1 range.
+    bool     g_dofPupilAuto  = false;
+    float    g_dofPupilMinMm = 4.0f;
+    float    g_dofPupilMaxMm = 16.0f;
+    float    g_dofPupilNowMm = -1.0f;   // the eased dynamic pupil (-1 = snap on the next frame)
     float    g_dofAccomDpt   = 10.0f;   // accommodation range, dioptres: the near point is 1/this m
     float    g_dofFocusRate  = 4.0f;    // 1/s: how fast the eye re-focuses (sim clock; holds paused)
     float    g_dofWindow     = 0.03f;   // autofocus window radius, fraction of the delivered height
@@ -21086,6 +21238,7 @@ namespace {
     bool     g_lastDofRan    = false;
     bool     g_dofSnap       = true;    // the next dispatch snaps D_f to the target (set by every build)
     float    g_lastDofPxPerRad = 0.0f;  // for the heartbeat: the px-per-radian the CoC ran at
+    float    g_lastDofEyeOff   = 0.0f;  // ...and how far the eye sat off the matrix origin (MW units)
     // What the pass actually used, for the heartbeat's bracket. The K it RAN at, not the knob: the
     // knob is clamped to [kMbTileKMin, kMbTileKMax] and a line reporting the unclamped value would
     // describe a configuration that never existed.
@@ -21996,6 +22149,38 @@ namespace {
     // THE SERVO'S STATE. Published to resolve.frag as gResolveParams.tone.x, and to the heartbeat as
     // `exp=`. double rather than float because it is integrated one lag step per frame at ~165 Hz.
     double g_exposure    = 1.0;
+
+    // DoF DYNAMIC PUPIL (tasks/forge-dof.md). The adapting luminance is the servo's mid-grey,
+    // 0.18/E scene units in cd/m^2 (the `EVapplied` restatement), and the eye's pupil at it is de Groot
+    // & Gebhard's fit, d = 7.175 exp(-0.00092 (7.597 + log10 L)^3) mm: ~2 mm at noon (EV 15), ~4.6 in
+    // a lit interior (EV 4), towards 7 in the dark. log10 L is floored at -4 (scotopic) because below
+    // -7.6 the cube changes sign and the fit runs away. Its 2..7 mm span maps linearly onto
+    // [dofPupilMinMm, dofPupilMaxMm]. Eased on the SIM clock like a real pupil — constricts fast
+    // (0.3 s), dilates slowly (2 s) — and held while paused (dt = 0).
+    float g_dofPupilUsedMm = 6.0f;   // what the last dispatch ran at (heartbeat `pupil=`)
+    float dofPupilNow() {
+        if (!g_dofPupilAuto) {
+            g_dofPupilNowMm  = -1.0f;   // re-enabling snaps rather than easing from a stale value
+            g_dofPupilUsedMm = g_dofPupilMm;
+            return g_dofPupilMm;
+        }
+        const double L    = 0.18 / std::max(g_exposure, 1.0e-12) * sceneUnitCdNow();
+        const double lg   = std::max(-4.0, std::log10(std::max(L, 1.0e-12)));
+        const double c    = 7.597 + lg;
+        const double eye  = 7.175 * std::exp(-0.00092 * c * c * c);
+        const float  t    = (float)std::min(1.0, std::max(0.0, (eye - 2.0) / (7.0 - 2.0)));
+        const float  lo   = std::max(0.0f, std::min(g_dofPupilMinMm, g_dofPupilMaxMm));
+        const float  hi   = std::max(g_dofPupilMinMm, g_dofPupilMaxMm);
+        const float  want = lo + (hi - lo) * t;
+        if (g_dofPupilNowMm < 0.0f) {
+            g_dofPupilNowMm = want;
+        } else {
+            const float tau = (want < g_dofPupilNowMm) ? 0.3f : 2.0f;
+            g_dofPupilNowMm += (want - g_dofPupilNowMm) * (1.0f - std::exp(-std::max(g_simDt, 0.0f) / tau));
+        }
+        g_dofPupilUsedMm = g_dofPupilNowMm;
+        return g_dofPupilNowMm;
+    }
     // The E the RESOLVE last published — i.e. the E the frame the APL readback measures was rendered
     // with. The closed-loop correction must multiply THAT, not the current state: once the servo can
     // snap, a reading taken before the snap would otherwise ask for the same correction twice.
@@ -25228,6 +25413,8 @@ namespace {
             { "pgiHiCut",            &g_pgiHiCut            },
             { "pgiHiEvery",          &g_pgiHiEvery          },
             { "pgiHiNorm",           &g_pgiHiNorm           },
+            { "pgiHiNear",           &g_pgiHiNear           },
+            { "pgiNearReach",        &g_pgiNearReach        },
             { "pgiBlame",            &g_pgiBlame            },
             { "pgiNudge",            &g_pgiNudge            },
             { "pgiNudgeMargin",      &g_pgiNudgeMargin      },
@@ -25343,6 +25530,8 @@ namespace {
             { "mbSoftZ",             &g_mbSoftZ             },
             // DoF (tasks/forge-dof.md): the eye model's numbers, env-armed for unattended A/Bs.
             { "dofPupilMm",          &g_dofPupilMm          },
+            { "dofPupilMinMm",       &g_dofPupilMinMm       },
+            { "dofPupilMaxMm",       &g_dofPupilMaxMm       },
             { "dofAccomDpt",         &g_dofAccomDpt         },
             { "dofFocusRate",        &g_dofFocusRate        },
             { "dofWindow",           &g_dofWindow           },
@@ -25475,6 +25664,8 @@ namespace {
             { "mbEnable",            &g_mbEnable            },
             // DoF's master switch. Ships OFF until the gather lands (D2).
             { "dofEnable",           &g_dofEnable           },
+            { "dofTargetCap",        &g_dofTargetCap        },
+            { "dofPupilAuto",        &g_dofPupilAuto        },
             // MB-2d. The A/B is a LOOK question and a COST question at once — object-only removes the
             // camera smear AND most of the gather's work — so it has to be reachable from a minimized
             // run, like every other arm in this table.
@@ -25687,7 +25878,7 @@ namespace {
             { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
             { "mbMaxTaps", &g_mbMaxTaps, 64u },
             { "mbDebug",   &g_mbDebug,   4u },
-            { "dofDebug",  &g_dofDebug,  1u },
+            { "dofDebug",  &g_dofDebug,  2u },
             // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
             { "mbBgMode",  &g_mbBgMode,  2u },
             // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 RETIRED (runs 4), 4 cdblur; frame 0 cotangent,
@@ -27125,14 +27316,21 @@ namespace {
         // -- Tab: Depth of field (tasks/forge-dof.md) -- right after the motion blur, where it runs.
         // An EYE: the blur is pupil x dioptre error, so the numbers below are an eye's, not a lens's.
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Depth of field";
-          t.checkbox("DoF enable (D0: no blur yet — identity, or the CoC view below)", &g_dofEnable);
-          t.sliderU("DEBUG: 0 off | 1 CoC view (orange far, blue near, green = under 1 px)",
-                    &g_dofDebug, 0u, 1u, 1u);
+          t.checkbox("DoF enable", &g_dofEnable);
+          t.sliderU("DEBUG: 0 blur | 1 CoC view (orange far, blue near, green = under 1 px) | 2 no lens",
+                    &g_dofDebug, 0u, 2u, 1u);
           t.sliderF("  CoC view full-scale (px of radius)", &g_dofDebugPx, 0.5f, 32.0f, 0.5f);
-          t.sliderF("Pupil diameter (mm; 2 bright noon .. 8 dark) — blur is linear in it",
-                    &g_dofPupilMm, 0.5f, 12.0f, 0.1f);
+          // Past 8 mm it is no eye: a lens aperture (focal / f-number; 50 mm f/1.4 = 36 mm).
+          t.sliderF("Pupil / aperture (mm; eye 2 noon .. 8 dark; 36 = 50mm f/1.4) — blur is linear in it",
+                    &g_dofPupilMm, 0.5f, 64.0f, 0.5f);
+          t.checkbox("Dynamic pupil: follow the exposure (bright = min, dark = max; replaces the above)",
+                     &g_dofPupilAuto);
+          t.sliderF("  \\- min (mm, bright noon)", &g_dofPupilMinMm, 0.5f, 64.0f, 0.5f);
+          t.sliderF("  \\- max (mm, dark)", &g_dofPupilMaxMm, 0.5f, 64.0f, 0.5f);
           t.sliderF("Accommodation (dioptres; near point = 1/this m; lower = presbyopia)",
                     &g_dofAccomDpt, 0.0f, 20.0f, 0.5f);
+          t.checkbox("Target cap: never blurrier than the focus target (refocus only eases blur IN)",
+                     &g_dofTargetCap);
           t.sliderF("Focus speed (1/s; sim clock — holds on a paused frame)",
                     &g_dofFocusRate, 0.1f, 30.0f, 0.1f);
           t.sliderF("Autofocus window (fraction of screen height, radius)",
@@ -28320,6 +28518,9 @@ namespace {
           t.sliderF("  roughness where the cube hands over to the SH lobe", &g_pgiHiCut, 0.1f, 1.0f, 0.05f);
           t.sliderF("  frames between cube re-lights", &g_pgiHiEvery, 1.0f, 120.0f, 1.0f, "%.0f");
           t.sliderF("  energy/tint normalization by the volume (0 = raw cube: the mirror truth test)", &g_pgiHiNorm, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Probe GI H2 NEAR probes: the 2 nearest probes' own cubes, parallax-corrected (0 = off, the world cube alone)",
+                    &g_pgiHiNear, 0.0f, 1.0f, 0.05f);
+          t.sliderF("  near probe reach (u): a receiver this far from it takes none of it", &g_pgiNearReach, 64.0f, 4096.0f, 32.0f, "%.0f");
           t.sliderF("Probe GI BLAME the crosshair (1 = rank the probes lighting the point under it: log [pgi-blame], worst = MAGENTA ball, next four ORANGE; view with DEBUG 33)", &g_pgiBlame, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI NUDGE (1 = a probe inside geometry, red, is moved through its nearest back face and recaptured)", &g_pgiNudge, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI nudge margin past the back face (u)", &g_pgiNudgeMargin, 0.0f, 128.0f, 4.0f, "%.0f");
@@ -35273,6 +35474,8 @@ void destroyHostWindow(Renderer* R);
         const uint32_t* groupOff;      // ...same shape: index (mir*2 + at)*kMaxBatches + b
         const uint32_t* dynamic;       // draw indices of the dynamic-morph (own VB/IB) parts
         uint32_t        dynamicCount;
+        const uint32_t* offView;       // FP2: draw indices of the off-view (hidden 1P body) rigid parts
+        uint32_t        offViewCount;
         const IPC::DrawItemWire* items;
         const void*     skinnedBlob;
         uint32_t        skinnedCount;
@@ -37822,6 +38025,11 @@ void destroyHostWindow(Renderer* R);
                     sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
                                                    | (blended ? kSkinBlendBit : 0u);
                     std::memcpy(&sinst[inst * kSkinInstU32 + 2], &item.matAlpha, sizeof(float));
+                    // FP2 OFF-VIEW (the hidden 1st-person body): packed above like every part, so the
+                    // casters and the reflection — which RECORD from these buffers — can draw it; never
+                    // drawn into the main view, whose camera sits inside its head. The client emits
+                    // these LAST in the blob, so no other part's slot moves.
+                    if (item.blendFlags & IPC::kSkinFlagOffView) { continue; }
                     // A transparent surface must not write the depth the opaque colour pass then
                     // tests EQUAL against — it would depth-kill everything behind the ghost. The
                     // pack above still ran, so the bone window and the instance slot are identical
@@ -37956,6 +38164,10 @@ void destroyHostWindow(Renderer* R);
                     // [15..17] the emissive ratio. multimap.vert is SHARED by this prepass and the
                     // colour pass, and the gain never touches SV_Position, so early-Z stays exact.
                     fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
+                    // FP2 off-view body part (the head on the hidden 1st-person body): filled like
+                    // every part — the casters and the reflection record from idx — but never drawn
+                    // into the main view. Emitted LAST by the client, so no other idx moves.
+                    if (it.drawFlags & IPC::kMMDrawFlagOffView) { ++preDrawnMM; continue; }
 
                     const int mirror = worldMirrored(it.world) ? 1 : 0;
                     if (mirror != boundMMMirror) {
@@ -39060,15 +39272,16 @@ void destroyHostWindow(Renderer* R);
             if (g_lastDofRan && g_live.pDofFocusReadback && fbr(g_live.pDofFocusReadback)) {
                 const float* df = (const float*)rbLane(g_live.pDofFocusReadback);
                 const double Df = (double)df[0], Dt = (double)df[1];
-                const double pupilM = (double)std::max(0.0f, g_dofPupilMm) * 0.001;
+                const double pupilM = (double)std::max(0.0f, g_dofPupilUsedMm) * 0.001;
                 LOG::logline(">> [forge-hb] dof: focus=%.2f m (%.3f dpt) target=%.2f m (%.3f dpt)"
                              " win=%.2f valid=%d | pupil=%.1fmm accom=%.1fdpt (near %.2f m)"
-                             " pxPerRad=%.0f sky r=%.2f px | dbg=%u ovr=%.1fm x%.2f",
+                             " pxPerRad=%.0f eyeOff=%.1fu sky r=%.2f px | dbg=%u ovr=%.1fm x%.2f",
                              Df > 1.0e-6 ? 1.0 / Df : 1.0e9, Df, Dt > 1.0e-6 ? 1.0 / Dt : 1.0e9, Dt,
                              (double)df[2], df[3] == 1.0f ? 1 : 0,
-                             (double)g_dofPupilMm, (double)g_dofAccomDpt,
+                             (double)g_dofPupilUsedMm, (double)g_dofAccomDpt,
                              g_dofAccomDpt > 0.0f ? 1.0 / (double)g_dofAccomDpt : 1.0e9,
-                             (double)g_lastDofPxPerRad, 0.5 * pupilM * Df * (double)g_lastDofPxPerRad,
+                             (double)g_lastDofPxPerRad, (double)g_lastDofEyeOff,
+                             0.5 * pupilM * Df * (double)g_lastDofPxPerRad,
                              g_dofDebug, (double)g_dofOvrDistM, (double)g_dofOvrWeight);
             }
             if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
@@ -44838,9 +45051,15 @@ void destroyHostWindow(Renderer* R);
         //     the hull and the pit interior every frame: they live BEHIND the very surface the
         //     portal exists to open, so as far as the occlusion test is concerned they are hidden.
         static std::vector<uint32_t> s_portal;
+        // FP2 OFF-VIEW: the hidden 1st-person body's rigid parts (head, helmet, held gear). Out of the
+        // arena groups and the dynamic list, so the main view (prepass + colour, which draw exactly
+        // those) never sees them; the casters read items[] directly and the reflection draws this
+        // list itself (reflRecordNear).
+        static std::vector<uint32_t> s_offView;
         s_arena.clear();
         s_dynamic.clear();
         s_portal.clear();
+        s_offView.clear();
         if (s_arena.capacity() < count) s_arena.reserve(count);
         uint64_t nearIndexSum = 0;                // heartbeat: submitted index weight (per pass)
         uint32_t nearATDraws = 0;                 // heartbeat: cutout draws (alpha-tested prepass)
@@ -44850,6 +45069,10 @@ void destroyHostWindow(Renderer* R);
                 continue;   // mesh not uploaded yet (or evicted)
             }
             const HostMesh& m = g_meshes[slot];
+            if (items[i].casterFlags & IPC::kDrawOffView) {
+                s_offView.push_back(i);
+                continue;
+            }
             nearIndexSum += m.indexCount;
             // Portal members bypass BOTH the arena groups and the dynamic list (see s_portal).
             // Gated on the PSOs existing: with no gate RT there is nothing to confine the hull's
@@ -45385,6 +45608,8 @@ void destroyHostWindow(Renderer* R);
                 ni.groupOff     = &groupOff[0][0][0];
                 ni.dynamic      = s_dynamic.empty() ? nullptr : s_dynamic.data();
                 ni.dynamicCount = (uint32_t)s_dynamic.size();
+                ni.offView      = s_offView.empty() ? nullptr : s_offView.data();
+                ni.offViewCount = (uint32_t)s_offView.size();
                 ni.items        = items;
                 ni.skinnedBlob  = skinnedBlob;
                 ni.skinnedCount = skinnedCount;
@@ -46005,6 +46230,9 @@ void destroyHostWindow(Renderer* R);
                                                | (blended ? kSkinBlendBit : 0u);
                 std::memcpy(&sinst[inst * kSkinInstU32 + 2], &item.matAlpha, sizeof(float));
                 skinPrepMs += hostNowMs() - tPrep0;
+                // FP2 off-view body part: packed like every part (the prepass's twin), never drawn
+                // here, and never queued for the main view's alpha stage either.
+                if (item.blendFlags & IPC::kSkinFlagOffView) { continue; }
 
                 // Blended: everything above already happened (pack, palette, instance entry) — this
                 // walk is where base/window are correct, which is exactly why the deferred record is
@@ -46164,6 +46392,8 @@ void destroyHostWindow(Renderer* R);
                 fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
                 fe[14] = it.matAlpha;   // unused by multimap.frag (opaque forces 1.0); kept in sync
                 fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
+                // FP2 off-view body part: filled (the prepass's twin), never drawn into the main view.
+                if (it.drawFlags & IPC::kMMDrawFlagOffView) { ++multiMapDrawn; continue; }
 
                 const int mirror = worldMirrored(it.world) ? 1 : 0;
                 if (mirror != boundMMMirror) {
@@ -47055,6 +47285,7 @@ void destroyHostWindow(Renderer* R);
                         // below would reject them anyway. Named here rather than left to that
                         // accident.
                         if (it.casterFlags & (IPC::kDrawPortalMask | IPC::kDrawPortalHull)) { continue; }
+                        if (it.casterFlags & IPC::kDrawOffView) { continue; }   // FP2: not in the main view
                         const uint32_t slot = it.slot;
                         if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
                         HostMesh& m = g_meshes[slot];
@@ -47238,6 +47469,7 @@ void destroyHostWindow(Renderer* R);
                         for (uint32_t k = 0; k < nMM && s_objVel.size() < kObjVelBatch; ++k) {
                             const IPC::MultiMapDrawWire& it = mmIt[k];
                             ++ovExaminedMM;
+                            if (it.drawFlags & IPC::kMMDrawFlagOffView) { continue; }   // FP2: not in the main view
                             const uint32_t slot = it.slot;
                             if (slot >= g_meshHigh || !g_meshes[slot].valid
                                 || !g_meshes[slot].multimap) { continue; }
@@ -47375,6 +47607,9 @@ void destroyHostWindow(Renderer* R);
                             // depth where it is opaque (robe sashes; 449 of 3058 skinned NIFs are
                             // blend-with-test) — keeps the camera vector too. Counted, not hidden.
                             if (skinIsBlended(item)) { ++ovsBlend; continue; }
+                            // FP2 off-view body: not in the main view, so no velocity to write. This
+                            // walk keeps its OWN cursor, so a skip here moves nothing else.
+                            if (item.blendFlags & IPC::kSkinFlagOffView) { continue; }
                             if (s_objVelSkin.size() >= kObjVelSkinned) { ovsCap = 1; continue; }
                             // ⚠ SKIPPED AND COUNTED, NEVER WRAPPED. kObjVelBones is exactly the
                             // 64 KB CBV cap, so there is no widening this window — growth means a
@@ -50366,9 +50601,9 @@ void destroyHostWindow(Renderer* R);
 
         // ===================== DEPTH OF FIELD (tasks/forge-dof.md) ================================
         // After the motion blur, on whichever image this frame delivered (instance = the resolve's
-        // own `mbRan ? 2 : (upscaled ? 1 : 0)`), before bloom — which keeps reading the raw scene, for
-        // MB-2's reason: a lens spill and a defocus are separable, and bloom off a blurred frame
-        // loses the punch of a point light.
+        // own `mbRan ? 2 : (upscaled ? 1 : 0)`), before bloom — which then reads pDof (kBloomSetDof):
+        // defocus and glare are both convolutions and commute, and the resolve's k = 0.5 lerp off the
+        // RAW scene put half a sharp frame back over the blur. (MB keeps MB-2's raw-scene rule.)
         bool dofRan = false;
         const bool dofEligible = shaderResolve && g_live.dofReady && g_dofEnable
                               && deliveredW > 0u && deliveredH > 0u
@@ -50382,6 +50617,21 @@ void destroyHostWindow(Renderer* R);
             // NDC (0,0) and (0,1) on the near plane give tan(half the vertical FOV); half the delivered
             // height over it is px per radian. No FOV knob to keep in step with MW's.
             float pxPerRad = 0.0f;
+            // THE EYE in the matrix's space. NOT the origin: a park fire re-aims last frame's payload,
+            // which is relative to the BAKE eye, so while moving the eye sits a frame's motion off it
+            // — and both the near-plane rays below (1 unit out) and every pixel's distance measured
+            // from the origin came out wrong (pxPerRad 1174 -> up to 3238: the blur surging while
+            // walking). The eye is the projection centre, the one point with clip w = 0 (x = y = 0
+            // too; the half-pixel and jitter fixups scale with w, so they keep it): invVP (0,0,1,0).
+            float eyeRel[3] = { 0.0f, 0.0f, 0.0f };
+            if (vpOk) {
+                float h[4] = {};
+                for (int j = 0; j < 4; ++j) { h[j] = invVP[2 * 4 + j]; }
+                if (std::fabs(h[3]) > 1.0e-12f) {
+                    eyeRel[0] = h[0] / h[3]; eyeRel[1] = h[1] / h[3]; eyeRel[2] = h[2] / h[3];
+                }
+            }
+            g_lastDofEyeOff = std::sqrt(eyeRel[0] * eyeRel[0] + eyeRel[1] * eyeRel[1] + eyeRel[2] * eyeRel[2]);
             if (vpOk) {
                 auto unproj = [&](float x, float y, float z, float o[3]) {
                     const float c[4] = { x, y, z, 1.0f };
@@ -50390,7 +50640,7 @@ void destroyHostWindow(Renderer* R);
                         for (int i = 0; i < 4; ++i) { p[j] += c[i] * invVP[i * 4 + j]; }
                     }
                     const float w = (std::fabs(p[3]) > 1.0e-12f) ? p[3] : 1.0e-12f;
-                    o[0] = p[0] / w; o[1] = p[1] / w; o[2] = p[2] / w;
+                    o[0] = p[0] / w - eyeRel[0]; o[1] = p[1] / w - eyeRel[1]; o[2] = p[2] / w - eyeRel[2];
                 };
                 float a[3], b[3];
                 unproj(0.0f, 0.0f, 1.0f, a);
@@ -50414,12 +50664,10 @@ void destroyHostWindow(Renderer* R);
 
             if (fbr(g_live.pDofParamsCbv)) {
                 float* dp = (float*)fbw(g_live.pDofParamsCbv);
-                // Reserved lanes first, then the written ones (MB-2 step 0's rule). opts.w = dp[35].
-                dp[35] = 0.0f;
                 std::memcpy(dp, invVP, 16 * sizeof(float));
                 dp[16] = (float)deliveredW;   dp[17] = (float)deliveredH;
                 dp[18] = (float)g_live.width; dp[19] = (float)g_live.height;
-                dp[20] = std::max(0.0f, g_dofPupilMm) * 0.001f;
+                dp[20] = std::max(0.0f, dofPupilNow()) * 0.001f;
                 dp[21] = std::max(0.0f, g_dofAccomDpt);
                 dp[22] = pxPerRad;
                 dp[23] = std::max(0.5f, g_dofMaxPx);
@@ -50431,35 +50679,46 @@ void destroyHostWindow(Renderer* R);
                 dp[29] = std::max(dp[28] + 1.0e-3f, g_dofHandsFarM);
                 dp[30] = kMwUnitMetres;
                 dp[31] = g_dofSnap ? 1.0f : 0.0f;
-                dp[32] = (float)std::min(g_dofDebug, 1u);
+                dp[32] = (float)std::min(g_dofDebug, 2u);
                 dp[33] = std::max(0.001f, std::min(0.5f, g_dofWindow));
                 dp[34] = std::max(0.5f, g_dofDebugPx);
+                // k: how many 16 px tiles the largest CoC can reach across (doftile's neighbourhood).
+                dp[35] = std::ceil(std::max(0.5f, g_dofMaxPx) / 16.0f);
+                dp[36] = g_dofTargetCap ? 1.0f : 0.0f;
+                dp[37] = eyeRel[0]; dp[38] = eyeRel[1]; dp[39] = eyeRel[2];
             }
             g_dofSnap = false;
 
             const uint32_t dofInst = mbRan ? 2u : (upscaled ? 1u : 0u);
             gpuPhaseBegin(kGpuPhaseDof);
-            cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.7f, 0.9f, "DEPTH OF FIELD (focus + coc)");
+            cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.7f, 0.9f, "DEPTH OF FIELD");
             {
                 TextureBarrier tb = { g_live.pDof, RESOURCE_STATE_SHADER_RESOURCE,
                                       RESOURCE_STATE_UNORDERED_ACCESS };
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
             }
-            // (1) AUTOFOCUS: one group; writes gDofFocus[0].
-            cmdBindPipeline(g_live.pCmd, g_live.pDofFocusPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, dofInst, g_live.pDofSet);
-            cmdDispatch(g_live.pCmd, 1, 1, 1);
-            {
-                BufferBarrier bb = {};
-                bb.pBuffer = g_live.pDofFocus;
-                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
-            }
-            // (2) CoC: per delivered pixel; reads gDofFocus[0], writes pDof.
-            cmdBindPipeline(g_live.pCmd, g_live.pDofCocPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, dofInst, g_live.pDofSet);
-            cmdDispatch(g_live.pCmd, (deliveredW + 7u) / 8u, (deliveredH + 7u) / 8u, 1);
+            // One global UAV barrier between passes (cullUavAll): every intermediate rests in
+            // UNORDERED_ACCESS and each pass reads what the one before wrote.
+            auto dofUavBarrier = [&]() { cullUavAll(); };
+            const uint32_t gx8  = (deliveredW + 7u) / 8u,   gy8  = (deliveredH + 7u) / 8u;
+            const uint32_t tilesW = (deliveredW + 15u) / 16u, tilesH = (deliveredH + 15u) / 16u;
+            auto dofPass = [&](int pass, uint32_t gx, uint32_t gy) {
+                cmdBindPipeline(g_live.pCmd, g_live.pDofPipelines[pass]);
+                cmdBindDescriptorSet(g_live.pCmd, dofInst, g_live.pDofSet);
+                cmdDispatch(g_live.pCmd, gx, gy, 1);
+            };
+            // (1) AUTOFOCUS: one group -> gDofFocus[0].  (2) CoC: one group per tile -> gDofCoc,
+            // gDofTile.  (3) the tile neighbourhood -> gDofTileNb.  (4)/(5) the disc kernel's rows
+            // -> gDofRe/Im/W, then its columns + recombine -> pDof (or the CoC view / identity).
+            dofPass(LiveRenderer::kDofPassFocus, 1u, 1u);
+            dofUavBarrier();
+            dofPass(LiveRenderer::kDofPassCoc, tilesW, tilesH);
+            dofUavBarrier();
+            dofPass(LiveRenderer::kDofPassTile, (tilesW + 7u) / 8u, (tilesH + 7u) / 8u);
+            dofUavBarrier();
+            dofPass(LiveRenderer::kDofPassBlurH, gx8, gy8);
+            dofUavBarrier();
+            dofPass(LiveRenderer::kDofPassBlurV, gx8, gy8);
             {
                 TextureBarrier tb = { g_live.pDof, RESOURCE_STATE_UNORDERED_ACCESS,
                                       RESOURCE_STATE_SHADER_RESOURCE };
@@ -50559,7 +50818,10 @@ void destroyHostWindow(Renderer* R);
             // shader derives its resample ratio as src/dst — exactly 2 at inputScale 1.0, so this is
             // bit-for-bit the old 2x2 box there, and 1 at 0.5, where it becomes a straight copy.
             // No second set instance and no source choice: gBloomSceneTex is always pSceneColor.
-            fill(0, g_live.width, g_live.height, lw(0), lh(0));
+            // ...unless the DoF ran: then the prefilter reads pDof, at the DELIVERED rect (kBloomSetDof).
+            const bool bloomFromDof = dofRan && g_live.bloomDofReady;
+            fill(0, bloomFromDof ? deliveredW : g_live.width, bloomFromDof ? deliveredH : g_live.height,
+                 lw(0), lh(0));
             for (uint32_t m = 1; m < levels; ++m) {
                 fill(bloomSetDown(m), lw(m - 1), lh(m - 1), lw(m), lh(m));
             }
@@ -50584,8 +50846,9 @@ void destroyHostWindow(Renderer* R);
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
             };
 
-            cmdBindPipeline(g_live.pCmd, g_live.pBloomPrefilterPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pBloomSet);
+            cmdBindPipeline(g_live.pCmd, bloomFromDof ? g_live.pBloomPrefilterDofPipeline
+                                                      : g_live.pBloomPrefilterPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, bloomFromDof ? kBloomSetDof : 0u, g_live.pBloomSet);
             cmdDispatch(g_live.pCmd, (lw(0) + 7u) / 8u, (lh(0) + 7u) / 8u, 1);
             if (levels > 1) {
                 cmdBindPipeline(g_live.pCmd, g_live.pBloomDownPipeline);
@@ -51392,6 +51655,20 @@ void destroyHostWindow(Renderer* R);
             if (g_live.pBloomDownShader)       { removeShader(R, g_live.pBloomDownShader);          g_live.pBloomDownShader = nullptr; }
             if (g_live.pBloomPrefilterPipeline){ removePipeline(R, g_live.pBloomPrefilterPipeline); g_live.pBloomPrefilterPipeline = nullptr; }
             if (g_live.pBloomPrefilterShader)  { removeShader(R, g_live.pBloomPrefilterShader);     g_live.pBloomPrefilterShader = nullptr; }
+            if (g_live.pBloomPrefilterDofPipeline) { removePipeline(R, g_live.pBloomPrefilterDofPipeline); g_live.pBloomPrefilterDofPipeline = nullptr; }
+            if (g_live.pBloomPrefilterDofShader)   { removeShader(R, g_live.pBloomPrefilterDofShader);     g_live.pBloomPrefilterDofShader = nullptr; }
+            {
+                ShaderLoadDesc bpd = {};
+                bpd.mComp.pFileName = "bloomprefilter_sc1.comp";
+                addShader(R, &bpd, &g_live.pBloomPrefilterDofShader);
+                if (g_live.pBloomPrefilterDofShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pBloomPrefilterDofShader;
+                    addPipeline(R, &pd, &g_live.pBloomPrefilterDofPipeline);
+                }
+                g_live.bloomDofReady = g_live.bloomDofReady && g_live.pBloomPrefilterDofPipeline;
+            }
             ShaderLoadDesc bpf = {};
             // ⚠ The SAME sampleCount-driven variant pick as the build path — the two MUST agree, or a
             // hot-reload silently swaps the resolve for a plain copy (or reads a Tex2DMS through a
@@ -51493,31 +51770,11 @@ void destroyHostWindow(Renderer* R);
         }
 
         // DoF: the same rebuild on the same trigger. Failure = dofReady false, the frame unchanged.
-        if (g_live.pDofFocusShader || g_live.pDofCocShader) {
-            if (g_live.pDofCocPipeline)   { removePipeline(R, g_live.pDofCocPipeline);   g_live.pDofCocPipeline = nullptr; }
-            if (g_live.pDofCocShader)     { removeShader(R, g_live.pDofCocShader);       g_live.pDofCocShader = nullptr; }
-            if (g_live.pDofFocusPipeline) { removePipeline(R, g_live.pDofFocusPipeline); g_live.pDofFocusPipeline = nullptr; }
-            if (g_live.pDofFocusShader)   { removeShader(R, g_live.pDofFocusShader);     g_live.pDofFocusShader = nullptr; }
-            ShaderLoadDesc dfs = {};
-            dfs.mComp.pFileName = "doffocus.comp";
-            addShader(R, &dfs, &g_live.pDofFocusShader);
-            ShaderLoadDesc dcs = {};
-            dcs.mComp.pFileName = "dofcoc.comp";
-            addShader(R, &dcs, &g_live.pDofCocShader);
-            if (g_live.pDofFocusShader && g_live.pDofCocShader) {
-                PipelineDesc pf = {};
-                pf.mType = PIPELINE_TYPE_COMPUTE;
-                pf.mComputeDesc.pShaderProgram = g_live.pDofFocusShader;
-                addPipeline(R, &pf, &g_live.pDofFocusPipeline);
-                PipelineDesc pc = {};
-                pc.mType = PIPELINE_TYPE_COMPUTE;
-                pc.mComputeDesc.pShaderProgram = g_live.pDofCocShader;
-                addPipeline(R, &pc, &g_live.pDofCocPipeline);
-            }
-            g_live.dofReady = g_live.pDof && g_live.pDofSet && g_live.pDofFocusPipeline
-                           && g_live.pDofCocPipeline;
+        if (g_live.pDofSet) {
+            dofRemovePipelines(R);
+            g_live.dofReady = dofAddPipelines(R) && g_live.pDof;
             LOG::logline(g_live.dofReady
-                             ? ">> [forge][dof] shaders hot-reloaded (doffocus + dofcoc)"
+                             ? ">> [forge][dof] shaders hot-reloaded (focus, coc, tile, blurh, blurv)"
                              : "!! [forge][dof] hot-reload FAILED — depth of field DISABLED");
             LOG::flush();
         }
@@ -64514,6 +64771,8 @@ void destroyHostWindow(Renderer* R);
             mp[kPgiSpecFloat + 1] = 0.0f;
             mp[kPgiSpecFloat + 2] = 0.0f;
             mp[kPgiSpecFloat + 3] = 0.0f;
+            for (uint32_t q = 0; q < 12u; ++q) { mp[kPgiNearFloat + q] = 0.0f; }   // H2 near probes: none
+            mp[kPgiNearFloat + 3] = mp[kPgiNearFloat + 7] = -1.0f;
             mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 1] = std::clamp(g_giOpenRef, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 2] = std::clamp(g_giUnderGain, 0.0f, 4.0f);
@@ -66488,6 +66747,10 @@ void destroyHostWindow(Renderer* R);
             if (*ss[i]) { removeShader(R, *ss[i]); *ss[i] = nullptr; }
         }
         if (g_pgi.cube) { removeResource(g_pgi.cube); g_pgi.cube = nullptr; }
+        for (auto& np : g_pgi.nearP) {
+            if (np.cube) { removeResource(np.cube); np.cube = nullptr; }
+            np.slot = -1; np.pend = np.hiFaces = 0; np.hiNew = np.cubeBuilt = np.cubeInSR = false;
+        }
         g_pgi.cubeInSR = g_pgi.cubeBuilt = false;
         g_pgi.worldHiFaces = 0; g_pgi.worldHiNew = false;
         if (g_pgi.vol)    { removeResource(g_pgi.vol);    g_pgi.vol = nullptr; }
@@ -66566,8 +66829,9 @@ void destroyHostWindow(Renderer* R);
             g_pgi.peekRes = std::max(8u, std::min(kPgiPeekRes, reflectSize()) / 8u * 8u);
             TextureDesc td = {};
             // rows 0-1 the two peeked probes' raw captures, rows 2-3 the same relit (PGI_PEEKLIT);
-            // rows 4-5 the WORLD probe's, raw and relit (pgiHiRes: the cube is built from row 5)
-            td.mWidth = 6u * g_pgi.peekRes; td.mHeight = 6u * g_pgi.peekRes; td.mDepth = 1; td.mArraySize = 1;
+            // rows 4-5 the WORLD probe's, raw and relit (pgiHiRes: the cube is built from row 5);
+            // rows 6 + 2j / 7 + 2j the H2 near probe j's (pgiHiNear)
+            td.mWidth = 6u * g_pgi.peekRes; td.mHeight = kPgiPeekRows * g_pgi.peekRes; td.mDepth = 1; td.mArraySize = 1;
             td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
             td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -66586,6 +66850,11 @@ void destroyHostWindow(Renderer* R);
             td.pName = "pgiWorldCube";
             TextureLoadDesc tl = {}; tl.ppTexture = &g_pgi.cube; tl.pDesc = &td;
             addResource(&tl, nullptr);
+            for (uint32_t j = 0; j < kPgiNear; ++j) {   // H2: the near probes' cubes, the same shape
+                td.pName = (j == 0u) ? "pgiNearCube0" : "pgiNearCube1";
+                TextureLoadDesc tn = {}; tn.ppTexture = &g_pgi.nearP[j].cube; tn.pDesc = &td;
+                addResource(&tn, nullptr);
+            }
         }
         {   // the VOLUME (7 SH planes + meta, stacked in slices) and its per-cell world tags
             TextureDesc td = {};
@@ -66701,7 +66970,7 @@ void destroyHostWindow(Renderer* R);
         }
         waitForAllResourceLoads();
         if (!g_pgi.gbuf || !g_pgi.gbufE || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
-            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.blameBuf || !g_pgi.blameRb || !g_pgi.moveBuf || !g_pgi.moveRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit || !g_pgi.cube) { return fail("resource alloc"); }
+            || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.blameBuf || !g_pgi.blameRb || !g_pgi.moveBuf || !g_pgi.moveRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit || !g_pgi.cube || !g_pgi.nearP[0].cube || !g_pgi.nearP[1].cube) { return fail("resource alloc"); }
         for (Buffer* b : g_pgi.cbv) { if (!b) { return fail("cbuffer alloc"); } }
         // "No read yet": NaN everywhere, so a lane never written matches no column.
         std::memset(g_pgi.placeRb->pCpuMappedAddress, 0xFF, (size_t)(kPgiPlaceLane * kFrameSlots));
@@ -66764,10 +67033,20 @@ void destroyHostWindow(Renderer* R);
             d[29].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGBufE);     d[29].ppTextures = &g_pgi.gbufE;
             // The cube: instance 7 + k writes mip k and reads mip k - 1 (mip 0's build reads the atlas);
             // every other instance binds mip 0 for both and never touches it.
-            d[30].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCubeOut);   d[30].ppTextures = &g_pgi.cube;
-            d[30].mUAVMipSlice = (uint16_t)((i >= 7u) ? i - 7u : 0u);
-            d[31].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCubeIn);    d[31].ppTextures = &g_pgi.cube;
-            d[31].mUAVMipSlice = (uint16_t)((i >= 8u) ? i - 8u : 0u);
+            // H2: instance kPgiNearMipInst + j * mips + k does the same for near probe j's cube.
+            Texture** cubeT = &g_pgi.cube;
+            uint32_t  cubeK = 0u;   // the mip this instance writes (it reads the one above)
+            bool      cubeW = false;
+            if (i >= 7u && i < 7u + kPgiCubeMips) { cubeK = i - 7u; cubeW = true; }
+            else if (i >= kPgiNearMipInst) {
+                const uint32_t j = (i - kPgiNearMipInst) / kPgiCubeMips;
+                cubeK = (i - kPgiNearMipInst) % kPgiCubeMips; cubeW = true;
+                cubeT = &g_pgi.nearP[j].cube;
+            }
+            d[30].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCubeOut);   d[30].ppTextures = cubeT;
+            d[30].mUAVMipSlice = (uint16_t)(cubeW ? cubeK : 0u);
+            d[31].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiCubeIn);    d[31].ppTextures = cubeT;
+            d[31].mUAVMipSlice = (uint16_t)((cubeW && cubeK > 0u) ? cubeK - 1u : 0u);
             for (DescriptorData& x : d) { x.mCount = 1; }
             updateDescriptorSet(R, i, g_pgi.set, 32, d);
         }
@@ -66788,6 +67067,13 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
         if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
+        for (uint32_t j = 0; j < kPgiNear; ++j) {   // H2: read only once pgiNear0/1.w >= 0
+            pf.mIndex = (j == 0u) ? SRT_RES_IDX(SrtData, PerFrame, gPgiNearCube0) : SRT_RES_IDX(SrtData, PerFrame, gPgiNearCube1);
+            pf.ppTextures = &g_pgi.nearP[j].cube;
+            if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
+            if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+            if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
+        }
         {   // "what the probe sees" reads the G-buffer atlas from the main colour pass
             DescriptorData gv = {};
             gv.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiGBufView);
@@ -67062,11 +67348,52 @@ void destroyHostWindow(Renderer* R);
                 }
             }
         }
+        // H2 NEAR PROBES (knob pgiHiNear): hold the kPgiNear FINISHED pool probes nearest the camera. A held
+        // probe stays held while it is still among the nearest kPgiNear + 1 (no churn at a midpoint); a freed
+        // hold takes the nearest one not already held. A new hold — or a held probe the relight nudged — is
+        // re-shot at peek resolution (pend = all six faces); its old cube stays out of use until rebuilt.
+        if (g_pgi.ballMode && g_pgiHiNear > 0.0f) {
+            constexpr uint32_t kTop = kPgiNear + 1u;
+            int   top[kTop];
+            float topD[kTop];
+            for (uint32_t t = 0; t < kTop; ++t) { top[t] = -1; topD[t] = 1e30f; }
+            for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
+                const PgiBall& b = g_pgi.pool[k];
+                if (b.slot < 0 || b.faces != 0x3Fu) { continue; }
+                const float dx = b.p[0] - ex, dy = b.p[1] - ey, dz = b.p[2] - g_pgi.eyeZ;
+                float d2 = dx * dx + dy * dy + dz * dz;
+                int   s  = b.slot;
+                for (uint32_t t = 0; t < kTop; ++t) {
+                    if (d2 < topD[t]) { std::swap(d2, topD[t]); std::swap(s, top[t]); }
+                }
+            }
+            auto inTop = [&](int s) { for (int t : top) { if (t == s && s >= 0) { return true; } } return false; };
+            auto held  = [&](int s) { for (const auto& np : g_pgi.nearP) { if (np.slot == s) { return true; } } return false; };
+            for (auto& np : g_pgi.nearP) {
+                if (np.slot >= 0 && (!inTop(np.slot) || g_pgi.slotOwner[np.slot] < 0)) { np.slot = -1; np.cubeBuilt = false; }
+                if (np.slot < 0) {
+                    for (uint32_t t = 0; t < kTop; ++t) {
+                        if (top[t] >= 0 && !held(top[t])) { np.slot = top[t]; np.pend = 0x3Fu; np.hiFaces = 0; np.cubeBuilt = false; ++np.shots; break; }
+                    }
+                }
+                if (np.slot >= 0) {
+                    const PgiBall& b = g_pgi.pool[g_pgi.slotOwner[np.slot]];
+                    const float dx = b.p[0] - np.p[0], dy = b.p[1] - np.p[1], dz = b.p[2] - np.p[2];
+                    if (np.pend == 0x3Fu || dx * dx + dy * dy + dz * dz > 1.0f) {
+                        if (np.pend != 0x3Fu) { np.pend = 0x3Fu; np.hiFaces = 0; np.cubeBuilt = false; ++np.shots; }
+                        np.p[0] = b.p[0]; np.p[1] = b.p[1]; np.p[2] = b.p[2];
+                    }
+                }
+            }
+        } else {
+            for (auto& np : g_pgi.nearP) { np.slot = -1; np.pend = np.hiFaces = 0; np.cubeBuilt = false; }
+        }
         // Capture: nearest incomplete probe, next missing face. Only on a DRY view (nothing on screen
         // samples the mirror), every pgiEvery-th such frame, and never under the probe oracle.
         g_pgi.capThis = false;
         g_pgi.capBall = -1;
         g_pgi.capWorld = false;
+        g_pgi.capNear = -1;
         if (!waterOk || probeOracleActive()) { return; }
         // A WET view (water on screen samples the mirror): steal 1 frame in pgiSteal, and only when
         // the last normal reflect frame (the previous one) left the corner plus a margin unsampled
@@ -67180,6 +67507,28 @@ void destroyHostWindow(Renderer* R);
             if (steal) { ++g_pgi.steals; }
             return;
         }
+        // H2 NEAR PROBES (pgiHiNear): next, a held near probe's missing face at peek resolution — on a DRY frame
+        // only (a stolen frame reserves just a pgiCapRes corner). The capture is its own slot's, so the gather
+        // refreshes that probe's G-buffer tile too; the raw face also goes to atlas row 6 + 2j.
+        if (g_pgi.ballMode && g_pgiHiNear > 0.0f && !steal) {
+            for (uint32_t j = 0; j < kPgiNear; ++j) {
+                const auto& np = g_pgi.nearP[j];
+                if (np.slot < 0 || !np.pend) { continue; }
+                uint32_t face = 0;
+                for (uint32_t k = 0; k < 6u; ++k) {
+                    if (np.pend & (1u << kFaceOrder[k])) { face = kFaceOrder[k]; break; }
+                }
+                g_pgi.capSlot = (uint32_t)np.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)np.slot / (kPgiG * kPgiG);
+                g_pgi.capFace = face; g_pgi.capBall = np.slot; g_pgi.capNear = (int)j;
+                g_pgi.capThis = true;
+                g_capFace.active = true; g_capFace.pgi = true;
+                g_capFace.pos[0] = np.p[0]; g_capFace.pos[1] = np.p[1]; g_capFace.pos[2] = np.p[2];
+                g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+                g_capFace.res = g_pgi.peekRes;
+                g_capFace.steal = false;
+                return;
+            }
+        }
         if (g_pgi.ballMode) {
             int bb = -1; float bd = 1e30f;
             for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
@@ -67275,11 +67624,18 @@ void destroyHostWindow(Renderer* R);
         const uint32_t pr = g_pgi.peekRow & 1u;
         // The WORLD probe at peek resolution (pgiHiRes) keeps its raw face too, in the atlas's row 4.
         const bool worldHi = g_pgi.capWorld && g_capFace.res == g_pgi.peekRes && g_pgiHiRes > 0.0f;
-        P->capMisc = float4(kProbeFar, (g_pgi.peekThis || worldHi) ? 1.0f : 0.0f, (float)(f * g_pgi.peekRes),
-                            (float)((worldHi ? 4u : pr) * g_pgi.peekRes));
+        // ...and an H2 NEAR probe's (pgiHiNear) in row 6 + 2j.
+        const bool nearHi = g_pgi.capNear >= 0 && g_capFace.res == g_pgi.peekRes;
+        const uint32_t rawRow = worldHi ? 4u : nearHi ? 6u + 2u * (uint32_t)g_pgi.capNear : pr;
+        P->capMisc = float4(kProbeFar, (g_pgi.peekThis || worldHi || nearHi) ? 1.0f : 0.0f, (float)(f * g_pgi.peekRes),
+                            (float)(rawRow * g_pgi.peekRes));
         P->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
         if (g_pgi.peekThis) { pgiPeekState(false); g_pgi.peekMask[pr] |= (uint8_t)(1u << f); }
         if (worldHi) { pgiPeekState(false); g_pgi.worldHiFaces |= (uint8_t)(1u << f); g_pgi.worldHiNew = true; }
+        if (nearHi) {
+            auto& np = g_pgi.nearP[g_pgi.capNear];
+            pgiPeekState(false); np.hiFaces |= (uint8_t)(1u << f); np.hiNew = true;
+        }
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "PGI gather");
         cmdBindPipeline(g_live.pCmd, g_pgi.pGather);
         cmdBindDescriptorSet(g_live.pCmd, 1, g_pgi.set);
@@ -67293,6 +67649,10 @@ void destroyHostWindow(Renderer* R);
         if (g_pgi.capWorld) {
             g_pgi.worldFaces |= (uint8_t)(1u << f);
             g_pgi.worldPend &= (uint8_t)~(1u << f);
+            return;
+        }
+        if (g_pgi.capNear >= 0) {   // a FINISHED probe's face re-shot: only the near probe's own bookkeeping
+            g_pgi.nearP[g_pgi.capNear].pend &= (uint8_t)~(1u << f);
             return;
         }
         if (g_pgi.ballMode) {   // the capture's ball (its slot's owner), same bookkeeping as a column layer
@@ -67523,6 +67883,68 @@ void destroyHostWindow(Renderer* R);
                 ++g_pgi.cubeBuilds;
                 cmdEndDebugMarker(cmd);
             }
+            // H2 NEAR PROBES (pgiHiNear): the world cube's chain per held near probe — PEEKLIT world mode from its
+            // raw row (6 + 2j) into its lit row (7 + 2j, w = the inverse hit distance), then its cube in NEAR mode
+            // (alpha = that distance, the parallax radius). Same cadence: a new face at once, else every pgiHiEvery.
+            for (uint32_t j = 0; j < kPgiNear; ++j) {
+                auto& np = g_pgi.nearP[j];
+                if (!(g_pgi.ballMode && g_pgiHiNear > 0.0f && g_pgi.pPeekLit && g_pgi.pCube && g_pgi.pCubeMip && np.cube
+                      && np.slot >= 0 && np.hiFaces == 0x3Fu
+                      && (np.hiNew || ++np.tick >= (uint32_t)std::max(1.0f, g_pgiHiEvery)))) { continue; }
+                np.tick = 0;
+                np.hiNew = false;
+                cmdBeginDebugMarker(cmd, 0.9f, 0.7f, 0.3f, "PGI near cube");
+                TextureBarrier ub = {};
+                ub.pTexture = g_pgi.sh; ub.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; ub.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &ub, 0, nullptr);
+                pgiPeekState(false);
+                const uint32_t R = g_pgi.peekRes;
+                {
+                    PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[kPgiNearLitInst + j]);
+                    std::memset(Q, 0, sizeof(PgiParams));
+                    Q->emis    = pgiEmisLane();
+                    Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());
+                    Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
+                    Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
+                    Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+                    Q->capPos  = float4(np.p[0], np.p[1], np.p[2], 0.0f);
+                    Q->capTile = float4((float)(6u + 2u * j), 0.0f, (float)R, 1.0f);   // x = its raw row, w = 1: world mode
+                    Q->place   = float4((float)np.slot, 0.0f, (float)np.hiFaces, 0.0f);
+                    const bool skyLiveN = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+                    Q->skyLive = float4(skyLiveN ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);
+                    cmdBindPipeline(cmd, g_pgi.pPeekLit);
+                    cmdBindDescriptorSet(cmd, kPgiNearLitInst + j, g_pgi.set);
+                    cmdDispatch(cmd, (6u * R + 7u) / 8u, (R + 7u) / 8u, 1);
+                }
+                TextureBarrier pb = {};
+                pb.pTexture = g_pgi.peek; pb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; pb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &pb, 0, nullptr);
+                TextureBarrier cb = {};
+                cb.pTexture = np.cube;
+                cb.mCurrentState = np.cubeInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
+                cb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
+                for (uint32_t k = 0; k < kPgiCubeMips; ++k) {
+                    const uint32_t n = std::max(1u, kPgiCubeRes >> k);
+                    const uint32_t inst = kPgiNearMipInst + j * kPgiCubeMips + k;
+                    PgiParams* Q = (PgiParams*)fbw(g_pgi.cbv[inst]);
+                    std::memset(Q, 0, sizeof(PgiParams));
+                    // x = the atlas face, y = its lit row, z = this mip's side, w = 1: near mode (alpha = 1/distance)
+                    Q->capTile = float4((float)R, (float)(7u + 2u * j), (float)n, 1.0f);
+                    cmdBindPipeline(cmd, (k == 0u) ? g_pgi.pCube : g_pgi.pCubeMip);
+                    cmdBindDescriptorSet(cmd, inst, g_pgi.set);
+                    cmdDispatch(cmd, (n + 7u) / 8u, (n + 7u) / 8u, 6);
+                    cb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; cb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);   // mip k is mip k + 1's input
+                }
+                cb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; cb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
+                np.cubeInSR = true;
+                np.cubeBuilt = true;
+                ++np.builds;
+                cmdEndDebugMarker(cmd);
+            }
             // SPLAT (ball mode): the relit probes -> the volume, while the SH is still a UAV.
             if (g_pgi.ballMode && g_pgi.pSplat) {
                 TextureBarrier ub = {};
@@ -67713,6 +68135,13 @@ void destroyHostWindow(Renderer* R);
                              (double)g_pgi.worldP[0], (double)g_pgi.worldP[1], (double)g_pgi.worldP[2],
                              (unsigned)g_pgi.worldHiFaces, g_pgi.cubeBuilds,
                              (g_pgi.cubeBuilt && g_pgi.cubeInSR) ? "LIVE" : "not built");
+                if (g_pgiHiNear > 0.0f) {   // H2
+                    const auto& a = g_pgi.nearP[0];
+                    const auto& b = g_pgi.nearP[1];
+                    LOG::logline(">> [pgi] near probes: 0 slot %d faces %02x pend %02x shots %u builds %u %s | 1 slot %d faces %02x pend %02x shots %u builds %u %s",
+                                 a.slot, (unsigned)a.hiFaces, (unsigned)a.pend, a.shots, a.builds, a.cubeBuilt ? "LIVE" : "-",
+                                 b.slot, (unsigned)b.hiFaces, (unsigned)b.pend, b.shots, b.builds, b.cubeBuilt ? "LIVE" : "-");
+                }
             }
             // The 4 x 4 columns around the camera: each probe's height and state (D done, . not),
             // against the eye's own height — where a receiver's probes stand is the whole question
@@ -67764,6 +68193,21 @@ void destroyHostWindow(Renderer* R);
         mp[kPgiSpecFloat + 2] = std::clamp(g_pgiHiCut, 0.1f, 1.0f);
         mp[kPgiSpecFloat + 3] = std::clamp(g_pgiHiNorm, 0.0f, 1.0f);   // skyamb.h.fsl PGI_CUBE_LASTMIP = kPgiCubeMips - 1
         static_assert(kPgiCubeMips == 5u, "skyamb.h.fsl PGI_CUBE_LASTMIP is 4");
+        // H2 NEAR PROBES (skyamb.h.fsl pgiNearOne): each one's absolute position + slot, w = -1 until its cube is
+        // built and resting readable (the same gate as the world cube's, which they need for the normalization).
+        for (uint32_t j = 0; j < kPgiNear; ++j) {
+            const auto& np = g_pgi.nearP[j];
+            const bool nOn = cubeOn && g_pgiHiNear > 0.0f && np.slot >= 0 && np.cubeBuilt && np.cubeInSR;
+            mp[kPgiNearFloat + 4 * j + 0] = np.p[0];
+            mp[kPgiNearFloat + 4 * j + 1] = np.p[1];
+            mp[kPgiNearFloat + 4 * j + 2] = np.p[2];
+            mp[kPgiNearFloat + 4 * j + 3] = nOn ? (float)np.slot : -1.0f;
+        }
+        mp[kPgiNearFloat + 8]  = std::clamp(g_pgiHiNear, 0.0f, 1.0f);
+        mp[kPgiNearFloat + 9]  = std::max(64.0f, g_pgiNearReach);
+        mp[kPgiNearFloat + 10] = 0.0f;
+        mp[kPgiNearFloat + 11] = 0.0f;
+        static_assert(kPgiNear == 2u, "shadowparams.h.fsl carries exactly pgiNear0 and pgiNear1");
     }
 
     void renderSunShadow() {
@@ -68478,6 +68922,37 @@ void destroyHostWindow(Renderer* R);
             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
             cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
+            ++nearDrawn;
+        }
+
+        // FP2 OFF-VIEW rigid parts (the hidden 1st-person body's head, helmet, held gear): kept out
+        // of the main view's groups and dynamic list, so the mirror draws them here, inline. They may
+        // be arena-resident or own their VB/IB; the instance slot is items[i]'s as everywhere else.
+        for (uint32_t k = 0; k < in.offViewCount; ++k) {
+            const uint32_t i     = in.offView[k];
+            const uint32_t slot  = in.items[i].slot;
+            const uint32_t batch = i / kBatchSize;
+            const uint32_t local = i % kBatchSize;
+            HostMesh& m = g_meshes[slot];
+            Buffer* meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+            Buffer* meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+            if (!meshVb || !meshIb) { continue; }
+            const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+            const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+            const int mirror = worldMirrored(in.items[i].world) ? 1 : 0;
+            if (mirror != boundMirror) {
+                cmdBindPipeline(g_live.pCmd, opaquePSO[mirror]);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                boundMirror = mirror;
+            }
+            cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+            Buffer*  vbs[2]     = { meshVb, g_live.pInstanceBuf[batch] };
+            uint32_t strides[2] = { vStride, iStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, local);
             ++nearDrawn;
         }
 
@@ -70310,6 +70785,9 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pBloomUpShader)         { removeShader(R, g_live.pBloomUpShader);            g_live.pBloomUpShader = nullptr; }
         if (g_live.pBloomDownShader)       { removeShader(R, g_live.pBloomDownShader);          g_live.pBloomDownShader = nullptr; }
         if (g_live.pBloomPrefilterShader)  { removeShader(R, g_live.pBloomPrefilterShader);     g_live.pBloomPrefilterShader = nullptr; }
+        if (g_live.pBloomPrefilterDofPipeline) { removePipeline(R, g_live.pBloomPrefilterDofPipeline); g_live.pBloomPrefilterDofPipeline = nullptr; }
+        if (g_live.pBloomPrefilterDofShader)   { removeShader(R, g_live.pBloomPrefilterDofShader);     g_live.pBloomPrefilterDofShader = nullptr; }
+        g_live.bloomDofReady = false;
         for (uint32_t s = 0; s < kBloomSetCount; ++s) {
             if (g_live.pBloomParamsCbv[s]) { removeFrameBuf(g_live.pBloomParamsCbv[s]); g_live.pBloomParamsCbv[s] = nullptr; }
         }
@@ -70346,10 +70824,12 @@ void destroyHostWindow(Renderer* R);
         // DoF. Same order: set, pipelines, shaders, resources. The rebuilt focus buffer starts at
         // .w = 0, and g_dofSnap makes the first dispatch snap to the target anyway.
         if (g_live.pDofSet)             { removeDescriptorSet(R, g_live.pDofSet);        g_live.pDofSet = nullptr; }
-        if (g_live.pDofCocPipeline)     { removePipeline(R, g_live.pDofCocPipeline);     g_live.pDofCocPipeline = nullptr; }
-        if (g_live.pDofFocusPipeline)   { removePipeline(R, g_live.pDofFocusPipeline);   g_live.pDofFocusPipeline = nullptr; }
-        if (g_live.pDofCocShader)       { removeShader(R, g_live.pDofCocShader);         g_live.pDofCocShader = nullptr; }
-        if (g_live.pDofFocusShader)     { removeShader(R, g_live.pDofFocusShader);       g_live.pDofFocusShader = nullptr; }
+        dofRemovePipelines(R);
+        for (Texture** t : { &g_live.pDofCoc, &g_live.pDofTile, &g_live.pDofTileNb,
+                             &g_live.pDofRe, &g_live.pDofIm, &g_live.pDofRe1, &g_live.pDofIm1,
+                             &g_live.pDofW }) {
+            if (*t) { removeResource(*t); *t = nullptr; }
+        }
         if (g_live.pDofFocusReadback)   { removeResource(g_live.pDofFocusReadback);      g_live.pDofFocusReadback = nullptr; }
         if (g_live.pDofFocus)           { removeResource(g_live.pDofFocus);              g_live.pDofFocus = nullptr; }
         if (g_live.pDofParamsCbv)       { removeFrameBuf(g_live.pDofParamsCbv);          g_live.pDofParamsCbv = nullptr; }

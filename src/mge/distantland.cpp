@@ -320,7 +320,10 @@ void DistantLand::frameSetupEarly() {
                              && RenderProcess::hasCompositeFrame()
                              // Host-drawn UI: a frozen world sends no kick, and the kick is what
                              // carries the UI to the host that presents it. The menu would freeze.
-                             && !RenderProcess::hostUiActive();
+                             && !RenderProcess::hostUiActive()
+                             // The dev panel likewise: its cursor and clicks ride the kick, so a
+                             // 1-in-8 refresh ran it at ~25 Hz (user 10-18: "host mouse is choppy").
+                             && !RenderProcess::devUiVisible();
     if (!freezeEligible) {
         // Leaving the menu (or losing the composite) resets the cadence so the next menu always
         // opens on a freshly rendered frame rather than mid-cycle.

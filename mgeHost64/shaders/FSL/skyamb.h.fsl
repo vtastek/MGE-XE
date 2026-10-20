@@ -653,7 +653,95 @@ float3 pgiWorldE(float3 N, float3 bw, out float valid)
 // with pgiSpecSharp 0, i.e. with smooth SH on both sides). Irradiance is smooth and positive.
 // pgiSpec.y = strength (published 0 until the cube is built and resting readable), w = its last mip.
 #define PGI_CUBE_LASTMIP 4.0f   // forgerender.cpp kPgiCubeMips - 1
-float3 pgiHiSpec(float3 R, float rough, float3 E, float3 eIrr)
+
+// Any probe slot's own irradiance at N (pgiWorldE's lookup at that slot's texel; layer = slot / G^2).
+float3 pgiSlotE(float slotF, float3 N, out float valid)
+{
+    const float  G    = gShadowParams.pgiParams0.w;
+    const uint   g    = (uint)G;
+    const uint   slot = (uint)max(slotF, 0.0f);
+    const uint   layer = slot / (g * g), s2 = slot % (g * g);
+    const float3 uv   = float3(((float)(s2 % g) + 0.5f) / G, ((float)(s2 / g) + 0.5f) / G, 0.0f);
+    const float4 m    = gPgiSH.SampleLevel(gSamplerPointClamp, uv + float3(0.0f, 0.0f, 14.0f + (float)layer), 0.0f);
+    valid = m.y;
+    if (m.y < 1.0e-3f) { return f3(0.0f); }
+    float4 q[7];
+    UNROLL for (int k = 0; k < 7; ++k) {
+        q[k] = gPgiSH.SampleLevel(gSamplerPointClamp, uv + float3(0.0f, 0.0f, (float)layer * 7.0f + (float)k), 0.0f) / m.y;
+    }
+    const float3 n = normalize(N);
+    const float Y[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x,
+                         1.092548f * n.x * n.y, 1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f),
+                         1.092548f * n.x * n.z, 0.546274f * (n.x * n.x - n.y * n.y) };
+    const float f[28] = { q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w,
+                          q[2].x, q[2].y, q[2].z, q[2].w, q[3].x, q[3].y, q[3].z, q[3].w,
+                          q[4].x, q[4].y, q[4].z, q[4].w, q[5].x, q[5].y, q[5].z, q[5].w,
+                          q[6].x, q[6].y, q[6].z, q[6].w };
+    float3 E = f3(0.0f);
+    UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
+    return max(E, f3(0.0f));
+}
+
+// The direction to look a near cube up with, for a ray from P along R: the SPHERE PROXY (user, 2026-10-18),
+// its radius taken from the cube itself — alpha is the mean INVERSE hit distance in that direction (pgi.comp.fsl
+// PGI_CUBE near mode; 0 = sky, i.e. no parallax). A first guess from the coarsest mip at R, then once more at
+// the direction that guess hit. d = P - C. A receiver outside its sphere (c > 0 with the ray leaving) or a hole
+// (alpha < 0) falls back to R.
+float3 pgiNearDir(float3 d, float3 R, uint which)
+{
+    float3 dir = R;
+    UNROLL for (int it = 0; it < 2; ++it) {
+        const float  lodR = (it == 0) ? PGI_CUBE_LASTMIP : PGI_CUBE_LASTMIP - 2.0f;
+        const float  inv  = (which == 0u) ? SampleLvlTexCube(gPgiNearCube0, gSamplerTrilinearClamp, dir, lodR).a
+                                          : SampleLvlTexCube(gPgiNearCube1, gSamplerTrilinearClamp, dir, lodR).a;
+        if (inv < 0.0f) { return dir; }
+        const float  r  = 1.0f / max(inv, 1.0e-5f);
+        const float  b  = dot(d, R);
+        const float  c  = dot(d, d) - r * r;
+        const float  disc = b * b - c;
+        if (c > 0.0f || disc < 0.0f) { return dir; }
+        dir = normalize(d + R * (-b + sqrt(disc)));
+    }
+    return dir;
+}
+
+// How much a near probe COVERS P (0 = none): full out to 75% of its reach, then a short fade. NOT a long ramp,
+// and no roughness term (the caller's outer lerp already trades the cube for the SH by roughness): a partial
+// weight shows the world cube through it, the same scene from another viewpoint — a building with a roof and
+// a faded second roof (user, 2026-10-19). Cheap — no fetch. Returns -1 for a probe that is not live.
+float pgiNearCover(float4 nP, float3 P, out float dist)
+{
+    dist = 1.0e30f;
+    if (nP.w < 0.0f || gShadowParams.pgiNearP.x <= 0.0f) { return -1.0f; }
+    const float reach = max(gShadowParams.pgiNearP.y, 1.0f);
+    dist = length(P - nP.xyz);
+    return gShadowParams.pgiNearP.x * (1.0f - smoothstep(0.75f * reach, reach, dist));
+}
+
+// One near cube's radiance for a receiver at P (absolute), normalized like the world cube by THIS probe's own
+// irradiance. Returns rgb and the weight it earns (w = pgiNearW's, 0 = none survives the lookups).
+float4 pgiNearOne(float4 nP, uint which, float3 P, float3 R, float rough, float cut, float3 eIrr, float w)
+{
+    const float3 d = P - nP.xyz;
+    float valid;
+    const float3 Ep = pgiSlotE(nP.w, R, valid);
+    if (valid < 1.0e-3f) { return f4(0.0f); }
+    const float3 dir = pgiNearDir(d, normalize(R), which);
+    const float  lod = saturate(rough / cut) * PGI_CUBE_LASTMIP;
+    float4 L0 = (which == 0u) ? SampleLvlTexCube(gPgiNearCube0, gSamplerTrilinearClamp, dir, lod)
+                              : SampleLvlTexCube(gPgiNearCube1, gSamplerTrilinearClamp, dir, lod);
+    if (L0.a < 0.0f) {   // a hole (a back face): two mips up, as the world cube fills one
+        L0 = (which == 0u) ? SampleLvlTexCube(gPgiNearCube0, gSamplerTrilinearClamp, dir, lod + 2.0f)
+                           : SampleLvlTexCube(gPgiNearCube1, gSamplerTrilinearClamp, dir, lod + 2.0f);
+        if (L0.a < 0.0f) { return f4(0.0f); }
+    }
+    const float3 ratio = lerp(f3(1.0f), min(eIrr / max(Ep, f3(1.0e-4f)), f3(8.0f)), saturate(gShadowParams.pgiSpec.w));
+    return float4(L0.rgb * ratio, w * saturate(valid));
+}
+
+// P = the receiver's ABSOLUTE position (the near probes' parallax and reach). The near probes' cubes win where
+// the receiver is near them; the world cube takes what they leave.
+float3 pgiHiSpec(float3 R, float rough, float3 E, float3 eIrr, float3 P)
 {
     const float4 H = gShadowParams.pgiSpec;
     if (H.y <= 0.0f) { return E; }
@@ -671,7 +759,34 @@ float3 pgiHiSpec(float3 R, float rough, float3 E, float3 eIrr)
     // H.w = how much of the normalization applies (knob pgiHiNorm; 0 = the cube's radiance as captured — the
     // truth test for a mirror: does it match the scene beside it?).
     const float3 ratio = lerp(f3(1.0f), min(eIrr / max(Ew, f3(1.0e-4f)), f3(8.0f)), saturate(H.w));
-    return lerp(E, L * ratio, w * saturate(valid));
+    float3 hi = L * ratio;
+    // H2: the near probes over the world cube. Each probe's COVERAGE (pgiNearCover) is near-binary, and the two
+    // split P by a SHARP distance share (power 8: a narrow band at their midpoint mixes them, everywhere else one
+    // owns it) — any wide mix of two viewpoints draws every edge twice. The weaker is looked up only inside that
+    // band, so most receivers pay for one lookup.
+    float d0, d1;
+    const float c0 = pgiNearCover(gShadowParams.pgiNear0, P, d0);
+    const float c1 = pgiNearCover(gShadowParams.pgiNear1, P, d1);
+    if (c0 > 0.0f || c1 > 0.0f) {
+        float s0 = (c0 > 0.0f) ? 1.0f : 0.0f;   // probe 0's share of the near term
+        if (c0 > 0.0f && c1 > 0.0f) {
+            const float r = d0 / max(d1, 1.0f);
+            const float r2 = r * r, r4 = r2 * r2;
+            s0 = 1.0f / (1.0f + r4 * r4);
+        }
+        // Explicit branches, not ?: — HLSL's ?: may evaluate both arms, which is the whole cost.
+        float4 n0 = f4(0.0f), n1 = f4(0.0f);
+        if (s0 >= 0.5f) {
+            n0 = pgiNearOne(gShadowParams.pgiNear0, 0u, P, R, rough, cut, eIrr, s0 * c0);
+            if (s0 < 0.9f) { n1 = pgiNearOne(gShadowParams.pgiNear1, 1u, P, R, rough, cut, eIrr, (1.0f - s0) * max(c1, 0.0f)); }
+        } else {
+            n1 = pgiNearOne(gShadowParams.pgiNear1, 1u, P, R, rough, cut, eIrr, (1.0f - s0) * c1);
+            if (s0 > 0.1f) { n0 = pgiNearOne(gShadowParams.pgiNear0, 0u, P, R, rough, cut, eIrr, s0 * max(c0, 0.0f)); }
+        }
+        const float ws = n0.a + n1.a;
+        if (ws > 0.0f) { hi = lerp(hi, (n0.rgb * n0.a + n1.rgb * n1.a) / ws, saturate(ws)); }
+    }
+    return lerp(E, hi, w * saturate(valid));
 }
 #endif
 
@@ -852,7 +967,7 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
                 eIrr = keepI + (eIrr - keepI) * (t * t);
             }
             // After the gates: the cube takes the energy the gated volume measured, not the probe's.
-            if (hiRough >= 0.0f && pg.a > 0.0f) { pg.rgb = pgiHiSpec(N, hiRough, pg.rgb, eIrr); }
+            if (hiRough >= 0.0f && pg.a > 0.0f) { pg.rgb = pgiHiSpec(N, hiRough, pg.rgb, eIrr, worldPosRel + gFrameData.lodEye.xyz); }
         }
         else {
             pg = pgiIrradiance(N, worldPosRel + gFrameData.lodEye.xyz, below);

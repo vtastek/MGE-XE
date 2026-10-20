@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 1110 "FSL/shaders.list"
+#line 1122 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobobake.frag.fsl"
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobobake.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1313,7 +1313,14 @@ STRUCT(ShadowMaskParams)
 
 
     float4 pgiSpec;
-#line 1115
+
+
+
+
+    float4 pgiNear0;
+    float4 pgiNear1;
+    float4 pgiNearP;
+#line 1122
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1767,8 +1774,13 @@ STRUCT(LightData)
 
 
 
+        TexCube(float4) gPgiNearCube0 :  register(t166,space1);
+        TexCube(float4) gPgiNearCube1 :  register(t167,space1);
 
-        Tex2D(float4) gSkyVisEye :  register(t166,space1);
+
+
+
+        Tex2D(float4) gSkyVisEye :  register(t168,space1);
 
 
 
@@ -1785,7 +1797,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 780 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 785 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 4064 ] :  register(t0,space0);
 
 
@@ -1796,7 +1808,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t4192,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 804 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 809 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gobobake.frag.fsl"
 
@@ -1833,4 +1845,4 @@ PsOut PS_MAIN( VSOutput In )
     Out.vis = f4(0.0f);
     return (Out);
 }
-#line 1111 "FSL/shaders.list"
+#line 1123 "FSL/shaders.list"

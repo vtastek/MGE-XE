@@ -21,6 +21,8 @@
 -- `hops` round trips of: exterior spot -> `interior` (dwell s) -> back to the SAME exterior spot
 -- (dwell s). Each leg is logged with the real seconds positionCell took, so the return trip's cost
 -- can be compared across builds; mgeXE.log carries the texture/geometry side.
+-- thirdPerson = true forces the 3rd-person view first (hop and door): the parked-exterior restore is
+-- where the 3P body went missing after an exit (tasks/todo.md, 10-18).
 
 local defaults = {
     enabled = false,
@@ -35,6 +37,7 @@ local defaults = {
     hops = 10,
     dwell = 4.0,
     interior = "Seyda Neen, Census and Excise Office",
+    thirdPerson = false,
 }
 
 local cfg = mwse.loadConfig("AutoZip", defaults)
@@ -225,6 +228,10 @@ local function beginHop()
         local p = ref.position
         hopInPos = { p.x, p.y, p.z + 64 }
         break
+    end
+    if cfg.thirdPerson then
+        local ok, res = pcall(tes3.force3rdPerson)
+        log("3rd person forced: ok=%s result=%s", tostring(ok), tostring(res))
     end
     hopHome = tes3.player.position:copy()
     hopHomeRot = tes3.player.orientation:copy()

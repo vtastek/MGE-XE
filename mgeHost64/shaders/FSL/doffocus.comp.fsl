@@ -35,7 +35,8 @@ void CS_MAIN( SV_GroupThreadID(uint3) GTid )
     float2 px  = delivered * 0.5f + g * r;
     int2   q   = dofDepthTexel(px, delivered, depthRect);
     float  dz  = LoadTex2D(gDofDepth, NO_SAMPLER, q, 0).r;
-    float  D   = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z);
+    float  D   = dofDioptre(gDofParams.invViewProj, q, depthRect, dz, gDofParams.hands.z,
+                               gDofParams.look.yzw);
     float  w   = exp(-2.0f * dot(g, g));
     // Hands out: nearer than hands.y metres = more than 1/hands.y dioptres.
     if (D > 1.0f / max(gDofParams.hands.y, 1.0e-3f))

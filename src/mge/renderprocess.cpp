@@ -254,6 +254,10 @@ namespace {
     // apart + a session cap. All three build-shrink toggles are panel-only (no keys — the
     // free numpad keys collide with the water-flow handlers' edge polls).
     bool g_buildSpikeLog = false;
+    // FP2: set only while buildGeometryDrawLists emits its OFF-VIEW tail (the hidden 1st-person body,
+    // see MGE::GeometryCache::offViewBodyKeys). The three emit helpers OR their list's OffView bit
+    // in, so those parts reach the host's casters and reflections and never its main view.
+    bool g_emitOffView = false;
     // Sky/FP membership-set drift validation (panel): run the old full-cache scans alongside
     // the set-driven consumers and log !! [memb-cmp] on any kept-key mismatch. DEFAULT OFF.
     bool g_membershipValidate = false;
@@ -1655,6 +1659,22 @@ namespace {
 
     VkCommandPool   g_cmdPool = VK_NULL_HANDLE;  // owned
     VkCommandBuffer g_cmd     = VK_NULL_HANDLE;
+    // PRE-RECORDED COPIES, one per host RT slot. The copy is the same three commands every frame (two
+    // barriers + one image copy, differing only by slot), but recording them per frame on DXVK's
+    // device was where the low-fps episodes lived: the 2026-10-18 play session spent 36 ms/frame
+    // inside those three vkCmd* calls for 1020 frames, and ~5 ms/frame after the alt-tab that ended
+    // it, while every minimized harness run logged none. Recording is pure CPU, so the driver was
+    // blocking inside it, apparently on a lock it shares with presentation. A pre-recorded buffer is
+    // only re-recorded when what it names changes (g_copyKey). MGE_COPY_PRERECORD=0 = per-frame record.
+    struct CopyKey {
+        VkImage src, dst; VkImageLayout layout; UINT rw, rh;
+        bool operator==(const CopyKey& o) const {   // field-wise: memcmp would compare the padding
+            return src == o.src && dst == o.dst && layout == o.layout && rw == o.rw && rh == o.rh;
+        }
+    };
+    VkCommandBuffer g_copyCmd[2] = {};
+    CopyKey         g_copyKey[2] = {};
+    bool            g_copyPrerecord = true;
     VkFence         g_fence   = VK_NULL_HANDLE;  // owned
     // The RT copy's COMPLETION, as a client-owned timeline semaphore: the copy signals g_copySeq and
     // returns without a CPU wait. The copy used to vkWaitForFences inline, which parked MW's main
@@ -2093,6 +2113,18 @@ namespace {
         if (vk.AllocateCommandBuffers(g_dev, &cbi, &g_cmd) != VK_SUCCESS) {
             return false;
         }
+        {
+            char v[4] = {};
+            g_copyPrerecord = !(GetEnvironmentVariableA("MGE_COPY_PRERECORD", v, sizeof(v)) > 0 && v[0] == '0');
+            cbi.commandBufferCount = 2;
+            if (vk.AllocateCommandBuffers(g_dev, &cbi, g_copyCmd) != VK_SUCCESS) {
+                g_copyCmd[0] = g_copyCmd[1] = VK_NULL_HANDLE;
+                g_copyPrerecord = false;
+            }
+            g_copyKey[0] = g_copyKey[1] = CopyKey{};
+            LOG::logline(">> [seam] RT copy: %s", g_copyPrerecord ? "pre-recorded per slot"
+                                                                  : "recorded every frame (MGE_COPY_PRERECORD=0)");
+        }
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (vk.CreateFence(g_dev, &fci, nullptr, &g_fence) != VK_SUCCESS) {
             return false;
@@ -2168,6 +2200,8 @@ namespace {
             g_copySubmitted.store(0);
             if (g_fence)     { vk.DestroyFence(g_dev, g_fence, nullptr); g_fence = VK_NULL_HANDLE; }
             if (g_cmdPool)   { vk.DestroyCommandPool(g_dev, g_cmdPool, nullptr); g_cmdPool = VK_NULL_HANDLE; g_cmd = VK_NULL_HANDLE; }
+            g_copyCmd[0] = g_copyCmd[1] = VK_NULL_HANDLE;   // freed with the pool
+            g_copyKey[0] = g_copyKey[1] = CopyKey{};
             for (unsigned i = 0; i < 2; ++i) {
                 if (g_importImg[i]) { vk.DestroyImage(g_dev, g_importImg[i], nullptr); g_importImg[i] = VK_NULL_HANDLE; }
                 if (g_importMem[i]) { vk.FreeMemory(g_dev, g_importMem[i], nullptr); g_importMem[i] = VK_NULL_HANDLE; }
@@ -2554,55 +2588,66 @@ namespace {
         }
         // Each Vulkan call of the record timed alone (one nowMs per call, ~free): the [rtcopy] spike line
         // names the call that blocked.
+        // The buffer this frame submits: the slot's pre-recorded copy, re-recorded only when what it
+        // names changed (a resize, a re-init's new images), or g_cmd recorded now (MGE_COPY_PRERECORD=0).
+        // A pre-recorded buffer is idle here: waitCopyRetired above waited for the LAST submitted copy,
+        // so every earlier one, including this slot's, has executed.
+        const CopyKey key = { g_importImg[slot], g_dstImg, g_dstLayout, g_rw, g_rh };
+        const bool reuse = g_copyPrerecord && g_copyKey[slot] == key;
+        VkCommandBuffer cmd = g_copyPrerecord ? g_copyCmd[slot] : g_cmd;
         const double lfK0 = nowMs();
-        vk.ResetCommandBuffer(g_cmd, 0);
-        const double lfK1 = nowMs();
-        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk.BeginCommandBuffer(g_cmd, &bi);
-        const double lfK2 = nowMs();
+        double lfK1 = lfK0, lfK2 = lfK0, lfK3 = lfK0, lfK4 = lfK0;
+        if (!reuse) {
+            vk.ResetCommandBuffer(cmd, 0);
+            lfK1 = nowMs();
+            VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            bi.flags = g_copyPrerecord ? 0 : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vk.BeginCommandBuffer(cmd, &bi);
+            lfK2 = nowMs();
 
-        const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-        // dst: DXVK resting layout -> TRANSFER_DST
-        VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        toDst.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        toDst.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toDst.oldLayout           = g_dstLayout;
-        toDst.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toDst.image               = g_dstImg;
-        toDst.subresourceRange    = range;
-        vk.CmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                              0, 0, nullptr, 0, nullptr, 1, &toDst);
+            // dst: DXVK resting layout -> TRANSFER_DST
+            VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            toDst.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            toDst.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toDst.oldLayout           = g_dstLayout;
+            toDst.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toDst.image               = g_dstImg;
+            toDst.subresourceRange    = range;
+            vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  0, 0, nullptr, 0, nullptr, 1, &toDst);
 
-        VkImageCopy region = {};
-        region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        // Copy only the current render sub-rect (top-left g_rw x g_rh of the g_w x g_h allocation);
-        // the composite samples exactly this region. Outside it the host RT is the (transparent)
-        // clear and is never sampled.
-        region.extent         = { g_rw, g_rh, 1 };
-        vk.CmdCopyImage(g_cmd, g_importImg[slot], VK_IMAGE_LAYOUT_GENERAL,
-                        g_dstImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            VkImageCopy region = {};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            // Copy only the current render sub-rect (top-left g_rw x g_rh of the g_w x g_h allocation);
+            // the composite samples exactly this region. Outside it the host RT is the (transparent)
+            // clear and is never sampled.
+            region.extent         = { g_rw, g_rh, 1 };
+            vk.CmdCopyImage(cmd, g_importImg[slot], VK_IMAGE_LAYOUT_GENERAL,
+                            g_dstImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-        // dst: TRANSFER_DST -> DXVK resting layout (so DXVK's tracking stays valid)
-        VkImageMemoryBarrier toRest = toDst;
-        toRest.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toRest.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        toRest.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toRest.newLayout     = g_dstLayout;
-        vk.CmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                              0, 0, nullptr, 0, nullptr, 1, &toRest);
-        const double lfK3 = nowMs();
+            // dst: TRANSFER_DST -> DXVK resting layout (so DXVK's tracking stays valid)
+            VkImageMemoryBarrier toRest = toDst;
+            toRest.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toRest.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            toRest.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toRest.newLayout     = g_dstLayout;
+            vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                  0, 0, nullptr, 0, nullptr, 1, &toRest);
+            lfK3 = nowMs();
 
-        vk.EndCommandBuffer(g_cmd);
-        const double lfK4 = nowMs();
+            vk.EndCommandBuffer(cmd);
+            lfK4 = nowMs();
+            if (g_copyPrerecord) { g_copyKey[slot] = key; }
+        }
 
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
         si.commandBufferCount = 1;
-        si.pCommandBuffers    = &g_cmd;
+        si.pCommandBuffers    = &cmd;
 
         // Tier 1: order this copy behind the host's draw with a GPU-side wait on the imported
         // timeline semaphore. TOP_OF_PIPE is the correct stage mask for a timeline wait that must
@@ -4728,7 +4773,8 @@ namespace {
             // the host's classify sees no change until a portal is actually on screen.
             item.casterFlags = (e.isLive ? IPC::kDrawCasterLive : 0u)
                              | (e.animated ? IPC::kDrawCasterAnimated : 0u)
-                             | portalFlags;
+                             | portalFlags
+                             | (g_emitOffView ? IPC::kDrawOffView : 0u);   // FP2 off-view tail
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE rendering: subtract the camera world position from the world
             // translation so vertices reach the shader near the origin. At MW's exterior
@@ -4801,7 +4847,8 @@ namespace {
             item.blendFlags = (e.blendEnable  ? IPC::kSkinFlagBlended   : 0u)
                             | (e.twoSided     ? IPC::kSkinFlagTwoSided  : 0u)
                             | (e.alphaTest    ? IPC::kSkinFlagAlphaTest : 0u)
-                            | (e.alphaAnimated? IPC::kSkinFlagAlphaAnim : 0u);
+                            | (e.alphaAnimated? IPC::kSkinFlagAlphaAnim : 0u)
+                            | (g_emitOffView  ? IPC::kSkinFlagOffView   : 0u);   // FP2 off-view tail
             item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
             item.srcBlend   = e.srcBlend;
             item.destBlend  = e.destBlend;
@@ -4900,7 +4947,8 @@ namespace {
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
             item.drawFlags  = (blended ? IPC::kMMDrawFlagBlended : 0u)   // Route C: alpha-stage blend draw
-                            | (e.enchantGlow ? IPC::kMMDrawFlagEnchantGlow : 0u);
+                            | (e.enchantGlow ? IPC::kMMDrawFlagEnchantGlow : 0u)
+                            | (g_emitOffView ? IPC::kMMDrawFlagOffView : 0u);   // FP2 off-view tail
             item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
             for (int s = 0; s < ns; ++s) {
                 const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
@@ -5192,6 +5240,7 @@ namespace {
         auto dispatch = [&](auto& slot, const auto& e) {
             if (e.isSky) return;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
             if (e.isFP) return;    // FP arms ride the dedicated host FP pass (buildFPDrawLists)
+            if (e.offViewFrame == g_buildCacheFrame) return;   // FP2 hidden body: the off-view tail ships it
             // Terrain: host-owned. Covers the alpha-SPLAT trishapes too (MW multi-passes terrain
             // texture blending), which is why this sits above the blendEnable branches — the host
             // heightfield already carries the blend, per-pixel, from the same VTEX data.
@@ -5477,7 +5526,7 @@ namespace {
                 // 3rd-person body — at the camera, so always inside the radius below).
                 // Without this the freshly-culled body kept re-emitting into the colour
                 // lists until the eviction sweep (the 3rd→1st POV-switch linger).
-                if (e.suppressedFrame == cacheFrame) { ++suppressSkips; continue; }
+                if (e.suppressedFrame == cacheFrame || e.offViewFrame == cacheFrame) { ++suppressSkips; continue; }
                 const bool isMM = !e.isLandscape && !e.blendEnable && e.d3dTexture
                                   && (e.d3dDark || e.d3dDetail || e.d3dGlow);
                 if (e.isSkinned) {
@@ -5595,7 +5644,7 @@ namespace {
                     const auto& e = cit->second;
                     if (s_visLookup.count(skey)) continue;                    // already emitted in the visible set
                     if (portalOwned(e)) continue;                            // inline portal block only (see above)
-                    if (e.suppressedFrame == cacheFrame) continue;
+                    if (e.suppressedFrame == cacheFrame || e.offViewFrame == cacheFrame) continue;
                     // Precise per-frame classification (the sweep collected a padded superset).
                     if (e.isSky || e.isFP || e.isSkinned || e.isLandscape || e.blendEnable || e.isLive) continue;
                     if (e.d3dTexture && (e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;   // MM → mover loop
@@ -5639,7 +5688,7 @@ namespace {
                     if (cit == cacheMap.end()) continue;               // stale key (evicted since sweep)
                     const auto& e = cit->second;
                     if (s_visLookup.count(akey)) continue;             // already in the visible alpha set
-                    if (e.suppressedFrame == cacheFrame) continue;
+                    if (e.suppressedFrame == cacheFrame || e.offViewFrame == cacheFrame) continue;
                     if (!e.blendEnable || e.isSky || e.isFP || e.isSkinned || e.isLandscape || e.isLive) continue;
                     if (!e.d3dTexture) continue;                       // need a base map to mask/composite
                     const float* w = e.worldTransformD3D;
@@ -5820,6 +5869,46 @@ namespace {
         if (!wantAlpha) {
             g_capVertScratch.clear();
             g_capIdxScratch.clear();
+        }
+
+        // ---- FP2 OFF-VIEW TAIL: the hidden 1st-person body ----------------------------------------
+        // Walked this frame only while an MWSE mod poses it (GeometryCache g_offViewBodyLive), and
+        // skipped by every emit path above (dispatch + the re-emit loops test offViewFrame). Emitted
+        // HERE, LAST on each of the three lists, with that list's OffView bit: every main-view walk
+        // on the host fills these slots and skips the draw, and because nothing follows them no other
+        // part's slot moves. The casters and the reflections draw them. Classified in dispatch's own
+        // order (skinned first, then multimap, then static); BLENDED rigid parts are left out — the
+        // casters skip them and a reflected translucent is not worth an alpha path of its own.
+        {
+            static std::uint32_t s_lastSk = ~0u, s_lastMM = ~0u, s_lastSt = ~0u;
+            std::uint32_t nSk = 0, nMM = 0, nSt = 0;
+            g_emitOffView = true;
+            for (std::uint32_t key : MGE::GeometryCache::offViewBodyKeys()) {
+                auto cit = cacheMap.find(key);
+                if (cit == cacheMap.end()) continue;
+                const auto& e = cit->second;
+                if (e.offViewFrame != g_buildCacheFrame || e.isFP || e.isSky) continue;
+                auto ks = g_keySlot.find(key);
+                if (ks == g_keySlot.end()) continue;   // not uploaded yet (first sight)
+                if (e.isSkinned) {
+                    if (wantSkinned) { emitSkinnedDraw(ks->second, e, skinnedCount); ++nSk; }
+                    continue;
+                }
+                if (e.blendEnable || e.isPickRoot) continue;
+                const bool isMM = e.d3dTexture && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+                if (isMM) {
+                    if (wantMM) { emitMultiMapDraw(ks->second, e, multiMapCount, g_multiMapScratch, /*blended=*/false); ++nMM; }
+                } else if (wantStatic) {
+                    emitStaticDraw(ks->second, e, drawCount);
+                    ++nSt;
+                }
+            }
+            g_emitOffView = false;
+            if (nSk != s_lastSk || nMM != s_lastMM || nSt != s_lastSt) {
+                LOG::logline("[fp2] off-view body shipped: skinned=%u multimap=%u static=%u (keys=%zu)",
+                             nSk, nMM, nSt, MGE::GeometryCache::offViewBodyKeys().size());
+                s_lastSk = nSk; s_lastMM = nMM; s_lastSt = nSt;
+            }
         }
 
         // Phase 0: publish the build-split. tailMs covers the offscreen-caster re-emit + live
@@ -9964,6 +10053,8 @@ namespace RenderProcess {
     // the locked surface, one slot per IDirect3DTexture9 (held by a ref so the address cannot be
     // recycled under the memo). Main thread only: capture at the UI stage, swap at Present, ship at
     // the next kick (which also runs on main).
+
+    bool devUiVisible() { return g_devUiVisible; }
 
     bool hostUiActive() {
         if (g_hostUiEnv < 0) {

@@ -174,6 +174,9 @@ namespace RenderProcess {
     // hostPresent=1,hostPresentDirect=1 and MGE_SEAM_PROBE=7). True while the Forge host owns the frame
     // and MW's UI draws are captured instead of drawn: the device's DIP hands them to captureUiDraw.
     bool hostUiActive();
+    // The host's dev panel (F9) is up. It is drawn by the host and fed (cursor, clicks) by the frame
+    // kick, so a menu's low-rate world refresh would run it at 1/8 rate: the choppy panel mouse.
+    bool devUiVisible();
     // One UI-stage DrawIndexedPrimitive: transformed to clip space and fixed-function lit on the CPU,
     // appended to this frame's UI list. proj = the projection MW set (not tracked in RenderedState).
     void captureUiDraw(const RenderedState* rs, const FragmentState* frs, const LightState* lrs,

@@ -1088,14 +1088,26 @@
 #include "mbgather.comp.fsl"
 #end
 
-// DEPTH OF FIELD (tasks/forge-dof.md): the eye's autofocus, then the CoC pass (D0: identity or the
-// CoC view; the bokeh gather lands in its place).
+// DEPTH OF FIELD (tasks/forge-dof.md): the eye's autofocus, the CoC per px and per tile, the tile
+// neighbourhood, then the separable disc kernel's two passes (the second also draws the CoC view).
 #comp doffocus.comp
 #include "doffocus.comp.fsl"
 #end
 
 #comp dofcoc.comp
 #include "dofcoc.comp.fsl"
+#end
+
+#comp doftile.comp
+#include "doftile.comp.fsl"
+#end
+
+#comp dofblurh.comp
+#include "dofblurh.comp.fsl"
+#end
+
+#comp dofblurv.comp
+#include "dofblurv.comp.fsl"
 #end
 
 // FIXTURE GOBOS (tasks/forge-light-gobo.md G1). gobobake draws each light fixture's own mesh into six

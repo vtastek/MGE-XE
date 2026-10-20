@@ -1,0 +1,102 @@
+// mgeHost64 — DoF D2: the disc kernel's VERTICAL pass and the recombine. Read dof.srt.h first.
+//
+// Per pixel, the same tile radius R as the horizontal pass. Along the column, each row's complex
+// response per component (gDofRe/Im = component 0, gDofRe1/Im1 = component 1, gDofW = both weights)
+// is multiplied by that component's complex tap F(j, R) and by the row pixel's COVERAGE of this one;
+// the disc is sum_c A_c Re_c + B_c Im_c, for the premultiplied rgba and for the weight alike, and the
+// image is their ratio. The weight channel is what normalises the kernel, so
+// there is no table of per-radius sums to keep in step.
+//
+// ⚠ A ZERO-COVERAGE ROW IS SKIPPED, NOT MULTIPLIED BY ZERO. A row in a sharp tile was never written
+// this frame (dofblurh writes nothing there), and 0 * a stale fp16 NaN is NaN
+// ([[project_nan_survives_zero_multiply]]). The coverage of such a row is 0 for |j| >= 1 by
+// construction: every CoC in a sharp tile's neighbourhood is under 0.5 px.
+//
+// opts.x: 0 the blur, 1 the CoC view (dofcoc's old arm, moved here), 2 the identity.
+
+#include "dof.srt.h"
+#include "dofcommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 p        = int2(DispatchThreadID.xy);
+    int2 deliverN = int2(gDofParams.rects.xy);
+    if (p.x >= deliverN.x || p.y >= deliverN.y)
+    {
+        RETURN();
+    }
+
+    float4 centre = LoadTex2D(gDofColor, NO_SAMPLER, p, 0);
+    float4 outv   = centre;
+    float  mode   = gDofParams.opts.x;
+    float  cp     = LoadRWTex2D(gDofCoc, p);
+
+    if (mode > 1.5f)
+    {
+        // The identity: the plumbing, no lens.
+    }
+    else if (mode > 0.5f)
+    {
+        // THE CoC VIEW: green = in focus (radius < 0.5 px), orange = far, blue = near, saturating at
+        // opts.z px of radius. The tint multiplies the pixel's own luminance, so it stays readable
+        // under any exposure.
+        float  lum  = dot(centre.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+        float  a    = saturate(abs(cp) / max(gDofParams.opts.z, 1.0e-3f));
+        float3 tint = (cp > 0.0f) ? float3(1.0f, 0.55f, 0.15f) : float3(0.15f, 0.45f, 1.0f);
+        float3 col  = lerp(f3(1.0f), tint, a);
+        if (abs(cp) < 0.5f)
+        {
+            col = float3(0.55f, 1.0f, 0.55f);
+        }
+        outv = float4(lum * col, centre.a);
+    }
+    else
+    {
+        float R = LoadRWTex2D(gDofTileNb, p / DOF_TILE);
+        if (R >= 0.5f)
+        {
+            float  Rk = max(R, 1.0f);
+            int    n  = int(ceil(R));
+            float4 re0 = f4(0.0f);
+            float4 im0 = f4(0.0f);
+            float4 re1 = f4(0.0f);
+            float4 im1 = f4(0.0f);
+            float4 wc  = f4(0.0f);   // (Re, Im) of component 0's weight, then component 1's
+            for (int j = -n; j <= n; ++j)
+            {
+                int2  s  = int2(p.x, clamp(p.y + j, 0, deliverN.y - 1));
+                float cs = LoadRWTex2D(gDofCoc, s);
+                float w  = dofCoverage(cs, cp, abs(float(j)));
+                if (w > 0.0f)
+                {
+                    float2 F0 = dofKernelTap(float(j), Rk, DOF_K0.xy) * w;
+                    float2 F1 = dofKernelTap(float(j), Rk, DOF_K1.xy) * w;
+                    float4 h0r = LoadRWTex2D(gDofRe,  s);
+                    float4 h0i = LoadRWTex2D(gDofIm,  s);
+                    float4 h1r = LoadRWTex2D(gDofRe1, s);
+                    float4 h1i = LoadRWTex2D(gDofIm1, s);
+                    float4 hw  = LoadRWTex2D(gDofW,   s);
+                    re0 += F0.x * h0r - F0.y * h0i;
+                    im0 += F0.x * h0i + F0.y * h0r;
+                    re1 += F1.x * h1r - F1.y * h1i;
+                    im1 += F1.x * h1i + F1.y * h1r;
+                    wc  += float4(F0.x * hw.x - F0.y * hw.y, F0.x * hw.y + F0.y * hw.x,
+                                  F1.x * hw.z - F1.y * hw.w, F1.x * hw.w + F1.y * hw.z);
+                }
+            }
+            float4 num = DOF_K0.z * re0 + DOF_K0.w * im0 + DOF_K1.z * re1 + DOF_K1.w * im1;
+            float  den = DOF_K0.z * wc.x + DOF_K0.w * wc.y + DOF_K1.z * wc.z + DOF_K1.w * wc.w;
+            if (den > 1.0e-4f)
+            {
+                // The kernel's residual negative lobe can still push a dark pixel beside a bright one
+                // under zero.
+                outv = max(num / den, f4(0.0f));
+            }
+        }
+    }
+    Write2D(gDofOut, p, outv);
+}

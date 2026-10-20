@@ -482,15 +482,18 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
     const uint R = (uint)gPgiParams.capTile.z;
-    // WORLD MODE (capTile.w = 1, knob pgiHiRes): the WORLD probe's one row — raw in atlas row 4, relit into
-    // row 5 (pgicube.comp builds the cube from it). capPos / place.x / place.z = its position, slot, faces.
+    // WORLD MODE (capTile.w = 1, knob pgiHiRes): ONE hi-res probe's row — raw in atlas row capTile.x (4 =
+    // the world probe, the default; 6 / 8 = the H2 near probes), relit into the row below it (pgicube.comp
+    // builds the cube from that). capPos / place.x / place.z = its position, slot, faces. The relit row's w
+    // is the texel's INVERSE hit distance (1/L; 0 = sky, -2 = a back face): the near cubes' parallax radius.
     const bool worldRow = gPgiParams.capTile.w > 0.5f;
     const uint2 id = DispatchThreadID.xy;
     if (R == 0u || id.x >= 6u * R || id.y >= (worldRow ? 1u : 2u) * R) { return; }
     const uint row = worldRow ? 0u : id.y / R, face = id.x / R;
-    const uint inY = worldRow ? 4u * R : 0u;
+    const uint wIn = (gPgiParams.capTile.x > 0.5f) ? (uint)gPgiParams.capTile.x : 4u;
+    const uint inY = worldRow ? wIn * R : 0u;
     const int2 inAt = int2((int)id.x, (int)(id.y + inY));
-    const int2 outAt = int2((int)id.x, (int)(id.y + (worldRow ? 5u : 2u) * R));
+    const int2 outAt = int2((int)id.x, (int)(id.y + (worldRow ? wIn + 1u : 2u) * R));
     const uint mask = (uint)((row == 0u) ? gPgiParams.place.z : gPgiParams.place.w);
     if ((mask & (1u << face)) == 0u) { Write2D(gPgiPeek, outAt, f4(0.0f)); return; }
     const float4 pv = LoadRWTex2D(gPgiPeek, inAt);
@@ -501,7 +504,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         const float a = ((float)(id.x % R) + 0.5f) / (float)R * 2.0f - 1.0f;
         const float b = 1.0f - ((float)(id.y % R) + 0.5f) / (float)R * 2.0f;
         const float3 d = normalize(fwd + a * right + b * up);
-        Write2D(gPgiPeek, outAt, float4((gPgiParams.skyLive.x > 0.5f) ? pgiSkyLive(d) : pv.rgb, 1.0f));
+        Write2D(gPgiPeek, outAt, float4((gPgiParams.skyLive.x > 0.5f) ? pgiSkyLive(d) : pv.rgb, worldRow ? 0.0f : 1.0f));
         return;
     }
     if (pv.r > PGI_BACK_SENTINEL && pv.b > PGI_BACK_SENTINEL && pv.g <= 0.0f) { Write2D(gPgiPeek, outAt, float4(0.0f, 0.0f, 0.0f, -2.0f)); return; }
@@ -555,7 +558,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         albP = odd ? (qok ? qv.rgb : f3(0.0f)) : pv.rgb;
         emP  = odd ? pv.rgb : (qok ? qv.rgb : f3(0.0f));
     }
-    Write2D(gPgiPeek, outAt, float4(albP * E + emP * gPgiParams.emis.y, 1.0f));
+    Write2D(gPgiPeek, outAt, float4(albP * E + emP * gPgiParams.emis.y,
+                                    worldRow ? 1.0f / max(length(P - pos), 1.0f) : 1.0f));
     RETURN();
 }
 #else
@@ -1266,25 +1270,43 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // A back face (w = -2 in the lit row) is a HOLE, not black: it is left out of the weights, a = the share
     // of this texel that had radiance, and the mips below average by it (a window seen from behind takes its
     // wall's light, not a black or a magenta square).
+    // capTile.y = the lit row (5 = the world probe, the default; 7 / 9 = the H2 near probes). capTile.w = 1:
+    // a NEAR cube, whose alpha is the mean INVERSE hit distance of the valid texels (the relit row's w; 0 =
+    // sky) — a harmonic mean, so the sky's infinity does not swamp a wall — and -1 for a hole. skyamb.h.fsl
+    // pgiNearSpec reads it as the parallax sphere's radius in that direction.
+    const uint litRow = (gPgiParams.capTile.y > 0.5f) ? (uint)gPgiParams.capTile.y : 5u;
+    const bool nearCube = gPgiParams.capTile.w > 0.5f;
     float3 acc = f3(0.0f);
-    float  wa = 0.0f;
+    float  wa = 0.0f, ia = 0.0f;
     UNROLL for (int j = 0; j < 2; ++j) {
         UNROLL for (int i = 0; i < 2; ++i) {
             const int2 q = clamp(int2(t0) + int2(i, j), int2(0, 0), int2((int)R - 1, (int)R - 1));
             const float w = ((i == 0) ? 1.0f - fr.x : fr.x) * ((j == 0) ? 1.0f - fr.y : fr.y);
-            const float4 v = LoadRWTex2D(gPgiPeek, int2((int)(cf * R) + q.x, (int)(5u * R) + q.y));
-            if (v.w > -1.5f) { acc += w * v.rgb; wa += w; }
+            const float4 v = LoadRWTex2D(gPgiPeek, int2((int)(cf * R) + q.x, (int)(litRow * R) + q.y));
+            if (v.w > -1.5f) { acc += w * v.rgb; wa += w; ia += w * max(v.w, 0.0f); }
         }
     }
-    Write3D(gPgiCubeOut, int3(id), float4(max(acc / max(wa, 1.0e-4f), f3(0.0f)), saturate(wa)));
+    const float3 rgb0 = max(acc / max(wa, 1.0e-4f), f3(0.0f));
+    Write3D(gPgiCubeOut, int3(id), float4(rgb0, nearCube ? ((wa > 1.0e-4f) ? ia / wa : -1.0f) : saturate(wa)));
 #else
     // Mip k from mip k-1: the 2 x 2 box weighted by coverage (a = how much of it had radiance).
     const int2 s = int2(id.xy) * 2;
     const float4 c0 = LoadRWTex3D(gPgiCubeIn, int3(s, (int)id.z)), c1 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(1, 0), (int)id.z));
     const float4 c2 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(0, 1), (int)id.z)), c3 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(1, 1), (int)id.z));
-    const float a = c0.a + c1.a + c2.a + c3.a;
-    const float3 rgb = (c0.rgb * c0.a + c1.rgb * c1.a + c2.rgb * c2.a + c3.rgb * c3.a) / max(a, 1.0e-4f);
-    Write3D(gPgiCubeOut, int3(id), float4(rgb, a * 0.25f));
+    if (gPgiParams.capTile.w > 0.5f) {
+        // A NEAR cube: alpha is the inverse hit distance (-1 = hole). Radiance and distance both average
+        // over the texels that have them; a mip with none stays a hole.
+        const float v0 = (c0.a > -0.5f) ? 1.0f : 0.0f, v1 = (c1.a > -0.5f) ? 1.0f : 0.0f;
+        const float v2 = (c2.a > -0.5f) ? 1.0f : 0.0f, v3 = (c3.a > -0.5f) ? 1.0f : 0.0f;
+        const float n = v0 + v1 + v2 + v3;
+        const float3 rgbN = (c0.rgb * v0 + c1.rgb * v1 + c2.rgb * v2 + c3.rgb * v3) / max(n, 1.0f);
+        const float  invN = (c0.a * v0 + c1.a * v1 + c2.a * v2 + c3.a * v3) / max(n, 1.0f);
+        Write3D(gPgiCubeOut, int3(id), float4(rgbN, (n > 0.5f) ? invN : -1.0f));
+    } else {
+        const float a = c0.a + c1.a + c2.a + c3.a;
+        const float3 rgb = (c0.rgb * c0.a + c1.rgb * c1.a + c2.rgb * c2.a + c3.rgb * c3.a) / max(a, 1.0e-4f);
+        Write3D(gPgiCubeOut, int3(id), float4(rgb, a * 0.25f));
+    }
 #endif
     RETURN();
 }

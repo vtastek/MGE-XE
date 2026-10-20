@@ -1110,6 +1110,13 @@ STRUCT(ShadowMaskParams)
     // lookup trades the volume's cosine-convolved SH for the surface's own lobe (knob pgiSpecSharp;
     // 0 = irradiance in the mirror direction, the shipped look). HI-RES WORLD CUBE (skyamb.h.fsl
     // pgiHiSpec): y = its strength (0 until built and readable), z = the roughness cut, w = how much of
-    // the volume's energy/tint normalization it takes (knob pgiHiNorm). Appended last.
+    // the volume's energy/tint normalization it takes (knob pgiHiNorm).
     DATA(float4,   pgiSpec,          None);
+    // H2 NEAR PROBES (skyamb.h.fsl pgiNearSpec, knob pgiHiNear): the two pool probes nearest the camera,
+    // shot at peek resolution into their own cubes. pgiNear0/1 = (absolute world position xyz, its probe
+    // slot; w < 0 = not built / not readable). pgiNearP = (strength, reach u: a receiver this far from the
+    // probe takes none of it, 0, 0). Appended last.
+    DATA(float4,   pgiNear0,         None);
+    DATA(float4,   pgiNear1,         None);
+    DATA(float4,   pgiNearP,         None);
 };

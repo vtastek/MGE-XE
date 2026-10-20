@@ -5,6 +5,7 @@
 # Usage: forge-zip-run.sh [delay=12] [save=ibodragonstareast360.ess] [target=500] [seed=1]
 #                         [timeout=1800] [clientEnv="NAME=v,NAME=v"] [trace] [farChance=0.4] [settle=20]
 #                         [mode=zip|hop|door] [hops=10] [dwell=4] [interior="Seyda Neen, Census and Excise Office"]
+#                         [thirdPerson=0|1]   (1: force the 3rd-person view before the hops start)
 #
 # mode=hop is the DOOR HOP: `hops` round trips exterior -> "Seyda Neen, Census and Excise Office" ->
 # the same exterior spot, `dwell` real seconds each side; MWSE.log logs each leg's positionCell ms.
@@ -34,7 +35,8 @@ MODE="${10:-zip}"
 HOPS="${11:-10}"
 DWELL="${12:-4}"
 INTERIOR="${13:-Seyda Neen, Census and Excise Office}"
-CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP MGE_GEOM_CONTENT_PROBE MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_PGI_EMIT MGE_GEOM_KEEP_MB MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_SCOPED_WALK MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR"
+THIRDP="${14:-0}"
+CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_COPY_PRERECORD MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP MGE_GEOM_CONTENT_PROBE MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_PGI_EMIT MGE_GEOM_KEEP_MB MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_SCOPED_WALK MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR MGE_FP2_PROBE"
 
 MW="/mnt/c/mgem/morrowind64"
 XELOG="$MW/mgeXE.log"
@@ -62,9 +64,9 @@ restore() {
 }
 trap restore EXIT
 
-python3 - "$ILCFG" "$SAVE" "$AZCFG" "$DELAY" "$TARGET" "$SEED" "$FARCHANCE" "$SETTLE" "$MODE" "$HOPS" "$DWELL" "$INTERIOR" <<'PY'
+python3 - "$ILCFG" "$SAVE" "$AZCFG" "$DELAY" "$TARGET" "$SEED" "$FARCHANCE" "$SETTLE" "$MODE" "$HOPS" "$DWELL" "$INTERIOR" "$THIRDP" <<'PY'
 import json, sys
-il, save, az, delay, target, seed, far, settle, mode, hops, dwell, interior = sys.argv[1:13]
+il, save, az, delay, target, seed, far, settle, mode, hops, dwell, interior, thirdp = sys.argv[1:14]
 with open(il) as f: cfg = json.load(f)
 cfg["continue"] = False          # else the mod loads the NEWEST save, not ours
 cfg["overrideFile"] = save
@@ -72,9 +74,10 @@ with open(il, "w") as f: json.dump(cfg, f, indent=2)
 with open(az, "w") as f:
     json.dump({"enabled": True, "delay": float(delay), "target": int(target), "seed": int(seed),
                "farChance": float(far), "settle": float(settle), "mode": mode, "hops": int(hops),
-               "dwell": float(dwell), "interior": interior}, f, indent=2)
+               "dwell": float(dwell), "interior": interior,
+               "thirdPerson": thirdp == "1"}, f, indent=2)
 PY
-echo "[zip] pinned save=$SAVE | mode=$MODE delay=${DELAY}s target=$TARGET seed=$SEED farChance=$FARCHANCE settle=${SETTLE}s hops=$HOPS dwell=${DWELL}s interior='$INTERIOR'"
+echo "[zip] pinned save=$SAVE | mode=$MODE delay=${DELAY}s target=$TARGET seed=$SEED farChance=$FARCHANCE settle=${SETTLE}s hops=$HOPS dwell=${DWELL}s interior='$INTERIOR' thirdPerson=$THIRDP"
 
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1
 for _ in $(seq 1 20); do

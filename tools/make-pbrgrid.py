@@ -206,7 +206,7 @@ def main():
                             trans=(ROW_X[row], (k - 5) * SPACING, 0.0)))
             t = dict(tprop); t["tex"] = [(base + 2,) + tuple(tprop["tex"][0][1:])] + list(tprop["tex"][1:])
             out.append(t)
-            out.append(dict(stex, file="vt\\pbrgrid\\%s.dds" % stem))
+            out.append(dict(stex, file="textures\\vt\\pbrgrid\\%s.dds" % stem))
             metal = 255 if row == "m" else 0
             g = round(rough * 255)
             open(os.path.join(tdir, stem + ".dds"), "wb").write(dxt1(ALBEDO[row]))

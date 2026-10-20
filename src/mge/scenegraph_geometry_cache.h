@@ -344,6 +344,11 @@ namespace MGE::GeometryCache {
         // it WAS while the camera looks where it IS. The emit helpers use this stamp to record
         // which shipped transforms need the player's own motion added back at fire time.
         uint64_t playerFrame;
+        // FP2: frame stamp set by the OFF-VIEW body walk (1st person, body posed by an MWSE mod) on
+        // every shape of the player's hidden 3rd-person body. Such an entry ships only from
+        // buildGeometryDrawLists' off-view tail, with the kDraw/kSkin/kMMDrawFlag OffView bits; every
+        // ordinary emit path skips it, so it can never reach the main view.
+        uint64_t offViewFrame = 0;
         // Nearest NiSwitchNode ancestor at capture (null for the overwhelming majority of
         // entries), plus the index of the switch child this shape hangs under. A NiSwitchNode
         // displays ONLY the child at switchIndex — Glow in the Dahrk's "NightDaySwitch" flips
@@ -560,6 +565,10 @@ namespace MGE::GeometryCache {
     // Invariant: both sets ⊆ keys(cache()).
     const std::unordered_set<uint32_t>& skyKeys();
     const std::unordered_set<uint32_t>& fpKeys();
+    // FP2: this frame's OFF-VIEW body shapes (the hidden 1st-person body, walked only while an MWSE
+    // mod poses it), in walk order. Rebuilt every frame; empty in 3rd person, with no posing mod,
+    // or with MGE_FP2_BODY=0. Every key's entry carries offViewFrame == currentFrame().
+    const std::vector<uint32_t>& offViewBodyKeys();
 
     // Keys carrying a stencil "fake hole" PORTAL role (CachedGeometry::stencilRole). Same
     // incremental-maintenance pattern as the sets above, and by far the smallest of them: the whole

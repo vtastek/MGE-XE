@@ -3,6 +3,7 @@
 # across cell borders -> report what the grid-driven texture/geometry systems did at each crossing.
 # Usage: forge-walk-run.sh [delay=12] [save=ibodragonstareast360.ess] [speed=600] [distance=24576]
 #                          [heading=-1] [timeout=300] [clientEnv="NAME=v,NAME=v"] [trace] [settle=20]
+#                          [hostKnobs="name=v,name=v"]   (MGE_HOST_KNOBS, as forge-perf-run.sh)
 #
 # heading: degrees, 0 = north, 90 = east; negative = the save's own facing. distance 24576 = three
 # cells, so at least two border crossings whatever the start position. settle defaults past the
@@ -26,7 +27,8 @@ TIMEOUT="${6:-300}"
 CLIENTENV="${7:-}"
 TRACE="${8:-}"
 SETTLE="${9:-20}"
-CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP MGE_GEOM_CONTENT_PROBE MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_PGI_EMIT MGE_GEOM_KEEP_MB MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_SCOPED_WALK MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR"
+KNOBS="${10:-}"
+CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_COPY_PRERECORD MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP MGE_GEOM_CONTENT_PROBE MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_PGI_EMIT MGE_GEOM_KEEP_MB MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_SCOPED_WALK MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR"
 
 MW="/mnt/c/mgem/morrowind64"
 XELOG="$MW/mgeXE.log"
@@ -91,7 +93,12 @@ if [ -n "$TRACE" ]; then
 else
   ENVSET="${ENVSET}Remove-Item Env:MGE_FRAME_TRACE -ErrorAction SilentlyContinue; "
 fi
-ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
+if [ -n "$KNOBS" ]; then
+  echo "[walk] host knobs = $KNOBS (MGE_HOST_KNOBS)"
+  ENVSET="${ENVSET}\$env:MGE_HOST_KNOBS='$KNOBS'; "
+else
+  ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
+fi
 for n in $CLIENT_ENV_NAMES; do
   ENVSET="${ENVSET}Remove-Item Env:$n -ErrorAction SilentlyContinue; "
 done

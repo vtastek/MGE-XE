@@ -742,6 +742,11 @@ BEGIN_SRT_NO_AB(SrtData)
         // gShadowParams.pgiSpec.y > 0, published once the cube is built and resting SHADER_RESOURCE.
         // Bound with gPgiVol (main, mirror geo, FP). Appended last.
         DECL_TEXTURE(PerFrame, TexCube(float4), gPgiWorldCube)
+        // H2 NEAR PROBES (knob pgiHiNear): the two nearest pool probes' cubes, same size and mips as the
+        // world cube; alpha = the mean INVERSE hit distance (parallax radius), -1 = a hole. Read only once
+        // gShadowParams.pgiNear0/1.w >= 0 (skyamb.h.fsl pgiNearSpec).
+        DECL_TEXTURE(PerFrame, TexCube(float4), gPgiNearCube0)
+        DECL_TEXTURE(PerFrame, TexCube(float4), gPgiNearCube1)
         // THE EYE'S SKY VISIBILITY (skyvis.comp's 1x1 eye texel): (vis, -1, coverage, 1) at the camera,
         // from the K sky-direction maps. The FIRST-PERSON meshes' sky AO (skyamb.h.fsl skyAOTermEye) —
         // they are in no prepass, so gSkyVisScreen never holds them. Bound to the FP set only; read only
