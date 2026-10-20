@@ -2375,7 +2375,7 @@ float3 pgiUnpackR11G11B10(uint v)
     return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
 }
 float pgiGbDist(uint4 g) { return f16tof32(g.w >> 16u); }
-#line 1247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1250 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 float3 pgiCubeDir(uint f, float2 uv)
 {
     const float a = uv.x * 2.0f - 1.0f, b = uv.y * 2.0f - 1.0f;
@@ -2445,7 +2445,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     const float inv0 = (wi > 1.0e-4f) ? ia / wi : 0.0f;
     Write3D(gPgiCubeOut, int3(id), float4(rgb0, nearCube ? ((wa > 1.0e-4f) ? inv0 : -1.0f) : saturate(wa)));
-#line 1336 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1339 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
     return;
 }
 #line 1173 "FSL/shaders.list"

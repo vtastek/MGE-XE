@@ -2502,6 +2502,9 @@ float pgiSunOccVis(float3 worldAbs)
 
 float pgiSunVisibility(float3 P, float3 N, float3 S, bool march)
 {
+
+
+    if (gPgiParams.sunDir.w > 2.5f) { return 1.0f; }
     const float sunM = pgiSunVisMap(P, N);
     if (sunM >= 0.0f) { return sunM; }
     return march ? pgiSunVis(P, S) : pgiSunOccVis(P);

@@ -6916,12 +6916,92 @@ namespace {
         return on;
     }
 
+    // INTERIORS (host knob pgiInterior, tasks/forge-gi.md "INTERIORS" I0): the same two lists carry the
+    // WHOLE CELL — every opaque static shape in the cache, emitting or not, in or out of MW's frustum —
+    // because an interior capture has nothing else to draw (no distant land, terrain or sky). Doors in;
+    // skinned, blended single-map, stencil portal shapes, collision proxies and the player out. Cached
+    // data only, like the offscreen caster re-emit. Over the cap the nearest win. The host draws it only
+    // under its knob, so with the knob off this is shipped and ignored.
+    constexpr std::uint32_t kMaxPgiInterior = 4096;    // per list: the host's kPgiEmitMax (4 world windows)
+    std::vector<std::uint32_t> g_pgiIntKeys;           // membership, rebuilt every 30 frames
+    std::uint64_t              g_pgiIntKeysFrame = 0;
+
+    void buildPgiInterior() {
+        const auto& cacheMap = MGE::GeometryCache::cache();
+        const auto cacheFrame = MGE::GeometryCache::currentFrame();
+        if (g_pgiIntKeys.empty() || cacheFrame - g_pgiIntKeysFrame >= 30 || cacheFrame < g_pgiIntKeysFrame) {
+            g_pgiIntKeys.clear();
+            for (const auto& kv : cacheMap) {
+                const auto& e = kv.second;
+                if (e.isSkinned || e.isSky || e.isLandscape || e.isFP || e.stencilRole != 0) { continue; }
+                g_pgiIntKeys.push_back(kv.first);
+            }
+            g_pgiIntKeysFrame = cacheFrame;
+        }
+
+        struct Cand { float d2; std::uint32_t key; bool mm; };
+        static std::vector<Cand> s_cand;
+        s_cand.clear();
+        struct Skips { std::uint32_t gone, suppressed, noslot, blend, proxy, player, cap; };
+        Skips skip = {};
+        float bmin[3] = { 1e30f, 1e30f, 1e30f }, bmax[3] = { -1e30f, -1e30f, -1e30f };
+        const auto& eye = DistantLand::eyePos;
+        for (std::uint32_t key : g_pgiIntKeys) {
+            auto cit = cacheMap.find(key);
+            if (cit == cacheMap.end()) { ++skip.gone; continue; }
+            const auto& e = cit->second;
+            if (e.suppressedFrame == cacheFrame || e.offViewFrame == cacheFrame) { ++skip.suppressed; continue; }
+            if (isPlayerOwned(e)) { ++skip.player; continue; }
+            if (g_keySlot.find(key) == g_keySlot.end()) { ++skip.noslot; continue; }   // never uploaded
+            // The dispatch's own classification; blended MULTI-MAP parts ship opaque, as the emitters' do.
+            const bool isMM = e.d3dTexture && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+            if (!isMM && e.blendEnable) { ++skip.blend; continue; }
+            if (!isMM && !e.d3dTexture && e.isPickRoot) { ++skip.proxy; continue; }   // collision proxy
+            D3DXVECTOR3 c; float rad;
+            cacheWorldBounds(e, c, rad);
+            for (int a = 0; a < 3; ++a) {
+                bmin[a] = std::min(bmin[a], (&c.x)[a] - rad);
+                bmax[a] = std::max(bmax[a], (&c.x)[a] + rad);
+            }
+            const float dx = c.x - eye.x, dy = c.y - eye.y, dz = c.z - eye.z;
+            s_cand.push_back({ dx * dx + dy * dy + dz * dz, key, isMM });
+        }
+        std::uint32_t nMMAll = 0;
+        for (const Cand& c : s_cand) { nMMAll += c.mm ? 1u : 0u; }
+        const std::uint32_t nStAll = (std::uint32_t)s_cand.size() - nMMAll;
+        if (nStAll > kMaxPgiInterior || nMMAll > kMaxPgiInterior) {
+            std::sort(s_cand.begin(), s_cand.end(), [](const Cand& a, const Cand& b) { return a.d2 < b.d2; });
+        }
+        std::uint32_t nStatic = 0, nMM = 0;
+        for (const Cand& c : s_cand) {
+            const auto& e = cacheMap.find(c.key)->second;
+            auto ks = g_keySlot.find(c.key);
+            if (c.mm) {
+                if (nMM >= kMaxPgiInterior) { ++skip.cap; continue; }
+                emitMultiMapDraw(ks->second, e, nMM, g_pgiEmitMMScratch, false);
+            } else {
+                if (nStatic >= kMaxPgiInterior) { ++skip.cap; continue; }
+                emitStaticDraw(ks->second, e, nStatic, g_pgiEmitScratch);
+            }
+        }
+
+        static std::uint64_t s_lastLog = 0;
+        if (cacheFrame - s_lastLog >= 300) {
+            s_lastLog = cacheFrame;
+            LOG::logline(">> [pgi-int] whole-cell list: %zu keys -> static %u mm %u | bounds (%.0f,%.0f,%.0f)..(%.0f,%.0f,%.0f)"
+                         " | skip: suppressed %u, noslot %u, blend %u, proxy %u, player %u, cap %u, gone %u",
+                         g_pgiIntKeys.size(), nStatic, nMM,
+                         (double)bmin[0], (double)bmin[1], (double)bmin[2], (double)bmax[0], (double)bmax[1], (double)bmax[2],
+                         skip.suppressed, skip.noslot, skip.blend, skip.proxy, skip.player, skip.cap, skip.gone);
+        }
+    }
+
     void buildPgiEmitters() {
         MGE_ZoneScopedN("build:pgiEmit");
         g_pgiEmitScratch.clear();
         g_pgiEmitMMScratch.clear();
         if (!pgiEmitOn() || !g_pgiEmitVec || !g_pgiEmitMMVec) { return; }
-        if (!MWBridge::get()->IsExterior()) { return; }   // probe GI is exterior-only today
+        if (!MWBridge::get()->IsExterior()) { buildPgiInterior(); return; }
 
         const auto& cacheMap = MGE::GeometryCache::cache();
         const auto cacheFrame = MGE::GeometryCache::currentFrame();

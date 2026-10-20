@@ -417,6 +417,9 @@ float pgiSunOccVis(float3 worldAbs)
 // the renderer's two sources in its order. place.z = 1 (knob pgiSunMarch): the old height-field march.
 float pgiSunVisibility(float3 P, float3 N, float3 S, bool march)
 {
+    // sunDir.w = 3: INDOORS (pgiInterior). MW's interior "sunlight" is a fill the main view applies with no
+    // shadow, and the sun maps / height field here are the last exterior's.
+    if (gPgiParams.sunDir.w > 2.5f) { return 1.0f; }
     const float sunM = pgiSunVisMap(P, N);
     if (sunM >= 0.0f) { return sunM; }
     return march ? pgiSunVis(P, S) : pgiSunOccVis(P);

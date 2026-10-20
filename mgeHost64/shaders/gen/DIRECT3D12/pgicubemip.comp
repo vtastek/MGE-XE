@@ -2375,7 +2375,7 @@ float3 pgiUnpackR11G11B10(uint v)
     return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
 }
 float pgiGbDist(uint4 g) { return f16tof32(g.w >> 16u); }
-#line 1247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1250 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 float3 pgiCubeDir(uint f, float2 uv)
 {
     const float a = uv.x * 2.0f - 1.0f, b = uv.y * 2.0f - 1.0f;
@@ -2397,7 +2397,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     const uint N = (uint)gPgiParams.capTile.z;
     const uint3 id = DispatchThreadID;
     if (id.x >= N || id.y >= N || id.z >= 6u) { return; }
-#line 1318 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1321 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
     const int2 s = int2(id.xy) * 2;
     const float4 c0 = LoadRWTex3D(gPgiCubeIn, int3(s, (int)id.z)), c1 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(1, 0), (int)id.z));
     const float4 c2 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(0, 1), (int)id.z)), c3 = LoadRWTex3D(gPgiCubeIn, int3(s + int2(1, 1), (int)id.z));

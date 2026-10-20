@@ -3799,11 +3799,11 @@ namespace {
         Buffer*        pFPInstanceBufMM = nullptr;          // FP multi-map per-draw instance VB (kMMInstU32)
         // Probe-GI near emitters (pgiRecordEmitters): OWN world + instance windows, for the FP
         // windows' reason — every other window is filled earlier in the same command list.
-        Buffer*        pPgiEmitWorldsBuf = nullptr;         // gBatch: one 64KB world window (rigid)
-        DescriptorSet* pPerBatchSetPgiEmit = nullptr;       // gBatch bound to pPgiEmitWorldsBuf
+        Buffer*        pPgiEmitWorldsBuf[4] = {};           // gBatch: kPgiEmitWin 64KB world windows (rigid)
+        DescriptorSet* pPerBatchSetPgiEmit[4] = {};         // gBatch bound to pPgiEmitWorldsBuf[w]
         Buffer*        pPgiEmitInstanceBuf = nullptr;       // rigid per-draw instance VB (kStaticInstU32)
-        Buffer*        pPgiEmitMMWorldsBuf = nullptr;       // gBatch: one 64KB world window (multi-map)
-        DescriptorSet* pPerBatchSetPgiEmitMM = nullptr;     // gBatch bound to pPgiEmitMMWorldsBuf
+        Buffer*        pPgiEmitMMWorldsBuf[4] = {};         // gBatch: kPgiEmitWin 64KB world windows (multi-map)
+        DescriptorSet* pPerBatchSetPgiEmitMM[4] = {};       // gBatch bound to pPgiEmitMMWorldsBuf[w]
         Buffer*        pPgiEmitInstanceBufMM = nullptr;     // multi-map per-draw instance VB (kMMInstU32)
         Pipeline*      pFPMultiMapPipeline = nullptr;       // multi-map colour, GEQUAL + WRITE, CCW
         Pipeline*      pFPMultiMapPipelineMirror = nullptr; // … FRONT_FACE_CW
@@ -4779,9 +4779,11 @@ namespace {
     // and this is the instance-buffer entry count.
     constexpr uint32_t kMaxFPDraws   = 128;
     constexpr uint32_t kMaxFPSkinned = 32;
-    // Probe-GI near emitters per list (rigid / multi-map): one gBatch world window each, and the
-    // multi-map instance packs its draw index in 10 bits — both bound it at kBatchSize (1024).
-    constexpr uint32_t kPgiEmitMax   = kBatchSize;
+    // Probe-GI near emitters per list (rigid / multi-map): kPgiEmitWin gBatch world windows each (the
+    // multi-map instance packs its draw index in 10 bits: an index WITHIN its window). Four windows for
+    // an interior's whole cell (pgiInterior); an exterior's emitters fit the first.
+    constexpr uint32_t kPgiEmitWin   = 4;
+    constexpr uint32_t kPgiEmitMax   = kBatchSize * kPgiEmitWin;
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 1024
     // parts/frame (== the window, no batching). Raised 256 -> 1024 (2026-07-17): glow-windows
@@ -6708,6 +6710,11 @@ namespace {
     // below the DL bake's size floor, glow-mapped trim; light fixtures excluded) drawn into probe-GI
     // captures, in or out of MW's frustum. Needs pgiEmis (the emission checkerboard). 0 = off.
     float g_pgiEmitNear   = 1.0f;
+    // knob pgiInterior (tasks/forge-gi.md "INTERIORS", I0): probe GI indoors. An interior has no distant
+    // land, terrain or sky, so its captures draw the client's WHOLE-CELL list instead (the emitter list's
+    // interior mode: every opaque static of the cell, in or out of MW's frustum); no sun / zenith balls,
+    // no world probe, no sky in the relight, no receiver sky gate. 0 = interiors keep the old ambient.
+    float g_pgiInterior   = 0.0f;
     const IPC::DrawItemWire*     g_pgiEmitItems   = nullptr;   // this frame's lists (setPgiEmitters)
     unsigned                     g_pgiEmitCount   = 0;
     const IPC::MultiMapDrawWire* g_pgiEmitMMItems = nullptr;
@@ -6854,6 +6861,10 @@ namespace {
         int            slotOwner[kPgiN];
         bool           slotClear[kPgiN] = {};
         bool           ballMode = false;      // pgiBalls latched for this frame
+        // The SPACE the pool lives in (pgiSchedule's reset): exterior or interior, and the last eye in it.
+        bool           spaceSeen = false, spaceExt = true;
+        float          spaceEye[3] = {};
+        uint32_t       spaceResets = 0;       // heartbeat
         int            capBall = -1;
         Texture*       vol = nullptr;         // RGBA16F VX x VX x 8 VZ (opaque.srt.h gPgiVol)
         Texture*       volTag = nullptr;      // R32_UINT VX x VX x VZ
@@ -18091,31 +18102,42 @@ namespace {
                 d.ppBuffer = out;
                 addFrameBuf(&d);
             };
-            addBuf(kBatchBytes, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "pgiEmitWorldsCbv", &g_live.pPgiEmitWorldsBuf);
+            static_assert(kPgiEmitWin <= 4u, "g_live's pgi emitter window arrays hold 4");
+            for (uint32_t w = 0; w < kPgiEmitWin; ++w) {
+                addBuf(kBatchBytes, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "pgiEmitWorldsCbv", &g_live.pPgiEmitWorldsBuf[w]);
+                addBuf(kBatchBytes, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "pgiEmitMMWorldsCbv", &g_live.pPgiEmitMMWorldsBuf[w]);
+            }
             addBuf((uint64_t)kPgiEmitMax * kStaticInstU32 * sizeof(uint32_t), DESCRIPTOR_TYPE_VERTEX_BUFFER,
                    "instanceVBPgiEmit", &g_live.pPgiEmitInstanceBuf);
-            addBuf(kBatchBytes, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "pgiEmitMMWorldsCbv", &g_live.pPgiEmitMMWorldsBuf);
             addBuf((uint64_t)kPgiEmitMax * kMMInstU32 * sizeof(uint32_t), DESCRIPTOR_TYPE_VERTEX_BUFFER,
                    "instanceVBPgiEmitMM", &g_live.pPgiEmitInstanceBufMM);
             waitForAllResourceLoads();
-            if (g_live.pPgiEmitWorldsBuf && g_live.pPgiEmitInstanceBuf
-                && g_live.pPgiEmitMMWorldsBuf && g_live.pPgiEmitInstanceBufMM) {
+            bool ok = g_live.pPgiEmitInstanceBuf && g_live.pPgiEmitInstanceBufMM;
+            for (uint32_t w = 0; w < kPgiEmitWin && ok; ++w) {
+                ok = g_live.pPgiEmitWorldsBuf[w] && g_live.pPgiEmitMMWorldsBuf[w];
+                if (!ok) { break; }
                 DescriptorSetDesc d0 = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
-                addDescriptorSet(R, &d0, &g_live.pPerBatchSetPgiEmit);
+                addDescriptorSet(R, &d0, &g_live.pPerBatchSetPgiEmit[w]);
                 DescriptorSetDesc d1 = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
-                addDescriptorSet(R, &d1, &g_live.pPerBatchSetPgiEmitMM);
-                if (g_live.pPerBatchSetPgiEmit && g_live.pPerBatchSetPgiEmitMM) {
-                    DescriptorData bw = {};
-                    bw.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
-                    bw.ppBuffers = &g_live.pPgiEmitWorldsBuf;
-                    updateDescriptorSet(R, 0, g_live.pPerBatchSetPgiEmit, 1, &bw);
-                    DescriptorData bm = {};
-                    bm.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
-                    bm.ppBuffers = &g_live.pPgiEmitMMWorldsBuf;
-                    updateDescriptorSet(R, 0, g_live.pPerBatchSetPgiEmitMM, 1, &bm);
+                addDescriptorSet(R, &d1, &g_live.pPerBatchSetPgiEmitMM[w]);
+                ok = g_live.pPerBatchSetPgiEmit[w] && g_live.pPerBatchSetPgiEmitMM[w];
+                if (!ok) { break; }
+                DescriptorData bw = {};
+                bw.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                bw.ppBuffers = &g_live.pPgiEmitWorldsBuf[w];
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetPgiEmit[w], 1, &bw);
+                DescriptorData bm = {};
+                bm.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                bm.ppBuffers = &g_live.pPgiEmitMMWorldsBuf[w];
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetPgiEmitMM[w], 1, &bm);
+            }
+            if (!ok) {
+                for (uint32_t w = 0; w < kPgiEmitWin; ++w) {
+                    if (g_live.pPerBatchSetPgiEmit[w])   { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmit[w]);   g_live.pPerBatchSetPgiEmit[w] = nullptr; }
+                    if (g_live.pPerBatchSetPgiEmitMM[w]) { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmitMM[w]); g_live.pPerBatchSetPgiEmitMM[w] = nullptr; }
                 }
             }
-            if (!g_live.pPerBatchSetPgiEmit || !g_live.pPerBatchSetPgiEmitMM) {
+            if (!g_live.pPerBatchSetPgiEmit[0] || !g_live.pPerBatchSetPgiEmitMM[0]) {
                 LOG::logline("!! [pgi-emis] near-emitter resources FAILED — near emitters stay out of the probes");
             }
         }
@@ -25448,6 +25470,7 @@ namespace {
             { "pgiSunMarch",         &g_pgiSunMarch         },
             { "pgiSkyLive",          &g_pgiSkyLive          },
             { "pgiBalls",            &g_pgiBalls            },
+            { "pgiInterior",         &g_pgiInterior         },
             { "pgiVolTau",           &g_pgiVolTau           },
             { "pgiVolPeriod",        &g_pgiVolPeriod        },
             { "pgiKernK",            &g_pgiKernK            },
@@ -28543,6 +28566,7 @@ namespace {
           t.sliderF("Probe GI gain", &g_pgiGain, 0.0f, 3.0f, 0.05f);
           t.sliderF("Probe GI: probe lift above the cell's low/high top (u)", &g_pgiLift, 8.0f, 256.0f, 8.0f, "%.0f");
           t.sliderF("Probe GI: BALL placement + volume (1) / columns (0)", &g_pgiBalls, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: in INTERIORS (whole-cell captures)", &g_pgiInterior, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI: WORLD probe share in the old model (0 = sky SH)", &g_pgiWorld, 0.0f, 1.0f, 1.0f, "%.2f");
           t.sliderF("Probe GI: world probe lift above camera / column top (u)", &g_pgiWorldLift, 0.0f, 2048.0f, 384.0f, "%.0f");
           t.sliderF("Probe GI: world probe re-shot after this move (u)", &g_pgiWorldMove, 64.0f, 8192.0f, 1024.0f, "%.0f");
@@ -34084,6 +34108,7 @@ void destroyHostWindow(Renderer* R);
 
     void setPgiEmitters(const void* blob, unsigned count, unsigned bytes,
                         const void* mmBlob, unsigned mmCount, unsigned mmBytes) {
+        // pgiRecordEmitters draws at most kPgiEmitMax of each (kPgiEmitWin world windows).
         const unsigned n  = blob   ? std::min(count,   bytes   / (unsigned)sizeof(IPC::DrawItemWire))     : 0u;
         const unsigned nm = mmBlob ? std::min(mmCount, mmBytes / (unsigned)sizeof(IPC::MultiMapDrawWire)) : 0u;
         g_pgiEmitItems   = n  ? (const IPC::DrawItemWire*)blob       : nullptr;
@@ -34239,6 +34264,12 @@ void destroyHostWindow(Renderer* R);
     // SH1 sky-ambient publish is gated on exterior-ness, and it happens up with the per-frame camera
     // write, not down in the DL cull.
     extern bool g_dlExterior;
+    // Probe GI runs here: every exterior, and an interior under pgiInterior.
+    inline bool pgiIndoor() { return !g_dlExterior && g_pgiInterior > 0.5f; }
+    inline bool pgiCtxOn()  { return g_dlExterior || pgiIndoor(); }
+    // The relight's sun-test lane (sunDir.w): pgiSunTap outdoors; 3 indoors = unshadowed (pgi.comp.fsl
+    // pgiSunVisibility) — the sun maps there are the last exterior's.
+    inline float pgiSunTapLane() { return g_dlExterior ? std::clamp(g_pgiSunTap, 0.0f, 2.0f) : 3.0f; }
 
     // ─── S3a: THE CALIBRATION SETPOINT ───────────────────────────────────────────────────────────
     // The user's target mean display values, as `apl` (0..1). This table is the whole reason the
@@ -44094,11 +44125,14 @@ void destroyHostWindow(Renderer* R);
                 g_capFace.dbgTerrain = g_probeModes > 1u;
             }
             {
+                // An INTERIOR with no water (pgiInterior): the mirror pass is the capture pass and nothing
+                // else ever samples it, so every frame is a dry one.
+                const bool dryInt  = pgiIndoor() && !waterEnabled;
                 const bool waterOk = g_drawReflect && g_live.reflectReady && g_live.reflectMipReady
-                                  && waterEnabled && waterParams && !underwater;
+                                  && (waterEnabled || dryInt) && waterParams && !underwater;
                 pgiActGather(items, count, skinnedBlob, skinnedCount, skinnedBytes,
                              multiMapBlob, multiMapCount, multiMapBytes);   // H2-A: the near content
-                pgiSchedule(fcbvR, dryTerrain || dryScreen, waterOk);   // may set g_capFace (pgi)
+                pgiSchedule(fcbvR, dryTerrain || dryScreen || dryInt, waterOk);   // may set g_capFace (pgi)
                 if (g_capFace.pgi) { g_reflWaterGateOff = false; }   // dry or stolen: the pass runs
             }
             if (waterParams) {
@@ -44126,8 +44160,10 @@ void destroyHostWindow(Renderer* R);
                                  : (dryScreen || dryTerrain) ? float4(0.70f, 1.0f, 0.70f, 1.0f)
                                                              : float4(0.70f, 0.85f, 1.0f, 1.0f);
             }
-            if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams
-                && !g_reflWaterGateOff) {
+            // ...and a capture face indoors (probe GI under pgiInterior, or the probe oracle) needs the pass
+            // whether or not the cell has water.
+            if (g_drawReflect && g_live.reflectReady && (waterEnabled || (g_capFace.active && pgiIndoor()))
+                && waterParams && !g_reflWaterGateOff) {
                 dlReflectGeoCull(R, viewProj, fcbvR, dRel, eyeAbsZ, waterLevelAbs, underwater);
             } else {
                 g_reflGeoReady = false;
@@ -45658,7 +45694,10 @@ void destroyHostWindow(Renderer* R);
             // Probe-GI near emitters (knob pgiEmitNear): after the DL statics and their layers, so
             // they overwrite any DL proxy under them. Rides the emission checkerboard (pgiEmis), so
             // pgiEmis 0 stays the pre-emission probes exactly.
-            if (probeFace && g_capFace.pgi && !actOnly && g_reflFrameReady && pgiEmisOn() && g_pgiEmitNear > 0.5f) {
+            // INDOORS (pgiInterior) the same list is the client's WHOLE CELL — the only geometry an interior
+            // capture has — drawn into every capture face, the probe oracle's included, emission or not.
+            if (probeFace && !actOnly && g_reflFrameReady
+                && ((g_capFace.pgi && pgiEmisOn() && g_pgiEmitNear > 0.5f) || pgiIndoor())) {
                 pgiRecordEmitters();
             }
             // IR3: ...then the NEAR scene, over both. Gated on g_reflFrameReady (the mirror matrix +
@@ -64848,7 +64887,9 @@ void destroyHostWindow(Renderer* R);
             }
             mp[kGiDebugFloat + 0] = std::clamp(g_giTint, 0.0f, 1.0f);   // GI bounce inspection (gitint.h.fsl)
             mp[kGiDebugFloat + 1] = std::clamp(g_giTintLevel, 0.0f, 1.0f);
-            mp[kGiDebugFloat + 2] = std::clamp(std::round(g_pgiRecvVis), 0.0f, 4.0f);   // 3 = debug view of the gate's inputs, 4 = mode 2 with a LINEAR underside rule   // probe GI: receiver / probe sky visibility share (skyamb.h.fsl)
+            // Indoors (pgiInterior) the gate is off: there is no sky, so a receiver's sky AO says nothing
+            // about what the probes see, and all their light is local.
+            mp[kGiDebugFloat + 2] = g_dlExterior ? std::clamp(std::round(g_pgiRecvVis), 0.0f, 4.0f) : 0.0f;   // 3 = debug view of the gate's inputs, 4 = mode 2 with a LINEAR underside rule   // probe GI: receiver / probe sky visibility share (skyamb.h.fsl)
             mp[kGiDebugFloat + 3] = std::clamp(g_pgiRecvKnee, 0.01f, 1.0f);   // ... and its knee
             mp[kPgiSpecFloat + 0] = std::clamp(g_pgiSpecSharp, 0.0f, 1.0f);   // PBR env through its own lobe (skyAmbSpecPx)
             mp[kPgiSpecFloat + 1] = 0.0f;
@@ -67223,7 +67264,7 @@ void destroyHostWindow(Renderer* R);
                       const void* multiMapBlob, uint32_t multiMapCount, uint32_t multiMapBytes) {
         g_pgi.act.clear();
         const float R = g_pgiNearAct;
-        if (!(R > 0.0f && g_pgiHiNear > 0.0f && g_pgiOn > 0.5f && g_dlExterior)) { return; }
+        if (!(R > 0.0f && g_pgiHiNear > 0.0f && g_pgiOn > 0.5f && pgiCtxOn())) { return; }
         auto push = [&](const float c[3], float r) {
             g_pgi.act.push_back(c[0]); g_pgi.act.push_back(c[1]); g_pgi.act.push_back(c[2]); g_pgi.act.push_back(r);
         };
@@ -67268,8 +67309,21 @@ void destroyHostWindow(Renderer* R);
     }
 
     void pgiSchedule(const float* fcbvR, bool dry, bool waterOk) {
-        const bool want = g_pgiOn > 0.5f && g_dlExterior;
+        const bool want = g_pgiOn > 0.5f && pgiCtxOn();
         if (!want) { g_pgi.active = false; return; }
+        // A NEW SPACE: crossing between an exterior and an interior, or a door from one interior to the next
+        // (the camera jumps; interiors share one coordinate space). The pool's probes, their slots and the
+        // volume belong to the old space, so everything starts over — the mode switch's reset below.
+        bool newSpace = false;
+        {
+            const float dx = fcbvR[56] - g_pgi.spaceEye[0], dy = fcbvR[57] - g_pgi.spaceEye[1], dz = fcbvR[58] - g_pgi.spaceEye[2];
+            newSpace = g_pgi.spaceSeen && (g_dlExterior != g_pgi.spaceExt
+                                           || (!g_dlExterior && dx * dx + dy * dy + dz * dz > 2048.0f * 2048.0f));
+            g_pgi.spaceSeen = true;
+            g_pgi.spaceExt  = g_dlExterior;
+            g_pgi.spaceEye[0] = fcbvR[56]; g_pgi.spaceEye[1] = fcbvR[57]; g_pgi.spaceEye[2] = fcbvR[58];
+            if (newSpace) { ++g_pgi.spaceResets; }
+        }
         if (!pgiEnsure(g_live.pRenderer)) { g_pgi.active = false; return; }
         g_pgi.active = true;
         const float S = std::max(64.0f, g_pgiSpacing);
@@ -67335,9 +67389,11 @@ void destroyHostWindow(Renderer* R);
         // PHASE 2 mode switch: the slots change owners wholesale, so every slot is cleared and the pool
         // (or the columns) start over.
         {
-            const bool bm = g_pgiBalls > 0.5f;
-            if (bm != g_pgi.ballMode) {
+            // Indoors always balls: the columns stand on terrain an interior does not have.
+            const bool bm = g_pgiBalls > 0.5f || !g_dlExterior;
+            if (bm != g_pgi.ballMode || newSpace) {
                 g_pgi.ballMode = bm;
+                for (auto& np : g_pgi.nearP) { np.slot = -1; np.pend = np.hiFaces = 0; np.cubeBuilt = false; }
                 g_pgi.pool.clear();
                 for (int& s : g_pgi.slotOwner) { s = -1; }
                 for (bool& c : g_pgi.slotClear) { c = true; }
@@ -67345,6 +67401,9 @@ void destroyHostWindow(Renderer* R);
                 g_pgi.volLive = false;
                 g_pgi.volInit = false;
                 g_pgi.worldFaces = g_pgi.worldPend = 0;
+                // Readbacks still in flight were measured in the old space: their balls and verdicts go.
+                for (auto& n : g_pgi.ballN) { n = 0; }
+                for (auto& n : g_pgi.moveN) { n = false; }
             }
         }
         // NUDGE: the relight's verdicts. A report names the position it judged; one about a ball that has
@@ -67501,7 +67560,8 @@ void destroyHostWindow(Renderer* R);
         // THE WORLD PROBE's spot: above the camera and above the top of the camera's column (a tower, a
         // canopy), so it sees the open sky and the land around. Re-shot there once the camera has moved
         // pgiWorldMove from it, and every pgiWorldEvery s (cells stream in; its sky is every probe's); one face per capture, ahead of the pool.
-        if (g_pgi.ballMode) {
+        // Not indoors: an interior has no sky to show the probes, and its "column top" is not a thing.
+        if (g_pgi.ballMode && g_dlExterior) {
             float top = g_pgi.eyeZ;
             const int cix = (int)std::floor(ex / S + 0.5f), ciy = (int)std::floor(ey / S + 0.5f);
             const PgiColumn& cc = g_pgi.col[wrap(ciy) * G + wrap(cix)];
@@ -68016,7 +68076,7 @@ void destroyHostWindow(Renderer* R);
             P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
             P->ambCol = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());   // w = the lanterns' gain (pgiPoint)
             P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], std::clamp(g_pgiBackMaxPart, 0.0f, 1.0f));   // w = partial probes' back-face limit
-            P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));   // w = the sun-map test (pgiSunTap)
+            P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], pgiSunTapLane());   // w = the sun-map test (pgiSunTap)
             P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], std::clamp(g_pgiBackMax, 0.0f, 1.0f));     // w = complete probes' back-face limit
             P->grid   = float4(g_pgi.spacing, (float)kPgiG, (float)g_pgi.phase, (float)R);
             // y = a transition's blend toward its new value; z = MULTI-BOUNCE on (knob pgiBounce)
@@ -68025,7 +68085,10 @@ void destroyHostWindow(Renderer* R);
                                 (g_pgiSunMarch > 0.5f || !g_live.pSunOcc) ? 1.0f : 0.0f, std::max(0.0f, g_pgiFillGain));   // z = the old sun march, w = fill share (pgiFillGain)
             // The LIVE sky: the atmosphere's sky-view field in scene units (skyhw.frag's own scale).
             const bool skyLive = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
-            P->skyLive = float4(skyLive ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, std::max(0.0f, g_pgiSkyGain));   // w = sky share (pgiSkyGain); x = missing faces take the old model (pgiFillOld), y = sun share (pgiSunGain)
+            // Indoors no sky: a capture texel no geometry covers is the void past the cell's shell (a window,
+            // a gap in the mesh), not light — its share is 0, not the stale exterior sky SH.
+            P->skyLive = float4(skyLive ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM,
+                                g_dlExterior ? std::max(0.0f, g_pgiSkyGain) : 0.0f);   // w = sky share (pgiSkyGain); x = missing faces take the old model (pgiFillOld), y = sun share (pgiSunGain)
             TextureBarrier tb = {};
             tb.pTexture = g_pgi.sh;
             tb.mCurrentState = g_pgi.shInSR ? RESOURCE_STATE_SHADER_RESOURCE : RESOURCE_STATE_UNORDERED_ACCESS;
@@ -68062,7 +68125,7 @@ void destroyHostWindow(Renderer* R);
                     Q->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
                     Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());   // w = the lanterns (pgiPoint)
                     Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
-                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], pgiSunTapLane());
                     Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
                     Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
                     Q->capPos  = float4(b0.p[0], b0.p[1], b0.p[2], 0.0f);
@@ -68096,7 +68159,7 @@ void destroyHostWindow(Renderer* R);
                     Q->emis    = pgiEmisLane();
                     Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());
                     Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
-                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], pgiSunTapLane());
                     Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
                     Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
                     Q->capPos  = float4(g_pgi.worldP[0], g_pgi.worldP[1], g_pgi.worldP[2], 0.0f);
@@ -68156,7 +68219,7 @@ void destroyHostWindow(Renderer* R);
                     Q->emis    = pgiEmisLane();
                     Q->ambCol  = float4(fcbvR[24], fcbvR[25], fcbvR[26], pgiPointGain());
                     Q->lodEye  = float4(fcbvR[56], fcbvR[57], fcbvR[58], 0.0f);
-                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], std::clamp(g_pgiSunTap, 0.0f, 2.0f));
+                    Q->sunDir  = float4(fcbvR[16], fcbvR[17], fcbvR[18], pgiSunTapLane());
                     Q->sunCol  = float4(fcbvR[20], fcbvR[21], fcbvR[22], 0.0f);
                     Q->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
                     Q->capPos  = float4(np.p[0], np.p[1], np.p[2], 0.0f);
@@ -68293,7 +68356,8 @@ void destroyHostWindow(Renderer* R);
         g_pgi.ballN[g_live.recSlot % kFrameSlots] = 0;
         if ((((int)g_pgiDebug & 32) || g_pgi.ballMode) && !g_live.firstFrame) {
             const uint32_t nCam = (uint32_t)std::clamp(g_pgiBallsCam, 0.0f, (float)kPgiBallMax);
-            const uint32_t nSun = std::min((uint32_t)std::max(0.0f, g_pgiBallsSun), kPgiBallMax - nCam);
+            // Indoors no sun balls: there is no sun map, and the zenith fallback reads the exterior's.
+            const uint32_t nSun = g_dlExterior ? std::min((uint32_t)std::max(0.0f, g_pgiBallsSun), kPgiBallMax - nCam) : 0u;
             PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[3]);
             std::memset(P, 0, sizeof(PgiParams));
             P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
@@ -68375,6 +68439,10 @@ void destroyHostWindow(Renderer* R);
                          g_pgi.steals,
                          c0.ix, c0.iy, (double)c0.z[0], (double)c0.z[1], g_readSlot,
                          rb ? (double)rb[0] : -1.0, rb ? (double)rb[1] : -1.0, rb ? (double)rb[2] : -1.0, rb ? (double)rb[3] : -1.0);
+            if (!g_dlExterior) {
+                LOG::logline(">> [pgi] INTERIOR: pool %zu, complete %u, space resets %u, near list %u + %u (the whole cell)",
+                             g_pgi.pool.size(), g_pgi.complete, g_pgi.spaceResets, g_pgiEmitCount, g_pgiEmitMMCount);
+            }
             if (!g_pgi.pool.empty() || g_pgi.ballIn) {
                 uint32_t byType[4] = {};
                 for (const PgiBall& b : g_pgi.pool) { ++byType[std::min(b.type, 3u)]; }
@@ -68419,7 +68487,7 @@ void destroyHostWindow(Renderer* R);
 
     // gShadowParams lanes for the receivers (skyamb.h.fsl pgiIrradiance).
     void pgiPublish(float* mp) {
-        const bool on = g_pgi.ready && g_pgi.active && g_pgi.shInSR && g_dlExterior;
+        const bool on = g_pgi.ready && g_pgi.active && g_pgi.shInSR && pgiCtxOn();
         const float S = std::max(1.0f, g_pgi.spacing);
         mp[kPgiFloat + 0] = on ? std::max(0.0f, g_pgiGain) : 0.0f;
         mp[kPgiFloat + 1] = 1.0f / (S * (float)kPgiG);
@@ -68978,7 +69046,7 @@ void destroyHostWindow(Renderer* R);
     // (ring VBs) are skipped.
     void pgiRecordEmitters() {
         static uint32_t s_drawn = 0, s_drawnMM = 0, s_skip = 0, s_calls = 0;
-        if (!g_live.pPerBatchSetPgiEmit || !g_live.pPerBatchSetPgiEmitMM) { return; }
+        if (!g_live.pPerBatchSetPgiEmit[0] || !g_live.pPerBatchSetPgiEmitMM[0]) { return; }
         cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.6f, 0.2f, "PGI near emitters");
         uint32_t drawn = 0, drawnMM = 0, skip = 0;
         const uint32_t vStride = (uint32_t)sizeof(IPC::GeomVertexWire);
@@ -68991,7 +69059,6 @@ void destroyHostWindow(Renderer* R);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetPgiEmit);
             for (uint32_t k = 0; k < n; ++k) {
                 const IPC::DrawItemWire& it = g_pgiEmitItems[k];
                 const uint32_t slot = it.slot;
@@ -69002,13 +69069,15 @@ void destroyHostWindow(Renderer* R);
                 Buffer* meshVb = m.inArena ? g_live.pArenaVB : m.vb;
                 Buffer* meshIb = m.inArena ? g_live.pArenaIB : m.ib;
                 if (!meshVb || !meshIb) { ++skip; continue; }
-                const uint32_t idx = drawn;
-                uint8_t* wdst = (uint8_t*)fbwRange(g_live.pPgiEmitWorldsBuf, (uint64_t)idx * 64, 64);
-                std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
+                // Window w = idx / kBatchSize holds this draw's world; the instance VB is one run.
+                const uint32_t idx = drawn, win = idx / kBatchSize, loc = idx % kBatchSize;
+                if (loc == 0u) { cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetPgiEmit[win]); }
+                uint8_t* wdst = (uint8_t*)fbwRange(g_live.pPgiEmitWorldsBuf[win], (uint64_t)loc * 64, 64);
+                std::memcpy(wdst + (size_t)loc * 64, it.world, 64);
                 uint32_t* inst = (uint32_t*)fbwRange(g_live.pPgiEmitInstanceBuf, (uint64_t)idx * kStaticInstU32 * 4, kStaticInstU32 * 4);
                 uint32_t* e = inst + (size_t)idx * kStaticInstU32;
                 float* fe = (float*)e;
-                e[0] = idx;   // DrawIndex -> gBatch.worlds[idx]
+                e[0] = loc;   // DrawIndex -> gBatch.worlds[loc] of window win
                 e[1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
                 fe[2]  = it.matDiffuse[0];  fe[3]  = it.matDiffuse[1];  fe[4]  = it.matDiffuse[2];
                 fe[5]  = it.matAmbient[0];  fe[6]  = it.matAmbient[1];  fe[7]  = it.matAmbient[2];
@@ -69034,16 +69103,16 @@ void destroyHostWindow(Renderer* R);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetPgiEmitMM);
             for (uint32_t k = 0; k < n; ++k) {
                 const IPC::MultiMapDrawWire& it = g_pgiEmitMMItems[k];
                 const uint32_t slot = it.slot;
                 if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++skip; continue; }
                 HostMesh& mm = g_meshes[slot];
                 if (!mm.multimap || !mm.vb || !mm.ib) { ++skip; continue; }
-                const uint32_t idx = drawnMM;
-                uint8_t* mdst = (uint8_t*)fbwRange(g_live.pPgiEmitMMWorldsBuf, (uint64_t)idx * 64, 64);
-                std::memcpy(mdst + (size_t)idx * 64, it.world, 64);
+                const uint32_t idx = drawnMM, win = idx / kBatchSize, loc = idx % kBatchSize;
+                if (loc == 0u) { cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetPgiEmitMM[win]); }
+                uint8_t* mdst = (uint8_t*)fbwRange(g_live.pPgiEmitMMWorldsBuf[win], (uint64_t)loc * 64, 64);
+                std::memcpy(mdst + (size_t)loc * 64, it.world, 64);
                 uint32_t* minst = (uint32_t*)fbwRange(g_live.pPgiEmitInstanceBufMM, (uint64_t)idx * kMMInstU32 * 4, kMMInstU32 * 4);
                 uint32_t* e = minst + (size_t)idx * kMMInstU32;
                 const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
@@ -69071,8 +69140,9 @@ void destroyHostWindow(Renderer* R);
 
         s_drawn += drawn; s_drawnMM += drawnMM; s_skip += skip;
         if (++s_calls >= 300) {
-            LOG::logline(">> [pgi-emis] captures drew near emitters: %.1f rigid + %.1f multi-map per capture "
+            LOG::logline(">> [pgi-emis] captures drew the near list (%s): %.1f rigid + %.1f multi-map per capture "
                          "(%.1f skipped) over %u captures; list now %u + %u",
+                         g_dlExterior ? "emitters" : "INTERIOR whole cell",
                          (double)s_drawn / s_calls, (double)s_drawnMM / s_calls, (double)s_skip / s_calls,
                          s_calls, g_pgiEmitCount, g_pgiEmitMMCount);
             s_drawn = s_drawnMM = s_skip = s_calls = 0;
@@ -70507,11 +70577,13 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pMultiMapReflectPipelineMirror) { removePipeline(R, g_live.pMultiMapReflectPipelineMirror); }
         if (g_live.pMultiMapReflectPipelineNone)   { removePipeline(R, g_live.pMultiMapReflectPipelineNone); }
         // Probe-GI near emitters.
-        if (g_live.pPerBatchSetPgiEmit)     { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmit); }
-        if (g_live.pPerBatchSetPgiEmitMM)   { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmitMM); }
-        if (g_live.pPgiEmitWorldsBuf)       { removeFrameBuf(g_live.pPgiEmitWorldsBuf); }
+        for (uint32_t w = 0; w < kPgiEmitWin; ++w) {
+            if (g_live.pPerBatchSetPgiEmit[w])   { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmit[w]); }
+            if (g_live.pPerBatchSetPgiEmitMM[w]) { removeDescriptorSet(R, g_live.pPerBatchSetPgiEmitMM[w]); }
+            if (g_live.pPgiEmitWorldsBuf[w])     { removeFrameBuf(g_live.pPgiEmitWorldsBuf[w]); }
+            if (g_live.pPgiEmitMMWorldsBuf[w])   { removeFrameBuf(g_live.pPgiEmitMMWorldsBuf[w]); }
+        }
         if (g_live.pPgiEmitInstanceBuf)     { removeFrameBuf(g_live.pPgiEmitInstanceBuf); }
-        if (g_live.pPgiEmitMMWorldsBuf)     { removeFrameBuf(g_live.pPgiEmitMMWorldsBuf); }
         if (g_live.pPgiEmitInstanceBufMM)   { removeFrameBuf(g_live.pPgiEmitInstanceBufMM); }
         if (g_live.pMultiMapPrepassPipeline)       { removePipeline(R, g_live.pMultiMapPrepassPipeline); }
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
