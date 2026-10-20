@@ -1320,7 +1320,11 @@ STRUCT(ShadowMaskParams)
     float4 pgiNear0;
     float4 pgiNear1;
     float4 pgiNearP;
-#line 1122
+
+
+
+    float4 pgiCapEye;
+#line 1126
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -3335,6 +3339,18 @@ float3 pgiHiSpec(float3 R, float rough, float3 E, float3 eIrr, float3 P)
 
 
 
+
+
+
+float3 pgiCapSpec(float3 R, float rough)
+{
+    if (gShadowParams.pgiSpec.y <= 0.0f) { return f3(0.0f); }
+    const float lod = saturate(rough / max(gShadowParams.pgiSpec.z, 0.05f)) *  4.0f ;
+    return max(SampleLvlTexCube(gPgiWorldCube, gSamplerTrilinearClamp, R, lod).rgb, f3(0.0f));
+}
+
+
+
 float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
 {
 
@@ -3389,7 +3405,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 863 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 875 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef = gShadowParams.skyAOGround.y;
@@ -3554,7 +3570,7 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
     const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
     if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
     return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
-#line 1030 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 1042 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 }
 #line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 

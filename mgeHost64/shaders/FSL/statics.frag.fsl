@@ -540,9 +540,20 @@ PSOut PS_MAIN( VSOutput In )
         const float bs = dot(cross(ddx(In.WorldPos), ddy(In.WorldPos)), In.WorldNormal);
         // Nor for BLENDED ones (0x20): two-sided by intent as well — they showed magenta in the peek.
         if (pgiCap && (In.Flags & 0x22u) == 0u && bs * PGI_BACK_SIGN > 0.0f) { Out.Color = float4(4.0f, 0.0f, 4.0f, 1.0f); RETURN(Out); }
+        // ONE LEVEL OF RECURSION (skyamb.h pgiCapSpec, opaque.frag's twin): the diffuse share as albedo, the
+        // world probe's cube as seen in the surface from the probe on the emission pixels.
+        float3 capSpec = f3(0.0f);
+        float3 capKd   = f3(1.0f);
+        if (pgiCap && pbrLive && gShadowParams.pgiCapEye.w > 0.5f && PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
+            const float3 f0c = pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x);
+            const float3 Vc  = normalize(gShadowParams.pgiCapEye.xyz - In.WorldPos);
+            const float  nvc = max(dot(nShade, Vc), 1.0e-4f);
+            capKd   = pbrKd;
+            capSpec = gFrameData.lodSunAmb.rgb * pgiCapSpec(reflect(-Vc, nShade), pbrRough) * pbrEnvBRDF(f0c, nvc, pbrRough);
+        }
         // P2 EMISSION (odd pixels): statics.vert hands this mode the emissive ALONE in Color.
-        if (pgiEmisPx) { Out.Color = float4(tex.rgb * In.Color.rgb, 1.0f); RETURN(Out); }
-        Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out);
+        if (pgiEmisPx) { Out.Color = float4(tex.rgb * In.Color.rgb + capSpec, 1.0f); RETURN(Out); }
+        Out.Color = float4(tex.rgb * capKd, 1.0f);      RETURN(Out);
     }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }

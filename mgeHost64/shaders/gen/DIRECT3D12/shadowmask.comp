@@ -1320,7 +1320,11 @@ STRUCT(ShadowMaskParams)
     float4 pgiNear0;
     float4 pgiNear1;
     float4 pgiNearP;
-#line 1122
+
+
+
+    float4 pgiCapEye;
+#line 1126
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

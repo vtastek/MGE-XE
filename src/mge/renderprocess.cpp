@@ -956,6 +956,10 @@ namespace {
     // are re-emitted for shadowing even when frustum-culled, so their shadows don't freeze/lose
     // parts as they leave view. ~2r of the largest shadow lights; bounded to a few NPCs indoors.
     constexpr float kShadowCasterRadius = 2048.0f;
+    // H2-A: plain statics this near the eye are re-emitted EVERY frame when off screen, not seeded once
+    // per cell — the host's near probes draw the near content within pgiNearAct (350 u) of the camera
+    // into their reflections from this frame's list, so a barrel behind you belongs in it.
+    constexpr float kProbeContentRadius = 512.0f;
 
     // Live near-actor pose refresh (fixes the offscreen dyn-shadow drift). Offscreen movers
     // were re-emitted from CACHED palettes, which the geometry cache only refreshes on the
@@ -5668,6 +5672,11 @@ namespace {
                     // (C4b keeps a settled record). Deferred: ensureLive must not run while this loop
                     // reads cacheMap.
                     if (movingStatic(e)) { s_animStaticRefresh.push_back({ skey, 0 }); continue; }
+                    // H2-A: near-probe content — every frame (kProbeContentRadius). Cached data, like the seed.
+                    if (dx * dx + dy * dy + dz * dz <= (kProbeContentRadius + rad) * (kProbeContentRadius + rad)) {
+                        emitStaticDraw(ks->second, e, drawCount);
+                        continue;
+                    }
                     auto seedIt = s_offscreenSeeded.find(skey);
                     if (seedIt != s_offscreenSeeded.end() && seedIt->second == ks->second.slot) continue;
                     s_offscreenSeeded[skey] = ks->second.slot;   // seed (or re-seed on a new slot)

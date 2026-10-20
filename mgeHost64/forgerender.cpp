@@ -6597,6 +6597,8 @@ namespace {
         bool     dbgTerrain = false;   // bind terrain_dbg (the isolation views live only there)
         uint32_t res = 0;              // viewport side (px); 0 = the whole mirror target
         bool     steal = false;        // a WET view: keep last frame's reflection, draw only the corner
+        bool     actOnly = false;      // H2-A: a near probe's near-content shot — only what is within pgiNearAct
+                                       // of the camera is drawn (no sky, land, statics); the gather merges it
     };
     CapFace g_capFace;
     // The mirror's horizon scissor top on the last NORMAL reflect frame: rows above it were cleared and
@@ -6654,7 +6656,9 @@ namespace {
     constexpr uint32_t kPgiNear = 2;
     constexpr uint32_t kPgiNearLitInst = 7u + kPgiCubeMips;              // near j's relight: instance 12 + j
     constexpr uint32_t kPgiNearMipInst = kPgiNearLitInst + kPgiNear;     // near j's mip k: 14 + j * mips + k
-    constexpr uint32_t kPgiPeekRows = 6u + 2u * kPgiNear;                // the peek atlas's rows of faces
+    // H2-A (pgiNearAct): near probe j's STATIC faces, row 6 + 2 kPgiNear + j — what a near-content shot merges over.
+    constexpr uint32_t kPgiNearStaticRow = 6u + 2u * kPgiNear;
+    constexpr uint32_t kPgiPeekRows = kPgiNearStaticRow + kPgiNear;      // the peek atlas's rows of faces
     // 0-5 as before, 6 world lit, 7.. the world cube's mips, then the near probes' relights and cube mips.
     constexpr uint32_t kPgiSetN = kPgiNearMipInst + kPgiNear * kPgiCubeMips;
     // BALLS (tasks/forge-gi.md "probes placed by shooting balls", phase 1 = placement only, drawn by
@@ -6730,6 +6734,17 @@ namespace {
     // receiver stops taking any of it.
     float g_pgiHiNear     = 1.0f;
     float g_pgiNearReach  = 768.0f;
+    // knob pgiNearAct (H2-A, u; 0 = off): what stands within this distance of the camera — the player (the FP2
+    // body in first person), NPCs, the clutter beside them — is drawn into the near probes' captures, from MW's
+    // near set (so what the camera's frustum holds, plus the off-view body). A near probe re-shoots a face when
+    // that content moves in it, else every pgiActEvery frames while it is there. Never in the probe's G-buffer
+    // tile, so the GI does not see it; nothing recursive (a capture draws albedo). 350 u ~ 5 m.
+    float g_pgiNearAct    = 350.0f;
+    float g_pgiActEvery   = 8.0f;
+    // knob pgiCapRefl (1 = on; 0 = off, the A/B): ONE level of recursion — in a probe-GI capture a PBR surface keeps
+    // its diffuse share as albedo and reflects the world probe's cube, seen from the probe, as emission
+    // ("use global probe, so spheres don't look white", user 2026-10-20).
+    float g_pgiCapRefl    = 1.0f;
     float g_pgiRecvVis   = 2.0f;    // knob pgiRecvVis: 0 off, 1 receiver sky AO over the probes' visibility, 2 receiver sky AO alone
     float g_pgiKernK     = 2.5f;    // knob pgiKernK: splat kernel radius = this x the pool's merge radius there
                                     // (1 also darkens a tunnel, but the receivers' own sky visibility does it
@@ -6882,8 +6897,18 @@ namespace {
             bool      hiNew = false, cubeBuilt = false, cubeInSR = false;
             uint32_t  tick = 0, builds = 0, shots = 0;
             Texture*  cube = nullptr;
+            // H2-A (pgiNearAct): faces to re-shoot for the near content, the faces it was in last frame and
+            // its signature there (a move changes it), and frames since each face was last shot.
+            uint8_t   actPend = 0, actHad = 0;
+            float     actSig[6] = {};
+            uint32_t  actAge[6] = {};
+            uint32_t  actShots = 0;
         } nearP[kPgiNear];
         int            capNear = -1;          // this frame's capture is near probe j's
+        // H2-A: this frame's near content as camera-relative spheres (x, y, z, r), and the turn counter
+        // that shares the capture with the pool.
+        std::vector<float> act;
+        uint32_t       actTurn = 0;
         Pgi() { for (int& s : slotOwner) { s = -1; } }
         PgiColumn      col[kPgiG * kPgiG];
         int            ix0 = 0, iy0 = 0;
@@ -7376,7 +7401,7 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, pgiSpec) == kPgiSpecFloat * sizeof(float),
                   "kPgiSpecFloat does not land on ShadowMaskParams::pgiSpec");
-    static_assert((kPgiNearFloat + 12) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kPgiNearFloat + 16) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, pgiNear0) == kPgiNearFloat * sizeof(float),
                   "kPgiNearFloat does not land on ShadowMaskParams::pgiNear0");
@@ -25415,6 +25440,9 @@ namespace {
             { "pgiHiNorm",           &g_pgiHiNorm           },
             { "pgiHiNear",           &g_pgiHiNear           },
             { "pgiNearReach",        &g_pgiNearReach        },
+            { "pgiNearAct",          &g_pgiNearAct          },
+            { "pgiActEvery",         &g_pgiActEvery         },
+            { "pgiCapRefl",          &g_pgiCapRefl          },
             { "pgiBlame",            &g_pgiBlame            },
             { "pgiNudge",            &g_pgiNudge            },
             { "pgiNudgeMargin",      &g_pgiNudgeMargin      },
@@ -28521,6 +28549,9 @@ namespace {
           t.sliderF("Probe GI H2 NEAR probes: the 2 nearest probes' own cubes, parallax-corrected (0 = off, the world cube alone)",
                     &g_pgiHiNear, 0.0f, 1.0f, 0.05f);
           t.sliderF("  near probe reach (u): a receiver this far from it takes none of it", &g_pgiNearReach, 64.0f, 4096.0f, 32.0f, "%.0f");
+          t.sliderF("  near content (u): player, NPCs, clutter this close to the camera show in the near probes (0 = off)", &g_pgiNearAct, 0.0f, 1024.0f, 25.0f, "%.0f");
+          t.sliderF("  frames between re-shots of a face whose near content holds still", &g_pgiActEvery, 1.0f, 120.0f, 1.0f, "%.0f");
+          t.sliderF("  captures: PBR surfaces reflect the world cube (one level of recursion; 0 = albedo only)", &g_pgiCapRefl, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI BLAME the crosshair (1 = rank the probes lighting the point under it: log [pgi-blame], worst = MAGENTA ball, next four ORANGE; view with DEBUG 33)", &g_pgiBlame, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI NUDGE (1 = a probe inside geometry, red, is moved through its nearest back face and recaptured)", &g_pgiNudge, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI nudge margin past the back face (u)", &g_pgiNudgeMargin, 0.0f, 128.0f, 4.0f, "%.0f");
@@ -35486,6 +35517,10 @@ void destroyHostWindow(Renderer* R);
         const void*     multiMapBlob;
         uint32_t        multiMapCount;
         uint32_t        multiMapBytes;
+        // H2-A (pgiNearAct): > 0 = draw only what lies within this distance of the camera, every item of
+        // the list by itself (the indirect groups are the main view's, not a distance's); 0 = all of it.
+        uint32_t        itemCount;
+        float           keepR;
     };
     void reflRecordNear(const ReflNearInput& in);                           // IR3 reflected near scene
     void pgiRecordEmitters();                                               // probe-GI near emitters (captures)
@@ -36204,6 +36239,9 @@ void destroyHostWindow(Renderer* R);
     // function. A pass that does not time anything simply does not take them.
     // PROBE GI (defined with the GI field producer, far below): forward declarations for the
     // W-gate scheduler, the reflect pass and the shadow-params publish.
+    void pgiActGather(const IPC::DrawItemWire* items, uint32_t count,
+                      const void* skinnedBlob, uint32_t skinnedCount, uint32_t skinnedBytes,
+                      const void* multiMapBlob, uint32_t multiMapCount, uint32_t multiMapBytes);
     void pgiSchedule(const float* fcbvR, bool dry, bool waterOk);
     void pgiGatherRecord();
     void pgiFrameRecord(const float* fcbvR);
@@ -44032,6 +44070,8 @@ void destroyHostWindow(Renderer* R);
             {
                 const bool waterOk = g_drawReflect && g_live.reflectReady && g_live.reflectMipReady
                                   && waterEnabled && waterParams && !underwater;
+                pgiActGather(items, count, skinnedBlob, skinnedCount, skinnedBytes,
+                             multiMapBlob, multiMapCount, multiMapBytes);   // H2-A: the near content
                 pgiSchedule(fcbvR, dryTerrain || dryScreen, waterOk);   // may set g_capFace (pgi)
                 if (g_capFace.pgi) { g_reflWaterGateOff = false; }   // dry or stolen: the pass runs
             }
@@ -45441,7 +45481,9 @@ void destroyHostWindow(Renderer* R);
             // STOLEN ones as well (2026-10-14): their viewport and scissor are the capRes corner, which
             // the steal only takes when the last real mirror left it unsampled — and without it, where
             // water is always in view EVERY probe fell to the ambCol stand-in (~10x the sky at dusk).
-            const bool drawReflSkyHw = g_skyPhys.active && g_skyViewPub[1] && !underwaterR
+            // H2-A: a near-content shot draws ONLY the near content — its empty texels are the static face's.
+            const bool actOnly = probeFace && g_capFace.actOnly;
+            const bool drawReflSkyHw = !actOnly && g_skyPhys.active && g_skyViewPub[1] && !underwaterR
                                     && g_live.pSkyHwPipeline && g_live.pPerBatchSetReflectSky;
             if (drawReflSkyHw) {
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (mirror)");
@@ -45466,7 +45508,7 @@ void destroyHostWindow(Renderer* R);
             // the moons in it as much as the sky above does. Same per-item skip, same skyElemPhys
             // narrowing, so the two views cannot disagree about what the sky contains.
             const bool skyElemPhysR = drawReflSkyHw && g_live.sceneReferred && g_live.linearScene;
-            const bool drawReflSky = g_drawSky
+            const bool drawReflSky = g_drawSky && !actOnly
                                   && skyBlob && skyCount && skyBytes && !underwaterR
                                   && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
             if (drawReflSky) {
@@ -45586,11 +45628,11 @@ void destroyHostWindow(Renderer* R);
             // pReflectColor/Depth, AFTER the sky (depth GEQUAL+write → occludes the reflected sky). Gated by
             // g_reflGeoReady (the cull ran + rings valid this frame).
             gpuPhaseBegin(kGpuPhaseReflGeo);
-            if (g_reflGeoReady) { dlReflectRecordGeo(); }
+            if (g_reflGeoReady && !actOnly) { dlReflectRecordGeo(); }
             // Probe-GI near emitters (knob pgiEmitNear): after the DL statics and their layers, so
             // they overwrite any DL proxy under them. Rides the emission checkerboard (pgiEmis), so
             // pgiEmis 0 stays the pre-emission probes exactly.
-            if (probeFace && g_capFace.pgi && g_reflFrameReady && pgiEmisOn() && g_pgiEmitNear > 0.5f) {
+            if (probeFace && g_capFace.pgi && !actOnly && g_reflFrameReady && pgiEmisOn() && g_pgiEmitNear > 0.5f) {
                 pgiRecordEmitters();
             }
             // IR3: ...then the NEAR scene, over both. Gated on g_reflFrameReady (the mirror matrix +
@@ -45602,8 +45644,15 @@ void destroyHostWindow(Renderer* R);
             // probe saw more of it as the camera turned ("rotating camera was updating the probes with
             // new statics", user 2026-10-12). The distant statics reach the eye in a capture and carry
             // everything a probe needs; small clutter does not belong in probes (user).
-            if (g_reflFrameReady && g_drawReflectNear && !(probeFace && g_capFace.pgi && g_pgiCapNear < 0.5f)) {
+            // H2-A (pgiNearAct): a near probe's near-content shot (actOnly) draws the part of it within
+            // pgiNearAct of the camera — the player, the nearest NPCs, what stands beside them — and nothing
+            // else; the gather merges it over the probe's static face, for its cube only.
+            const bool capPgi = probeFace && g_capFace.pgi;
+            const bool capAct = capPgi && actOnly;
+            if (g_reflFrameReady && g_drawReflectNear && (!capPgi || g_pgiCapNear >= 0.5f || capAct)) {
                 ReflNearInput ni = {};
+                ni.itemCount    = count;
+                ni.keepR        = capAct ? g_pgiNearAct : 0.0f;
                 ni.groupCount   = &groupCount[0][0][0];
                 ni.groupOff     = &groupOff[0][0][0];
                 ni.dynamic      = s_dynamic.empty() ? nullptr : s_dynamic.data();
@@ -64771,7 +64820,7 @@ void destroyHostWindow(Renderer* R);
             mp[kPgiSpecFloat + 1] = 0.0f;
             mp[kPgiSpecFloat + 2] = 0.0f;
             mp[kPgiSpecFloat + 3] = 0.0f;
-            for (uint32_t q = 0; q < 12u; ++q) { mp[kPgiNearFloat + q] = 0.0f; }   // H2 near probes: none
+            for (uint32_t q = 0; q < 16u; ++q) { mp[kPgiNearFloat + q] = 0.0f; }   // H2 near probes: none (+ pgiCapEye)
             mp[kPgiNearFloat + 3] = mp[kPgiNearFloat + 7] = -1.0f;
             mp[kSkyAOGroundFloat + 0] = std::clamp(g_skyAOGroundExempt, 0.0f, 1.0f);
             mp[kSkyAOGroundFloat + 1] = std::clamp(g_giOpenRef, 0.0f, 1.0f);
@@ -66830,7 +66879,7 @@ void destroyHostWindow(Renderer* R);
             TextureDesc td = {};
             // rows 0-1 the two peeked probes' raw captures, rows 2-3 the same relit (PGI_PEEKLIT);
             // rows 4-5 the WORLD probe's, raw and relit (pgiHiRes: the cube is built from row 5);
-            // rows 6 + 2j / 7 + 2j the H2 near probe j's (pgiHiNear)
+            // rows 6 + 2j / 7 + 2j the H2 near probe j's (pgiHiNear); then each near probe's static faces (H2-A)
             td.mWidth = 6u * g_pgi.peekRes; td.mHeight = kPgiPeekRows * g_pgi.peekRes; td.mDepth = 1; td.mArraySize = 1;
             td.mMipLevels = 1; td.mSampleCount = SAMPLE_COUNT_1;
             td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
@@ -67096,6 +67145,94 @@ void destroyHostWindow(Renderer* R);
 
     // PRE-beginCmd, beside the W-gate (every frame): scroll the window, take the placement readback,
     // and — when this view has no water on screen — aim the mirror at the next missing probe face.
+    // H2-A (pgiNearAct): a draw's bound as a camera-relative sphere — localCenter / localRadius through its
+    // world, the caster gathers' expression — and whether it comes within R of the camera.
+    inline void pgiActSphereWorld(const float* w, const HostMesh& hm, float c[3], float& r) {
+        c[0] = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+        c[1] = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+        c[2] = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+        const float s0 = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+        const float s1 = w[4]*w[4] + w[5]*w[5] + w[6]*w[6];
+        const float s2 = w[8]*w[8] + w[9]*w[9] + w[10]*w[10];
+        r = hm.localRadius * std::sqrt(std::max(s0, std::max(s1, s2)));
+    }
+    // A skinned part: its bones' centroid and spread (the skinned caster gather's bound) plus a limb's slop.
+    inline void pgiActSphereSkin(const uint8_t* palette, uint32_t bones, float c[3], float& r) {
+        c[0] = c[1] = c[2] = 0.0f;
+        for (uint32_t b = 0; b < bones; ++b) {
+            const float* m = (const float*)(palette + (size_t)b * 64);
+            c[0] += m[12]; c[1] += m[13]; c[2] += m[14];   // bone world translation (camera-rel)
+        }
+        if (bones > 0) { const float inv = 1.0f / (float)bones; c[0] *= inv; c[1] *= inv; c[2] *= inv; }
+        float maxd2 = 0.0f;
+        for (uint32_t b = 0; b < bones; ++b) {
+            const float* m = (const float*)(palette + (size_t)b * 64);
+            const float dx = m[12] - c[0], dy = m[13] - c[1], dz = m[14] - c[2];
+            maxd2 = std::max(maxd2, dx*dx + dy*dy + dz*dz);
+        }
+        r = std::sqrt(maxd2) + 32.0f;
+    }
+    inline bool pgiActNear(const float c[3], float r, float R) {
+        const float d = R + r;
+        return c[0]*c[0] + c[1]*c[1] + c[2]*c[2] <= d * d;
+    }
+    inline bool pgiActKeepWorld(const float* w, const HostMesh& hm, float R) {
+        float c[3], r; pgiActSphereWorld(w, hm, c, r); return pgiActNear(c, r, R);
+    }
+    inline bool pgiActKeepSkin(const uint8_t* palette, uint32_t bones, float R) {
+        float c[3], r; pgiActSphereSkin(palette, bones, c, r); return pgiActNear(c, r, R);
+    }
+    // This frame's near content (g_pgi.act): the same three lists, the same keep test reflRecordNear
+    // draws a near probe's capture with, as spheres the scheduler can place in a probe's faces.
+    void pgiActGather(const IPC::DrawItemWire* items, uint32_t count,
+                      const void* skinnedBlob, uint32_t skinnedCount, uint32_t skinnedBytes,
+                      const void* multiMapBlob, uint32_t multiMapCount, uint32_t multiMapBytes) {
+        g_pgi.act.clear();
+        const float R = g_pgiNearAct;
+        if (!(R > 0.0f && g_pgiHiNear > 0.0f && g_pgiOn > 0.5f && g_dlExterior)) { return; }
+        auto push = [&](const float c[3], float r) {
+            g_pgi.act.push_back(c[0]); g_pgi.act.push_back(c[1]); g_pgi.act.push_back(c[2]); g_pgi.act.push_back(r);
+        };
+        float c[3], r;
+        for (uint32_t i = 0; items && i < count; ++i) {
+            const uint32_t slot = items[i].slot;
+            if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+            if (items[i].casterFlags & IPC::kDrawPortalAny) { continue; }
+            pgiActSphereWorld(items[i].world, g_meshes[slot], c, r);
+            if (pgiActNear(c, r, R)) { push(c, r); }
+        }
+        if (skinnedBlob && skinnedCount && skinnedBytes) {
+            const uint8_t* sp   = (const uint8_t*)skinnedBlob;
+            const uint8_t* sEnd = sp + skinnedBytes;
+            for (uint32_t k = 0; k < skinnedCount; ++k) {
+                if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                IPC::SkinnedDrawWire item;
+                std::memcpy(&item, sp, sizeof(item));
+                const uint8_t* palette = sp + sizeof(item);
+                if (palette + (uint64_t)item.numBones * 64 > sEnd) { break; }
+                sp = palette + (uint64_t)item.numBones * 64;
+                const uint32_t slot = item.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
+                const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                pgiActSphereSkin(palette, bones, c, r);
+                if (pgiActNear(c, r, R)) { push(c, r); }
+            }
+        }
+        if (multiMapBlob && multiMapCount && multiMapBytes) {
+            const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+            const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+            const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
+            for (uint32_t k = 0; k < nMM; ++k) {
+                const IPC::MultiMapDrawWire& it = mmItems[k];
+                if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
+                pgiActSphereWorld(it.world, g_meshes[slot], c, r);
+                if (pgiActNear(c, r, R)) { push(c, r); }
+            }
+        }
+    }
+
     void pgiSchedule(const float* fcbvR, bool dry, bool waterOk) {
         const bool want = g_pgiOn > 0.5f && g_dlExterior;
         if (!want) { g_pgi.active = false; return; }
@@ -67388,6 +67525,41 @@ void destroyHostWindow(Renderer* R);
         } else {
             for (auto& np : g_pgi.nearP) { np.slot = -1; np.pend = np.hiFaces = 0; np.cubeBuilt = false; }
         }
+        // H2-A (pgiNearAct): which faces of each held near probe this frame's near content falls in, and
+        // whether it moved there since last frame (its signature changed, or it came or went). A face whose
+        // content holds still is re-shot every pgiActEvery frames anyway (an NPC's idle, a turning head).
+        // Face f = +X -X +Y -Y +Z -Z: a sphere is in it when it reaches inside the face's four 45-degree planes.
+        {
+            const uint32_t every = (uint32_t)std::max(1.0f, g_pgiActEvery);
+            for (auto& np : g_pgi.nearP) {
+                uint8_t has = 0;
+                float   sig[6] = {};
+                if (np.slot >= 0) {
+                    for (size_t a = 0; a + 3 < g_pgi.act.size(); a += 4) {
+                        const float v[3] = { g_pgi.act[a]     + g_eyeAbsShadow[0] - np.p[0],
+                                             g_pgi.act[a + 1] + g_eyeAbsShadow[1] - np.p[1],
+                                             g_pgi.act[a + 2] + g_eyeAbsShadow[2] - np.p[2] };
+                        const float r = g_pgi.act[a + 3], rk = r * 1.41421356f;
+                        const float s = v[0] * 0.37f + v[1] * 0.61f + v[2] * 0.89f + r;
+                        for (uint32_t f = 0; f < 6u; ++f) {
+                            const uint32_t ax = f >> 1, b = (ax + 1u) % 3u, d = (ax + 2u) % 3u;
+                            const float fw = (f & 1u) ? -v[ax] : v[ax];
+                            if (fw - std::fabs(v[b]) >= -rk && fw - std::fabs(v[d]) >= -rk) { has |= (uint8_t)(1u << f); sig[f] += s; }
+                        }
+                    }
+                }
+                for (uint32_t f = 0; f < 6u; ++f) {
+                    const uint8_t bit = (uint8_t)(1u << f);
+                    ++np.actAge[f];
+                    if (!((has | np.actHad) & bit)) { continue; }
+                    const bool moved = ((has ^ np.actHad) & bit) || std::fabs(sig[f] - np.actSig[f]) > 2.0f;
+                    if (moved || ((has & bit) && np.actAge[f] >= every)) { np.actPend |= bit; }
+                }
+                if (np.slot < 0) { np.actPend = 0; }
+                np.actHad = has;
+                std::copy(sig, sig + 6, np.actSig);
+            }
+        }
         // Capture: nearest incomplete probe, next missing face. Only on a DRY view (nothing on screen
         // samples the mirror), every pgiEvery-th such frame, and never under the probe oracle.
         g_pgi.capThis = false;
@@ -67509,7 +67681,8 @@ void destroyHostWindow(Renderer* R);
         }
         // H2 NEAR PROBES (pgiHiNear): next, a held near probe's missing face at peek resolution — on a DRY frame
         // only (a stolen frame reserves just a pgiCapRes corner). The capture is its own slot's, so the gather
-        // refreshes that probe's G-buffer tile too; the raw face also goes to atlas row 6 + 2j.
+        // refreshes that probe's G-buffer tile too; the raw face also goes to atlas row 6 + 2j, and (H2-A) is
+        // kept as the static face its near content merges over.
         if (g_pgi.ballMode && g_pgiHiNear > 0.0f && !steal) {
             for (uint32_t j = 0; j < kPgiNear; ++j) {
                 const auto& np = g_pgi.nearP[j];
@@ -67526,6 +67699,36 @@ void destroyHostWindow(Renderer* R);
                 g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
                 g_capFace.res = g_pgi.peekRes;
                 g_capFace.steal = false;
+                return;
+            }
+        }
+        // H2-A (pgiNearAct): then a held near probe's face whose near content moved — the one waiting longest.
+        // It shares the capture with the pool: every frame while no pool probe is missing a face, else every
+        // other one. Peek resolution, so not on a stolen frame either.
+        if (g_pgi.ballMode && g_pgiHiNear > 0.0f && g_pgiNearAct > 0.0f && !steal) {
+            int bj = -1; uint32_t bf = 0, bAge = 0;
+            for (uint32_t j = 0; j < kPgiNear; ++j) {
+                const auto& np = g_pgi.nearP[j];
+                if (np.slot < 0 || !np.actPend || np.hiFaces != 0x3Fu) { continue; }
+                for (uint32_t f = 0; f < 6u; ++f) {
+                    if ((np.actPend & (1u << f)) && (bj < 0 || np.actAge[f] > bAge)) { bj = (int)j; bf = f; bAge = np.actAge[f]; }
+                }
+            }
+            bool poolWork = false;
+            if (bj >= 0) {
+                for (const PgiBall& b : g_pgi.pool) { if (b.slot >= 0 && b.faces != 0x3Fu) { poolWork = true; break; } }
+            }
+            if (bj >= 0 && (!poolWork || (++g_pgi.actTurn & 1u))) {
+                const auto& np = g_pgi.nearP[bj];
+                g_pgi.capSlot = (uint32_t)np.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)np.slot / (kPgiG * kPgiG);
+                g_pgi.capFace = bf; g_pgi.capBall = np.slot; g_pgi.capNear = bj;
+                g_pgi.capThis = true;
+                g_capFace.active = true; g_capFace.pgi = true;
+                g_capFace.pos[0] = np.p[0]; g_capFace.pos[1] = np.p[1]; g_capFace.pos[2] = np.p[2];
+                g_capFace.face = bf; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+                g_capFace.res = g_pgi.peekRes;
+                g_capFace.steal = false;
+                g_capFace.actOnly = true;
                 return;
             }
         }
@@ -67630,6 +67833,12 @@ void destroyHostWindow(Renderer* R);
         P->capMisc = float4(kProbeFar, (g_pgi.peekThis || worldHi || nearHi) ? 1.0f : 0.0f, (float)(f * g_pgi.peekRes),
                             (float)(rawRow * g_pgi.peekRes));
         P->grid    = float4(g_pgi.spacing, (float)kPgiG, 0.0f, 1.0f);
+        // H2-A (place.x): 1 = a near probe's full shot — also kept as its STATIC face (row place.y); 2 = its
+        // near-content shot (actOnly) — merged over that static face into the raw row, nearest hit wins, and
+        // the G-buffer tile left alone: the player and the NPCs stay out of the GI.
+        const bool nearAct = g_pgi.capNear >= 0 && g_capFace.actOnly;
+        P->place   = float4(g_pgi.capNear < 0 ? 0.0f : nearAct ? 2.0f : 1.0f,
+                            (float)((kPgiNearStaticRow + (uint32_t)std::max(0, g_pgi.capNear)) * g_pgi.peekRes), 0.0f, 0.0f);
         if (g_pgi.peekThis) { pgiPeekState(false); g_pgi.peekMask[pr] |= (uint8_t)(1u << f); }
         if (worldHi) { pgiPeekState(false); g_pgi.worldHiFaces |= (uint8_t)(1u << f); g_pgi.worldHiNew = true; }
         if (nearHi) {
@@ -67652,7 +67861,15 @@ void destroyHostWindow(Renderer* R);
             return;
         }
         if (g_pgi.capNear >= 0) {   // a FINISHED probe's face re-shot: only the near probe's own bookkeeping
-            g_pgi.nearP[g_pgi.capNear].pend &= (uint8_t)~(1u << f);
+            auto& np = g_pgi.nearP[g_pgi.capNear];
+            if (nearAct) {   // H2-A: this shot holds the face's near content as it is now
+                ++np.actShots;
+                np.actPend &= (uint8_t)~(1u << f);
+                np.actAge[f] = 0;
+            } else {         // a static shot: the face's near content (if any) goes back over it next
+                np.pend &= (uint8_t)~(1u << f);
+                if (np.actHad & (1u << f)) { np.actPend |= (uint8_t)(1u << f); }
+            }
             return;
         }
         if (g_pgi.ballMode) {   // the capture's ball (its slot's owner), same bookkeeping as a column layer
@@ -67932,6 +68149,8 @@ void destroyHostWindow(Renderer* R);
                     std::memset(Q, 0, sizeof(PgiParams));
                     // x = the atlas face, y = its lit row, z = this mip's side, w = 1: near mode (alpha = 1/distance)
                     Q->capTile = float4((float)R, (float)(7u + 2u * j), (float)n, 1.0f);
+                    // H2-A: mip 0's parallax radius from the STATIC row — the near content stays out of it.
+                    Q->capMisc = float4((float)(kPgiNearStaticRow + j), 0.0f, 0.0f, 0.0f);
                     cmdBindPipeline(cmd, (k == 0u) ? g_pgi.pCube : g_pgi.pCubeMip);
                     cmdBindDescriptorSet(cmd, inst, g_pgi.set);
                     cmdDispatch(cmd, (n + 7u) / 8u, (n + 7u) / 8u, 6);
@@ -68138,9 +68357,12 @@ void destroyHostWindow(Renderer* R);
                 if (g_pgiHiNear > 0.0f) {   // H2
                     const auto& a = g_pgi.nearP[0];
                     const auto& b = g_pgi.nearP[1];
-                    LOG::logline(">> [pgi] near probes: 0 slot %d faces %02x pend %02x shots %u builds %u %s | 1 slot %d faces %02x pend %02x shots %u builds %u %s",
+                    LOG::logline(">> [pgi] near probes: 0 slot %d faces %02x pend %02x shots %u builds %u %s | 1 slot %d faces %02x pend %02x shots %u builds %u %s"
+                                 " | content %zu spheres, faces %02x/%02x pend %02x/%02x re-shots %u/%u",
                                  a.slot, (unsigned)a.hiFaces, (unsigned)a.pend, a.shots, a.builds, a.cubeBuilt ? "LIVE" : "-",
-                                 b.slot, (unsigned)b.hiFaces, (unsigned)b.pend, b.shots, b.builds, b.cubeBuilt ? "LIVE" : "-");
+                                 b.slot, (unsigned)b.hiFaces, (unsigned)b.pend, b.shots, b.builds, b.cubeBuilt ? "LIVE" : "-",
+                                 g_pgi.act.size() / 4u, (unsigned)a.actHad, (unsigned)b.actHad,
+                                 (unsigned)a.actPend, (unsigned)b.actPend, a.actShots, b.actShots);
                 }
             }
             // The 4 x 4 columns around the camera: each probe's height and state (D done, . not),
@@ -68207,6 +68429,14 @@ void destroyHostWindow(Renderer* R);
         mp[kPgiNearFloat + 9]  = std::max(64.0f, g_pgiNearReach);
         mp[kPgiNearFloat + 10] = 0.0f;
         mp[kPgiNearFloat + 11] = 0.0f;
+        // pgiCapEye (shadowparams.h.fsl): this frame's capture probe, camera-relative, and whether its PBR
+        // surfaces reflect the world cube (knob pgiCapRefl). Its own lane: eyePos stays the camera's,
+        // because terrain picks its morph / displacement LOD from it and a capture must keep the camera's.
+        const bool capRefl = g_capFace.active && g_capFace.pgi && g_pgiCapRefl > 0.5f && cubeOn;
+        mp[kPgiNearFloat + 12] = g_capFace.pos[0] - g_pgi.eye[0];
+        mp[kPgiNearFloat + 13] = g_capFace.pos[1] - g_pgi.eye[1];
+        mp[kPgiNearFloat + 14] = g_capFace.pos[2] - g_pgi.eyeZ;
+        mp[kPgiNearFloat + 15] = capRefl ? 1.0f : 0.0f;
         static_assert(kPgiNear == 2u, "shadowparams.h.fsl carries exactly pgiNear0 and pgiNear1");
     }
 
@@ -68864,10 +69094,25 @@ void destroyHostWindow(Renderer* R);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
         int boundMirror = 0;
 
+        // H2-A (keepR > 0): only what lies within keepR of the camera, and every item by itself — the
+        // inline list below takes them (arena-resident or not, off-view or not); the groups and the
+        // dynamic list are skipped. Portal members stay out: their draws are nothing but order.
+        const bool keep = in.keepR > 0.0f;
+        static std::vector<uint32_t> s_keep;   // reused frame-to-frame
+        s_keep.clear();
+        if (keep) {
+            for (uint32_t i = 0; i < in.itemCount; ++i) {
+                const uint32_t slot = in.items[i].slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+                if (in.items[i].casterFlags & IPC::kDrawPortalAny) { continue; }
+                if (pgiActKeepWorld(in.items[i].world, g_meshes[slot], in.keepR)) { s_keep.push_back(i); }
+            }
+        }
+
         // Re-execute the SAME indirect groups the main pass walks. The colour PSO ignores the
         // alpha-test split (that exists only to keep the prepass's PS-less fast path), so both `at`
         // blocks of a mirror group go through one pipeline.
-        for (uint32_t mir = 0; mir < 2; ++mir) {
+        for (uint32_t mir = 0; mir < 2 && !keep; ++mir) {
             bool anyInMirror = false;
             for (uint32_t at = 0; at < 2 && !anyInMirror; ++at) {
                 for (uint32_t b = 0; b < kMaxBatches; ++b) {
@@ -68902,7 +69147,8 @@ void destroyHostWindow(Renderer* R);
 
         // Dynamic-morph parts (own CPU_TO_GPU VB/IB, so they can't ride the shared-arena indirect
         // call). ~1-4 per frame.
-        for (uint32_t k = 0; k < in.dynamicCount; ++k) {
+        const uint32_t dynN = keep ? 0u : in.dynamicCount;
+        for (uint32_t k = 0; k < dynN; ++k) {
             const uint32_t i     = in.dynamic[k];
             const uint32_t slot  = in.items[i].slot;
             const uint32_t batch = i / kBatchSize;
@@ -68928,8 +69174,11 @@ void destroyHostWindow(Renderer* R);
         // FP2 OFF-VIEW rigid parts (the hidden 1st-person body's head, helmet, held gear): kept out
         // of the main view's groups and dynamic list, so the mirror draws them here, inline. They may
         // be arena-resident or own their VB/IB; the instance slot is items[i]'s as everywhere else.
-        for (uint32_t k = 0; k < in.offViewCount; ++k) {
-            const uint32_t i     = in.offView[k];
+        // H2-A: the same inline draw takes the kept list instead.
+        const uint32_t* inl  = keep ? s_keep.data() : in.offView;
+        const uint32_t  inlN = keep ? (uint32_t)s_keep.size() : in.offViewCount;
+        for (uint32_t k = 0; k < inlN; ++k) {
+            const uint32_t i     = inl[k];
             const uint32_t slot  = in.items[i].slot;
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
@@ -69000,6 +69249,8 @@ void destroyHostWindow(Renderer* R);
                 uint32_t base = 0;
                 if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
                 const uint32_t window = packWin;
+                // H2-A: a part beyond keepR is skipped AFTER the cursor moved, keeping the lockstep.
+                if (keep && !pgiActKeepSkin(palette, bones, in.keepR)) { ++skinDrawn; continue; }
                 // A blended part MUST NOT go through skinPSO here: those are skinned.vert +
                 // opaque.frag, and its instance entry carries the blend bit, which makes
                 // skinned.vert forward matAlpha through OverlayIndex — opaque.frag would read that
@@ -69120,6 +69371,8 @@ void destroyHostWindow(Renderer* R);
                 const uint32_t slot = it.slot;
                 if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
                 const uint32_t idx = mmDrawn;
+                // H2-A: beyond keepR — skipped after taking its index, as the cursor requires.
+                if (keep && !pgiActKeepWorld(it.world, g_meshes[slot], in.keepR)) { ++mmDrawn; continue; }
 
                 // Winding is picked from the part's own world determinant and then swapped, the
                 // same way the opaque walk picks it — NOT copied from the main pass's choice.

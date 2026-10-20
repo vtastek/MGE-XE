@@ -1115,8 +1115,12 @@ STRUCT(ShadowMaskParams)
     // H2 NEAR PROBES (skyamb.h.fsl pgiNearSpec, knob pgiHiNear): the two pool probes nearest the camera,
     // shot at peek resolution into their own cubes. pgiNear0/1 = (absolute world position xyz, its probe
     // slot; w < 0 = not built / not readable). pgiNearP = (strength, reach u: a receiver this far from the
-    // probe takes none of it, 0, 0). Appended last.
+    // probe takes none of it, 0, 0).
     DATA(float4,   pgiNear0,         None);
     DATA(float4,   pgiNear1,         None);
     DATA(float4,   pgiNearP,         None);
+    // ONE LEVEL OF RECURSION in a probe capture (skyamb.h.fsl pgiCapSpec, knob pgiCapRefl): this frame's capture
+    // probe, CAMERA-RELATIVE xyz (the capture's view origin — NOT eyePos, which terrain LOD and fog key on), w = 1
+    // when a probe-GI capture reflects the world cube in its PBR surfaces. Appended last.
+    DATA(float4,   pgiCapEye,        None);
 };

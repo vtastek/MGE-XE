@@ -210,6 +210,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                     // windows in the mirror, and the lit peek's "magenta specks"; user 2026-10-17).
                     if (pc.r > PGI_BACK_SENTINEL && pc.b > PGI_BACK_SENTINEL) { o4 = float4(1.0f, 0.0f, 1.0f, -2.0f); }
                 }
+                // H2-A (place.x, place.y = the near probe's static row): 1 = this full shot is also its static
+                // face; 2 = a near-content shot, merged over that static face — the content wins where it hit
+                // (not a back face) nearer than the static surface, or where the static face saw sky.
+                const int2 sp = int2((int)gPgiParams.capMisc.z, (int)gPgiParams.place.y) + p;
+                if (gPgiParams.place.x > 1.5f) {
+                    const float4 st = LoadRWTex2D(gPgiPeek, sp);
+                    if (!(o4.w > 0.0f) || (st.w > 0.0f && st.w <= o4.w)) { o4 = st; }
+                } else if (gPgiParams.place.x > 0.5f) {
+                    Write2D(gPgiPeek, sp, o4);
+                }
                 Write2D(gPgiPeek, int2(gPgiParams.capMisc.zw) + p, o4);
             }
             // SKY: no geometry here. A dry-view capture draws the real sky (pgi captures did not, and the
@@ -260,16 +270,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     const float  invA = emisCap ? 1.0f / max((float)nAlb, 1.0f) : inv;
     const float3 nW  = nAcc.x * right + nAcc.y * up + nAcc.z * fwd;
     const float  skyFrac = (float)nSky / (float)(B * B);
-    uint4 o;
-    o.x = pgiPackUnorm4(float4(alb * invA, skyFrac));
-    o.y = pgiPackNormal(nW);
-    o.z = (nSky > 0u) ? pgiPackR11G11B10(skyC / (float)nSky) : 0u;
-    o.w = min(nGeo, 255u) | (min(nBack, 255u) << 8u)
-        | (f32tof16(nGeo > 0u ? min(dist * inv, 60000.0f) : -1.0f) << 16u);
-    Write2D(gPgiGBuf, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), o);
-    // The EMISSION lane: mean emitted radiance over the texel's geometry (its emission parity), 0 = none.
-    Write2D(gPgiGBufE, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy),
-            (emisCap && nEm > 0u) ? pgiPackR11G11B10(emA / (float)nEm) : 0u);
+    // H2-A: a near-content shot (place.x = 2) feeds its cube's raw row above and leaves the G-buffer
+    // tile — the GI — as it was.
+    if (gPgiParams.place.x < 1.5f) {
+        uint4 o;
+        o.x = pgiPackUnorm4(float4(alb * invA, skyFrac));
+        o.y = pgiPackNormal(nW);
+        o.z = (nSky > 0u) ? pgiPackR11G11B10(skyC / (float)nSky) : 0u;
+        o.w = min(nGeo, 255u) | (min(nBack, 255u) << 8u)
+            | (f32tof16(nGeo > 0u ? min(dist * inv, 60000.0f) : -1.0f) << 16u);
+        Write2D(gPgiGBuf, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), o);
+        // The EMISSION lane: mean emitted radiance over the texel's geometry (its emission parity), 0 = none.
+        Write2D(gPgiGBufE, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy),
+                (emisCap && nEm > 0u) ? pgiPackR11G11B10(emA / (float)nEm) : 0u);
+    }
     RETURN();
 }
 
@@ -1276,18 +1290,29 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // pgiNearSpec reads it as the parallax sphere's radius in that direction.
     const uint litRow = (gPgiParams.capTile.y > 0.5f) ? (uint)gPgiParams.capTile.y : 5u;
     const bool nearCube = gPgiParams.capTile.w > 0.5f;
+    // H2-A: capMisc.x > 0 = a near cube's STATIC row (raw: w = the hit distance, -1 sky, -2 back face). The
+    // parallax radius comes from THERE, the colour from the merged lit row: the player / NPCs in the colour,
+    // never in the radius. A body 2 m from the probe put a bump in the radius field, and every receiver ray
+    // that crossed the bump was folded into the body — two, three copies of it (user, 2026-10-20).
+    const uint staticRow = (uint)max(gPgiParams.capMisc.x, 0.0f);
     float3 acc = f3(0.0f);
-    float  wa = 0.0f, ia = 0.0f;
+    float  wa = 0.0f, ia = 0.0f, wi = 0.0f;
     UNROLL for (int j = 0; j < 2; ++j) {
         UNROLL for (int i = 0; i < 2; ++i) {
             const int2 q = clamp(int2(t0) + int2(i, j), int2(0, 0), int2((int)R - 1, (int)R - 1));
             const float w = ((i == 0) ? 1.0f - fr.x : fr.x) * ((j == 0) ? 1.0f - fr.y : fr.y);
             const float4 v = LoadRWTex2D(gPgiPeek, int2((int)(cf * R) + q.x, (int)(litRow * R) + q.y));
-            if (v.w > -1.5f) { acc += w * v.rgb; wa += w; ia += w * max(v.w, 0.0f); }
+            if (v.w > -1.5f) { acc += w * v.rgb; wa += w; }
+            if (staticRow > 0u) {
+                const float sd = LoadRWTex2D(gPgiPeek, int2((int)(cf * R) + q.x, (int)(staticRow * R) + q.y)).w;
+                if (sd > -1.5f) { ia += w * ((sd > 0.0f) ? 1.0f / sd : 0.0f); wi += w; }
+            } else if (v.w > -1.5f) { ia += w * max(v.w, 0.0f); wi += w; }
         }
     }
     const float3 rgb0 = max(acc / max(wa, 1.0e-4f), f3(0.0f));
-    Write3D(gPgiCubeOut, int3(id), float4(rgb0, nearCube ? ((wa > 1.0e-4f) ? ia / wa : -1.0f) : saturate(wa)));
+    // A texel with radiance but no static distance (the static face saw a back face there) parallaxes as sky.
+    const float  inv0 = (wi > 1.0e-4f) ? ia / wi : 0.0f;
+    Write3D(gPgiCubeOut, int3(id), float4(rgb0, nearCube ? ((wa > 1.0e-4f) ? inv0 : -1.0f) : saturate(wa)));
 #else
     // Mip k from mip k-1: the 2 x 2 box weighted by coverage (a = how much of it had radiance).
     const int2 s = int2(id.xy) * 2;

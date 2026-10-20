@@ -788,6 +788,18 @@ float3 pgiHiSpec(float3 R, float rough, float3 E, float3 eIrr, float3 P)
     }
     return lerp(E, hi, w * saturate(valid));
 }
+
+// ONE LEVEL OF RECURSION in a probe capture (user, 2026-10-20: "we can have one level of recursive, use global
+// probe, so spheres don't look white"). A capture writes ALBEDO, so a chrome sphere was relit as a white diffuse
+// ball. What a PBR surface REFLECTS there comes from the WORLD probe's cube, in the env term's factor units (the
+// caller multiplies by its ambient colour and the env BRDF), and rides the emission pixels; 0 = no cube yet. The
+// cube itself is never read through this in the pass that builds it, so this is one level and no more.
+float3 pgiCapSpec(float3 R, float rough)
+{
+    if (gShadowParams.pgiSpec.y <= 0.0f) { return f3(0.0f); }
+    const float lod = saturate(rough / max(gShadowParams.pgiSpec.z, 0.05f)) * PGI_CUBE_LASTMIP;
+    return max(SampleLvlTexCube(gPgiWorldCube, gSamplerTrilinearClamp, R, lod).rgb, f3(0.0f));
+}
 #endif
 
 // The pre-probe ambient factor (sky SH x sky AO + the GI field / floor). skyAmbFactorAOp below wraps it.

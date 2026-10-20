@@ -38,7 +38,7 @@ STRUCT(PgiParams)
     DATA(float4, capPos,  None);   // GATHER: probe ABSOLUTE position xyz, w = face (0..5)
     DATA(float4, capTile, None);   // GATHER: atlas tile origin xy (texels), z = capture res (px), w = near
     DATA(float4, capMisc, None);   // GATHER: x = far, y = 1: also copy the raw capture to gPgiPeek at zw
-    DATA(float4, place,   None);   // PLACE: xy = window's first column index (ix0, iy0)
+    DATA(float4, place,   None);   // PLACE: xy = window's first column index (ix0, iy0); GATHER (H2-A): x = 1 keep the static face at row y, 2 merge over it (no G-buffer write)
     DATA(float4, terrain, None);   // PLACE: the LAND grid (skyheight.srt.h gridInfo): minX, minY, spanX, spanY
     // BALLS: x = camera balls, y = sun balls, z = frame seed, w = lift (u off the hit surface)
     DATA(float4, balls,   None);

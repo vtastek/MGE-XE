@@ -735,9 +735,22 @@ float4 PS_MAIN( VSOutput In )
         // as the distant statics are; a probe in a hollow under it saw through it, unflagged.
         const float bs = dot(cross(pbrDPdx, pbrDPdy), In.Normal);
         if (pgiCap && In.AlphaRef <= 0.0f && bs * PGI_BACK_SIGN > 0.0f) { RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f)); }
+        // ONE LEVEL OF RECURSION (skyamb.h pgiCapSpec): a PBR surface keeps only its diffuse share as albedo,
+        // and what it reflects — the world probe's cube from the probe (eyePos is the probe in a capture) —
+        // rides the emission pixels. A metal sphere was relit as a white ball. Seen from the PROBE
+        // (gShadowParams.pgiCapEye), not eyePos: that stays the camera's for terrain LOD and fog.
+        float3 capSpec = f3(0.0f);
+        float3 capKd   = f3(1.0f);
+        if (pgiCap && pbrOn && gShadowParams.pgiCapEye.w > 0.5f && PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
+            const float3 f0c = pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x);
+            const float3 Vc  = normalize(gShadowParams.pgiCapEye.xyz - In.WorldPos);
+            const float  nvc = max(dot(pbrNb, Vc), 1.0e-4f);
+            capKd   = f3(1.0f - pbrMetalness(pbrParam));
+            capSpec = gFrameData.ambCol.rgb * pgiCapSpec(reflect(-Vc, pbrNb), pbrRough) * pbrEnvBRDF(f0c, nvc, pbrRough);
+        }
         // P2 EMISSION (odd pixels): the emissive addend exactly as `c` takes it above.
-        if (pgiEmisPx) { RETURN(float4(albedo.rgb * (emis + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f)), 1.0f)); }
-        RETURN(float4(albedo.rgb, 1.0f));
+        if (pgiEmisPx) { RETURN(float4(albedo.rgb * (emis + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f)) + capSpec, 1.0f)); }
+        RETURN(float4(albedo.rgb * capKd, 1.0f));
     }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                            // mode 6: lit only (lighting, no texture)
     if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)
