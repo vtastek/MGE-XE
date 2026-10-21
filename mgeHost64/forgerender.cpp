@@ -5044,7 +5044,11 @@ namespace {
     // IGN static, 2 pixel IGN per frame, 3 auto = 2 under a temporal upscaler, else 1. The white hash
     // left the penumbra grainy: under DLAA it re-rolls every frame (jitter moves the hashed point)
     // but white noise has no spatial structure, so the resolve's neighbourhood clamp keeps it.
-    uint32_t           g_sunPcssNoise    = 3u;
+    // 4 = FIXED disc, the default since 2026-10-21: once the bleed fix made the penumbra a true tap
+    // fraction, the IGN rotation showed as a fixed hatch that boiled wherever swaying leaves moved
+    // the penumbra (aanthirin save, spread 0.12; "cheese grater" at spread 0). At <= 3.9 texels of
+    // radius with bilinear 2x2 taps the unrotated disc is smooth and perfectly stable.
+    uint32_t           g_sunPcssNoise    = 4u;
     // Depth biases for the near cascade, in WORLD units (normalised at publish, like g_sunShadowBias).
     // Separate numbers because a binary depth compare and MSM's quadrature fail differently: MSM
     // needs a large constant bias to survive moment quantisation, PCF needs a small constant one plus
@@ -20304,6 +20308,10 @@ namespace {
     // value is resolution- and FOV-dependent in a way the radius is not; retune it if either moves
     // far, and raise it first if half res ever looks blocky rather than blaming the AO.
     float    g_aoUpSigma    = 1.0f;   // upscale range sigma, WORLD units (same form as the blur's)
+    // Half-res depth downsample: 0 = the closest of each 2x2 (legacy), 1 = MAJORITY, the 2x2's middle
+    // pair (aodepthdown.comp.fsl; user 2026-10-21 "AO looks dirty, aliasing" — grass blades took
+    // every 2x2 they touched and starved the upscale of ground taps).
+    float    g_aoDownMode   = 1.0f;
     // ===== THE UPSCALE'S BISECT LANE (aoUpProf), same instrument maskProf already proved ========
     // The AO chain is the largest addressable pass in an interior -- postdepth floors at 1.72 ms of
     // a 5.82 ms frame -- and it is NOT dominated by AO: the horizon search is ~0.20 while the blur
@@ -22831,6 +22839,15 @@ namespace {
     // nothing" and should not be mistaken for the arm being off.
     float g_sunAimAppliedDeg = 0.0f;
     float g_sunAimWeight     = 0.0f;
+    // DISC STEP (degrees): when > 0 the aimed light HOLDS until the disc has moved this far, then jumps.
+    // DEFAULT 0 = continuous. Added 2026-10-21 against a "boiling" canopy shadow on a WRONG diagnosis:
+    // the shadow was full of texel holes (the vcol ref sat in the grass shadow-dither flag bit), and a
+    // shadow of holes changes completely under any sub-texel light motion. With the holes fixed the
+    // continuous follow is kept (user: "set it back to continuous"); the knob stays as the A/B.
+    float g_sunDiscStepDeg = 0.0f;
+    // TEST: freeze the aimed sun light at its first exterior frame (no steps at all) — shadow artifacts
+    // then cannot be the light moving (user 2026-10-21: "set sun to a fixed position, use lit debug").
+    bool  g_sunFreeze = false;
 
     // WT2 water debug: output one isolated water term instead of the composited surface, so the
     // reflection / refraction contents are directly inspectable. Driven by two panel CHECKBOXES
@@ -25146,6 +25163,7 @@ namespace {
             // nothing more ([[project_forge_ao_blur_extent]]).
             { "alphaDepthRef",      &g_alphaDepthRef      },
             { "aoUpSigma",          &g_aoUpSigma          },
+            { "aoDownMode",         &g_aoDownMode         },
             { "aoBlurPx",           &g_aoBlurPx           },
             // SHADOW MASK: the test range (the pass's area dial — covered area ~ rangeK², and the
             // point light's reach is slaved to it) and the three cost-profile arms. Here for exactly
@@ -25216,6 +25234,9 @@ namespace {
             { "sunShadowNormalOff", &g_sunShadowNormalOff },   // normal offset (texels)
             { "sunPcfBias",         &g_sunPcfBias         },   // near-cascade PCF constant bias (world u)
             { "sunPcfSlopeBias",    &g_sunPcfSlopeBias    },   // near-cascade PCF slope bias (world u x tan)
+            { "sunPcssSpread",      &g_sunPcssSpread      },   // PCSS penumbra spread (the panel's slider)
+            { "sunPcfMinRadius",    &g_sunPcfMinRadius    },   // PCF floor radius, texels (the panel's slider)
+            { "sunDiscStepDeg",     &g_sunDiscStepDeg     },   // aimed sun light moves in steps of this (0 = continuous)
             { "sunStaticsCullNone", &g_sunStaticsCullNone },
             { "dumpBurst",          &g_dumpBurst          },
             { "dumpBurstX",         &g_dumpBurstX         },
@@ -25755,6 +25776,7 @@ namespace {
             // MW's own light arc — and the A/B for it is a walk at a fixed hour, which is a run,
             // not a click.
             { "sunLightFollowsDisc", &g_sunLightFollowsDisc },
+            { "sunFreeze",           &g_sunFreeze           },   // TEST: aimed sun held at its first frame
             // The alpha fold fix (near-opaque depth prepass), so a dense-alpha scene (the CAP candle
             // staircase: 420 flame billboards in view) can be A/B'd from a minimized harness run.
             { "alphaDepthWrite", &g_alphaDepthWrite },
@@ -26033,6 +26055,12 @@ namespace {
             // same slice budget, the only difference being whether a 2x2 neighbourhood sweeps a
             // COMPLETE angular set or four random draws from a continuum.
             { "aoDither",       &g_aoDither,       4u },
+            // AO MODE (the panel's dropdown): 0 GTAO, 1 HBAO, 2 VBAO, 3 SSAO-fast (default). Here so a
+            // harness arm can pick it; the panel file's ao_lighting.ao_mode is overridden by an arm.
+            { "aoMode",         &g_aoMode,         (uint32_t)kAOModeCount - 1u },
+            // Sun PCSS disc rotation (msmrecv.h sunDiscRotation): 0 white hash, 1 pixel IGN, 2 IGN per
+            // frame, 3 auto (2 under a temporal upscaler, else 1), 4 fixed disc (no rotation).
+            { "sunPcssNoise",   &g_sunPcssNoise,   4u },
             // Frames per STBN slice. Raising it slows the cycle (trades decorrelation for calm)
             // without giving up the temporal axis entirely — the middle setting between rungs 2
             // and 1. See [[project_forge_ao_stbn_dither]].
@@ -29155,6 +29183,9 @@ namespace {
           // cast shadows for a sun at 41 degrees. Off = that old behaviour exactly, for the A/B.
           t.checkbox("Sun: LIGHT follows the visible DISC (off = MW's own light arc)",
                      &g_sunLightFollowsDisc);
+          t.checkbox("Sun: FREEZE the aimed light (test: shadows cannot move)", &g_sunFreeze);
+          t.sliderF("Sun: aimed light STEP, degrees (0 = continuous, the default)",
+                    &g_sunDiscStepDeg, 0.0f, 1.0f, 0.01f, "%.2f");
           // The two ends of the handover, in DISC elevation. Leave them alone unless the dusk
           // transition is visibly swinging: 18 is where MW's two arcs cross, so the correction is
           // already ~0 at both ends of the default band. Read `aim=` and `w=` on [forge-hb][sky].
@@ -29173,8 +29204,8 @@ namespace {
           // PCSS/PCF over the raw depth — the COLOUR receiver on every cascade. Unrelated to the MSM
           // softness above, which now exists only for the volumetric fog's per-step tap.
           t.checkbox("Sun PCSS: enable (off = MSM everywhere, the A/B)", &g_sunPcfNear);
-          t.sliderU("Sun PCSS: noise (0 white hash, 1 pixel IGN, 2 IGN per frame, 3 auto)",
-                    &g_sunPcssNoise, 0u, 3u, 1u);
+          t.sliderU("Sun PCSS: noise (0 white hash, 1 pixel IGN, 2 IGN per frame, 3 auto, 4 fixed disc)",
+                    &g_sunPcssNoise, 0u, 4u, 1u);
           t.sliderF("Sun PCSS: penumbra SPREAD (fraction of blocker gap)", &g_sunPcssSpread, 0.0f, 0.5f, 0.005f, "%.3f");
           t.sliderF("Sun PCSS: blocker search radius (TEXELS)", &g_sunPcssSearch, 1.0f, 32.0f, 1.0f, "%.0f");
           t.sliderF("Sun PCSS: min PCF radius (TEXELS; contact hardness)", &g_sunPcfMinRadius, 0.5f, 8.0f, 0.1f, "%.2f");
@@ -35177,6 +35208,32 @@ void destroyHostWindow(Renderer* R);
         if (!(tl > 1.0e-3f)) { return; }
         t[0] /= tl; t[1] /= tl; t[2] /= tl;
 
+        // DISC STEP (g_sunDiscStepDeg): hold the AIMED direction until it has moved a step, then jump.
+        // The per-frame motion of the target and the step count are logged every 300 frames.
+        {
+            static float  s_t[3] = { 0.0f, 0.0f, 0.0f }, s_raw[3] = { 0.0f, 0.0f, 0.0f };
+            static bool   s_have = false;
+            static double s_movSum = 0.0; static uint32_t s_movN = 0, s_steps = 0;
+            if (s_have) {
+                const float c = std::min(1.0f, t[0]*s_raw[0] + t[1]*s_raw[1] + t[2]*s_raw[2]);
+                s_movSum += std::acos(c) * 57.2957795f;
+                if (++s_movN == 300u) {
+                    LOG::logline(">> [sun] aimed light target motion %.5f deg/frame; light stepped %u times in 300 frames (step %.3f deg)",
+                                 s_movSum / s_movN, s_steps, (double)g_sunDiscStepDeg);
+                    s_movSum = 0.0; s_movN = 0; s_steps = 0;
+                }
+            }
+            s_raw[0] = t[0]; s_raw[1] = t[1]; s_raw[2] = t[2];
+            const float c = s_t[0]*t[0] + s_t[1]*t[1] + s_t[2]*t[2];
+            const float cStep = std::cos(std::max(g_sunDiscStepDeg, 0.0f) * 0.017453293f);
+            if (!s_have || (!g_sunFreeze && (g_sunDiscStepDeg <= 0.0f || c < cStep))) {
+                if (s_have) { ++s_steps; }
+                s_t[0] = t[0]; s_t[1] = t[1]; s_t[2] = t[2];
+                s_have = true;
+            }
+            t[0] = s_t[0]; t[1] = s_t[1]; t[2] = s_t[2];
+        }
+
         g_sunAimWeight     = w;
         g_sunAimAppliedDeg = (std::asin(std::max(-1.0f, std::min(t[2], 1.0f)))
                             - std::asin(std::max(-1.0f, std::min(a[2], 1.0f)))) * 57.2957795f;
@@ -37286,7 +37343,7 @@ void destroyHostWindow(Renderer* R);
                 // ⚠ .z WAS DOCUMENTED "spare" AND IS NOW THE PROFILE LANE -- keep aohalfres.srt.h's
                 // comment in step, since the struct's comment is the only description of it.
                 up[24] = g_aoUpSigma; up[25] = g_aoPlaneSig;
-                up[26] = (float)g_aoUpProf; up[27] = 0.0f;
+                up[26] = (float)g_aoUpProf; up[27] = g_aoDownMode;
             }
 
             // End the prepass render pass, then pDepth DEPTH_WRITE -> SHADER_RESOURCE (first depth
@@ -57872,6 +57929,21 @@ void destroyHostWindow(Renderer* R);
                 }
                 if (layerOp == 3u) { def.emits |= 0x2u; }
                 if (nightOnly)     { def.emits |= 0x4u; }
+                // VERTEX-COLOUR SPLIT ref, the client's rule (scenegraph_geometry_cache.cpp vcolRef) on the
+                // bake's own colours: the 95th percentile of each vertex's brightest channel. Without it the
+                // near mesh's sun took the lift and its distant twin did not — a lighting seam at the
+                // handover (user 2026-10-21). Flags bits 9-15 (halved), display-referred like the near ref.
+                uint32_t vcolRef = 0;
+                if (verts > 0) {
+                    uint32_t hist[256] = {};
+                    for (int v = 0; v < verts; ++v) {
+                        const uint8_t* c = vbSrc + (size_t)v * 20 + 12;   // D3DCOLOR B,G,R,A
+                        ++hist[std::max(std::max(c[0], c[1]), c[2])];
+                    }
+                    const uint32_t want = (uint32_t)verts - (uint32_t)verts / 20u;
+                    uint32_t run = 0;
+                    for (; vcolRef < 255u; ++vcolRef) { run += hist[vcolRef]; if (run >= want) { break; } }
+                }
                 uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
                 if (p + pathsize > end) { p = end; break; }
                 // texname -> path RELATIVE to statics\textures\, lowercased, .dds. The LOD library
@@ -57892,7 +57964,11 @@ void destroyHostWindow(Renderer* R);
                                | (hasUVCtrl ? 0x4u : 0u)    // bit2: NiUVController -> scroll V (ghostfence)
                                | (nightOnly ? 0x8u : 0u)    // bit3: draw only while windows are lit
                                | (dayOnly  ? 0x10u : 0u)    // bit4: draw only while they are not
-                               | (layerOp << 6);            // bits6-7: layer op (1 MOD, 2 MOD2X, 3 ADD)
+                               | (layerOp << 6)             // bits6-7: layer op (1 MOD, 2 MOD2X, 3 ADD)
+                               | ((vcolRef >> 1) << 9);     // bits9-15: vertex-colour split ref / 2 (statics.vert)
+                // ⚠ NOT bit 8: that is the GRASS lane's shadow-dither flag (sunshadow_statics.frag 0x100).
+                // The ref first sat in bits 8-15 and every odd ref dithered a distant static's shadow —
+                // the canopy "holes" (user 2026-10-21). Bits >= 24 do not survive InstParams' float.
                 if (verts > 0 && faces > 0) {
                     megaVB.insert(megaVB.end(), vbSrc, vbSrc + vbBytes);
                     megaIB.insert(megaIB.end(), ibSrc, ibSrc + ibBytes);
@@ -65051,7 +65127,7 @@ void destroyHostWindow(Renderer* R);
         static uint32_t s_sunNoiseFrame = 0;
         ++s_sunNoiseFrame;
         uint32_t mode = g_sunPcssNoise;
-        if (mode >= 3u) { mode = upscaleTemporalActive() ? 2u : 1u; }
+        if (mode == 3u) { mode = upscaleTemporalActive() ? 2u : 1u; }
         mp[kSunNoiseFloat + 0] = (float)mode;
         mp[kSunNoiseFloat + 1] = (float)(s_sunNoiseFrame & 63u);
         mp[kSunNoiseFloat + 2] = g_terrainMorph ? std::clamp(g_terrainLodScale, 0.25f, 4.0f) : 0.0f;  // terrain geomorph

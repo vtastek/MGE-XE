@@ -1899,6 +1899,11 @@ float2 sunDiscTap(int i, int n, float rot)
 float sunDiscRotation(float3 worldPosRel)
 {
     float4 nz = gShadowParams.sunNoise;
+
+
+
+
+    if (nz.x > 3.5f) { return 0.0f; }
     if (nz.x < 0.5f)
     {
         float2 h = float2(dot(worldPosRel, float3(0.7391f, 0.3179f, 0.5107f)),
@@ -1983,7 +1988,7 @@ float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
     }
     return occlusion * (1.0f / float( 16 ));
 }
-#line 281 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 286 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunOccMapOcclusion(float3 worldAbs)
 {
     float4 so = gShadowParams.sunOcc;
@@ -2008,7 +2013,7 @@ float sunOccMapOcclusion(float3 worldAbs)
     t = t * t * (3.0f - 2.0f * t);
     return t * so.x * edge;
 }
-#line 335 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 340 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunShadowVolumetric(float3 p)
 {
     if (gShadowParams.sunParams.x <= 0.0f) { return 1.0f; }
@@ -2046,7 +2051,7 @@ float sunShadowVolumetric(float3 p)
     }
     return 1.0f - occ;
 }
-#line 388 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 393 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunCascadeShadowMode(int c, float3 p, float3 worldPosRel, float zBias, float slopeBias, int cheap)
 {
     if (cheap == 0 && gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
@@ -2057,7 +2062,7 @@ float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float s
 {
     return sunCascadeShadowMode(c, p, worldPosRel, zBias, slopeBias, 0);
 }
-#line 414 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 419 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunShadowVisibilityMode(float3 worldPosRel, float3 N, int cheap)
 {
     float strength = gShadowParams.sunParams.x;
@@ -2118,7 +2123,7 @@ float sunShadowVisibilityMode(float3 worldPosRel, float3 N, int cheap)
                                              worldPosRel, bias, slopeBias, cheap);
         occlusion = lerp(occlusion, occNext, t);
     }
-#line 493 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 498 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
     if (cheap != 0 || gShadowParams.sunPcf1.z <= 0.5f)
     {
         float lbr = gShadowParams.sunParams.z;

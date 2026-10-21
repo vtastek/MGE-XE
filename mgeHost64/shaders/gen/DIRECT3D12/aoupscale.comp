@@ -989,7 +989,9 @@ STRUCT(AOUpParams)
 
 
 
-#line 40
+
+
+#line 42
 };
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoupscale.srt.h"
 

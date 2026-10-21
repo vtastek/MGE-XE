@@ -30,6 +30,24 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float z2 = LoadTex2D(gAODownDepthIn, NO_SAMPLER, min(f + int2(0, 1), hi), 0).r;
     float z3 = LoadTex2D(gAODownDepthIn, NO_SAMPLER, min(f + int2(1, 1), hi), 0).r;
 
+    // MAJORITY (upParams.w 1): the two MIDDLE depths of the 2x2. Closest-only let a grass blade covering
+    // one pixel of four claim the whole texel, so the ground between blades vanished from the half-res
+    // buffer; the upscale's 2x2 then held no tap near a ground pixel, its range weights collapsed and it
+    // fell back to the blade's AO — 2-pixel steps and checkered dark pixels under grass (user
+    // 2026-10-21). The middle pair is the surface that holds at least two of the four pixels: 1 blade
+    // in 4 gives ground, 3 in 4 the blade. Continuous (within 3%), their mean is EXACTLY a plane's depth
+    // at the texel centre; across a 2/2 silhouette it is the closer one, as before (a mean there would
+    // sit in mid-air). NOT a checkerboard of closest/farthest: the search reads this buffer too, and
+    // alternating depths on a sloped plane are a bumpy surface that shadows itself.
+    if (gAODownParams.upParams.w > 0.5f)
+    {
+        const float a = max(z0, z1), b = min(z0, z1), c = max(z2, z3), d = min(z2, z3);
+        const float m1 = min(a, c);   // second largest...
+        const float m2 = max(b, d);   // ...and second smallest of the four
+        const float hi = max(m1, m2), lo = min(m1, m2);
+        Write2D(gAODownDepthOut, px, (hi - lo <= 0.03f * hi) ? 0.5f * (hi + lo) : hi);
+        RETURN();
+    }
     Write2D(gAODownDepthOut, px, max(max(z0, z1), max(z2, z3)));
     RETURN();
 }

@@ -178,6 +178,11 @@ float2 sunDiscTap(int i, int n, float rot)
 float sunDiscRotation(float3 worldPosRel)
 {
     float4 nz = gShadowParams.sunNoise;
+    // Mode 4: NO rotation — one fixed disc everywhere. Since the bleed fix (2026-10-20) the penumbra is
+    // a true tap fraction, and a per-pixel rotation then shows as a fixed hatch that BOILS wherever a
+    // swaying caster moves the penumbra ("shadows are flickering with noise", user 2026-10-21). The
+    // radius is capped at a few texels and every tap is a bilinear 2x2 PCF, so a fixed disc is smooth.
+    if (nz.x > 3.5f) { return 0.0f; }
     if (nz.x < 0.5f)
     {
         float2 h = float2(dot(worldPosRel, float3(0.7391f, 0.3179f, 0.5107f)),

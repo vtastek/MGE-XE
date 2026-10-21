@@ -36,5 +36,7 @@ STRUCT(AOUpParams)
                                          //        sigma for the BEND channel (<= 0 disables)
                                          //        z = aoUpProf BISECT STAGE, cumulative:
                                          //            0/4 full, 1 nearest only, 2 +Lanczos,
-                                         //            3 +range weight. w spare
+                                         //            3 +range weight.
+                                         //        w = downsample mode (aodepthdown): 0 closest,
+                                         //            1 majority (the 2x2's middle pair)
 };

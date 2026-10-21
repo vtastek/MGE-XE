@@ -218,8 +218,15 @@ VSOutput VS_MAIN( VSInput In )
     //     printed a bright sun-aligned line along the terminator. See statics.frag.
     //
     // It also retires Gouraud sun on LOD meshes, which are exactly the low-poly case it shows on.
-    Out.SunLight = (gShadowParams.pbrStatics.z != 0.0f) ? (vcol * gFrameData.sunCol.rgb)
-                                                       : (vcol * sunlit);
+    //
+    // VERTEX-COLOUR SPLIT (skyamb.h vcolSplitLift), as the near frags: the sun takes vcol + the lift to the
+    // mesh's own level (the host's ref / 2, Flags bits 9-15 — bit 8 is the grass shadow-dither flag); the
+    // ambient above keeps vcol. Without it the near mesh was brighter in the sun than its distant twin — a
+    // seam at the handover (user 2026-10-21).
+    const float vref = decodeAuthored1((float)((((uint)(In.InstParams.y + 0.5f) >> 9u) & 0x7Fu) * 2u) / 255.0f);
+    const float3 vsun = vcol + vcolSplitLift(2u, vcol, vref, (uint)(gFrameData.debugParams.w + 0.5f));
+    Out.SunLight = (gShadowParams.pbrStatics.z != 0.0f) ? (vsun * gFrameData.sunCol.rgb)
+                                                       : (vsun * sunlit);
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
     Out.Flags    = (uint)(In.InstParams.y + 0.5f);
