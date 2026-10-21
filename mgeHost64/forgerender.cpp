@@ -22848,6 +22848,9 @@ namespace {
     // TEST: freeze the aimed sun light at its first exterior frame (no steps at all) — shadow artifacts
     // then cannot be the light moving (user 2026-10-21: "set sun to a fixed position, use lit debug").
     bool  g_sunFreeze = false;
+    // Knob "dumpLdrOnly": dumps write the TGA alone. A long series of a debug view (the near/far
+    // producer, mode 28) fills the disk at 32 MB of EXR a frame for colours it never reads.
+    bool  g_dumpLdrOnly = false;
 
     // WT2 water debug: output one isolated water term instead of the composited surface, so the
     // reflection / refraction contents are directly inspectable. Driven by two panel CHECKBOXES
@@ -25777,6 +25780,7 @@ namespace {
             // not a click.
             { "sunLightFollowsDisc", &g_sunLightFollowsDisc },
             { "sunFreeze",           &g_sunFreeze           },   // TEST: aimed sun held at its first frame
+            { "dumpLdrOnly",         &g_dumpLdrOnly         },   // dumps skip the EXR
             // The alpha fold fix (near-opaque depth prepass), so a dense-alpha scene (the CAP candle
             // staircase: 420 flame billboards in view) can be A/B'd from a minimized harness run.
             { "alphaDepthWrite", &g_alphaDepthWrite },
@@ -33006,7 +33010,9 @@ namespace {
                           g_lastApl[0], g_lastApl[1], g_lastApl[2]);
 
             bool exrOK = false, tgaOK = false;
-            if (pHdrRb && pHdrRb->pCpuMappedAddress && dumpR11) {
+            if (g_dumpLdrOnly) {
+                // no EXR: a picture series of a debug view needs only its colours
+            } else if (pHdrRb && pHdrRb->pCpuMappedAddress && dumpR11) {
                 // Widen R11G11B10F to RGBA16F rows. Each channel is an unsigned float with half's 5-bit
                 // exponent (bias 15): R/G carry a 6-bit mantissa, B a 5-bit one, so placing exponent and
                 // mantissa into half's fields is exact. Alpha (no channel) = 1.0.

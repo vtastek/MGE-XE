@@ -3619,12 +3619,16 @@ namespace MGE::GeometryCache {
             // half worth trimming). Distance-only (not frustum) so panning never
             // churns capture. The sky walk is exempt — sky shapes ride orbit
             // transforms unrelated to eye distance.
+            // HORIZONTAL distance (2026-10-21): height changes in seconds (levitation, a fall, a
+            // descent onto a town) and MW's grid does not move with it. Measured in 3D, a save
+            // 13667 u above Old Ebonheart left the whole town outside the gate; flying down, it
+            // entered MW's view all at once and trickled in through the first-sight budget, whole
+            // buildings missing (DL had already yielded them) for a second or more.
             if (g_gateThisFrame && !g_walkingSky && !g_walkingFP) {
                 const float dx = av->worldBoundOrigin.x - g_gateEye[0];
                 const float dy = av->worldBoundOrigin.y - g_gateEye[1];
-                const float dz = av->worldBoundOrigin.z - g_gateEye[2];
                 const float reach = g_gateRadius + av->worldBoundRadius;
-                if (dx * dx + dy * dy + dz * dz > reach * reach) {
+                if (dx * dx + dy * dy > reach * reach) {
                     ++g_gateSkipsThisFrame;
                     return;
                 }
@@ -4552,9 +4556,8 @@ namespace MGE::GeometryCache {
         if (g_gateThisFrame) {
             const float dx = root->worldBoundOrigin.x - g_gateEye[0];
             const float dy = root->worldBoundOrigin.y - g_gateEye[1];
-            const float dz = root->worldBoundOrigin.z - g_gateEye[2];
             const float reach = g_gateRadius + root->worldBoundRadius;
-            if (dx * dx + dy * dy + dz * dz > reach * reach) {
+            if (dx * dx + dy * dy > reach * reach) {   // horizontal, as walk()'s gate
                 ++g_gateSkipsThisFrame;
                 return;
             }
@@ -5791,8 +5794,7 @@ namespace MGE::GeometryCache {
                     if (evict && g_gateThisFrame && g_frame - e.lastFrame <= kFarKeepFrames) {
                         const float dx = e.worldTransformD3D[12] - g_gateEye[0];
                         const float dy = e.worldTransformD3D[13] - g_gateEye[1];
-                        const float dz = e.worldTransformD3D[14] - g_gateEye[2];
-                        if (dx * dx + dy * dy + dz * dz > evictR2) {
+                        if (dx * dx + dy * dy > evictR2) {   // horizontal, as the walk's gate
                             evict = false;
                         }
                     }

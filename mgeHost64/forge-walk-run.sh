@@ -3,7 +3,10 @@
 # across cell borders -> report what the grid-driven texture/geometry systems did at each crossing.
 # Usage: forge-walk-run.sh [delay=12] [save=ibodragonstareast360.ess] [speed=600] [distance=24576]
 #                          [heading=-1] [timeout=300] [clientEnv="NAME=v,NAME=v"] [trace] [settle=20]
-#                          [hostKnobs="name=v,name=v"]   (MGE_HOST_KNOBS, as forge-perf-run.sh)
+#                          [hostKnobs="name=v,name=v"]   (MGE_HOST_KNOBS, as forge-perf-run.sh) [fly]
+#
+# fly: non-empty = glide along the camera, keeping the save's camera (AutoWalk `fly`); or
+#      "z,pitch" (e.g. 2500,5) = start at that altitude, look `pitch` degrees down along `heading`.
 #
 # heading: degrees, 0 = north, 90 = east; negative = the save's own facing. distance 24576 = three
 # cells, so at least two border crossings whatever the start position. settle defaults past the
@@ -28,6 +31,7 @@ CLIENTENV="${7:-}"
 TRACE="${8:-}"
 SETTLE="${9:-20}"
 KNOBS="${10:-}"
+FLY="${11:-}"
 CLIENT_ENV_NAMES="MGE_TIER1_SEM MGE_TIER1_EVENT MGE_COPY_AT_BLIT MGE_COPY_PRERECORD MGE_FRAME_AHEAD MGE_TEX_PREFETCH_MB MGE_TEX_STREAM_MB MGE_TEX_EVICT_FRAMES MGE_TEX_BOOKKEEP MGE_GEOM_CONTENT_PROBE MGE_GEOM_ALIAS MGE_GEOM_ALIAS_SKIN MGE_GEOM_MEMO MGE_PGI_EMIT MGE_GEOM_KEEP_MB MGE_TEX_STREAM_ASYNC MGE_TEX_IO_THREAD MGE_SCOPED_WALK MGE_GATE_LAZY MGE_WALK_RESUME MGE_KEEP_EXTERIOR"
 
 MW="/mnt/c/mgem/morrowind64"
@@ -56,16 +60,18 @@ restore() {
 }
 trap restore EXIT
 
-python3 - "$ILCFG" "$SAVE" "$AWCFG" "$DELAY" "$SPEED" "$DISTANCE" "$HEADING" "$SETTLE" <<'PY'
+python3 - "$ILCFG" "$SAVE" "$AWCFG" "$DELAY" "$SPEED" "$DISTANCE" "$HEADING" "$SETTLE" "$FLY" <<'PY'
 import json, sys
-il, save, aw, delay, speed, distance, heading, settle = sys.argv[1:9]
+il, save, aw, delay, speed, distance, heading, settle, fly = sys.argv[1:10]
 with open(il) as f: cfg = json.load(f)
 cfg["continue"] = False          # else the mod loads the NEWEST save, not ours
 cfg["overrideFile"] = save
 with open(il, "w") as f: json.dump(cfg, f, indent=2)
 with open(aw, "w") as f:
     json.dump({"enabled": True, "delay": float(delay), "speed": float(speed),
-               "distance": float(distance), "heading": float(heading), "settle": float(settle)}, f, indent=2)
+               "distance": float(distance), "heading": float(heading), "settle": float(settle),
+               "fly": bool(fly),
+               **({"z": float(fly.split(",")[0]), "pitch": float(fly.split(",")[1])} if "," in fly else {})}, f, indent=2)
 PY
 echo "[walk] pinned save=$SAVE | delay=${DELAY}s speed=$SPEED distance=$DISTANCE heading=$HEADING settle=${SETTLE}s"
 

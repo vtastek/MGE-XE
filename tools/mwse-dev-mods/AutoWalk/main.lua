@@ -25,6 +25,13 @@
 --   heading   degrees (0 = north, 90 = east, MW's facing convention); negative = the current facing.
 --   settle    real seconds to hold still afterwards. Longer than 600 frames (the stale-texture
 --             eviction age) so a release of anything still in the grid would show in the log.
+--   fly       true = keep the save's camera (pitch included) and glide along its 3D view direction,
+--             instead of following the ground and facing the walk; `heading` is ignored. Stops 1000
+--             units above the ground. For a save that looks down on a town from above: the town
+--             crosses MW's near reach the way it does when the player flies down to it.
+--   z         fly only: start altitude instead of the save's (absent = the save's).
+--   pitch     fly only: degrees below the horizon to look and glide along, with `heading`, instead
+--             of the save's camera (absent = the save's camera).
 
 local defaults = {
     enabled = false,
@@ -33,6 +40,7 @@ local defaults = {
     distance = 24576.0,
     heading = -1.0,
     settle = 20.0,
+    fly = false,
 }
 
 local cfg = mwse.loadConfig("AutoWalk", defaults)
@@ -46,7 +54,7 @@ local walking = false
 local walked = 0.0        -- units covered
 local simTime = 0.0
 local startPos = nil
-local dirX, dirY, heading = 0.0, 0.0, 0.0
+local dirX, dirY, dirZ, heading = 0.0, 0.0, 0.0, 0.0
 local lastZ = 0.0
 local nextMark = 0.0
 local wroteBad = 0
@@ -100,8 +108,21 @@ onSimulate = function(e)
     local x = startPos.x + dirX * walked
     local y = startPos.y + dirY * walked
     local z = groundZ(x, y)
+    if cfg.fly then
+        local fz = startPos.z + dirZ * walked
+        if fz < z + 1000.0 then
+            log("fly: 1000 units above the ground at %.0f units - stopping", walked)
+            cfg.distance = walked
+        end
+        z = math.max(fz, z + 1000.0)
+        if cfg.pitch then
+            tes3.player.orientation = tes3vector3.new(math.rad(cfg.pitch), 0, heading)
+        end
+    end
     tes3.player.position = tes3vector3.new(x, y, z)
-    tes3.player.orientation = tes3vector3.new(0, 0, heading)
+    if not cfg.fly then
+        tes3.player.orientation = tes3vector3.new(0, 0, heading)
+    end
 
     local got = tes3.player.position
     if math.abs(got.x - x) > 1.0 or math.abs(got.y - y) > 1.0 then
@@ -131,12 +152,30 @@ local function beginWalk()
     startPos = tes3.player.position:copy()
     heading = cfg.heading >= 0 and math.rad(cfg.heading) or tes3.mobilePlayer.facing
     -- MW facing: 0 = +Y (north), increasing clockwise, so east (+X) is pi/2.
-    dirX, dirY = math.sin(heading), math.cos(heading)
+    dirX, dirY, dirZ = math.sin(heading), math.cos(heading), 0.0
+    if cfg.fly and cfg.pitch then
+        local p = math.rad(cfg.pitch)
+        dirX, dirY, dirZ = math.sin(heading) * math.cos(p), math.cos(heading) * math.cos(p), -math.sin(p)
+        if cfg.z then startPos.z = cfg.z end
+        log("fly: heading %.1f pitch %.1f from z %.0f", math.deg(heading) % 360, cfg.pitch, startPos.z)
+    elseif cfg.fly then
+        local v = tes3.getCameraVector()
+        dirX, dirY, dirZ = v.x, v.y, v.z
+        heading = math.atan2(v.x, v.y)
+        if cfg.z then startPos.z = cfg.z end
+        log("fly: camera vector (%.3f, %.3f, %.3f)", v.x, v.y, v.z)
+    end
     lastZ = startPos.z
+    if cfg.fly then
+        -- A bare position write does not hold against the player's own update (gridwalk, 2026-09-19).
+        tes3.mobilePlayer.movementCollision = false
+        tes3.mobilePlayer.isFlying = true
+    end
     walked, simTime, nextMark, wroteBad, crossings = 0.0, 0.0, 0.0, 0, 0
     local gx, gy = gridOf(startPos.x, startPos.y)
-    log("WALK START: %.0f units at %.0f u/s, heading %.1f deg, from (%.0f, %.0f) grid (%d,%d)",
-        cfg.distance, cfg.speed, math.deg(heading) % 360, startPos.x, startPos.y, gx, gy)
+    log("WALK START: %.0f units at %.0f u/s, heading %.1f deg, from (%.0f, %.0f, %.0f) grid (%d,%d)%s",
+        cfg.distance, cfg.speed, math.deg(heading) % 360, startPos.x, startPos.y, startPos.z, gx, gy,
+        cfg.fly and " FLYING" or "")
     walking = true
     event.register("simulate", onSimulate)
 end
