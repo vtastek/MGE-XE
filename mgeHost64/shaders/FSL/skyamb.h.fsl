@@ -430,8 +430,64 @@ float skyLateralOpen(float3 worldAbs, float R)
 // TEST (pgiEmis 2): the same capture with EVERY distant static emitting its texture (statics.vert emissive
 // 1) — the emission path end to end on a scene with no glow of its own.
 #define PGI_CAPTURE_EMIS_TEST 66u
-#define PGI_IS_EMIS(d) ((d) == PGI_CAPTURE_EMIS || (d) == PGI_CAPTURE_EMIS_TEST)
+// The PROBE ORACLE's emission view (probeOracleModes 5, I2): EVERY pixel the emitted radiance — its faces
+// are read texel by texel, so no checkerboard. The independent truth adds it as a source (a lava room's
+// light is its lava); litTerm - ambient cancels emission, so without this lane the truth had none.
+#define PGI_CAPTURE_EMIS_ALL 67u
+#define PGI_IS_EMIS(d) ((d) == PGI_CAPTURE_EMIS || (d) == PGI_CAPTURE_EMIS_TEST || (d) == PGI_CAPTURE_EMIS_ALL)
 bool pgiCapEmisPx(float2 pos) { return ((((uint)pos.x) ^ ((uint)pos.y)) & 1u) != 0u; }
+// The emission pixels of capture mode d: the odd checkerboard, or all of them under PGI_CAPTURE_EMIS_ALL.
+bool pgiCapEmisPxD(uint d, float2 pos) { return d == PGI_CAPTURE_EMIS_ALL || pgiCapEmisPx(pos); }
+// THE CAPTURE'S ALBEDO IS THE EFFECTIVE DIFFUSE REFLECTANCE: texture x the material tint MW's routing
+// multiplies the light by (vColSource 2: the vertex colour; else MatDiffuse). The relight multiplies its
+// light by the captured albedo, and with the texture alone it missed every interior's baked vertex-colour
+// darkening: stored probes 1.5x the independent truth in the census office (2026-10-20).
+float3 pgiCapTint(uint vColSource, float3 vcol, float3 matDiffuse) { return (vColSource == 2u) ? vcol : matDiffuse; }
+// PHYSICAL ALBEDO (gShadowParams.calParams.z = exponent g, 0 = off; host knob albedoPhys; user 2026-10-20).
+// MW's textures decode to 0.05-0.2 linear — darker than any real plaster or wood — and a bounce returns
+// about the albedo, so the probes measured shadows fed by 3% bounce and the exposure, metering the lamp
+// pools, crushed them. The texture's LUMINANCE goes to L^g (chroma kept), capped at a physical 0.9:
+// sRGB 0.7 plaster 0.45 -> 0.62, sRGB 0.4 wood 0.13 -> 0.29 at g 0.6. Texture albedo only — never a
+// dark map, a vertex tint or an emitter. Frame and probe captures alike (same frags).
+// TOE: L^g's gain L^(g-1) is unbounded toward black — a near-black texel (L 1e-4, a doorway's painted
+// shadow, all its little energy green) came out 40x, a vivid green patch (census office, user 2026-10-21).
+// Under PHYS_ALBEDO_TOE the gain fades to 1 (lerp to L by L / toe; monotone for any toe < 1): painted
+// black stays black, real dark materials (0.05+) keep the whole lift.
+#define PHYS_ALBEDO_TOE 0.04f
+float3 physAlbedo(float3 a)
+{
+    const float g = gShadowParams.calParams.z;
+    if (g <= 0.0f) { return a; }
+    const float L = dot(a, float3(0.2126f, 0.7152f, 0.0722f));
+    if (L <= 1.0e-6f) { return a; }
+    const float w = saturate(L / PHYS_ALBEDO_TOE);
+    float3 o = a * lerp(1.0f, pow(L, g) / L, w);
+    const float mx = max(max(o.r, o.g), o.b);
+    return (mx > 0.9f) ? o * (0.9f / mx) : o;
+}
+// VERTEX-COLOUR SPLIT (debugParams.w bit 7, host knob vcolSplit; user 2026-10-20). MW paints vertex colours
+// for HUE and for baked AO-like DARKNESS, and as an albedo multiplier the darkness made the albedo too dark —
+// dark bounces, then a sky blown out by the exposure lifting them. Split against the mesh's own unoccluded
+// level `ref` (client: 95th percentile of each vertex's brightest channel, in matAmbient.x on DiffAmb
+// draws; 0 = none): with m the vertex's brightest channel, the DIRECT light (and the probes' albedo) take
+// vcol + max(0, ref - m) — the missing brightness given back as a NEUTRAL lift — and the AMBIENT keeps
+// vcol: the darkness dims the indirect light only. A lift, not a scale (vcol x ref / m): the scale
+// amplified the meaningless hue of a near-black vertex to full brightness (a green doorway in the census
+// office, 2026-10-20). Returns the lift; 0 = no split.
+float vcolSplitLift(uint vColSource, float3 vcol, float ref, uint flags)
+{
+    if (vColSource != 2u || (flags & 128u) == 0u || ref <= 1.0e-3f) { return 0.0f; }
+    return max(0.0f, ref - max(max(vcol.r, vcol.g), vcol.b));
+}
+// ...so the PROBE ORACLE's lighting views (its litTerm and ambient jobs) are the UNTINTED d + a and a:
+// the truth is albedo x (litTerm - ambient), and the tint is in its albedo now. F12 6 and 7 are unchanged.
+// Frags without a material tint (statics, terrain, grass) show their 6 / 7 for these.
+#define PGI_ORACLE_LIGHT 68u
+#define PGI_ORACLE_AMB   69u
+// 70: the RELIGHT's direct light at this pixel (pgipoint.h.fsl, the probes' own formula: the sun unshadowed as
+// indoors, the lanterns with their atlas shadows, no gobo) — the oracle's full-resolution relight (probeOracleModes 6).
+#define PGI_ORACLE_RELIGHT 70u
+uint pgiOracleAsView(uint d) { return (d == PGI_ORACLE_LIGHT || d == PGI_ORACLE_RELIGHT) ? 6u : d == PGI_ORACLE_AMB ? 7u : d; }
 
 #ifndef PGI_COMPUTE
 // PROBE GI (pgi.srt.h): E/pi at N from the probe field — the same units ambCol x factor has — and the

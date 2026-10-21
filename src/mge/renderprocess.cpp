@@ -4771,6 +4771,7 @@ namespace {
             item.matEmissive[0] = e.matEmissive[0];  item.matEmissive[1] = e.matEmissive[1];  item.matEmissive[2] = e.matEmissive[2];
             MGE::GeometryCache::emissiveForDraw(e, item.emissiveGain);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            if (item.vColSource == 2u) { item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = e.vcolRef; }   // VERTEX-COLOUR SPLIT ref (MW never reads ambient on DiffAmb)
             // C4d shadow-caster category: LIVE (NPC/creature parts + held equipment,
             // activators, doors) → the host's dynamic shadow tile, not the cached statics.
             // …plus the stencil-portal role (IPC::kDrawPortalMask): 0 for every ordinary draw, so
@@ -4948,6 +4949,7 @@ namespace {
             item.matEmissive[0] = e.matEmissive[0];  item.matEmissive[1] = e.matEmissive[1];  item.matEmissive[2] = e.matEmissive[2];
             MGE::GeometryCache::emissiveForDraw(e, item.emissiveGain);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            if (item.vColSource == 2u) { item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = e.vcolRef; }   // VERTEX-COLOUR SPLIT ref (MW never reads ambient on DiffAmb)
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
             item.drawFlags  = (blended ? IPC::kMMDrawFlagBlended : 0u)   // Route C: alpha-stage blend draw
@@ -5001,6 +5003,7 @@ namespace {
             item.matEmissive[0] = e.matEmissive[0];  item.matEmissive[1] = e.matEmissive[1];  item.matEmissive[2] = e.matEmissive[2];
             MGE::GeometryCache::emissiveForDraw(e, item.emissiveGain);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            if (item.vColSource == 2u) { item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = e.vcolRef; }   // VERTEX-COLOUR SPLIT ref (MW never reads ambient on DiffAmb)
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE: shift translation by -eye (see emitStaticDraw).
             shipEntryT(&item.world[12], e);
@@ -5049,6 +5052,7 @@ namespace {
             // vert MULTIPLIES by it, so a zero would black this DIP's emissive out entirely).
             item.emissiveGain[0] = item.emissiveGain[1] = item.emissiveGain[2] = 1.0f;
             item.vColSource = rec.vColSource;
+            if (item.vColSource == 2u) { item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = 0.0f; }   // no mesh: no vertex-colour split
             memcpy(item.world, rec.world, 16 * sizeof(float));
             // Same eye as every other subtraction (ExactPos::eye); the record itself carries no
             // node, so its translation stays the float one — a recorded residual.
@@ -6004,6 +6008,12 @@ namespace {
         g_lightGoboScratch.clear();
         std::uint32_t count = 0;
         std::uint32_t culled = 0;
+        // INTERIORS ship the WHOLE cell's lights (tasks/forge-gi.md "I1 landed", user 2026-10-20: "it is a
+        // fixed area"): probe GI, its captures and the probe oracle light what the camera does not see,
+        // and a frustum-culled list left them with the 14-16 lights in view of a guild that has many
+        // more. The main view's froxel binning keeps an off-screen light off every pixel. The cap holds.
+        const bool interior = !MWBridge::get()->IsExterior();
+        std::uint32_t wouldCull = 0;
         for (const auto& pl : lights) {
             // P2: resolve persistent identity BEFORE the frustum cull so a light that steps
             // off-screen keeps its id + lastPos updated (it can't recycle just for being culled).
@@ -6039,8 +6049,11 @@ namespace {
             ls.center = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
             ls.radius = 2.0f * pl.radius;
             if (lightFrustum.ContainsSphere(ls) == ViewFrustum::OUTSIDE) {
-                ++culled;
-                continue;
+                if (!interior) {
+                    ++culled;
+                    continue;
+                }
+                ++wouldCull;
             }
             if (count >= IPC::kMaxPointLights) {
                 static bool logged = false;
@@ -6122,6 +6135,20 @@ namespace {
             const std::size_t sz = g_lightGoboScratch.size() * sizeof(IPC::LightGoboWire);
             g_lightScratch.resize(at + sz);
             memcpy(g_lightScratch.data() + at, g_lightGoboScratch.data(), sz);
+        }
+
+        // Census (on change): the cell's lights indoors, and how many the old frustum cull dropped.
+        {
+            static std::size_t s_total = ~std::size_t(0);
+            static bool s_interior = false;
+            if (interior != s_interior || (interior && lights.size() != s_total)) {
+                s_interior = interior;
+                s_total = lights.size();
+                if (interior) {
+                    LOG::logline(">> [light] interior census: %zu point lights, %u shipped (cap %u), %u off-frustum (the exterior cull would drop them)",
+                                 lights.size(), count, IPC::kMaxPointLights, wouldCull);
+                }
+            }
         }
 
         // Evict identity entries whose light hasn't been seen in a long time (cell changes drop

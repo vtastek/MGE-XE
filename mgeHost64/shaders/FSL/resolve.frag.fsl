@@ -395,6 +395,9 @@ float4 PS_MAIN(PsIn In)
         // frame that just finished, which ALREADY CONTAINS the E it was rendered with, so the host
         // correction multiplies the current exposure instead of replacing it.
         straight *= gResolveParams.tone.x;
+        // AUTO WHITE BALANCE (resolve.srt.h wb): von Kries gains on scene radiance, beside the exposure
+        // and for its reason — before the curve, so it is a change of illuminant and not of contrast.
+        if (gResolveParams.wb.w > 0.5f) { straight *= gResolveParams.wb.rgb; }
         // ── BLOOM (step 4) ──
         // Bright things spill light into their surroundings. Position is forced twice over: INSIDE
         // the curve because bloom is light and not a display effect, and inside the UN-PREMULTIPLIED

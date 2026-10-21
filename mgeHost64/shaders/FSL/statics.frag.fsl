@@ -177,6 +177,7 @@ PSOut PS_MAIN( VSOutput In )
     uint bucket = In.TexIndex >> 16;
     uint layer  = In.TexIndex & 0xFFFFu;
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+    tex.rgb = physAlbedo(tex.rgb);   // PHYSICAL ALBEDO (skyamb.h)
     {   // GI bounce inspection (gitint.h.fsl): the vert's pick rides Flags bits 28-30.
         const uint gc = (In.Flags >> 28u) & 7u;
         if (gc != 0u) { tex.rgb = giTintAlbedo(gc); }
@@ -514,9 +515,9 @@ PSOut PS_MAIN( VSOutput In )
 #endif
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
-    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
     const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance
     if (pgiCap) { dbg = 5u; }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

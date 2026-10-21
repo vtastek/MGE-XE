@@ -1842,7 +1842,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     if (blame < 0.5f && In.Info.w > 3.5f) {
         const uint t = (uint)(In.Info.w + 0.5f);
-        float3 bc = (t == 4u) ? float3(0.0f, 0.9f, 1.0f) : (t == 5u) ? float3(1.0f, 0.85f, 0.0f) : f3(1.0f);
+        float3 bc = (t == 4u) ? float3(0.0f, 0.9f, 1.0f) : (t == 5u) ? float3(1.0f, 0.85f, 0.0f)
+                  : (t == 7u) ? float3(1.0f, 0.4f, 0.05f) : f3(1.0f);
         if (In.IsBox > 0.5f) { RETURN(float4(bc * 2.0f, 1.0f)); }
         const float k = 0.35f + 0.65f * saturate(dot(normalize(In.Normal), In.Info.xyz) * 0.5f + 0.5f);
         return (float4(bc * k, 1.0f));

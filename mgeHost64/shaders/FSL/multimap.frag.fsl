@@ -22,6 +22,7 @@
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
+#include "pgipoint.h.fsl"    // pgiPointLightRaw() — the relight's lanterns, for the oracle's code 70
 
 STRUCT(VSOutput)
 {
@@ -251,7 +252,10 @@ float4 PS_MAIN( VSOutput In )
     // in the vertex stage.
     float3 emis = ((vColSource == 1u) ? In.Color.rgb : In.MatEmissive)
                 * gShadowParams.calParams.x;
-    float3 lit = (vColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+    // VERTEX-COLOUR SPLIT (skyamb.h vcolSplitLift): the direct light takes the vertex colour at the mesh's own
+    // level; the ambient keeps it whole — its darkness occludes the indirect light only.
+    const float vk = vcolSplitLift(vColSource, In.Color.rgb, In.MatAmbient.x, aoFlags);
+    float3 lit = (vColSource == 2u) ? ((In.Color.rgb + vk) * d + In.Color.rgb * a + emis)
                                     : (In.MatDiffuse * d + In.MatAmbient * a + emis);
     // --- END lit block ---
 
@@ -288,7 +292,7 @@ float4 PS_MAIN( VSOutput In )
         // The emissive gain lands only on CLIPPED texels (scenecolor.h.fsl), applied HERE and not
         // after the loop: the base texel is in hand, and the later MOD/MOD2X/ADD stages then
         // modulate the corrected emissive exactly as they modulate the rest of lit.
-        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b;
+        if (op == 0u)      { float3 b = physAlbedo(t.rgb) * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b;
                              if (pgiEmisMode) { emAcc = b * (emis + expandExposedEmissiveDelta(emis, b, 1.0f)); } } // BASE (MOD x DIFFUSE)
         else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; emAcc *= t.rgb; }          // MOD
         else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; emAcc *= m; }   // MOD2X
@@ -311,7 +315,7 @@ float4 PS_MAIN( VSOutput In )
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
@@ -326,13 +330,21 @@ float4 PS_MAIN( VSOutput In )
         // and the view showing that honestly rather than inventing one.
         RETURN(float4(aoAmbientTermProxy(aoSample.a, aoFlags), 1.0f));
     }
-    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN    if (dbg == 5u) { RETURN(float4(pgiEmisPx ? emAcc : alb, 1.0f)); }        // mode 5: albedo only (texture product); P2 odd: emission
+    if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN
+    if (dbg == 5u) {                                                        // mode 5: albedo only (texture product); P2 odd: emission
+        // (This line had been swallowed by the comment above: multimap fed the probes its LIT colour.)
+        RETURN(float4(pgiEmisPx ? emAcc : alb * (pgiCap ? pgiCapTint(vColSource, In.Color.rgb + vk, In.MatDiffuse) : f3(1.0f)), 1.0f));
+    }
+    if (dbg == PGI_ORACLE_LIGHT) { RETURN(float4(d + a, 1.0f)); }
+    if (dbg == PGI_ORACLE_AMB)   { RETURN(float4(a, 1.0f)); }
+    if (dbg == PGI_ORACLE_RELIGHT) { const float3 Nv = normalize(In.Normal);   // the relight's own direct formula
+        RETURN(float4(gFrameData.sunCol.rgb * saturate(dot(Nv, -gFrameData.sunDir.xyz)) + pgiPointLightRaw(In.WorldPos, Nv), 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                           // mode 6: lit only (lighting, no texture)
     if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)
         float3 al;
-        if (vColSource == 2u)      { al = In.Color.rgb * a + In.MatEmissive; }
-        else if (vColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
-        else                       { al = In.MatAmbient * a + In.MatEmissive; }
+        // AMBIENT ONLY: emission is not ambient — it put the candles and the fire into the view (and 4-5x
+        // outliers into probe-relight's SHIPPED amb7 column, 2026-10-20).
+        al = (vColSource == 2u) ? In.Color.rgb * a : In.MatAmbient * a;
         RETURN(float4(al, 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {   // world-distance grayscale (reverse-Z NDC is too crushed to read)

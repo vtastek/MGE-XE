@@ -719,6 +719,8 @@ float4 PS_MAIN( VSOutput In )
         albedo += sampleLand(id11, uvS, gdx, gdy, gradArmEff) * w11;
     }
 
+    albedo = physAlbedo(albedo);   // PHYSICAL ALBEDO (skyamb.h): the blended texture, before VCLR paints it
+
     // VCLR is Morrowind's hand-painted per-vertex TINT over the land texture — it multiplies, it is
     // not the albedo (which is what T1 had to pretend while there were no textures).
     //
@@ -1392,9 +1394,9 @@ float4 PS_MAIN( VSOutput In )
 
 #ifdef TERRAIN_DEBUG_VIEWS
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
-    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
     const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     // AO buffer views (3/4), same branches as opaque.frag / multimap.frag. Added with the AO
     // receive above: the ground is most of the screen, so without these the AO debug view was

@@ -58,7 +58,7 @@ float4 PS_MAIN( VSOutput In )
     // PROBE GI capture (P2): the glow is EMITTED radiance, so it lands on the odd (emission) pixels only
     // and adds nothing to the albedo ones; no fog — the capture's base pixels carry none either.
     if (PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
-        RETURN(float4(pgiCapEmisPx(In.Position.xy) ? liftInPass(tex.rgb) * gShadowParams.sunny16.y : f3(0.0f), 0.0f));
+        RETURN(float4(pgiCapEmisPxD((uint)(gFrameData.debugParams.x + 0.5f), In.Position.xy) ? liftInPass(tex.rgb) * gShadowParams.sunny16.y : f3(0.0f), 0.0f));
     }
     RETURN(float4(liftInPass(tex.rgb) * gShadowParams.sunny16.y * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
 }

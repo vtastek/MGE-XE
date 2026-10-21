@@ -1477,6 +1477,7 @@ namespace MGE::GeometryCache {
             // and the alpha ride the SAME diffuse lane in both engines, so taking the vertex colour
             // for shading necessarily takes its alpha too.
             e.vColSource = 0;   // SOURCE_IGNORE until a VertexColorProperty says otherwise
+            e.vcolRef = 0.0f;   // baked with the vertex data (the upload walk)
 
             auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
             if (!ps) return;
@@ -2209,6 +2210,21 @@ namespace MGE::GeometryCache {
                 // so the re-upload trigger keeps tracking the engine rather than our correction
                 // (and the crossing itself, which moves those colours, is what re-fires it).
                 if (g_walkingSky) { vcol = skyVcolUnblend(e, vcol, vertexCount); }
+                // VERTEX-COLOUR SPLIT: the mesh's "unoccluded" level — the 95th percentile of each
+                // vertex's brightest channel. Below it a vertex's darkness is read as baked occlusion
+                // (the host dims only the indirect light by it); the level itself stays in the albedo.
+                e.vcolRef = 0.0f;
+                if (vcol && vertexCount) {
+                    uint32_t hist[256] = {};
+                    for (uint32_t i = 0; i < vertexCount; ++i) {
+                        const DWORD c = *reinterpret_cast<const DWORD*>(&vcol[i]);   // B,G,R,A
+                        ++hist[std::max(std::max(c & 0xFFu, (c >> 8) & 0xFFu), (c >> 16) & 0xFFu)];
+                    }
+                    const uint32_t want = vertexCount - vertexCount / 20u;   // 95th percentile
+                    uint32_t run = 0, b = 0;
+                    for (; b < 255u; ++b) { run += hist[b]; if (run >= want) { break; } }
+                    e.vcolRef = (float)b / 255.0f;
+                }
                 const auto* triList = data->getTriList();
 
                 // ---- UV-animated meshes: one shared UV array for every INSTANCE ------------------

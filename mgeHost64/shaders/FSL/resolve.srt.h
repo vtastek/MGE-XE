@@ -266,6 +266,13 @@ STRUCT(ResolveParams)
     // things ([[feedback_one_knob_two_jobs]]). Ninth float4 = 144 B against a 256 B cbuffer, so
     // still no allocation change.
     DATA(float4, prefilter, None);
+
+    // AUTO WHITE BALANCE (host knob wbAuto; user 2026-10-20). rgb = von Kries gains toward the frame's
+    // own illuminant (gray world over the APL's scene mean, luminance-neutral, partial strength so a
+    // torchlit room stays warm); w != 0 = armed. Multiplies scene radiance beside the exposure, before
+    // either curve. APL measures the scene target ahead of this pass, so the gains never see themselves.
+    // Tenth float4 = 160 B against the 256 B cbuffer.
+    DATA(float4, wb, None);
 };
 
 BEGIN_SRT(ResolveSrtData)

@@ -116,6 +116,7 @@ PSOut PS_MAIN( VSOutput In )
     // lane agrees on it ([[project_uniform_branch_is_not_free]]). Statics textures are all sampled
     // WRAP (the LOD bake has no per-map clamp mode), so WrapWrap is the only variant grass needs.
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSampler2xWrapWrap, uvw);
+    tex.rgb = physAlbedo(tex.rgb);   // PHYSICAL ALBEDO (skyamb.h)
 
 #if !GRASS_EARLY_Z
     // ⚠ BEFORE ANY DISCARD: a2cCoverageMaskFaded takes a derivative, which needs the whole 2x2 quad
@@ -232,9 +233,9 @@ PSOut PS_MAIN( VSOutput In )
 #endif
 
     // F12 distance grayscale parity with statics.frag / distantland.frag / opaque.frag.
-    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
     const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

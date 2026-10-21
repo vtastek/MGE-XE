@@ -14,6 +14,7 @@
 #include "parallax.h.fsl"    // parallaxOffsetUVTex() + Drobot soft shadows (tasks/forge-parallax.md)
 #include "a2c.h.fsl"         // a2cCoverageMask() — SHARED cutout coverage (prepass/colour parity)
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
+#include "pgipoint.h.fsl"    // pgiPointLightRaw() — the relight's lanterns, for the oracle's code 70
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
@@ -574,6 +575,7 @@ float4 PS_MAIN( VSOutput In )
         }
         albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
     }
+    albedo.rgb = physAlbedo(albedo.rgb);   // PHYSICAL ALBEDO (skyamb.h): the texture's, before weather paints it
     weatherApply(albedo.rgb, normalize(In.Normal), In.WorldPos,
                  (In.AlphaRef > 0.0f) ? 0.3f : 1.0f);   // wetness + snow (identity when dry); cutout = foliage
 
@@ -610,7 +612,10 @@ float4 PS_MAIN( VSOutput In )
                                       pbrNoV, pbrRough, gShadowParams.pbrShade2.z);
         d *= kE; a *= kE;
     }
-    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+    // VERTEX-COLOUR SPLIT (skyamb.h vcolSplitLift): the direct light takes the vertex colour at the mesh's own
+    // level; the ambient keeps it whole — its darkness occludes the indirect light only.
+    const float vk = vcolSplitLift(In.VColSource, In.Color.rgb, In.MatAmbient.x, aoFlags);
+    float3 lit = (In.VColSource == 2u) ? ((In.Color.rgb + vk) * d + In.Color.rgb * a + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
     // (albedo is sampled ABOVE now, before `lit` — the AO multi-bounce term needs it. The alpha
@@ -694,7 +699,7 @@ float4 PS_MAIN( VSOutput In )
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
@@ -750,14 +755,18 @@ float4 PS_MAIN( VSOutput In )
         }
         // P2 EMISSION (odd pixels): the emissive addend exactly as `c` takes it above.
         if (pgiEmisPx) { RETURN(float4(albedo.rgb * (emis + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f)) + capSpec, 1.0f)); }
-        RETURN(float4(albedo.rgb * capKd, 1.0f));
+        RETURN(float4(albedo.rgb * capKd * (pgiCap ? pgiCapTint(In.VColSource, In.Color.rgb + vk, In.MatDiffuse) : f3(1.0f)), 1.0f));
     }
+    if (dbg == PGI_ORACLE_LIGHT) { RETURN(float4(d + a, 1.0f)); }
+    if (dbg == PGI_ORACLE_AMB)   { RETURN(float4(a, 1.0f)); }
+    if (dbg == PGI_ORACLE_RELIGHT) { const float3 Nv = normalize(In.Normal);   // the relight's own direct formula
+        RETURN(float4(gFrameData.sunCol.rgb * saturate(dot(Nv, -gFrameData.sunDir.xyz)) + pgiPointLightRaw(In.WorldPos, Nv), 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                            // mode 6: lit only (lighting, no texture)
     if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)
         float3 al;
-        if (In.VColSource == 2u)      { al = In.Color.rgb * a + In.MatEmissive; }
-        else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
-        else                          { al = In.MatAmbient * a + In.MatEmissive; }
+        // AMBIENT ONLY: emission is not ambient — it put the candles and the fire into the view (and 4-5x
+        // outliers into probe-relight's SHIPPED amb7 column, 2026-10-20).
+        al = (In.VColSource == 2u) ? In.Color.rgb * a : In.MatAmbient * a;
         RETURN(float4(al, 1.0f));
     }
     if (dbg == 8u) {                                                        // mode 8: world-space normal (RGB = N*0.5+0.5)

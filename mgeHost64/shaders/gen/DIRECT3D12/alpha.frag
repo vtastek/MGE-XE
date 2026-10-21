@@ -2658,8 +2658,50 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 438 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 bool pgiCapEmisPx(float2 pos) { return ((((uint)pos.x) ^ ((uint)pos.y)) & 1u) != 0u; }
+
+bool pgiCapEmisPxD(uint d, float2 pos) { return d ==  67u  || pgiCapEmisPx(pos); }
+
+
+
+
+float3 pgiCapTint(uint vColSource, float3 vcol, float3 matDiffuse) { return (vColSource == 2u) ? vcol : matDiffuse; }
+#line 457 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float3 physAlbedo(float3 a)
+{
+    const float g = gShadowParams.calParams.z;
+    if (g <= 0.0f) { return a; }
+    const float L = dot(a, float3(0.2126f, 0.7152f, 0.0722f));
+    if (L <= 1.0e-6f) { return a; }
+    const float w = saturate(L /  0.04f );
+    float3 o = a * lerp(1.0f, pow(L, g) / L, w);
+    const float mx = max(max(o.r, o.g), o.b);
+    return (mx > 0.9f) ? o * (0.9f / mx) : o;
+}
+
+
+
+
+
+
+
+
+
+float vcolSplitLift(uint vColSource, float3 vcol, float ref, uint flags)
+{
+    if (vColSource != 2u || (flags & 128u) == 0u || ref <= 1.0e-3f) { return 0.0f; }
+    return max(0.0f, ref - max(max(vcol.r, vcol.g), vcol.b));
+}
+
+
+
+
+
+
+
+
+uint pgiOracleAsView(uint d) { return (d ==  68u  || d ==  70u ) ? 6u : d ==  69u  ? 7u : d; }
 
 
 
@@ -2819,7 +2861,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan
     float3 eIrr;
     return pgiVolIrradianceW(N, worldAbs, vis, lan, f3(1.0f), eIrr);
 }
-#line 609 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 665 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 pgiSpecBands(float rough, float k)
 {
     const float a2 = max(rough * rough * rough * rough, 1.0e-4f);
@@ -2855,7 +2897,7 @@ float3 pgiWorldE(float3 N, float3 bw, out float valid)
     UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
     return max(E, f3(0.0f));
 }
-#line 658 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 pgiSlotE(float slotF, float3 N, out float valid)
 {
     const float G = gShadowParams.pgiParams0.w;
@@ -3058,7 +3100,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 875 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 931 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef = gShadowParams.skyAOGround.y;
@@ -3223,7 +3265,7 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
     const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
     if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
     return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
-#line 1042 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 1098 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 }
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -4941,6 +4983,42 @@ float capSlotVisibility(float3 P, float3 N, float3 lightPos)
     return 1.0f;
 }
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgipoint.h.fsl"
+
+
+
+
+
+
+
+
+
+
+float3 pgiPointLightRaw(float3 Prel, float3 N)
+{
+    const uint nL = min((uint) gLights .lightParams.x, (uint) 128 );
+    const float reachK =  gLights .lightParams.y;
+    float3 E = f3(0.0f);
+    for (uint i = 0u; i < nL; ++i) {
+        const float4 posR =  gLights .lights[i * 3u + 0u];
+        const float3 toL = posR.xyz - Prel;
+        const float d2 = dot(toL, toL);
+        const float reach = posR.w * reachK;
+        if (d2 >= reach * reach) { continue; }
+        const float invD = rsqrt(max(d2, 1.0e-8f));
+        const float lambert = saturate(dot(N, toL) * invD);
+        if (lambert <= 0.0f) { continue; }
+        const float d = d2 * invD;
+        const float4 fo =  gLights .lights[i * 3u + 2u];
+        float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1.0e-4f);
+        att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
+        const uint slotP1 = (uint)fo.w;
+        if (slotP1 != 0u) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        E +=  gLights .lights[i * 3u + 1u].rgb * (lambert * att);
+    }
+    return E;
+}
+#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -4959,7 +5037,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
     DATA(FLAT(uint), ClampMode, TEXCOORD10);
     DATA(FLAT(uint), DrawIdx, TEXCOORD11);
-#line 45
+#line 46
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -5003,7 +5081,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float2 aoUv = In.Position.xy * gShadowParams.screenAlloc.zw;
     float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
                                 : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-#line 108 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
     float sndl = dot(N, -gFrameData.sunDir.xyz);
 
 
@@ -5029,7 +5107,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     bool causProj = causticProjectorActive(In.WorldPos);
-#line 145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
     a *= gFrameData.dbgScales.x;
 
 
@@ -5059,7 +5137,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
             uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 200 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
             const bool useSlot = slotP1 != 0u && !inReflect && gLights.lightParams.z < 0.5f;
             if (receiveShadows && !useSlot) { att *= fixtureGoboNear(gLights.goboNear[i >> 1u], i, toLight); }
             if (receiveShadows && useSlot)
@@ -5110,7 +5188,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb
                    : (In.VColSource == 3u) ? f3(0.0f) : In.MatEmissive)
                 * gShadowParams.calParams.x;
-    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+
+
+    const float vk = vcolSplitLift(In.VColSource, In.Color.rgb, In.MatAmbient.x, aoFlags);
+    float3 lit = (In.VColSource == 2u) ? ((In.Color.rgb + vk) * d + In.Color.rgb * a + emis)
                : (In.VColSource == 3u) ? (In.Color.rgb * (d + a) + In.MatEmissive * a)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
@@ -5120,7 +5201,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (albedo.a < In.AlphaRef) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
-#line 275 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
     if (In.DrawIdx != 0xFFFFFFFFu)
     {
         uint4 stg = gAlphaStages[In.DrawIdx];
@@ -5169,8 +5250,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg ==  64u  ||  ((dbg) == 65u || (dbg) == 66u ) );
-    const bool pgiEmisPx =  ((dbg) == 65u || (dbg) == 66u )  && pgiCapEmisPx(In.Position.xy);
+    const bool pgiCap = (dbg ==  64u  ||  ((dbg) == 65u || (dbg) == 66u || (dbg) == 67u ) );
+    const bool pgiEmisPx =  ((dbg) == 65u || (dbg) == 66u || (dbg) == 67u )  && pgiCapEmisPxD(dbg, In.Position.xy);
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
 
@@ -5182,15 +5263,24 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
 
-    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(albedo.rgb, 1.0f)); }
+    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f)
+                                      : float4(albedo.rgb * (pgiCap ? pgiCapTint(In.VColSource == 3u ? 2u : In.VColSource, In.Color.rgb + vk, In.MatDiffuse)
+                                                                    : f3(1.0f)), 1.0f)); }
+    if (dbg ==  68u ) { RETURN(float4(d + a, 1.0f)); }
+    if (dbg ==  69u ) { RETURN(float4(a, 1.0f)); }
+    if (dbg ==  70u ) { const float3 Nv = normalize(In.Normal);
+        return (float4(gFrameData.sunCol.rgb * saturate(dot(Nv, -gFrameData.sunDir.xyz)) + pgiPointLightRaw(In.WorldPos, Nv), 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
     if (dbg == 7u) {
         float3 al;
+
+
+
+
         if (In.VColSource == 3u) { al = (In.Color.rgb + In.MatEmissive) * a; }
-        else if (In.VColSource == 2u) { al = In.Color.rgb * a + In.MatEmissive; }
-        else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
-        else { al = In.MatAmbient * a + In.MatEmissive; }
-        return (float4(al, 1.0f));
+        else if (In.VColSource == 2u) { al = In.Color.rgb * a; }
+        else { al = In.MatAmbient * a; }
+        return (float4(al, outA));
     }
     if (dbg == 8u) {
         return (float4(N * 0.5f + 0.5f, 1.0f));

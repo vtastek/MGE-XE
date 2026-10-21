@@ -328,6 +328,10 @@ namespace MGE::GeometryCache {
         // so, else real material colours win (don't white-wash them).
         bool    hasVertexColor;
         uint8_t vColSource;
+        // VERTEX-COLOUR SPLIT (host bit 7): the mesh's own "unoccluded" vertex colour — the 95th
+        // percentile of each vertex's brightest channel, 0..1 display-referred (0 = none / not baked).
+        // Ships in matAmbient.x on DiffAmb draws, where MW's routing never reads the material ambient.
+        float   vcolRef;
         // Lifecycle
         uint64_t lastFrame;             // frame counter from most recent visit
         // FP0: frame stamp set by markSubtreeSuppressed on entries under a subtree the

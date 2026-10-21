@@ -1,0 +1,34 @@
+// THE RELIGHT'S LANTERNS, shared: pgi.comp.fsl's pgiPointLight (the probes' relight, at a G-buffer block's
+// hit) and the probe oracle's code 70 (PGI_ORACLE_RELIGHT, the capture frags at every pixel) run this one
+// body, so the oracle can score the relight's own light formula at full resolution against the frame's
+// direct term (user 2026-10-21: "I need relight at full res"). PGI_POINT_LIGHTS names the light cbuffer
+// (the frags' gLights, the relight's gPgiLights); fpShadowVisibility comes from fpshadow.h.fsl.
+// opaque.frag's response — 1/(k0 + k1 d + k2 d^2), the tail ramp to the reach, N.L — shadowed from the
+// atlas directly where the light has a slot. No gobo, no gain: the caller applies its own.
+#ifndef PGI_POINT_LIGHTS
+#define PGI_POINT_LIGHTS gLights
+#endif
+float3 pgiPointLightRaw(float3 Prel, float3 N)
+{
+    const uint  nL = min((uint)PGI_POINT_LIGHTS.lightParams.x, (uint)MAX_POINT_LIGHTS);
+    const float reachK = PGI_POINT_LIGHTS.lightParams.y;
+    float3 E = f3(0.0f);
+    for (uint i = 0u; i < nL; ++i) {
+        const float4 posR = PGI_POINT_LIGHTS.lights[i * 3u + 0u];
+        const float3 toL = posR.xyz - Prel;
+        const float  d2 = dot(toL, toL);
+        const float  reach = posR.w * reachK;
+        if (d2 >= reach * reach) { continue; }
+        const float invD = rsqrt(max(d2, 1.0e-8f));
+        const float lambert = saturate(dot(N, toL) * invD);
+        if (lambert <= 0.0f) { continue; }
+        const float  d  = d2 * invD;
+        const float4 fo = PGI_POINT_LIGHTS.lights[i * 3u + 2u];
+        float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1.0e-4f);
+        att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+        const uint slotP1 = (uint)fo.w;
+        if (slotP1 != 0u) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        E += PGI_POINT_LIGHTS.lights[i * 3u + 1u].rgb * (lambert * att);
+    }
+    return E;
+}

@@ -24,6 +24,7 @@
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — direct cube-atlas test for non-owners of the mask
+#include "pgipoint.h.fsl"    // pgiPointLightRaw() — the relight's lanterns, for the oracle's code 70
 
 STRUCT(VSOutput)
 {
@@ -246,7 +247,10 @@ float4 PS_MAIN( VSOutput In )
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb
                    : (In.VColSource == 3u) ? f3(0.0f) : In.MatEmissive)
                 * gShadowParams.calParams.x;
-    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+    // VERTEX-COLOUR SPLIT (skyamb.h vcolSplitLift): the direct light takes the vertex colour at the mesh's own
+    // level; the ambient keeps it whole — its darkness occludes the indirect light only.
+    const float vk = vcolSplitLift(In.VColSource, In.Color.rgb, In.MatAmbient.x, aoFlags);
+    float3 lit = (In.VColSource == 2u) ? ((In.Color.rgb + vk) * d + In.Color.rgb * a + emis)
                : (In.VColSource == 3u) ? (In.Color.rgb * (d + a) + In.MatEmissive * a)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
@@ -321,7 +325,7 @@ float4 PS_MAIN( VSOutput In )
     // F12 debug views (opaque.frag's, alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPx(In.Position.xy);   // odd: emitted radiance (P2)
+    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
     if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
@@ -333,15 +337,24 @@ float4 PS_MAIN( VSOutput In )
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
     // P2: no blended pass is recorded into a capture (glass, flames); a skinned ghost emits nothing.
-    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(albedo.rgb, 1.0f)); }
+    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f)
+                                      : float4(albedo.rgb * (pgiCap ? pgiCapTint(In.VColSource == 3u ? 2u : In.VColSource, In.Color.rgb + vk, In.MatDiffuse)
+                                                                    : f3(1.0f)), 1.0f)); }   // 3: lit as 2
+    if (dbg == PGI_ORACLE_LIGHT) { RETURN(float4(d + a, 1.0f)); }
+    if (dbg == PGI_ORACLE_AMB)   { RETURN(float4(a, 1.0f)); }
+    if (dbg == PGI_ORACLE_RELIGHT) { const float3 Nv = normalize(In.Normal);   // the relight's own direct formula
+        RETURN(float4(gFrameData.sunCol.rgb * saturate(dot(Nv, -gFrameData.sunDir.xyz)) + pgiPointLightRaw(In.WorldPos, Nv), 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
     if (dbg == 7u) {                                      // ambient-only (matches opaque.frag)
         float3 al;
+        // AMBIENT ONLY: emission is not ambient — it put the candles and the fire into the view (and 4-5x
+        // outliers into probe-relight's SHIPPED amb7 column, 2026-10-20).
+        // ...and the sheet's own COVERAGE: forced to 1, every card drew its whole quad (the quill a white
+        // rectangle, the fire's particles solid squares). 3: MatEmissive x a is an ambient-scaled term.
         if (In.VColSource == 3u)      { al = (In.Color.rgb + In.MatEmissive) * a; }
-        else if (In.VColSource == 2u) { al = In.Color.rgb * a + In.MatEmissive; }
-        else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
-        else                          { al = In.MatAmbient * a + In.MatEmissive; }
-        RETURN(float4(al, 1.0f));
+        else if (In.VColSource == 2u) { al = In.Color.rgb * a; }
+        else                          { al = In.MatAmbient * a; }
+        RETURN(float4(al, outA));
     }
     if (dbg == 8u) {                                      // world-space normal (RGB = N*0.5+0.5)
         RETURN(float4(N * 0.5f + 0.5f, 1.0f));

@@ -3005,8 +3005,50 @@ float skyLateralOpen(float3 worldAbs, float R)
     }
     return sum * 0.2f;
 }
-#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 438 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 bool pgiCapEmisPx(float2 pos) { return ((((uint)pos.x) ^ ((uint)pos.y)) & 1u) != 0u; }
+
+bool pgiCapEmisPxD(uint d, float2 pos) { return d ==  67u  || pgiCapEmisPx(pos); }
+
+
+
+
+float3 pgiCapTint(uint vColSource, float3 vcol, float3 matDiffuse) { return (vColSource == 2u) ? vcol : matDiffuse; }
+#line 457 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float3 physAlbedo(float3 a)
+{
+    const float g = gShadowParams.calParams.z;
+    if (g <= 0.0f) { return a; }
+    const float L = dot(a, float3(0.2126f, 0.7152f, 0.0722f));
+    if (L <= 1.0e-6f) { return a; }
+    const float w = saturate(L /  0.04f );
+    float3 o = a * lerp(1.0f, pow(L, g) / L, w);
+    const float mx = max(max(o.r, o.g), o.b);
+    return (mx > 0.9f) ? o * (0.9f / mx) : o;
+}
+
+
+
+
+
+
+
+
+
+float vcolSplitLift(uint vColSource, float3 vcol, float ref, uint flags)
+{
+    if (vColSource != 2u || (flags & 128u) == 0u || ref <= 1.0e-3f) { return 0.0f; }
+    return max(0.0f, ref - max(max(vcol.r, vcol.g), vcol.b));
+}
+
+
+
+
+
+
+
+
+uint pgiOracleAsView(uint d) { return (d ==  68u  || d ==  70u ) ? 6u : d ==  69u  ? 7u : d; }
 
 
 
@@ -3166,7 +3208,7 @@ float4 pgiVolIrradiance(float3 N, float3 worldAbs, out float vis, out float3 lan
     float3 eIrr;
     return pgiVolIrradianceW(N, worldAbs, vis, lan, f3(1.0f), eIrr);
 }
-#line 609 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 665 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 pgiSpecBands(float rough, float k)
 {
     const float a2 = max(rough * rough * rough * rough, 1.0e-4f);
@@ -3202,7 +3244,7 @@ float3 pgiWorldE(float3 N, float3 bw, out float valid)
     UNROLL for (int b = 0; b < 9; ++b) { E += float3(f[3 * b + 0], f[3 * b + 1], f[3 * b + 2]) * Y[b]; }
     return max(E, f3(0.0f));
 }
-#line 658 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 714 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float3 pgiSlotE(float slotF, float3 N, out float valid)
 {
     const float G = gShadowParams.pgiParams0.w;
@@ -3405,7 +3447,7 @@ float3 skyAmbFactorAOpOld(float3 N, float ao, float3 worldPosRel)
     const float under = gShadowParams.skyAOGround.z * max(ao - aoPos, 0.0f);
     return f + (bounce * ((1.0f - ao) + under) - f3(fl) * (1.0f - ao)) * (w * open);
 }
-#line 875 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 931 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyOpenness(float ao, float3 worldPosRel)
 {
     const float openRef = gShadowParams.skyAOGround.y;
@@ -3570,7 +3612,7 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
     const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
     if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
     return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
-#line 1042 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 1098 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 }
 #line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 
@@ -3607,7 +3649,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 t = (layerOp == 2u) ? mod2xStage(tex.rgb) : tex.rgb;
 #line 76 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
-    if ( (((uint)(gFrameData.debugParams.x + 0.5f)) == 65u || ((uint)(gFrameData.debugParams.x + 0.5f)) == 66u ) ) { RETURN(float4(t, 1.0f)); }
+    if ( (((uint)(gFrameData.debugParams.x + 0.5f)) == 65u || ((uint)(gFrameData.debugParams.x + 0.5f)) == 66u || ((uint)(gFrameData.debugParams.x + 0.5f)) == 67u ) ) { RETURN(float4(t, 1.0f)); }
     float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
     return (float4(m, 1.0f));
 }

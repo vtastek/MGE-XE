@@ -1008,15 +1008,22 @@ STRUCT(ResolveParams)
 
 
     float4 prefilter;
-#line 269
+
+
+
+
+
+
+    float4 wb;
+#line 276
 };
 
         CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
 
         Tex2DMS(float4, 4 ) gResolveSource :  register(t1,space3);
-#line 294 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+#line 301 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
         Tex2D(float4) gBloomTex :  register(t2,space3);
-#line 307 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+#line 314 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
         Tex2D(float4) gResolveFiltered :  register(t3,space3);
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
@@ -1361,16 +1368,19 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
 
         straight *= gResolveParams.tone.x;
-#line 424 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+
+
+        if (gResolveParams.wb.w > 0.5f) { straight *= gResolveParams.wb.rgb; }
+#line 427 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
         float bloomK = gResolveParams.bloom.x;
         if (bloomK > 0.0f)
         {
-#line 438 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 441 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
             float4 bloomPre = rBloomTap(pixelPos, gResolveParams.bloom.yz);
             float3 bloomStraight = bloomPre.rgb / max(bloomPre.a, 1.0e-3f);
             straight = lerp(straight, bloomStraight, bloomK);
         }
-#line 455 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 458 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
         if (gResolveParams.tone.y > 0.5f)
         {
 

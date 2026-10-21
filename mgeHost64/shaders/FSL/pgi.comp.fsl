@@ -52,13 +52,14 @@ uint pgiPackNormal(float3 n)
     n /= l;
     float2 e = n.xy;
     if (n.z < 0.0f) { e = (1.0f - abs(n.yx)) * float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f); }
-    uint2 q = uint2(saturate(e * 0.5f + 0.5f) * 65534.0f + 1.5f);   // 1..65535; 0 = none
-    return q.x | (q.y << 16);
+    uint2 q = uint2(saturate(e * 0.5f + 0.5f) * 4094.0f + 1.5f);   // 12 + 12 bits, 1..4095; 0 = none (bits 24-31: pgiGbDist's ratio)
+    return q.x | (q.y << 12);
 }
 float3 pgiUnpackNormal(uint p)
 {
+    p &= 0xFFFFFFu;
     if (p == 0u) { return f3(0.0f); }
-    float2 e = (float2(float(p & 0xFFFFu), float(p >> 16)) - 1.0f) / 65534.0f * 2.0f - 1.0f;
+    float2 e = (float2(float(p & 0xFFFu), float(p >> 12)) - 1.0f) / 4094.0f * 2.0f - 1.0f;
     float3 n = float3(e, 1.0f - abs(e.x) - abs(e.y));
     if (n.z < 0.0f) { n.xy = (1.0f - abs(n.yx)) * float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f); }
     return normalize(n);
@@ -76,7 +77,17 @@ float3 pgiUnpackR11G11B10(uint v)
 {
     return float3(f16tof32((v & 0x7FFu) << 4u), f16tof32(((v >> 11u) & 0x7FFu) << 4u), f16tof32(((v >> 22u) & 0x3FFu) << 5u));
 }
-float pgiGbDist(uint4 g) { return f16tof32(g.w >> 16u); }
+// TWO HIT DISTANCES per texel (the gather): w's f16 is the block's surface ON ITS CENTRE RAY (plane-exact,
+// pgiGbDistPlane) — where the relight rebuilds the hit; y's top byte is log2(mean ray length / that) in
+// 1/32 stops from -1, which pgiGbDist rebuilds: the "how far does this block see" every SIGHT test (merge
+// by sight, nudge, ceiling / floor, ball birth, splat visibility) was tuned on. Plane-exact there pulled a
+// near-edge-plus-far-wall block to the edge and refused joins: +80 probes in the census office.
+float pgiGbDistPlane(uint4 g) { return f16tof32(g.w >> 16u); }
+float pgiGbDist(uint4 g)
+{
+    const float hp = f16tof32(g.w >> 16u);
+    return (hp > 0.0f) ? hp * exp2((float)(g.y >> 24u) * (1.0f / 32.0f) - 1.0f) : hp;
+}
 
 #if defined(PGI_PLACE)
 // ─── PLACE: per window column, the lowest FLOOR and highest TOP over the cell ────────────────────
@@ -186,7 +197,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float3 fwd, up, right;
     pgiFaceBasis(face, fwd, up, right);
     float3 alb = f3(0.0f), nAcc = f3(0.0f), skyC = f3(0.0f), emA = f3(0.0f);
-    float  dist = 0.0f;
+    float  invZ = 0.0f;   // sum of 1 / view depth over the block's geometry pixels (the plane-exact hit distance below)
+    float  dist = 0.0f;   // sum of ray lengths (the sight distance below)
     uint   nGeo = 0u, nSky = 0u, nBack = 0u, nAlb = 0u, nEm = 0u;
     const bool peek = gPgiParams.capMisc.y > 0.5f;
     // P2 CHECKERBOARD (PGI_CAPTURE_EMIS): odd pixels hold the EMITTED radiance, even ones the albedo.
@@ -239,27 +251,50 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             if (col.r > PGI_BACK_SENTINEL && col.b > PGI_BACK_SENTINEL && (!emPx || col.g <= 0.0f)) { ++nBack; }
             else if (emPx) { emA += col; }
             else { alb += col; }
+            invZ += 1.0f / zv;
             dist += zv * sqrt(1.0f + fx * fx + fy * fy);
             ++nGeo;
             // Normal: the right and down neighbours, when both continue this surface (view depth
             // within 3%), oriented toward the probe. Face space (right, up, fwd).
+            // ...or, where the 3% fails, a FLAT neighbourhood: 1 / depth is linear across a plane in screen
+            // space at any angle, so its second difference left-centre-right and up-centre-down is ~0 on a
+            // plane and of the slope's order at a crease. The 3% alone dropped every surface seen beyond ~60°
+            // off its normal (depth changes faster than that per pixel), and the relight's fallback N = -d lit
+            // those blocks as if they faced the probe: 0.84x of the frame's direct over a quarter of the
+            // light, whole blocks black at grazing (census office, the oracle's full-resolution relight, 10-21).
             if (p.x + 1 < (int)res && p.y + 1 < (int)res) {
                 const float dr = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p + int2(1, 0), 0).r;
                 const float dd = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p + int2(0, 1), 0).r;
                 if (dr > 0.0f && dd > 0.0f) {
                     const float zr = qn / (dr * qd + zn), zd = qn / (dd * qd + zn);
+                    const float px = 2.0f / (float)res;
+                    const float3 P0 = float3(fx * zv, fy * zv, zv);
+                    float3 n = f3(0.0f);
                     if (abs(zr - zv) <= 0.03f * zv && abs(zd - zv) <= 0.03f * zv) {
-                        const float px = 2.0f / (float)res;
-                        const float3 P0 = float3(fx * zv, fy * zv, zv);
                         const float3 Pr = float3((fx + px) * zr, fy * zr, zr);
                         const float3 Pd = float3(fx * zd, (fy - px) * zd, zd);
-                        float3 n = cross(Pr - P0, Pd - P0);
-                        const float nl = length(n);
-                        if (nl > 1.0e-20f) {
-                            n /= nl;
-                            if (dot(n, P0) > 0.0f) { n = -n; }
-                            nAcc += n;
+                        n = cross(Pr - P0, Pd - P0);
+                    } else if (p.x > 0 && p.y > 0) {
+                        const float dl = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p - int2(1, 0), 0).r;
+                        const float du = LoadTex2D(gPgiReflDepth, NO_SAMPLER, p - int2(0, 1), 0).r;
+                        if (dl > 0.0f && du > 0.0f) {
+                            // 1 / z = (d qd + zn) / qn: the device depths' second differences, against their slopes.
+                            const float sx = abs(dr - d) + abs(d - dl), sy = abs(dd - d) + abs(d - du);
+                            if (abs(dl + dr - 2.0f * d) <= 0.1f * sx + 1.0e-7f && abs(du + dd - 2.0f * d) <= 0.1f * sy + 1.0e-7f) {
+                                const float zl = qn / (dl * qd + zn), zu = qn / (du * qd + zn);
+                                const float3 Pr = float3((fx + px) * zr, fy * zr, zr);
+                                const float3 Pl = float3((fx - px) * zl, fy * zl, zl);
+                                const float3 Pd = float3(fx * zd, (fy - px) * zd, zd);
+                                const float3 Pu = float3(fx * zu, (fy + px) * zu, zu);
+                                n = cross(Pr - Pl, Pd - Pu);
+                            }
                         }
+                    }
+                    const float nl = length(n);
+                    if (nl > 1.0e-20f) {
+                        n /= nl;
+                        if (dot(n, P0) > 0.0f) { n = -n; }
+                        nAcc += n;
                     }
                 }
             }
@@ -275,10 +310,24 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     if (gPgiParams.place.x < 1.5f) {
         uint4 o;
         o.x = pgiPackUnorm4(float4(alb * invA, skyFrac));
-        o.y = pgiPackNormal(nW);
+        o.y = pgiPackNormal(nW);   // bits 24-31 below: the sight distance's ratio
         o.z = (nSky > 0u) ? pgiPackR11G11B10(skyC / (float)nSky) : 0u;
+        // THE HIT DISTANCE is the block's surface ON ITS CENTRE RAY, the ray the relight rebuilds the hit
+        // along: 1 / view depth is linear across a plane in screen space, so its block mean is exactly that
+        // plane's depth at the block centre. The mean RAY LENGTH it replaces always overshot (length goes
+        // as 1 / cos over a plane): on a ceiling seen at grazing the hit landed far behind it and the
+        // surface shadowed itself — whole blocks of lamp-lit ceiling relit black (census office, the
+        // oracle's full-resolution relight, user 2026-10-21).
+        const float fxc = ((float)DispatchThreadID.x + 0.5f) / (float)PGI_FACE_TEX * 2.0f - 1.0f;
+        const float fyc = 1.0f - ((float)DispatchThreadID.y + 0.5f) / (float)PGI_FACE_TEX * 2.0f;
+        const float hdC = (nGeo > 0u) ? (float)nGeo / max(invZ, 1.0e-20f) * sqrt(1.0f + fxc * fxc + fyc * fyc) : -1.0f;
         o.w = min(nGeo, 255u) | (min(nBack, 255u) << 8u)
-            | (f32tof16(nGeo > 0u ? min(dist * inv, 60000.0f) : -1.0f) << 16u);
+            | (f32tof16(nGeo > 0u ? min(hdC, 60000.0f) : -1.0f) << 16u);
+        if (nGeo > 0u) {
+            const float hp = f16tof32(f32tof16(min(hdC, 60000.0f)));   // the ratio against what pgiGbDist will read back
+            const float rq = (log2(max(dist * inv, 1.0e-6f) / max(hp, 1.0e-6f)) + 1.0f) * 32.0f;
+            o.y |= (uint)clamp(rq + 0.5f, 0.0f, 255.0f) << 24u;
+        }
         Write2D(gPgiGBuf, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), o);
         // The EMISSION lane: mean emitted radiance over the texel's geometry (its emission parity), 0 = none.
         Write2D(gPgiGBufE, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy),
@@ -431,31 +480,13 @@ float pgiSunVisibility(float3 P, float3 N, float3 S, bool march)
 // slotless light is unshadowed (the captures' fixture gobo is not here). Prel is camera-relative, the
 // lights' space. Without it a tunnel lit only by lanterns relit black: the independent truth at the
 // Telvanni root is 0.003 E_ref with lanterns, 0.000 without (2026-10-17).
+#define PGI_POINT_LIGHTS gPgiLights
+#include "pgipoint.h.fsl"     // the loop itself, shared with the oracle's full-resolution relight (code 70)
 float3 pgiPointLight(float3 Prel, float3 N)
 {
     const float gain = gPgiParams.ambCol.w;
     if (gain <= 0.0f) { return f3(0.0f); }
-    const uint  nL = min((uint)gPgiLights.lightParams.x, (uint)MAX_POINT_LIGHTS);
-    const float reachK = gPgiLights.lightParams.y;
-    float3 E = f3(0.0f);
-    for (uint i = 0u; i < nL; ++i) {
-        const float4 posR = gPgiLights.lights[i * 3u + 0u];
-        const float3 toL = posR.xyz - Prel;
-        const float  d2 = dot(toL, toL);
-        const float  reach = posR.w * reachK;
-        if (d2 >= reach * reach) { continue; }
-        const float invD = rsqrt(max(d2, 1.0e-8f));
-        const float lambert = saturate(dot(N, toL) * invD);
-        if (lambert <= 0.0f) { continue; }
-        const float  d  = d2 * invD;
-        const float4 fo = gPgiLights.lights[i * 3u + 2u];
-        float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1.0e-4f);
-        att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
-        const uint slotP1 = (uint)fo.w;
-        if (slotP1 != 0u) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
-        E += gPgiLights.lights[i * 3u + 1u].rgb * (lambert * att);
-    }
-    return E * gain;
+    return pgiPointLightRaw(Prel, N) * gain;
 }
 
 // MW's sky, as the radiance it hands an open surface: ambCol x the SH1 shape skyAmbFactorAO applies.
@@ -584,6 +615,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 // to the group's nearest. A rejected probe reports it (gPgiMoveOut) and the host moves the ball through
 // that surface into the open — a ball lifted off a tunnel wall into a root that crosses it.
 GroupShared(float4, g_pgiNear[PGI_THREADS]);
+GroupShared(float4, g_pgiNearF[PGI_THREADS]);   // CLEARANCE: each thread's nearest FRONT surface (normal, plane distance)
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
 void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
@@ -649,6 +681,12 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
     float  visS = 0.0f, visW = 0.0f;   // SKY VISIBILITY: cosine-weighted share of the upper dome that is sky
     float  skyAll = 0.0f;              // the sky's solid angle over every captured direction (debug: blame)
     float4 nearB = float4(0.0f, 0.0f, 0.0f, 1.0e9f);   // NUDGE: this thread's nearest back-face texel (dir, dist)
+    // CLEARANCE (DDGI's other relocation case; knob pgiNudgeClear = emis.z, 0 = off): the nearest FRONT surface
+    // as (its normal, the probe's distance to its plane). A ball born a unit under a ceiling was never rejected —
+    // it sees no back faces — and the ceiling inside the capture's near plane read as VOID: its whole up face
+    // black (census office probe 100, user 2026-10-21: "nudge isn't nudging it correctly").
+    const float clr = gPgiParams.emis.z;
+    float4 nearF = float4(0.0f, 0.0f, 0.0f, 1.0e9f);
     const bool fillOld = gPgiParams.place.x > 0.5f;
     // MULTI-BOUNCE: the ambient a captured surface is lit by is this probe's OWN previous irradiance
     // for that surface's normal (DDGI's feedback). The sky model alone (no bounce at all) left the
@@ -718,6 +756,17 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
             if (2u * nBackT > nGeoT) {
                 const float hb = pgiGbDist(gb);
                 if (hb > 0.0f && hb < nearB.w) { nearB = float4(d, hb); }
+            } else if (clr > 0.0f && nGeoT > 0u) {
+                // Only a hit that is itself near: a far wall's plane can pass close to the probe.
+                const float hf = pgiGbDistPlane(gb);
+                const float3 Nf = pgiUnpackNormal(gb.y);
+                // No normal (the gather's 3% depth test fails on a surface a unit away, seen at grazing): the
+                // surface faces the probe — its distance along the ray, the conservative plane distance.
+                if (hf > 0.0f && hf < 4.0f * clr) {
+                    const float3 nf = (dot(Nf, Nf) > 0.5f) ? normalize(Nf) : -d;
+                    const float perp = hf * max(-dot(d, nf), 0.0f);
+                    if (perp < nearF.w) { nearF = float4(nf, perp); }
+                }
             }
             // The CAPTURED sky where there is one (not near the sun's disc: the sun is added on its own
             // below), else the stand-in (a stolen frame's capture draws no sky).
@@ -735,7 +784,8 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
             }
             const bool   useCap = (skyCap.r + skyCap.g + skyCap.b) > 0.0f && dot(d, S) < 0.9962f;
             float3 L = skyF * gPgiParams.skyLive.w * (skyLive ? pgiSkyLive(d) : useCap ? skyCap : pgiSkyRadiance(d));   // w = knob pgiSkyGain (test)
-            const float hd = pgiGbDist(gb);
+            float3 Ldir = f3(0.0f);   // the oracle's split preview (below)
+            const float hd = pgiGbDistPlane(gb);   // the hit ON the block's centre ray (pgiGbDistPlane)
             if (skyF < 0.999f && hd > 0.0f) {
                 float3 N = pgiUnpackNormal(gb.y);
                 if (dot(N, N) < 0.5f) { N = -d; }
@@ -762,6 +812,7 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
                 const float3 Elan = pgiPointLight(Prel, N);
                 const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb + Elan;
                 L += (1.0f - skyF) * as.rgb * E;
+                Ldir = (1.0f - skyF) * as.rgb * (E - amb);
                 lanAcc += (1.0f - skyF) * as.rgb * (Elan + min(amb, prevEl)) * dom;
                 // EMISSION (pgiEmis, P2): what the hit itself emits — windows, glow maps. Radiance, not lit by
                 // anything, and local light like the lanterns: it rides their L0 past the receiver's sky gate.
@@ -775,9 +826,13 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
             }
             // LIT PREVIEW (pgiDebug 64): the radiance this texel hands the SH — sun with its cascade
             // shadow, the bounce, the sky — beside the G-buffer tile it came from.
+            // capMisc.w = 2 (probeOracleAtProbes, the oracle's _lit.bin sidecar): the SPLIT instead — rgb the
+            // DIRECT radiance (albedo x (sun + lanterns), no sky, no emission), w the G-buffer albedo's luma —
+            // scored texel by texel against the independent truth's albedo x (litTerm - ambient), so a loss
+            // splits into the albedo and the light.
             if (gPgiParams.capMisc.w > 0.5f) {
                 Write2D(gPgiLit, int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx, (layer * G + cy) * PGI_FACE_TEX + ty),
-                        float4(L, 1.0f));
+                        (gPgiParams.capMisc.w > 1.5f) ? float4(Ldir, dot(as.rgb, float3(0.2126f, 0.7152f, 0.0722f))) : float4(L, 1.0f));
             }
             capL += L * dom;
             capD += dom;
@@ -805,14 +860,17 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
     g_pgiA[tid * PGI_LANES + 10u] = float4(capD, visS, visW, skyAll);
     g_pgiA[tid * PGI_LANES + 11u] = float4(lanAcc, 0.0f);
     g_pgiNear[tid] = nearB;
+    g_pgiNearF[tid] = nearF;
     GroupMemoryBarrier();
     for (uint s = PGI_THREADS / 2u; s > 0u; s >>= 1u) {
         float4 v[PGI_LANES];
         for (uint k = 0u; k < PGI_LANES; ++k) { v[k] = (tid < s) ? g_pgiA[(tid + s) * PGI_LANES + k] : f4(0.0f); }
         const float4 nb = (tid < s) ? g_pgiNear[tid + s] : float4(0.0f, 0.0f, 0.0f, 1.0e9f);
+        const float4 nf = (tid < s) ? g_pgiNearF[tid + s] : float4(0.0f, 0.0f, 0.0f, 1.0e9f);
         GroupMemoryBarrier();
         if (tid < s) { for (uint k = 0u; k < PGI_LANES; ++k) { g_pgiA[tid * PGI_LANES + k] = g_pgiA[tid * PGI_LANES + k] + v[k]; } }
         if (tid < s && nb.w < g_pgiNear[tid].w) { g_pgiNear[tid] = nb; }
+        if (tid < s && nf.w < g_pgiNearF[tid].w) { g_pgiNearF[tid] = nf; }
         GroupMemoryBarrier();
     }
     // INSIDE GEOMETRY (DDGI's probe classification): more than PGI_BACK_MAX of what the captured faces
@@ -830,10 +888,14 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
     }
     // NUDGE report (host pgiNudge): (nearest back face dir, its distance or -1) and (the position judged,
     // 1 = rejected). The position lets the host drop a report about a ball it has since moved.
+    // 2 = a CLEARANCE move instead: (the near surface's normal, how far along it) — not inside anything, too close.
     if (tid == 9u) {
         const float4 nb = g_pgiNear[0];
-        gPgiMoveOut[2u * p]      = (rejected && nb.w < 1.0e8f) ? nb : float4(0.0f, 0.0f, 0.0f, -1.0f);
-        gPgiMoveOut[2u * p + 1u] = float4(pr.xyz, rejected ? 1.0f : 0.0f);
+        const float4 nf = g_pgiNearF[0];
+        const bool tooClose = !rejected && valid && clr > 0.0f && nf.w < clr;
+        gPgiMoveOut[2u * p]      = (rejected && nb.w < 1.0e8f) ? nb
+                                 : tooClose ? float4(nf.xyz, clr - nf.w) : float4(0.0f, 0.0f, 0.0f, -1.0f);
+        gPgiMoveOut[2u * p + 1u] = float4(pr.xyz, rejected ? 1.0f : tooClose ? 2.0f : 0.0f);
     }
     if (tid < 7u) {
         // Cosine-lobe convolution / pi, per band: the receiver's dot with the basis is then E/pi —
@@ -927,7 +989,8 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
 // Importance: sun balls land around the camera (a Gaussian over the cascade tiles, which are centred on
 // it), camera balls toward the view's centre. No sun map (overcast, night): straight down through the
 // sky-top height map instead. Out: two float4 per ball, (absolute position, type: 0 none, 1 camera,
-// 2 sun, 3 zenith) and (normal, 0). The host reads them back and keeps a pruned pool.
+// 2 sun, 3 zenith, 4 light, 5 bounce) and (normal, the pool slot + 1 that SEES it, 0 none). The host
+// reads them back and keeps a pruned pool. Thread ranges: camera, sun / zenith, light, bounce.
 uint pgibHash(uint x)
 {
     x ^= x >> 16u; x *= 0x7FEB352Du; x ^= x >> 15u; x *= 0x846CA68Bu; x ^= x >> 16u;
@@ -949,6 +1012,9 @@ float3 pgibCamPos(int2 p, float2 dims, out bool hit)
     const float4 w = mul(gPgiShadow.invViewProj, float4(ndc, d, 1.0f));
     return w.xyz / w.w;
 }
+// A ball stands off its surface along the normal only when that normal faces back up the ray it came
+// on by at least this cosine; past grazing, a wrong normal carries it through the surface.
+#define PGIB_GRAZE 0.3f
 // Sun atlas texel of cascade c -> camera-relative position (the cascade's ortho inverse).
 float3 pgibSunPos(uint c, int2 p, float2 tile)
 {
@@ -959,6 +1025,90 @@ float3 pgibSunPos(uint c, int2 p, float2 tile)
     return w.xyz / w.w;
 }
 
+// INTERIORS (I1, tasks/forge-gi.md "GLOBAL placement"). LIGHT balls: a point-shadow cube is six first-hit
+// ray casts from its light, so a random texel of a random active slot is where that ray stopped
+// (fpShadowVisibility's mapping, inverted). The static atlas only: walls and floors live there.
+// Camera-relative, as the slots are. false = the ray left the cube's range (no hit stored).
+bool pgibLightHit(uint s, uint f, float2 t, out float3 P)
+{
+    P = f3(0.0f);
+    const float4 posRad = gPgiShadow.slotPosRad[s];
+    const float4 tile   = gPgiShadow.slotTile[s];
+    const float  nearZ  = gPgiShadow.maskParams.y;
+    const float  farZ   = 2.0f * posRad.w;
+    float uvScale = gPgiShadow.slotFlick[s].z;
+    uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;
+    const int2 tp = int2(float2(tile.x + (float)(f % 3u) * tile.z, tile.y + (float)(f / 3u) * tile.z) + t);
+    const float z = LoadTex2D(gPgiShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (z <= 1.0e-6f) { return false; }
+    const float ma = nearZ * farZ / (z * (farZ - nearZ) + nearZ);   // refZ inverted: the major-axis distance
+    if (ma >= 0.98f * farZ) { return false; }
+    const float2 uv = ((t + 0.5f) / tile.z - 0.5f) * 2.0f / uvScale;   // (u, v) / ma
+    const float u = uv.x * ma, v = uv.y * ma;
+    float3 d;
+    if      (f == 0u) { d = float3( ma, -v, -u); }
+    else if (f == 1u) { d = float3(-ma, -v,  u); }
+    else if (f == 2u) { d = float3( u,  ma,  v); }
+    else if (f == 3u) { d = float3( u, -ma, -v); }
+    else if (f == 4u) { d = float3( u, -v,  ma); }
+    else              { d = float3(-u, -v, -ma); }
+    P = posRad.xyz + d;
+    return true;
+}
+
+// MERGE BY SIGHT: the nearest pool probe within `rad` of the ball (absolute X) that SEES it — its face
+// toward X captured and its hit distance there reaching X (the splat's visibility test and slack).
+// Returns slot + 1, 0 = none. A probe with that face not captured yet is the host's call (it merges by
+// distance until the face lands, then sight decides).
+uint pgibSeenBy(float3 X, float rad)
+{
+    const uint G = (uint)gPgiParams.grid.y;
+    const uint nP = 2u * G * G - 1u;   // the last slot is the world probe
+    uint best = 0u;
+    float bestL = rad;
+    for (uint p = 0u; p < nP; ++p) {
+        const float4 pr = gPgiProbes[p];
+        if (pr.w < 0.5f || pr.w > 2.5f) { continue; }
+        const float3 d = X - pr.xyz;
+        const float L = length(d);
+        if (L >= bestL) { continue; }
+        const float3 a = abs(d);
+        const uint f = (a.x >= a.y && a.x >= a.z) ? (d.x > 0.0f ? 0u : 1u)
+                     : (a.y >= a.z) ? (d.y > 0.0f ? 2u : 3u) : (d.z > 0.0f ? 4u : 5u);
+        const uint fmask = (uint)(frac(pr.w) * 128.0f + 0.5f) & 63u;
+        if ((fmask & (1u << f)) == 0u) { continue; }
+        if (L > 1.0f) {
+            const uint layer = p / (G * G), slot = p % (G * G), cx = slot % G, cy = slot / G;
+            float3 fwd, up, right;
+            pgiFaceBasis(f, fwd, up, right);
+            const float fz = dot(d, fwd);
+            const float u = dot(d, right) / fz, v = dot(d, up) / fz;
+            const int tx = (int)min((uint)((u * 0.5f + 0.5f) * (float)PGI_FACE_TEX), PGI_FACE_TEX - 1u);
+            const int ty = (int)min((uint)((0.5f - v * 0.5f) * (float)PGI_FACE_TEX), PGI_FACE_TEX - 1u);
+            // A texel's distance is the MEAN over its ~11 deg cone: clutter or an edge inside it reads as a
+            // surface between. capMisc.z (knob pgiSightNbr): the farthest of the 3 x 3 texels around the
+            // direction decides — a wall still covers all nine; a path beside an edge is open.
+            const int nr = (gPgiParams.capMisc.z > 0.5f) ? 1 : 0;
+            bool open = false;
+            for (int oy = -nr; oy <= nr && !open; ++oy) {
+                for (int ox = -nr; ox <= nr && !open; ++ox) {
+                    const int qx = tx + ox, qy = ty + oy;
+                    if (qx < 0 || qy < 0 || qx >= (int)PGI_FACE_TEX || qy >= (int)PGI_FACE_TEX) { continue; }
+                    const uint4 gb = LoadRWTex2D(gPgiGBuf, int2((int)(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX) + qx,
+                                                                 (int)((layer * G + cy) * PGI_FACE_TEX) + qy));
+                    const float hd = pgiGbDist(gb);
+                    const float slack = gPgiParams.capMisc.x * L + gPgiParams.capMisc.y;
+                    open = (gb.w & 0xFFu) == 0u || hd <= 0.0f || hd + slack >= L;
+                }
+            }
+            if (!open) { continue; }   // a surface between
+        }
+        bestL = L;
+        best = p + 1u;
+    }
+    return best;
+}
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
@@ -966,7 +1116,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     INIT_MAIN;
     const uint i = DispatchThreadID.x;
     const uint nCam = (uint)gPgiParams.balls.x, nSun = (uint)gPgiParams.balls.y;
-    if (i >= nCam + nSun) { return; }
+    const uint nLight = (uint)gPgiParams.place.x, nBounce = (uint)gPgiParams.place.y;
+    if (i >= nCam + nSun + nLight + nBounce) { return; }
     uint s = pgibHash(i * 9781u + (uint)gPgiParams.balls.z * 6271u + 1u);
     const float lift = gPgiParams.balls.w;
     const float3 eye = gPgiParams.lodEye.xyz;
@@ -977,19 +1128,93 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             const float2 dims = gPgiShadow.screenParams.xy;
             const float2 uv = clamp(0.5f + pgibGauss(s) * gPgiParams.ballsMisc.w, f2(0.01f), f2(0.99f));
             const int2 p = int2(uv * dims);
-            bool h0, hr, hd;
+            bool h0, hr, hl, hd, hu;
             const float3 P  = pgibCamPos(p, dims, h0);
-            const float3 Pr = pgibCamPos(p + int2(2, 0), dims, hr);
-            const float3 Pd = pgibCamPos(p + int2(0, 2), dims, hd);
             if (h0) {
-                float3 n = (hr && hd) ? cross(Pr - P, Pd - P) : -P;
+                // Per axis the neighbour that stays on this surface (the smaller depth step): at a corner
+                // the other side's surface bent the normal past grazing, and the ball went through the
+                // floor into the void, where no probe could see it — a new probe per such pixel (census
+                // office, 2026-10-20).
+                const float dl = length(P);
+                const float3 Pr = pgibCamPos(p + int2(2, 0), dims, hr), Pl = pgibCamPos(p - int2(2, 0), dims, hl);
+                const float3 Pd = pgibCamPos(p + int2(0, 2), dims, hd), Pu = pgibCamPos(p - int2(0, 2), dims, hu);
+                const float er = hr ? abs(length(Pr) - dl) : 1.0e30f, el = hl ? abs(length(Pl) - dl) : 1.0e30f;
+                const float ed = hd ? abs(length(Pd) - dl) : 1.0e30f, eu = hu ? abs(length(Pu) - dl) : 1.0e30f;
+                const float3 Px = (er <= el) ? Pr : Pl, Py = (ed <= eu) ? Pd : Pu;
+                float3 n = cross(Px - P, Py - P);
                 if (dot(n, n) < 1.0e-12f) { n = -P; }
                 n = normalize(n);
                 if (dot(n, P) > 0.0f) { n = -n; }                     // toward the camera: the side it saw
-                // A depth edge (the neighbours left this surface): stand back along the ray instead.
-                const float dl = length(P);
-                if (!hr || !hd || abs(length(Pr) - dl) > 0.05f * dl || abs(length(Pd) - dl) > 0.05f * dl) { n = -P / dl; }
+                // A depth edge (no neighbour stays on this surface) or a grazing normal: stand back along
+                // the ray instead, which the camera always sees.
+                if (min(er, el) > 0.05f * dl || min(ed, eu) > 0.05f * dl || dot(n, -P / dl) < PGIB_GRAZE) { n = -P / dl; }
                 o0 = float4(P + n * lift + eye, 1.0f);
+                o1 = float4(n, 0.0f);
+            }
+        }
+    } else if (i >= nCam + nSun + nLight) {
+        // BOUNCE: a COMPLETE pool probe's capture is 6 x 8 x 8 first hits of rays shot from it; one of
+        // them, stuck off its surface, is a ball in the open space that probe sees — through a doorway
+        // into the next room, never through a wall (the wall is the hit). A few tries for a complete one.
+        const uint G = (uint)gPgiParams.grid.y;
+        const uint nP = 2u * G * G - 1u;
+        for (uint tries = 0u; tries < 8u; ++tries) {
+            const uint p = min((uint)(pgibRand(s) * (float)nP), nP - 1u);
+            const float4 pr = gPgiProbes[p];
+            if (pr.w < 0.5f || pr.w > 2.5f) { continue; }
+            if (((uint)(frac(pr.w) * 128.0f + 0.5f) & 63u) != 63u) { continue; }
+            const uint f  = min((uint)(pgibRand(s) * 6.0f), 5u);
+            const uint tx = min((uint)(pgibRand(s) * (float)PGI_FACE_TEX), PGI_FACE_TEX - 1u);
+            const uint ty = min((uint)(pgibRand(s) * (float)PGI_FACE_TEX), PGI_FACE_TEX - 1u);
+            const uint layer = p / (G * G), slot = p % (G * G), cx = slot % G, cy = slot / G;
+            const uint4 gb = LoadRWTex2D(gPgiGBuf, int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx,
+                                                         (layer * G + cy) * PGI_FACE_TEX + ty));
+            const uint nGeo = gb.w & 0xFFu, nBack = (gb.w >> 8u) & 0xFFu;
+            const float hd = pgiGbDist(gb);
+            if (nGeo == 0u || hd <= 0.0f || 2u * nBack > nGeo) { break; }   // sky, nothing, or inside geometry
+            float3 fwd, up, right;
+            pgiFaceBasis(f, fwd, up, right);
+            const float a = ((float)tx + 0.5f) / (float)PGI_FACE_TEX * 2.0f - 1.0f;
+            const float b = 1.0f - ((float)ty + 0.5f) / (float)PGI_FACE_TEX * 2.0f;
+            const float3 d = normalize(fwd + a * right + b * up);
+            float3 n = pgiUnpackNormal(gb.y);
+            if (dot(n, n) < 0.5f || dot(normalize(n), d) > -PGIB_GRAZE) { n = -d; }   // no normal / grazing: back along the ray
+            n = normalize(n);
+            // Never past the probe itself (a hit nearer than the lift).
+            const float back = min(lift, 0.5f * hd);
+            o0 = float4(pr.xyz + d * hd + n * back, 5.0f);
+            o1 = float4(n, 0.0f);
+            break;
+        }
+    } else if (i >= nCam + nSun) {
+        // LIGHT: a texel of an active shadow slot's static cube = where that light's ray stopped. The lit
+        // side faces the light; a depth edge between texels stands back toward the light.
+        const uint bits = gPgiShadow.slotBits.x;
+        const uint nAct = countbits(bits);
+        if (nAct > 0u) {
+            uint k = min((uint)(pgibRand(s) * (float)nAct), nAct - 1u);
+            uint bb = bits;
+            for (uint j = 0u; j < k; ++j) { bb &= bb - 1u; }
+            const uint sl = firstbitlow(bb);
+            const float T = gPgiShadow.slotTile[sl].z;
+            const uint f = min((uint)(pgibRand(s) * 6.0f), 5u);
+            const float2 t = floor(clamp(float2(pgibRand(s), pgibRand(s)) * (T - 1.0f), f2(0.0f), f2(T - 2.0f)));
+            float3 P, Pr, Pd;
+            if (T >= 4.0f && pgibLightHit(sl, f, t, P)) {
+                const float3 Lp = gPgiShadow.slotPosRad[sl].xyz;
+                const float3 toL = normalize(Lp - P);
+                float3 n = toL;
+                if (pgibLightHit(sl, f, t + float2(1.0f, 0.0f), Pr) && pgibLightHit(sl, f, t + float2(0.0f, 1.0f), Pd)) {
+                    const float dl = length(P - Lp);
+                    float3 c = cross(Pr - P, Pd - P);
+                    if (dot(c, c) > 1.0e-12f && abs(length(Pr - Lp) - dl) < 0.05f * dl && abs(length(Pd - Lp) - dl) < 0.05f * dl) {
+                        c = normalize(c);
+                        n = (dot(c, toL) < 0.0f) ? -c : c;
+                    }
+                }
+                if (dot(n, toL) < PGIB_GRAZE) { n = toL; }   // grazing: back toward the light, which sees it
+                const float back = min(lift, 0.5f * length(Lp - P));
+                o0 = float4(P + n * back + eye, 4.0f);
                 o1 = float4(n, 0.0f);
             }
         }
@@ -1036,6 +1261,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 }
             }
         }
+    }
+    // MERGE BY SIGHT (vol2.z = 1; xy = the host's merge radius R0 + Rk x distance to the camera).
+    if (o0.w > 0.5f && gPgiParams.vol2.z > 0.5f) {
+        const float rad = gPgiParams.vol2.x + gPgiParams.vol2.y * length(o0.xyz - eye);
+        o1.w = (float)pgibSeenBy(o0.xyz, rad);
     }
     gPgiBallOut[2u * i]      = o0;
     gPgiBallOut[2u * i + 1u] = o1;
