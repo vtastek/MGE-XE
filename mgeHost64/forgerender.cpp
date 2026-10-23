@@ -6739,7 +6739,9 @@ namespace {
     // land, terrain or sky, so its captures draw the client's WHOLE-CELL list instead (the emitter list's
     // interior mode: every opaque static of the cell, in or out of MW's frustum); no sun / zenith balls,
     // no world probe, no sky in the relight, no receiver sky gate. 0 = interiors keep the old ambient.
-    float g_pgiInterior   = 0.0f;
+    // DEFAULT ON (2026-10-23): without it a surface lit only by a light the player's shadow blocks went
+    // black (the census candle's dish, self-caged from its own flame); the probes fill it.
+    float g_pgiInterior   = 1.0f;
     // I1 GLOBAL PLACEMENT (indoors; tasks/forge-gi.md "Revision: GLOBAL placement"): balls from every
     // shadowed light's cube (LIGHT) and from finished probes' own hits (BOUNCE) fill the cell without the
     // camera looking; a ball merges only into a probe that SEES it; the pool holds (no eviction by camera
