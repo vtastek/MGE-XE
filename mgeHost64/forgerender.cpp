@@ -53306,7 +53306,15 @@ void destroyHostWindow(Renderer* R);
             }
         } else {
             const uint32_t bits = ddsRd32(d + 88);   // dwRGBBitCount
-            if (bits == 32) { fmt = TinyImageFormat_B8G8R8A8_UNORM; }   // MW A8R8G8B8
+            // The masks decide the byte order, not the bit count. MW's own art is A8R8G8B8 (R mask
+            // 0x00ff0000, BGRA in memory), but modern replacers (Dwemer Ruins Replacer: 16 of 41) ship
+            // A8B8G8R8 (R mask 0x000000ff, RGBA in memory). D3DX honours the masks; reading those
+            // as BGRA swaps red and blue, and the orange Dwemer brass comes out BLUE.
+            if (bits == 32) {
+                const uint32_t rMask = ddsRd32(d + 92), bMask = ddsRd32(d + 100);
+                fmt = (rMask == 0x000000ffu && bMask == 0x00ff0000u) ? TinyImageFormat_R8G8B8A8_UNORM
+                                                                     : TinyImageFormat_B8G8R8A8_UNORM;   // MW A8R8G8B8
+            }
         }
         if (fmt == TinyImageFormat_UNDEFINED || width == 0 || height == 0) { return r; }
         r.fmt = fmt; r.width = width; r.height = height; r.mipLevels = mips;
