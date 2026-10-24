@@ -203,6 +203,29 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     const bool peek = gPgiParams.capMisc.y > 0.5f;
     // P2 CHECKERBOARD (PGI_CAPTURE_EMIS): odd pixels hold the EMITTED radiance, even ones the albedo.
     const bool emisCap = gPgiParams.emis.x > 0.5f;
+    // SPLIT (knob pgiSplit = fog.w, the ratio): a block whose view depths spread past it holds two surfaces —
+    // a near rock and the floor beyond it — and ONE hit can only light one of them. The relight rebuilt it at
+    // the plane-exact depth, which the near pixels dominate, so the FAR surface's light was lost; a probe in a
+    // nook sees exactly that (shadowed rock close, its light out through the opening): 0.03-0.10x of the light
+    // in such blocks, dim probes 0.17x of truth (probeoracle_0226, 2026-10-24). Split at the geometric mean
+    // depth; each side keeps its own albedo, normal and plane depth (gPgiGBuf2).
+    float zMin = 1.0e30f, zMax = 0.0f;
+    if (gPgiParams.fog.w > 1.0f) {
+        for (uint j = 0u; j < B; ++j) {
+            for (uint i = 0u; i < B; ++i) {
+                const float d = LoadTex2D(gPgiReflDepth, NO_SAMPLER, int2(DispatchThreadID.xy * B + uint2(i, j)), 0).r;
+                if (d <= 0.0f) { continue; }
+                const float zv = qn / (d * qd + zn);
+                zMin = min(zMin, zv); zMax = max(zMax, zv);
+            }
+        }
+    }
+    const bool  split = gPgiParams.fog.w > 1.0f && zMax > gPgiParams.fog.w * zMin;
+    const float zCut  = sqrt(zMin * zMax);
+    float3 albS[2] = { f3(0.0f), f3(0.0f) }, nAccS[2] = { f3(0.0f), f3(0.0f) };
+    float  invZS[2] = { 0.0f, 0.0f };
+    float2 fxyS[2]  = { f2(0.0f), f2(0.0f) };   // each side's pixel centroid (face coords): where its hit is
+    uint   nGeoS[2] = { 0u, 0u }, nAlbS[2] = { 0u, 0u };
     for (uint j = 0u; j < B; ++j) {
         for (uint i = 0u; i < B; ++i) {
             const int2 p = int2(DispatchThreadID.xy * B + uint2(i, j));
@@ -246,14 +269,18 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             // the probe is inside something. Counted; it adds no albedo.
             // An emission pixel's radiance can pass the sentinel's red and blue; its green is 0 only there.
             const bool emPx = emisCap && ((((uint)p.x) ^ ((uint)p.y)) & 1u) != 0u;
+            const uint sd = (split && zv > zCut) ? 1u : 0u;   // the split side: 0 near, 1 far
             // Each parity divides by ITS geometry pixels, back faces included — the old mean's denominator.
-            if (emPx) { ++nEm; } else { ++nAlb; }
+            if (emPx) { ++nEm; } else { ++nAlb; ++nAlbS[sd]; }
             if (col.r > PGI_BACK_SENTINEL && col.b > PGI_BACK_SENTINEL && (!emPx || col.g <= 0.0f)) { ++nBack; }
             else if (emPx) { emA += col; }
-            else { alb += col; }
+            else { alb += col; albS[sd] += col; }
             invZ += 1.0f / zv;
+            invZS[sd] += 1.0f / zv;
+            fxyS[sd]  += float2(fx, fy);
             dist += zv * sqrt(1.0f + fx * fx + fy * fy);
             ++nGeo;
+            ++nGeoS[sd];
             // Normal: the right and down neighbours, when both continue this surface (view depth
             // within 3%), oriented toward the probe. Face space (right, up, fwd).
             // ...or, where the 3% fails, a FLAT neighbourhood: 1 / depth is linear across a plane in screen
@@ -295,6 +322,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                         n /= nl;
                         if (dot(n, P0) > 0.0f) { n = -n; }
                         nAcc += n;
+                        nAccS[sd] += n;
                     }
                 }
             }
@@ -332,6 +360,24 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // The EMISSION lane: mean emitted radiance over the texel's geometry (its emission parity), 0 = none.
         Write2D(gPgiGBufE, int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy),
                 (emisCap && nEm > 0u) ? pgiPackR11G11B10(emA / (float)nEm) : 0u);
+        // The SPLIT layers: each side's albedo, normal, and its hit — on the ray through ITS OWN pixel centroid
+        // (z = the face coords, f16 x2), at the depth there: 1 / view depth is linear across a plane in screen
+        // space, so its mean over the side's pixels IS the depth at their centroid — exact for a planar side.
+        // The block's centre ray put a near rock filling one corner in mid-air beside itself (mixed blocks lit
+        // NEAR read 0.62x of the formula with the centre ray, probeoracle_0228). x.w = the far side's share of
+        // the block's geometry (0 = not split: slice 1 says so and the relight reads gPgiGBuf).
+        const float farW = (split && nGeoS[0] > 0u && nGeoS[1] > 0u) ? (float)nGeoS[1] / (float)nGeo : 0.0f;
+        UNROLL for (uint s2 = 0u; s2 < 2u; ++s2) {
+            const float3 nS = nAccS[s2].x * right + nAccS[s2].y * up + nAccS[s2].z * fwd;
+            const float2 cS = fxyS[s2] / max((float)nGeoS[s2], 1.0f);
+            const float  hS = (nGeoS[s2] > 0u) ? (float)nGeoS[s2] / max(invZS[s2], 1.0e-20f) * sqrt(1.0f + dot(cS, cS)) : -1.0f;
+            uint4 o2;
+            o2.x = pgiPackUnorm4(float4(albS[s2] / max((float)nAlbS[s2], 1.0f), farW));
+            o2.y = pgiPackNormal(nS);
+            o2.z = f32tof16(cS.x) | (f32tof16(cS.y) << 16u);
+            o2.w = min(nGeoS[s2], 255u) | (f32tof16(min(hS, 60000.0f)) << 16u);
+            Write3D(gPgiGBuf2, int3(int2(gPgiParams.capTile.xy) + int2(DispatchThreadID.xy), (int)s2), o2);
+        }
     }
     RETURN();
 }
@@ -481,6 +527,8 @@ float pgiSunVisibility(float3 P, float3 N, float3 S, bool march)
 // lights' space. Without it a tunnel lit only by lanterns relit black: the independent truth at the
 // Telvanni root is 0.003 E_ref with lanterns, 0.000 without (2026-10-17).
 #define PGI_POINT_LIGHTS gPgiLights
+#define gGoboArray gPgiGoboArray
+#include "gobosample.h.fsl"   // fixtureGoboNear — a slotless light's cage, as the frame's near frags (pgipoint.h.fsl)
 #include "pgipoint.h.fsl"     // the loop itself, shared with the oracle's full-resolution relight (code 70)
 float3 pgiPointLight(float3 Prel, float3 N)
 {
@@ -788,34 +836,51 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
             float3 L = skyF * gPgiParams.skyLive.w * (skyLive ? pgiSkyLive(d) : useCap ? skyCap : pgiSkyRadiance(d));   // w = knob pgiSkyGain (test)
             float3 Ldir = f3(0.0f);   // the oracle's split preview (below)
             const float hd = pgiGbDistPlane(gb);   // the hit ON the block's centre ray (pgiGbDistPlane)
+            // SPLIT (pgiSplit; gather): the near and the far surface, each lit at its own hit and weighted by
+            // its share of the geometry. Else the one hit, exactly as before.
+            const int2  gt  = int2(cx * 6u * PGI_FACE_TEX + f * PGI_FACE_TEX + tx, (layer * G + cy) * PGI_FACE_TEX + ty);
+            const float farW = (gPgiParams.fog.w > 1.0f) ? pgiUnpackUnorm4(LoadRWTex3D(gPgiGBuf2, int3(gt, 1)).x).w : 0.0f;
+            const uint  nSurf = (farW > 0.0f) ? 2u : 1u;
             if (skyF < 0.999f && hd > 0.0f) {
-                float3 N = pgiUnpackNormal(gb.y);
-                if (dot(N, N) < 0.5f) { N = -d; }
-                const float3 P = pr.xyz + d * hd;
-                const float3 Prel = P - gPgiParams.lodEye.xyz;
-                const float sunV = pgiSunVisibility(P, N, S, gPgiParams.place.z > 0.5f);   // the renderer's two sources
-                // No value of its own yet: the old model's ambient at the hit (pgiFillOld 1), or none —
-                // the bounce then builds from the probe's own field over the next relights.
-                float3 amb = (fillOld || gPgiParams.capMisc.z <= 0.0f)
-                           ? gPgiParams.ambCol.rgb * skyAmbFactorAO(N, skyAOTerm(N, Prel)) : f3(0.0f);
-                if (prevW > 0.0f) {
-                    const float Yn[9] = { 0.282095f, 0.488603f * N.y, 0.488603f * N.z, 0.488603f * N.x,
-                                          1.092548f * N.x * N.y, 1.092548f * N.y * N.z, 0.315392f * (3.0f * N.z * N.z - 1.0f),
-                                          1.092548f * N.x * N.z, 0.546274f * (N.x * N.x - N.y * N.y) };
-                    const float fp[28] = { prevC[0].x, prevC[0].y, prevC[0].z, prevC[0].w, prevC[1].x, prevC[1].y, prevC[1].z, prevC[1].w,
-                                           prevC[2].x, prevC[2].y, prevC[2].z, prevC[2].w, prevC[3].x, prevC[3].y, prevC[3].z, prevC[3].w,
-                                           prevC[4].x, prevC[4].y, prevC[4].z, prevC[4].w, prevC[5].x, prevC[5].y, prevC[5].z, prevC[5].w,
-                                           prevC[6].x, prevC[6].y, prevC[6].z, prevC[6].w };
-                    float3 Ep = f3(0.0f);
-                    UNROLL for (uint b = 0u; b < 9u; ++b) { Ep += float3(fp[3u * b], fp[3u * b + 1u], fp[3u * b + 2u]) * Yn[b]; }
-                    amb = max(Ep, f3(0.0f)) * gPgiParams.capMisc.z;   // E/pi, the units ambCol x factor is in; x knob pgiBounceGain (test)
+                float3 Lgeo = f3(0.0f), LdirG = f3(0.0f);   // albedo x E, and albedo x (E - amb), over the surfaces
+                for (uint sf = 0u; sf < nSurf; ++sf) {
+                    const uint4  gs  = (nSurf == 2u) ? LoadRWTex3D(gPgiGBuf2, int3(gt, (int)sf)) : gb;
+                    const float  wS  = (nSurf == 2u) ? (sf == 0u ? 1.0f - farW : farW) : 1.0f;
+                    const float3 aS  = (nSurf == 2u) ? pgiUnpackUnorm4(gs.x).rgb : as.rgb;
+                    const float  hS  = pgiGbDistPlane(gs);
+                    if (!(hS > 0.0f)) { continue; }
+                    float3 N = pgiUnpackNormal(gs.y);
+                    // A split side's hit is on the ray through ITS pixel centroid (gather), not the texel's.
+                    const float3 dS = (nSurf == 2u) ? normalize(fwd + f16tof32(gs.z) * right + f16tof32(gs.z >> 16u) * up) : d;
+                    if (dot(N, N) < 0.5f) { N = -dS; }
+                    const float3 P = pr.xyz + dS * hS;
+                    const float3 Prel = P - gPgiParams.lodEye.xyz;
+                    const float sunV = pgiSunVisibility(P, N, S, gPgiParams.place.z > 0.5f);   // the renderer's two sources
+                    // No value of its own yet: the old model's ambient at the hit (pgiFillOld 1), or none —
+                    // the bounce then builds from the probe's own field over the next relights.
+                    float3 amb = (fillOld || gPgiParams.capMisc.z <= 0.0f)
+                               ? gPgiParams.ambCol.rgb * skyAmbFactorAO(N, skyAOTerm(N, Prel)) : f3(0.0f);
+                    if (prevW > 0.0f) {
+                        const float Yn[9] = { 0.282095f, 0.488603f * N.y, 0.488603f * N.z, 0.488603f * N.x,
+                                              1.092548f * N.x * N.y, 1.092548f * N.y * N.z, 0.315392f * (3.0f * N.z * N.z - 1.0f),
+                                              1.092548f * N.x * N.z, 0.546274f * (N.x * N.x - N.y * N.y) };
+                        const float fp[28] = { prevC[0].x, prevC[0].y, prevC[0].z, prevC[0].w, prevC[1].x, prevC[1].y, prevC[1].z, prevC[1].w,
+                                               prevC[2].x, prevC[2].y, prevC[2].z, prevC[2].w, prevC[3].x, prevC[3].y, prevC[3].z, prevC[3].w,
+                                               prevC[4].x, prevC[4].y, prevC[4].z, prevC[4].w, prevC[5].x, prevC[5].y, prevC[5].z, prevC[5].w,
+                                               prevC[6].x, prevC[6].y, prevC[6].z, prevC[6].w };
+                        float3 Ep = f3(0.0f);
+                        UNROLL for (uint b = 0u; b < 9u; ++b) { Ep += float3(fp[3u * b], fp[3u * b + 1u], fp[3u * b + 2u]) * Yn[b]; }
+                        amb = max(Ep, f3(0.0f)) * gPgiParams.capMisc.z;   // E/pi, the units ambCol x factor is in; x knob pgiBounceGain (test)
+                    }
+                    // place.y = knob pgiSunGain (test): the sun term's share (1 = as is).
+                    const float3 Elan = pgiPointLight(Prel, N);
+                    const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb + Elan;
+                    Lgeo  += wS * aS * E;
+                    LdirG += wS * aS * (E - amb);
+                    lanAcc += (1.0f - skyF) * wS * aS * (Elan + min(amb, prevEl)) * dom;
                 }
-                // place.y = knob pgiSunGain (test): the sun term's share (1 = as is).
-                const float3 Elan = pgiPointLight(Prel, N);
-                const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb + Elan;
-                float3 Lhit = (1.0f - skyF) * as.rgb * E;
-                Ldir = (1.0f - skyF) * as.rgb * (E - amb);
-                lanAcc += (1.0f - skyF) * as.rgb * (Elan + min(amb, prevEl)) * dom;
+                float3 Lhit = (1.0f - skyF) * Lgeo;
+                Ldir = (1.0f - skyF) * LdirG;
                 // EMISSION (pgiEmis, P2): what the hit itself emits — windows, glow maps. Radiance, not lit by
                 // anything, and local light like the lanterns: it rides their L0 past the receiver's sky gate.
                 if (gPgiParams.emis.x > 0.5f) {
@@ -827,7 +892,7 @@ void CS_MAIN( SV_GroupID(uint3) GroupID, SV_GroupThreadID(uint3) GroupThreadID )
                 }
                 // FOG, ENERGY ONLY (user 2026-10-23: "fog can be simplified to pass the energy only"): MW's
                 // linear ramp over the PROBE's distance to the hit, toward the frame's fog colour — no haze
-                // target, no extinction shape, no water segment. fog: x start, y end, z on, w unused; the
+                // target, no extinction shape, no water segment. fog: x start, y end, z on, w = pgiSplit; the
                 // colour rides fogCol (scene units, the main view's fogColNear).
                 if (gPgiParams.fog.z > 0.5f) {
                     const float fr = saturate((hd - gPgiParams.fog.x) / max(gPgiParams.fog.y - gPgiParams.fog.x, 1.0f));

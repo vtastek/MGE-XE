@@ -4810,6 +4810,8 @@ float fixtureGoboNear(float4 g, uint i, float3 toL)
 
 
 
+
+
 float nearHandoverT(float3 worldPosRel, float band)
 {
     float hand = gFrameData.lodParams.x;

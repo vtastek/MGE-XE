@@ -62,6 +62,7 @@ STRUCT(PgiParams)
     DATA(float4, emis, None);
     // RELIGHT FOG, energy only (knob pgiFog): x = MW fog start, y = fog end (u, the probe's distance to the
     // hit), z = 1 on; fogCol.rgb = the frame's fog colour in scene units (the main view's fogColNear).
+    // fog.w (GATHER + RELIGHT) = knob pgiSplit, the depth ratio that splits a block in two (0 = off; gPgiGBuf2).
     DATA(float4, fog, None);
     DATA(float4, fogCol, None);
 };
@@ -79,6 +80,11 @@ STRUCT(PgiLightData)
 {
     DATA(float4, lightParams, None);
     DATA(float4, lights[MAX_POINT_LIGHTS * 3], None);
+    // The rest of LightData's layout up to the G3 gobo tail, so a SLOTLESS light takes its fixture gobo
+    // here as the frame's near frags do (gobosample.h.fsl fixtureGoboNear; pgipoint.h.fsl).
+    DATA(float4, froxelDimsNear, None);
+    DATA(float4, froxelZNear,    None);
+    DATA(float4, goboNear[MAX_POINT_LIGHTS / 2], None);
 };
 
 BEGIN_SRT(PgiSrtData)
@@ -117,5 +123,13 @@ BEGIN_SRT(PgiSrtData)
         // (the mip above; mip 0's build reads the peek atlas's world-lit row instead). Per set instance.
         DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiCubeOut)
         DECL_RWTEXTURE(PerBatch, RWTex2DArray(float4),  gPgiCubeIn)
+        // FIXTURE GOBOS (G3) for the relight's slotless lights = g_gobo.pArray, bound once the bake lands
+        // (pgiBindGobo). Unbound reads 0 = occlusion 0 = open: the pre-gobo relight, never a black light.
+        DECL_TEXTURE  (PerBatch, Tex2DArray(float), gPgiGoboArray)
+        // SPLIT BLOCKS (knob pgiSplit, fog.w): a G-buffer texel whose depths spread past the ratio is kept as
+        // two surfaces — slice 0 the near one, 1 the far — each in gPgiGBuf's layout (x albedo rgb + w the
+        // FAR share of the block's geometry, y normal, w count | plane distance f16 << 16). Slice 1's x.w = 0:
+        // one surface, relit from gPgiGBuf as before.
+        DECL_RWTEXTURE(PerBatch, RWTex2DArray(uint4), gPgiGBuf2)
     END_SRT_SET(PerBatch)
 END_SRT(PgiSrtData)

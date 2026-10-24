@@ -1921,6 +1921,8 @@ float fixtureGoboNear(float4 g, uint i, float3 toL)
 
 
 
+
+
 float nearHandoverT(float3 worldPosRel, float band)
 {
     float hand = gFrameData.lodParams.x;
@@ -5152,16 +5154,7 @@ float capSlotVisibility(float3 P, float3 N, float3 lightPos)
 }
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgipoint.h.fsl"
-
-
-
-
-
-
-
-
-
-
+#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgipoint.h.fsl"
 float3 pgiPointLightRaw(float3 Prel, float3 N)
 {
     const uint nL = min((uint) gLights .lightParams.x, (uint) 128 );
@@ -5181,7 +5174,8 @@ float3 pgiPointLightRaw(float3 Prel, float3 N)
         float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1.0e-4f);
         att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
         const uint slotP1 = (uint)fo.w;
-        if (slotP1 != 0u) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        if (slotP1 != 0u &&  gLights .lightParams.z < 0.5f) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        else { att *= fixtureGoboNear( gLights .goboNear[i >> 1u], i, toL); }
         E +=  gLights .lights[i * 3u + 1u].rgb * (lambert * att);
     }
     return E;

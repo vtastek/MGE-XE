@@ -42,6 +42,8 @@ float fixtureGoboNear(float4 g, uint i, float3 toL)
     return fixtureGoboVis(toL, (e.x < 0.0f) ? (-e.x - 1.0f) : e.x, e.y);
 }
 
+// The probe relight (PGI_COMPUTE) takes only fixtureGoboNear: its gFrameData alias has no lodParams.
+#ifndef PGI_COMPUTE
 // 0 -> 1 over the last `band` units before the near/far light handover (gFrameData.lodParams.x, 0 in
 // an interior = never). The one ramp G4 and G4b share, so the shadow and the light fade together.
 float nearHandoverT(float3 worldPosRel, float band)
@@ -65,3 +67,4 @@ float goboSlotFade(float sv, float4 g, uint i, float3 toL, float3 worldPosRel, f
     if (t <= 0.0f) { return sv; }
     return lerp(sv, fixtureGoboNear(g, i, toL), t);
 }
+#endif   // PGI_COMPUTE

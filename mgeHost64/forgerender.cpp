@@ -6876,6 +6876,13 @@ namespace {
     float g_pgiWorldSkyStops = 0.5f;  // knob pgiWorldSkyStops: and re-shot once the sky's illuminance moved this many stops (0 = off)
     float g_pgiResetStops = 1.0f;     // knob pgiResetStops: a LIGHT EVENT = the frame's light this many stops off its lagged self (0 = off)
     float g_pgiFog = 1.0f;            // knob pgiFog: the relight fogs each hit by the probe's distance (energy only; 0 = off)
+    // knob pgiSplit: a G-buffer block whose depths spread past this ratio (max / min) is kept as TWO
+    // surfaces, near and far, each relit at its own hit (gPgiGBuf2). 0 = off: one hit per block. A block
+    // relit only at its near surface lost the far one's light — a nook's probe sees shadowed rock close by
+    // and its light far out through the opening: 0.03-0.10x of the light in those blocks, dim probes
+    // 0.17x of truth (iboaddamasartusbounceweak, probeoracle_0226, 2026-10-24).
+    float g_pgiSplit = 1.5f;
+    inline float pgiSplitLane() { return g_pgiSplit > 1.0f ? g_pgiSplit : 0.0f; }   // PgiParams.fog.w
     float g_pgiTrace = 0.0f;          // knob pgiTrace (debug): log [pgi-trace], each probe's irradiance against its age
     float g_pgiTraceIn[8] = {};       // TRACE: the relight's last inputs (sunCol rgb, sunDir z, ambCol rgb, fog end)
     float g_pgiCapStop = 0.0f;        // knob pgiCapStop (test): > 0 = no probe capture after this many s of host time
@@ -6924,6 +6931,7 @@ namespace {
     struct Pgi {
         Texture*       gbuf = nullptr;        // G-buffer atlas, RGBA32_UINT
         Texture*       gbufE = nullptr;       // ...its EMISSION lane (P2), R32_UINT = packed R11G11B10; rests UAV
+        Texture*       gbuf2 = nullptr;       // ...its NEAR / FAR layers of a split block (pgiSplit), 2 slices; rests UAV
         Texture*       sh = nullptr;          // the field, G x G x 16 RGBA16F
         Buffer*        placeBuf = nullptr;    // RW float4 per slot (lo, hi, ix, iy)
         Buffer*        placeRb = nullptr;     // its readback, one lane per frame slot
@@ -25748,6 +25756,7 @@ namespace {
             { "pgiWorldSkyStops",    &g_pgiWorldSkyStops    },
             { "pgiResetStops",       &g_pgiResetStops       },
             { "pgiFog",              &g_pgiFog              },
+            { "pgiSplit",            &g_pgiSplit            },
             { "pgiTrace",            &g_pgiTrace            },
             { "pgiBounceGain",       &g_pgiBounceGain       },
             { "pgiCapStop",          &g_pgiCapStop          },
@@ -54088,6 +54097,16 @@ void destroyHostWindow(Renderer* R);
         std::vector<uint8_t> usable;
     };
     GoboState g_gobo;
+    // The probe relight's slotless lights take their fixture gobo too (pgi.srt.h gPgiGoboArray,
+    // pgipoint.h.fsl). Bound into every probe-GI set instance once BOTH the bake and the sets exist:
+    // whichever lands second calls this. Unbound reads 0 = open, the pre-gobo relight.
+    void pgiBindGobo() {
+        if (!g_gobo.ready || !g_gobo.pArray || !g_pgi.set) { return; }
+        DescriptorData gd = {};
+        gd.mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGoboArray);
+        gd.mCount = 1; gd.ppTextures = &g_gobo.pArray;
+        for (uint32_t i = 0; i < kPgiSetN; ++i) { updateDescriptorSet(g_live.pRenderer, i, g_pgi.set, 1, &gd); }
+    }
     constexpr float kGoboSealedOpen = 0.02f;
     // Phase F: compact, MESHED-only glow source list (positions + precomputed luminance/chromaticity),
     // built once from g_dlBakedLights. The per-frame billboard walk streams THIS — cache-tight, no
@@ -60124,6 +60143,7 @@ void destroyHostWindow(Renderer* R);
             if (g_live.pPerFrameSetReflect)    { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, 1, &gd); }
             if (g_live.pPerFrameSetCap)        { updateDescriptorSet(R, 0, g_live.pPerFrameSetCap, 1, &gd); }
             if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &gd); }
+            pgiBindGobo();
         }
         LOG::logline(">> [gobo] fixtures=%u baked=%u draws=%u batches=%u ms=%.1f (oct %u², face %u², carve thr %.3f)",
                      N, N, draws, batches, hostNowMs() - t0, kGoboOctRes, kGoboFaceRes, thr);
@@ -67460,6 +67480,7 @@ namespace ForgeRender {
         g_pgi.pool.clear();
         if (g_pgi.gbuf) { removeResource(g_pgi.gbuf); g_pgi.gbuf = nullptr; }
         if (g_pgi.gbufE) { removeResource(g_pgi.gbufE); g_pgi.gbufE = nullptr; }
+        if (g_pgi.gbuf2) { removeResource(g_pgi.gbuf2); g_pgi.gbuf2 = nullptr; }
         if (g_pgi.peek) { removeResource(g_pgi.peek); g_pgi.peek = nullptr; }
         if (g_pgi.lit)  { removeResource(g_pgi.lit);  g_pgi.lit = nullptr; }
         if (g_pgi.sh)   { removeResource(g_pgi.sh);   g_pgi.sh = nullptr; }
@@ -67508,6 +67529,12 @@ namespace ForgeRender {
             tde.pName = "pgiGBufE";
             TextureLoadDesc tle = {}; tle.ppTexture = &g_pgi.gbufE; tle.pDesc = &tde;
             addResource(&tle, nullptr);
+            TextureDesc td2 = td;   // slice 0 = the near surface, 1 = the far one (pgiSplit; gPgiGBuf's layout)
+            td2.mArraySize = 2;
+            td2.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE;   // compute only: never leaves UAV
+            td2.pName = "pgiGBuf2";
+            TextureLoadDesc tl2 = {}; tl2.ppTexture = &g_pgi.gbuf2; tl2.pDesc = &td2;
+            addResource(&tl2, nullptr);
             TextureDesc tdl = td;
             tdl.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
             tdl.pName = "pgiLit";
@@ -67675,7 +67702,7 @@ namespace ForgeRender {
             addFrameBuf(&lb);
         }
         waitForAllResourceLoads();
-        if (!g_pgi.gbuf || !g_pgi.gbufE || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
+        if (!g_pgi.gbuf || !g_pgi.gbufE || !g_pgi.gbuf2 || !g_pgi.peek || !g_pgi.sh || !g_pgi.placeBuf || !g_pgi.placeRb || !g_pgi.probes
             || !g_pgi.ballBuf || !g_pgi.ballRb || !g_pgi.blameBuf || !g_pgi.blameRb || !g_pgi.moveBuf || !g_pgi.moveRb || !g_pgi.vol || !g_pgi.volTag || !g_pgi.lit || !g_pgi.cube || !g_pgi.nearP[0].cube || !g_pgi.nearP[1].cube) { return fail("resource alloc"); }
         for (Buffer* b : g_pgi.cbv) { if (!b) { return fail("cbuffer alloc"); } }
         // "No read yet": NaN everywhere, so a lane never written matches no column.
@@ -67756,6 +67783,13 @@ namespace ForgeRender {
             d[31].mUAVMipSlice = (uint16_t)((cubeW && cubeK > 0u) ? cubeK - 1u : 0u);
             for (DescriptorData& x : d) { x.mCount = 1; }
             updateDescriptorSet(R, i, g_pgi.set, 32, d);
+        }
+        pgiBindGobo();   // the fixture gobos, if the bake already landed (else the bake binds them)
+        {   // the split layers (pgiSplit): past the 32-entry block above
+            DescriptorData g2 = {};
+            g2.mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGBuf2);
+            g2.mCount = 1; g2.ppTextures = &g_pgi.gbuf2;
+            for (uint32_t i = 0; i < kPgiSetN; ++i) { updateDescriptorSet(R, i, g_pgi.set, 1, &g2); }
         }
         // The receivers: every set whose lit frags take skyAmbFactor (the GI field's three).
         DescriptorData pf = {};
@@ -68704,6 +68738,7 @@ namespace ForgeRender {
         PgiParams* P = (PgiParams*)fbw(g_pgi.cbv[1]);
         std::memset(P, 0, sizeof(PgiParams));
         P->emis = pgiEmisLane();   // P2: the capture's checkerboard + the relight's emission gain
+        P->fog  = float4(0.0f, 0.0f, 0.0f, pgiSplitLane());   // w: the gather's near/far split ratio (pgiSplit)
         P->capPos  = float4(g_capFace.pos[0], g_capFace.pos[1], g_capFace.pos[2], (float)f);
         P->capTile = float4((float)((s % kPgiG) * 48u + f * 8u), (float)((l * kPgiG + s / kPgiG) * 8u),
                             (float)g_capFace.res, kProbeNear);
@@ -68732,10 +68767,11 @@ namespace ForgeRender {
         cmdBindPipeline(g_live.pCmd, g_pgi.pGather);
         cmdBindDescriptorSet(g_live.pCmd, 1, g_pgi.set);
         cmdDispatch(g_live.pCmd, 1, 1, 1);
-        TextureBarrier tb[2] = {};   // the G-buffer and its emission lane (P2)
+        TextureBarrier tb[3] = {};   // the G-buffer, its emission lane (P2) and its split layers (pgiSplit)
         tb[0].pTexture = g_pgi.gbuf; tb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; tb[0].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
         tb[1] = tb[0]; tb[1].pTexture = g_pgi.gbufE;
-        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
+        tb[2] = tb[0]; tb[2].pTexture = g_pgi.gbuf2;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 3, tb, 0, nullptr);
         cmdEndDebugMarker(g_live.pCmd);
         ++g_pgi.captures;
         if (g_pgi.capWorld) {
@@ -68930,7 +68966,7 @@ namespace ForgeRender {
             P->grid   = float4(g_pgi.spacing, (float)kPgiG, (float)g_pgi.phase, (float)R);
             // y = a transition's blend toward its new value; z = MULTI-BOUNCE on (knob pgiBounce)
             // FOG, energy only (knob pgiFog): MW's ramp over the probe's distance to each hit, toward fogColNear.
-            P->fog    = float4(fcbvR[32], fcbvR[33], g_pgiFog > 0.5f ? 1.0f : 0.0f, 0.0f);
+            P->fog    = float4(fcbvR[32], fcbvR[33], g_pgiFog > 0.5f ? 1.0f : 0.0f, pgiSplitLane());
             P->fogCol = float4(g_fogNearScene[0], g_fogNearScene[1], g_fogNearScene[2], 0.0f);
             P->capMisc = float4(g_pgiLiveSky > 0.5f ? 1.0f : 0.0f, alpha, (g_pgiBounce > 0.5f && !reset) ? std::max(0.0f, g_pgiBounceGain) : 0.0f, ((int)g_pgiDebug & 64) ? 1.0f : (g_pgi.litRb ? 2.0f : 0.0f));   // x = live sky, w = lit preview (2: the oracle's split)
             P->place   = float4(g_pgiFillOld > 0.5f ? 1.0f : 0.0f, std::max(0.0f, g_pgiSunGain),

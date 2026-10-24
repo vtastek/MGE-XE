@@ -1398,9 +1398,10 @@ STRUCT(PgiParams)
     float4 emis;
 
 
+
     float4 fog;
     float4 fogCol;
-#line 67
+#line 68
 };
 
 
@@ -1416,7 +1417,12 @@ STRUCT(PgiLightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 82
+
+
+    float4 froxelDimsNear;
+    float4 froxelZNear;
+    float4 goboNear[ 128  / 2];
+#line 88
 };
 
         CBUFFER(PgiParams) gPgiParams :  register(b0,space2);
@@ -1453,6 +1459,14 @@ STRUCT(PgiLightData)
 
         RWTex2DArray(float4) gPgiCubeOut :  register(u30,space2);
         RWTex2DArray(float4) gPgiCubeIn :  register(u31,space2);
+
+
+        Tex2DArray(float) gPgiGoboArray :  register(t32,space2);
+
+
+
+
+        RWTex2DArray(uint4) gPgiGBuf2 :  register(u33,space2);
 #line 4 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
@@ -2468,7 +2482,7 @@ float pgiGbDist(uint4 g)
     const float hp = f16tof32(g.w >> 16u);
     return (hp > 0.0f) ? hp * exp2((float)(g.y >> 24u) * (1.0f / 32.0f) - 1.0f) : hp;
 }
-#line 1007 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
+#line 1072 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 uint pgibHash(uint x)
 {
     x ^= x >> 16u; x *= 0x7FEB352Du; x ^= x >> 15u; x *= 0x846CA68Bu; x ^= x >> 16u;

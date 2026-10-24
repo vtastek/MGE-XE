@@ -4,7 +4,10 @@
 // direct term (user 2026-10-21: "I need relight at full res"). PGI_POINT_LIGHTS names the light cbuffer
 // (the frags' gLights, the relight's gPgiLights); fpShadowVisibility comes from fpshadow.h.fsl.
 // opaque.frag's response — 1/(k0 + k1 d + k2 d^2), the tail ramp to the reach, N.L — shadowed from the
-// atlas directly where the light has a slot. No gobo, no gain: the caller applies its own.
+// atlas directly where the light has a slot, else (or under goboForceNear) its FIXTURE GOBO — exactly the
+// frame's near frags' choice in a capture view. The relight used to leave slotless lights unshadowed, and
+// lit their caged spill: the formula read 1.21x the frame's direct in the cave
+// (iboaddamasartusbounceweak, probeoracle_0226, 2026-10-24). No gain: the caller applies its own.
 #ifndef PGI_POINT_LIGHTS
 #define PGI_POINT_LIGHTS gLights
 #endif
@@ -27,7 +30,8 @@ float3 pgiPointLightRaw(float3 Prel, float3 N)
         float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1.0e-4f);
         att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
         const uint slotP1 = (uint)fo.w;
-        if (slotP1 != 0u) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        if (slotP1 != 0u && PGI_POINT_LIGHTS.lightParams.z < 0.5f) { att *= fpShadowVisibility(Prel, N, slotP1 - 1u); }
+        else { att *= fixtureGoboNear(PGI_POINT_LIGHTS.goboNear[i >> 1u], i, toL); }
         E += PGI_POINT_LIGHTS.lights[i * 3u + 1u].rgb * (lambert * att);
     }
     return E;
