@@ -1053,6 +1053,11 @@ namespace {
     // clearer. 1 = the physical medium (front-loaded: T 0.38 at D/4 — MW's linear fog had not started).
     // 3 by the user's pick from the old / p1 / p2 / p3 contact sheet.
     float g_apDistPow = 3.0f;   // user, 2026-10-24: "prefer clearer 3"
+    // S3.6: VISIBILITY, as a multiple of MW's fog end: the air reaches Koschmieder's 2% at apVis x fogEnd.
+    // 1 = MW's own reach (the S3.4 calibration). Above 1 the air is thinner than MW's curtain: the sea
+    // (drawn to the true horizon since the far plane went to infinity) shows past the land's end, and
+    // the land's own cut at the draw distance starts to show — S3.6 stage C's fade covers that.
+    float g_apVis = 1.0f;
     // The live weather row's sea-level green extinction (1/m), written by atmosDispatch's packing; 0 until
     // the chain has packed once (apCalibrate then falls back to the Clear row).
     float g_apBetaLiveG = 0.0f;
@@ -9690,7 +9695,13 @@ namespace {
         //
         // Coarsest level only. Any finer level's outer ring is stitched to the next one out and
         // moving it would tear the T-junction fix.
-        constexpr float kWaterSkirt = 8.0f;
+        //
+        // S3.6: 8 -> 1024. The far plane went to infinity, so this edge IS the waterline now, and it
+        // sits atan(h / edge) under the true horizon: at 8x (1.05M u) that was 1.2 deg from 325 m up,
+        // a strip of below-horizon sky fill 5% darker than the sea (ibovivecwaterlinefogline.ess).
+        // 1024x = 134M u: 0.01 deg there, 0.04 deg from 100k u up — under a pixel. Positions that
+        // far are ~16 u apart in float, which nothing behind an opaque air column can show.
+        constexpr float kWaterSkirt = 1024.0f;
         g_waterVertTotal = (uint32_t)(L * verts1D * verts1D);
         std::vector<float> verts;                  // float3 per vertex
         verts.reserve((size_t)g_waterVertTotal * 3);
@@ -25576,6 +25587,7 @@ namespace {
             { "apScale",            &g_apScale            },   // S3.2: medium m per MW m, 0 = calibrated
             { "apAltScale",         &g_apAltScale         },   // S3.4: altitude scale, 1 = real, 0 = = apScale
             { "apDistPow",          &g_apDistPow          },   // S3.4: optical depth ~ (d/D)^p, 1 = physical
+            { "apVis",              &g_apVis              },   // S3.6: air 2% at apVis x MW fog end
             { "fogModel",           &g_fogModel           },   // S3.4: 1 = aerial perspective, 0 = MW curtain
             { "atmosMiePhase",      &g_atmosMiePhase      },
             { "atmosOzoneMul",      &g_atmosOzoneMul      },
@@ -46146,16 +46158,16 @@ void destroyHostWindow(Renderer* R);
             uint32_t reflScissorTop = 0;
             if (g_reflHorizonScissor && !underwaterR && !probeFace) {
                 const float* MV = fcbvR;                            // row-major D3DX; wp*M (homogeneous)
-                const float waterZrel = waterLevelAbs - eyeAbsZ;    // water plane, camera-relative
-                const float R = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f)
-                              * 8192.0f * 4.0f;                     // well past the far plane → true horizon
+                // S3.6: the sea now draws to the TRUE horizon (infinite far plane), so the bound is the
+                // horizon itself — horizontal DIRECTIONS (w = 0), the limit every water-plane point
+                // approaches from below — not points at 4x the draw distance, which sat under it.
                 float minYfrac = 1.0f;                             // 0 = screen top, 1 = bottom
                 bool anyFront = false;
                 for (int a = 0; a < 16; ++a) {
                     const float ang = (float)a * (6.28318531f / 16.0f);
-                    const float px = R * std::cos(ang), py = R * std::sin(ang), pz = waterZrel;
-                    const float cy = px*MV[1] + py*MV[5] + pz*MV[9] + MV[13];
-                    const float cw = px*MV[3] + py*MV[7] + pz*MV[11] + MV[15];
+                    const float px = std::cos(ang), py = std::sin(ang);
+                    const float cy = px*MV[1] + py*MV[5];
+                    const float cw = px*MV[3] + py*MV[7];
                     if (cw <= 1e-4f) { continue; }                 // behind camera → not on screen
                     anyFront = true;
                     const float yfrac = 0.5f * (1.0f - cy / cw);
@@ -50734,15 +50746,15 @@ void destroyHostWindow(Renderer* R);
                     p[25] = g_wddFrame ? (float)aplGrid : (float)g_live.height;
                     // srcDims.z = AIR REJECTION (S3.4): the distance past which the aerial perspective
                     // keeps less than half of a surface, from the calibration's own closed form
-                    // T(d) = exp(-3.912 (d/fogEnd)^p) -> d_half = fogEnd (ln2/3.912)^(1/p). Only while
-                    // the volume is armed this frame (apFog0.x) and the scale is calibrated; 0 = off.
+                    // T(d) = exp(-3.912 (d/V)^p) -> d_half = V (ln2/3.912)^(1/p), V = the visibility
+                    // apCalibrate published (S3.6: apVis x fogEnd). Only while the volume is armed this
+                    // frame (apFog0.x) and the scale is calibrated; 0 = off.
                     {
                         float dHalf = 0.0f;
-                        if (g_aplRejectAir && sp && lf && sp[kApFogFloat + 0] > 0.5f && !(g_apScale > 0.0f)) {
-                            const float D  = sp[kApFogFloat + 1];
-                            const float fe = std::max(0.05f * D, std::min(lf[33], 4.0f * D));
+                        if (g_aplRejectAir && sp && sp[kApFogFloat + 0] > 0.5f && !(g_apScale > 0.0f)) {
+                            const float V  = sp[kApFogFloat + 2];
                             const float pw = std::max(0.25f, std::min(g_apDistPow, 4.0f));
-                            dHalf = fe * std::pow(0.69314718f / 3.912023f, 1.0f / pw);
+                            dHalf = V * std::pow(0.69314718f / 3.912023f, 1.0f / pw);
                         }
                         p[26] = dHalf;
                     }
@@ -56248,10 +56260,14 @@ void destroyHostWindow(Renderer* R);
         // PADDED past the LAND extent by the maximum view distance. Default land has to exist
         // wherever the player can SEE, not merely where a LAND record does: standing on the last
         // real cell and looking out, every direction within DrawDist has to answer "flat sheet at
-        // -2048" rather than "nothing", or the horizon reverts to MW's frame showing through. 40 is
-        // Configuration.DL.DrawDist's ceiling in cells, so from any cell with land the whole horizon
-        // is covered. Cost is one uint per position — 269x173 here, ~186 KB.
-        constexpr int32_t kTerrainGridPad = 40;
+        // -2048" rather than "nothing", or the horizon reverts to MW's frame showing through. The pad
+        // follows DrawDist (+1 for the cull's extra cell) with 40 as its floor: the comment here used to
+        // call 40 DrawDist's ceiling, but the ini allows 300, and past the pad the terrain simply
+        // stopped. Missing land is default seabed wherever the land can be seen (S3.6; past the draw
+        // distance water.frag supplies the same sheet analytically). One uint per position — 269x173
+        // at 40, ~186 KB; ~1.6 MB at 300.
+        const int32_t kTerrainGridPad = std::max<int32_t>(
+            40, (int32_t)std::ceil(Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f) + 1);
         int32_t eMinX = 0, eMinY = 0, eMaxX = 0, eMaxY = 0;
         Terrain::extent(eMinX, eMinY, eMaxX, eMaxY);
         g_terrainGridMinX = eMinX - kTerrainGridPad;
@@ -66581,8 +66597,14 @@ namespace ForgeRender {
     // Foggy closes in where MW says, Clear dissolves at the draw distance as before.
     //
     // With the distance power p the optical depth is beta x s x D_m x (d/D)^p, so s solves that = 3.912
-    // at d = fogEnd. beta is the live row's (atmosDispatch's packing), the Clear row's until it lands.
-    struct ApScale { float s, D, betaG; };
+    // at d = V. beta is the live row's (atmosDispatch's packing), the Clear row's until it lands.
+    //
+    // S3.6: TWO DISTANCES, NO LONGER ONE. V = apVis x fogEnd is where the air reaches 2%; D is the
+    // VOLUME's extent, where it reaches 1e-4 (V x (ln 1e4 / 3.912)^(1/p), 1.33 V at p 3). It used to be
+    // the draw distance because that was the far plane and nothing lay past it; the sea now runs to the
+    // true horizon, and past a volume that stopped at 2% the far sea kept 2% of itself (the sun's glitter
+    // ran on under an opaque sky). Past D the last slice is opaque, so holding it is exact.
+    struct ApScale { float s, D, V, betaG; };
     ApScale apCalibrate()
     {
         static float s_clearBeta = -1.0f, s_keyMie = -1.0f, s_keyPhase = -1.0f, s_lastLoggedS = -1.0f;
@@ -66601,30 +66623,33 @@ namespace ForgeRender {
             s_clearBeta = pk[1] + pk[9];
         }
         const float draw  = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f);
-        const float D     = draw * 8192.0f;                         // cells -> MW units: the far plane
-        const float Dm    = D * Atmosphere::kMwUnitToMetre;
+        const float landD = draw * 8192.0f;                         // cells -> MW units: where the land ends
         const float betaG = (g_apBetaLiveG > 0.0f) ? g_apBetaLiveG : s_clearBeta;
         // MW's fog end for this weather, off this frame's cbuffer. Clamped: under water the client swaps
         // in the below-water range (~2458 u), and nothing reads the volume from there (both fog paths
         // return first), but the scale must not go to infinity on the frame the eye surfaces.
         const float* fdr = (g_live.pFrameCbv && fbr(g_live.pFrameCbv)) ? (const float*)fbr(g_live.pFrameCbv) : nullptr;
-        float fogEnd = fdr ? fdr[33] : D;
-        fogEnd = std::max(0.05f * D, std::min(fogEnd, 4.0f * D));
-        const float p    = std::max(0.25f, std::min(g_apDistPow, 4.0f));
-        const float reach = Dm * std::pow(fogEnd / D, p);           // medium metres per unit s at fogEnd
+        float fogEnd = fdr ? fdr[33] : landD;
+        fogEnd = std::max(0.05f * landD, std::min(fogEnd, 4.0f * landD));
+        const float p  = std::max(0.25f, std::min(g_apDistPow, 4.0f));
+        const float V  = fogEnd * std::max(0.25f, std::min(g_apVis, 16.0f));
+        const float D  = V * std::pow(9.2103404f / 3.912023f, 1.0f / p);   // ln 1e4: T = 1e-4 here
+        const float Dm = D * Atmosphere::kMwUnitToMetre;
+        const float reach = Dm * std::pow(V / D, p);                // medium metres per unit s at V
         float s = (betaG > 0.0f && reach > 0.0f) ? (3.912023f / (betaG * reach)) : 1.0f;
         if (g_apScale > 0.0f) { s = g_apScale; }
         // Logged when it moves by more than 2% (weather walks it continuously).
         if (!(s_lastLoggedS > 0.0f) || std::fabs(s / s_lastLoggedS - 1.0f) > 0.02f) {
             s_lastLoggedS = s;
             LOG::logline(">> [forge-atmos] aerial scale s=%.2f%s | MW fog end %.0f u (%.2f of draw %.0f u)"
-                         " | live beta_ext(G) %.3g /m (Clear %.3g) | p %.2f",
-                         (double)s, (g_apScale > 0.0f) ? " (apScale OVERRIDE)" : " (T=2% at MW's fog end)",
-                         (double)fogEnd, (double)(fogEnd / D), (double)D, (double)betaG,
-                         (double)s_clearBeta, (double)p);
+                         " | visibility %.0f u (apVis %.2f), volume to %.0f u | live beta_ext(G) %.3g /m"
+                         " (Clear %.3g) | p %.2f",
+                         (double)s, (g_apScale > 0.0f) ? " (apScale OVERRIDE)" : " (T=2% at the visibility)",
+                         (double)fogEnd, (double)(fogEnd / landD), (double)landD, (double)V, (double)g_apVis,
+                         (double)D, (double)betaG, (double)s_clearBeta, (double)p);
             LOG::flush();
         }
-        return { s, D, betaG };
+        return { s, D, V, betaG };
     }
 
     // ─── S3.3: THE AERIAL-PERSPECTIVE VOLUME, EVERY EXTERIOR FRAME ──────────────────────────────────
@@ -66644,7 +66669,7 @@ namespace ForgeRender {
             if (!mp) { return; }
             mp[kApFogFloat + 0] = (on && g_fogModel >= 0.5f) ? 1.0f : 0.0f;
             mp[kApFogFloat + 1] = cal.D;
-            mp[kApFogFloat + 2] = 0.0f;
+            mp[kApFogFloat + 2] = cal.V;
             mp[kApFogFloat + 3] = 0.0f;
             mp[kApFogFloat + 4] = (float)kApFroxW;
             mp[kApFogFloat + 5] = (float)kApFroxH;

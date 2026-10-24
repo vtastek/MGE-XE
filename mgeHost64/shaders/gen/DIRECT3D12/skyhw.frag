@@ -3227,12 +3227,336 @@ float waterFogVolStrength()
     return gShadowParams.waterFogExt.w;
 }
 #line 60 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyhw.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 55 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+#line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 80 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+#line 122 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogNearHaze(float dist)
+{
+
+
+
+
+    float k = max(gFrameData.froxelZ.w, 0.0f);
+    return (k > 0.0f) ? exp(-k * max(dist, 0.0f)) : 1.0f;
+}
+
+float mwFogRamp(float dist)
+{
+    float fogStart = gFrameData.fogParams.x;
+    float fogEnd = gFrameData.fogParams.y;
+    float S = gShadowParams.toneParams.z;
+
+
+
+
+
+
+    float span = max(fogEnd - fogStart, 1.0f);
+    float t = saturate((dist - fogStart) / span);
+
+    if (S > 0.0f)
+    {
+#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+        float x = S * t * t;
+        float e = exp(-S);
+        return saturate(mwFogNearHaze(dist) * (exp(-x) - e) / (1.0f - e));
+    }
+
+
+    return saturate(mwFogNearHaze(dist) * (1.0f - t));
+}
+#line 203 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogFactor(float dist)
+{
+    if (waterCameraSubmerged()) { return 1.0f; }
+    return mwFogRamp(dist);
+}
+#line 225 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogFactorAt(float3 worldPos)
+{
+    return mwFogFactor(length(worldPos - gFrameData.eyePos.xyz));
+}
+#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
+float mwFogAirShare(float fog, float waterShare, float dist)
+{
+
+    if (waterShare <= 0.0f) { return fog; }
+
+    float oTot = 1.0f - mwFogRamp(dist);
+    if (oTot <= 0.0f) { return 1.0f; }
+
+    float oAir = 1.0f - mwFogRamp(dist * (1.0f - waterShare));
+    return 1.0f - (1.0f - fog) * saturate(oAir / oTot);
+}
+
+
+
+float mwFogAirShareAt(float fog, float3 worldPosRel)
+{
+    return mwFogAirShare(fog, waterFogSample(worldPosRel).y, length(worldPosRel));
+}
+#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyradiance.h.fsl"
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aerial.h.fsl"
+#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aerial.h.fsl"
+bool apFogActive()
+{
+    return gShadowParams.apFog0.x > 0.5f && gFrameData.skyZenith.x > 0.0f;
+}
+
+
+
+float2 apAtlasUv(float2 uv, float k, float row0)
+{
+    const float W = gShadowParams.apFog1.x;
+    const float H = gShadowParams.apFog1.y;
+    const float N = gShadowParams.apFog1.z;
+    const float x = k * W + clamp(uv.x * W, 0.5f, W - 0.5f);
+    const float y = row0 + clamp(uv.y * H, 0.5f, H - 0.5f);
+    return float2(x / (W * N), y / (2.0f * H));
+}
+
+
+
+
+
+
+void apSample(float3 worldPosRel, float airLen, out(float3) T, out(float3) L)
+{
+    const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));
+    const float2 ndc = clip.xy / max(clip.w, 1.0e-6f);
+    const float2 uv = saturate(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f));
+
+    const float D = gShadowParams.apFog0.y;
+    const float N = gShadowParams.apFog1.z;
+    const float H = gShadowParams.apFog1.y;
+    const float w = sqrt(saturate(airLen / max(D, 1.0f))) * N - 1.0f;
+    const float k0 = floor(w);
+    const float f = w - k0;
+    const float k1 = min(k0 + 1.0f, N - 1.0f);
+
+    float3 L0 = f3(0.0f), T0 = f3(1.0f);
+    if (k0 >= 0.0f)
+    {
+        L0 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k0, 0.0f), 0).rgb;
+        T0 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k0, H), 0).rgb;
+    }
+    const float3 L1 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k1, 0.0f), 0).rgb;
+    const float3 T1 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k1, H), 0).rgb;
+    T = lerp(T0, T1, f);
+    L = lerp(L0, L1, f) * gFrameData.skyZenith.x;
+}
+
+
+
+float3 apSampleFar(float3 worldPosRel)
+{
+    const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));
+    const float2 ndc = clip.xy / max(clip.w, 1.0e-6f);
+    const float2 uv = saturate(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f));
+    const float N = gShadowParams.apFog1.z;
+    return SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, N - 1.0f, 0.0f), 0).rgb
+         * gFrameData.skyZenith.x;
+}
+
+
+
+
+float apTransmittanceMean(float3 worldPosRel, float airLen)
+{
+    float3 T, L;
+    apSample(worldPosRel, airLen, T, L);
+    return dot(T, f3(1.0f / 3.0f));
+}
+#line 59 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 87 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float4 fogSkySample(float2 pixelXy)
+{
+    return SampleLvlTex2D(gSkyColor, gSamplerBilinearClamp, pixelXy * gFrameData.fogParams.zw, 0);
+}
+#line 133 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 fogHazeTarget(float3 worldPosRel, float fogAir)
+{
+    float scale = gFrameData.skyZenith.x;
+    if (!(scale > 0.0f)) { return gFrameData.fogColNear.rgb; }
+    float3 ray = worldPosRel - float3(0.0f, 0.0f, gFrameData.skyZenith.y);
+    float3 dir = ray * rsqrt(max(dot(ray, ray), 1.0e-12f));
+    float knee = clamp(gFrameData.froxelZ.z, 1.0e-3f, 0.999f);
+    float nearW = 1.0f - saturate((1.0f - fogAir) / knee);
+
+
+
+
+    if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
+
+
+    float floorDeg = floor(gFrameData.skyZenith.z);
+    float sinLift = gFrameData.skyZenith.z - floorDeg;
+    dir.z = max(dir.z, sinLift * nearW);
+
+
+
+
+
+
+
+    if (floorDeg > 0.0f)
+    {
+        float mu = clamp(dir.z, -1.0f, 1.0f);
+        float2 hz = dir.xy * rsqrt(max(dot(dir.xy, dir.xy), 1.0e-12f));
+        float3 dU = float3(hz * sqrt(max(0.0f, 1.0f - mu * mu)), mu);
+        dir = atmosSunFloorDir(dU, radians(floorDeg));
+    }
+
+
+
+    float3 L = atmosSkyRadianceNative(dir, gAtmosParams.planet.w) * scale;
+    return atmosSkyHazedAt(dir, L, gAtmosParams.planet.w, scale);
+}
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 fogSkyTarget(float4 s, float skyShare, float3 haze)
+{
+    float3 mw = gFrameData.fogColNear.rgb;
+    float w = gFrameData.fogColNear.w;
+    float3 sky = s.rgb + haze * (1.0f - s.a);
+    return lerp(mw, sky, w * skyShare) + (haze - mw) * (w * (1.0f - skyShare));
+}
+#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float fogSkyShare(float fogAir)
+{
+
+
+    float knee = clamp(gFrameData.froxelZ.z, 0.0f, 0.999f);
+    return smoothstep(knee, 1.0f, 1.0f - fogAir);
+}
+
+
+
+
+
+float3 fogSkyColor(float2 pixelXy)
+{
+    return fogSkyTarget(fogSkySample(pixelXy), 1.0f, gFrameData.fogColNear.rgb);
+}
+
+
+
+
+
+float3 fogSkyColorAt(float2 pixelXy, float fogAir, float3 worldPosRel)
+{
+    return fogSkyTarget(fogSkySample(pixelXy), fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir));
+}
+#line 285 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float fogExtinction(float fogAir, float skyBehind)
+{
+    float ramp = pow(1.0f - fogAir, gFrameData.timeParams.w);
+    return 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
+}
+#line 325 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 apSkyMatch(float3 worldPosRel, float3 L)
+{
+    const float scale = gFrameData.skyZenith.x;
+    const float r = gAtmosParams.planet.w;
+    const float3 ray = worldPosRel - float3(0.0f, 0.0f, gFrameData.skyZenith.y);
+    float3 dir = ray * rsqrt(max(dot(ray, ray), 1.0e-12f));
+    if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
+    const float3 Lsky = atmosSkyHazedAt(dir, atmosSkyRadianceNative(dir, r) * scale, r, scale);
+    const float3 Lfar = apSampleFar(worldPosRel);
+
+
+
+
+    return Lsky * saturate(L / max(Lfar, f3(1.0e-6f)));
+}
+
+float3 apApplyFog(float3 lit, float3 worldPosRel)
+{
+    float2 wf = waterFogSample(worldPosRel);
+    float3 behind = waterFogComposite(lit, worldPosRel, wf);
+    if (waterCameraSubmerged()) { return behind; }
+    float3 T, L;
+    apSample(worldPosRel, length(worldPosRel) * (1.0f - wf.y), T, L);
+    return behind * T + apSkyMatch(worldPosRel, L);
+}
+
+
+
+
+
+
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
+{
+
+    if (apFogActive()) { return apApplyFog(lit, worldPosRel); }
+
+
+
+    float fog = mwFogFactorAt(worldPosRel);
+
+
+
+
+    float2 wf = waterFogSample(worldPosRel);
+
+
+
+
+
+
+
+
+
+    fog = saturate(fog);
+
+
+
+
+
+
+    if (fog >= 1.0f && wf.x == 0.0f && wf.y == 0.0f && !waterCameraSubmerged()) { return lit; }
+
+    float4 s = fogSkySample(pixelXy);
+#line 458 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float fogAir = mwFogAirShare(fog, wf.y, length(worldPosRel));
+#line 484 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    if (waterCameraSubmerged()) { fogAir = 1.0f; }
+#line 518 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
+    float skyBehind = max(s.a, saturate(upness *  38.0f ));
+#line 575 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float3 behind = waterFogComposite(lit, worldPosRel, wf);
+
+
+
+
+
+    behind *= fogExtinction(fogAir, skyBehind);
+
+
+
+
+
+    return lerp(fogSkyTarget(s, fogSkyShare(fogAir), fogHazeTarget(worldPosRel, fogAir)), behind, fogAir);
+}
+#line 61 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyhw.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float2, Uv, TEXCOORD0);
-#line 65
+#line 66
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -3253,7 +3577,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float4 hpA = mul(gSkyView.invViewProj, float4(ndc, 0.25f, 1.0f));
     float4 hpB = mul(gSkyView.invViewProj, float4(ndc, 0.75f, 1.0f));
     float3 dir = normalize(hpA.xyz / hpA.w - hpB.xyz / hpB.w);
-#line 121 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyhw.frag.fsl"
+#line 122 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyhw.frag.fsl"
     float3 Lnative = atmosSkyRadianceNative(dir, gSkyView.sunDirW.w);
 
 
@@ -3267,6 +3591,12 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float3 L = Lnative * gSkyView.radiance.w;
 
     L = atmosSkyHazed(dir, L);
+#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyhw.frag.fsl"
+    if (dir.z < 0.0f && !waterFogCameraSubmerged() && apFogActive())
+    {
+        const float bedRel = -2048.0f - gFrameData.lodEye.z;
+        if (bedRel < 0.0f) { L = apApplyFog(f3(0.0f), dir * (bedRel / dir.z)); }
+    }
 
 
 

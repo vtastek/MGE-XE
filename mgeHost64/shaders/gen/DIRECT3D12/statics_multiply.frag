@@ -2619,6 +2619,7 @@ float2 apAtlasUv(float2 uv, float k, float row0)
 
 
 
+
 void apSample(float3 worldPosRel, float airLen, out(float3) T, out(float3) L)
 {
     const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));

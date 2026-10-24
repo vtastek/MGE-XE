@@ -40,8 +40,9 @@ float2 apAtlasUv(float2 uv, float k, float row0)
 
 // T and L for a point `worldPosRel` (relative to THIS view's eye) whose AIR path is `airLen` units.
 // Slice k ends at D((k+1)/N)^2, so the fractional slice is sqrt(d/D) N - 1; below slice 0 the value
-// runs from the eye's (T = 1, L = 0). Past D it holds the last slice: the far plane is D, so nothing
-// drawn lies beyond it.
+// runs from the eye's (T = 1, L = 0). Past D it holds the last slice, which is exact: S3.6 put D where
+// the air is opaque (T = 1e-4), not at the far plane, which is at infinity now that the sea runs to the
+// true horizon.
 void apSample(float3 worldPosRel, float airLen, out(float3) T, out(float3) L)
 {
     const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));

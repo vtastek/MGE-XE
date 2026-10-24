@@ -58,13 +58,13 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float2 frac_ = gMvParams.screenParams.xy * gMvParams.allocParams.xy;
     float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
 
-    // ⚠ NO SPECIAL CASE FOR THE SKY, AND NONE IS NEEDED. Reverse-Z far (dz == 0, the per-frame
-    // clear, which is what every sky and un-drawn pixel carries) is NOT infinity here: the frame has
-    // a FINITE far plane (DrawDist x cellSize), so this unprojects to a real point at that distance
-    // and reprojects to the rotation-only motion the sky actually has. A translation of a few tens
-    // of units against a far plane in the hundreds of thousands is ~1e-4 rad, i.e. correctly
-    // negligible. An infinite far plane would make w == 0 here and would need the special case.
-    float4 wp  = mul(gMvParams.invViewProj, float4(ndc, dz, 1.0f));
+    // ⚠ THE SKY (dz == 0, the per-frame clear, which every sky and un-drawn pixel carries) IS AT
+    // INFINITY since S3.6 put the exterior far plane there, so w would be 0 and the point inf/NaN.
+    // It is pushed to a FINITE depth instead: zn/1e-6 ~ 4M units, where a translation of a few tens
+    // of units is ~1e-5 rad, so it reprojects to the rotation-only motion the sky actually has —
+    // what the old finite far plane (DrawDist x cellSize) gave for free. The far sea, which writes
+    // no depth, takes the same vector, and it is that far away.
+    float4 wp  = mul(gMvParams.invViewProj, float4(ndc, max(dz, 1.0e-6f), 1.0f));
     float3 rel = wp.xyz / wp.w;
 
     float2 mv       = float2(0.0f, 0.0f);

@@ -331,7 +331,11 @@ float3 apSkyMatch(float3 worldPosRel, float3 L)
     if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
     const float3 Lsky = atmosSkyHazedAt(dir, atmosSkyRadianceNative(dir, r) * scale, r, scale);
     const float3 Lfar = apSampleFar(worldPosRel);
-    return L * clamp(Lsky / max(Lfar, f3(1.0e-6f)), f3(0.0f), f3(4.0f));
+    // The clamp sits on L/Lfar — how much of the column's far in-scatter this fragment has reached,
+    // in [0,1] since in-scatter only grows along a column — never on Lsky/Lfar, which is unbounded:
+    // at sunset the anti-sun sky is MW's orange over a blue Rayleigh volume, red ran past a 4x clamp
+    // and the far sea came out grey under an orange horizon.
+    return Lsky * saturate(L / max(Lfar, f3(1.0e-6f)));
 }
 
 float3 apApplyFog(float3 lit, float3 worldPosRel)

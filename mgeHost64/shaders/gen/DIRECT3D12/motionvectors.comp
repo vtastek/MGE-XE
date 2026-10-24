@@ -1060,7 +1060,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-    float4 wp = mul(gMvParams.invViewProj, float4(ndc, dz, 1.0f));
+    float4 wp = mul(gMvParams.invViewProj, float4(ndc, max(dz, 1.0e-6f), 1.0f));
     float3 rel = wp.xyz / wp.w;
 
     float2 mv = float2(0.0f, 0.0f);

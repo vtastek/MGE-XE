@@ -8641,9 +8641,17 @@ namespace RenderProcess {
         // is walked from MW's own skyRoot, which MW renders inside mwProj by construction.
         const bool isExterior = MWBridge::get()->IsExterior();
         D3DXMATRIX farProj = DistantLand::mwProj;
+        // S3.6: the far plane is at INFINITY, not at the draw distance. The land still stops at
+        // DrawDist (the host's terrain and statics culls own that), but the sea does not: the water
+        // mesh's outer ring reaches 8x past it, and a far plane at DrawDist cut it there, leaving a
+        // fog-coloured wall between the waterline and the true horizon that grew with eye height
+        // (atan(h / fogEnd); 11 deg from 325 m). zf -> inf of editProjectionZ: _33 = 1, _43 = -zn.
+        // Exact rather than a large finite far, whose zf/(zf-zn) is 1 within a few float ulps and
+        // whose slope the host's reverse-Z flip (col3 - col2) would then lose.
         if (isExterior) {
             const float zn = (farProj._33 != 0.0f) ? (-farProj._43 / farProj._33) : 4.0f;
-            DistantLand::editProjectionZ(&farProj, zn, Configuration.DL.DrawDist * DistantLand::kCellSize);
+            farProj._33 = 1.0f;
+            farProj._43 = -zn;
         }
         D3DXMATRIX viewProj;
         D3DXMatrixMultiply(&viewProj, &viewRel, &farProj);

@@ -280,12 +280,33 @@ STRUCT(VSOutput)
 
 // Reconstruct camera-relative world position from a screen UV + reverse-Z device depth, exactly as
 // gtao.comp's reconstructWorld (invViewProj of the SAME camera-relative rzViewProj).
+// S3.6: the exterior far plane is at infinity, so the un-drawn depth 0 (sky in the main view AND in
+// gReflectDepth, and nothing-behind past the land's end) would give w = 0 and inf/NaN. Clamped as
+// volfog.frag does: it lands ~4M units out, which every consumer below reads as "very far".
 float3 reconstructWorld(float4x4 invVP, float2 uv, float deviceZ)
 {
     float ndcX = uv.x * 2.0f - 1.0f;
     float ndcY = 1.0f - uv.y * 2.0f;
-    float4 p = mul(invVP, float4(ndcX, ndcY, deviceZ, 1.0f));
+    float4 p = mul(invVP, float4(ndcX, ndcY, max(deviceZ, 1.0e-6f), 1.0f));
     return p.xyz / p.w;
+}
+
+// THE SCENE BEHIND THE SURFACE, with MISSING LAND as DEFAULT SEABED (S3.6, user: "we should add the missing
+// land as default seabed anyhow"). Inside the draw distance the terrain grid already draws MW's default
+// cell (a flat sheet at -2048) wherever no LAND record exists; past it the sea now runs to the true horizon
+// and the depth there is 0 = nothing. That ray meets the same sheet here, analytically, so the far sea has
+// the seabed the near sea has instead of a bottomless 4M-unit water column. Main-view scene depth only —
+// the mirror's depth 0 is SKY (reflDist), which goes through reconstructWorld.
+float3 reconstructScene(float4x4 invVP, float2 uv, float deviceZ)
+{
+    float3 p = reconstructWorld(invVP, uv, deviceZ);
+    if (deviceZ <= 0.0f)
+    {
+        const float3 d = normalize(p);
+        const float  bedRel = -2048.0f - gFrameData.lodEye.z;   // terrain.h: VHGT -256 x kHeightScale 8
+        if (d.z < -1.0e-6f && bedRel < 0.0f) { p = d * (bedRel / d.z); }
+    }
+    return p;
 }
 
 // --- THE OCCLUSION GUARD ON A DISTORTED TAP ----------------------------------------------------
@@ -341,7 +362,7 @@ float occlusionFrom(float waterDist, float sceneDist, float nearRange)
 float sceneOcclusionAt(float4x4 invVP, float2 uvVp, float2 texToVp, float waterDist, float nearRange)
 {
     float devZ      = waterSceneDevZ(uvVp / texToVp);
-    float sceneDist = length(reconstructWorld(invVP, uvVp, devZ));
+    float sceneDist = length(reconstructScene(invVP, uvVp, devZ));
     return occlusionFrom(waterDist, sceneDist, nearRange);
 }
 
@@ -2117,7 +2138,7 @@ float4 PS_MAIN( VSOutput In )
     float shorePre = 0.0f;
     if (shoreDepthMax > 0.0f) {
         float  shoreDevZ = waterSceneDevZ(baseUV);
-        float  shoreDist = length(reconstructWorld(invVP, baseUV * texToVp, shoreDevZ));
+        float  shoreDist = length(reconstructScene(invVP, baseUV * texToVp, shoreDevZ));
         float  shoreDepth = max(shoreDist - dist, 0.0f) + shoreBreath * (0.95f - normal.z);
         shorePre = (1.0f - smoothstep(0.0f, shoreDepthMax, shoreDepth))
                  * (1.0f - smoothstep(shoreFadeNear, shoreFadeFar, dist))
@@ -2156,7 +2177,7 @@ float4 PS_MAIN( VSOutput In )
     // --- refraction (depth-gated, distorted) ---
     float2 distUV   = clampAllocUV(baseUV + reffactorR.yx * invAlloc);
     float  sceneDevZ= waterSceneDevZ(distUV);
-    float3 sceneW   = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
+    float3 sceneW   = reconstructScene(invVP, distUV * texToVp, sceneDevZ);
     float  sceneDist= length(sceneW);
     // ⚠ W22e — `depth` AND ITS RAMP ARE GONE. `saturate(depth / 100.0f)` used to scale the tap
     // below, and it is the last surviving instance of a mistake this file has already fixed twice
@@ -2792,7 +2813,7 @@ float4 PS_MAIN( VSOutput In )
             // Shore band from the vertical water depth under this pixel (undistorted), muted at
             // silhouettes the way shorePre is.
             const float  fDevZ  = waterSceneDevZ(baseUV);
-            const float  fDist  = length(reconstructWorld(invVP, baseUV * texToVp, fDevZ));
+            const float  fDist  = length(reconstructScene(invVP, baseUV * texToVp, fDevZ));
             const float  vDepth = max(fDist - dist, 0.0f) * abs(EyeVec.z) + 40.0f * (0.95f - normal.z);
             // A GRADIENT, not a strip: full at the waterline, gone by ~1.7 m of depth. The cover stays
             // <= 1 so the erosion below always has noise left to carve — at 1.6 it saturated into a

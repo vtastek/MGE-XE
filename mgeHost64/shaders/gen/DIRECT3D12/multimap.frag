@@ -4915,6 +4915,7 @@ float2 apAtlasUv(float2 uv, float k, float row0)
 
 
 
+
 void apSample(float3 worldPosRel, float airLen, out(float3) T, out(float3) L)
 {
     const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));
@@ -5057,7 +5058,11 @@ float3 apSkyMatch(float3 worldPosRel, float3 L)
     if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
     const float3 Lsky = atmosSkyHazedAt(dir, atmosSkyRadianceNative(dir, r) * scale, r, scale);
     const float3 Lfar = apSampleFar(worldPosRel);
-    return L * clamp(Lsky / max(Lfar, f3(1.0e-6f)), f3(0.0f), f3(4.0f));
+
+
+
+
+    return Lsky * saturate(L / max(Lfar, f3(1.0e-6f)));
 }
 
 float3 apApplyFog(float3 lit, float3 worldPosRel)
@@ -5107,14 +5112,14 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
     if (fog >= 1.0f && wf.x == 0.0f && wf.y == 0.0f && !waterCameraSubmerged()) { return lit; }
 
     float4 s = fogSkySample(pixelXy);
-#line 454 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 458 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float fogAir = mwFogAirShare(fog, wf.y, length(worldPosRel));
-#line 480 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 484 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     if (waterCameraSubmerged()) { fogAir = 1.0f; }
-#line 514 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 518 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
     float skyBehind = max(s.a, saturate(upness *  38.0f ));
-#line 571 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 575 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float3 behind = waterFogComposite(lit, worldPosRel, wf);
 
 

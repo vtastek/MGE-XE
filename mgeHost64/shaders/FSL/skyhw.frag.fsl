@@ -57,6 +57,7 @@
 #include "linearize.h.fsl"  // linearToSrgb(), for the gamma-domain build
 #include "scenecolor.h.fsl" // tonemapInPass()/sceneIsLinear() — which units the target wants
 #include "waterfog.h.fsl"   // the sky is behind water too, exactly as sky.frag has to handle
+#include "skydome.h.fsl"    // apApplyFog(): the default seabed past the land (S3.6)
 
 STRUCT(VSOutput)
 {
@@ -131,6 +132,23 @@ float4 PS_MAIN(VSOutput In)
     float3 L = Lnative * gSkyView.radiance.w;
     // S3.5b: the haze in front of it (skyradiance.h.fsl). skyHaze 0 = untouched.
     L = atmosSkyHazed(dir, L);
+
+    // --- S3.6: DEFAULT SEABED where the land is missing --------------------------------------------
+    // User: "we should add the missing land as default seabed anyhow." The sea runs to the true horizon
+    // now (infinite far plane), and the water is a BLENDED surface: what lies behind it arrives as the
+    // destination. Inside the draw distance that is terrain — MW's default cell, a flat sheet at -2048,
+    // wherever no LAND record exists — already water- and air-fogged by its own applyFog. Past the last
+    // terrain cell the destination was THIS pass, i.e. the sky, so the far sea came out as bright as the
+    // sky in cell-shaped steps (measured, ibovivecwaterlinefogline.ess @ apVis 3). A downward ray here
+    // meets the same sheet, and gets exactly what a terrain fragment there would: its lit colour through
+    // the water column, then the air. The lit colour is 0 — under >= 2048 units of water the seabed's own
+    // light is extinguished both ways, and 0 invents no albedo. Above water and on the AP path only (the
+    // old curtain needs the screen-space sky snapshot this pass is busy writing).
+    if (dir.z < 0.0f && !waterFogCameraSubmerged() && apFogActive())
+    {
+        const float bedRel = -2048.0f - gFrameData.lodEye.z;   // terrain.h: VHGT -256 x kHeightScale 8
+        if (bedRel < 0.0f) { L = apApplyFog(f3(0.0f), dir * (bedRel / dir.z)); }
+    }
 
     // --- the sky is behind water too (W8) ----------------------------------------------------
     // Verbatim the gate and the reasoning sky.frag carries: the sky has no POSITION, only a
