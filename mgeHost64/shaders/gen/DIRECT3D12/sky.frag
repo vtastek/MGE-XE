@@ -1324,7 +1324,13 @@ STRUCT(ShadowMaskParams)
 
 
     float4 pgiCapEye;
-#line 1126
+
+
+
+
+    float4 apFog0;
+    float4 apFog1;
+#line 1132
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2593,6 +2599,12 @@ float3 atmosHazeRadianceAt(float3 dir, float r, float scale)
 
 
     lvl = min(lvl, hl * scale);
+
+
+
+
+
+    lvl = max(lvl, gShadowParams.skyHaze2.w);
     if (!(hl > 1.0e-20f)) { return f3(0.0f); }
 
     float4 h1 = gShadowParams.skyHaze1;

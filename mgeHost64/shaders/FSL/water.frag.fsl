@@ -2957,7 +2957,16 @@ float4 PS_MAIN( VSOutput In )
 	// the same contradiction, and between them they could take the air fog off the water surface
 	// entirely on any frame the two underwater lanes fell out of step. One branch decides the medium,
 	// at the top; nothing downstream re-litigates it.
-	if (!noFogMelt) {
+	// S3.4 fogModel 1: the same air column out of the aerial-perspective volume. The DESTINATION took
+	// its own `T` and `L` through applyFog over this same eye->surface segment, so through the blend
+	// this surface scales only what it sends (`result * T`) and adds the in-scatter only for the share
+	// it owns (`1 - kDst`); kDst takes no factor, because nothing here is an extra darkening any more.
+	// Expanded: result*T + L*(1-kDst) + kDst*(seabed*T + L) = (result + kDst*seabed)*T + L.
+	if (!noFogMelt && apFogActive()) {
+	    float3 apT, apL;
+	    apSample(In.WorldPos, length(In.WorldPos), apT, apL);
+	    result = result * apT + apSkyMatch(In.WorldPos, apL) * (1.0f - kDst);
+	} else if (!noFogMelt) {
 	    float E = fogExtinction(fog, 1.0f);
 	    result *= E;
 	    kDst   *= E;      // ...and the destination with it — see above.

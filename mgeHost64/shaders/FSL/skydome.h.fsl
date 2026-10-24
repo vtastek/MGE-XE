@@ -55,6 +55,7 @@
 #include "fog.h.fsl"      // mwFogAirShare() — the air/water ray split
 #include "atmosphere.h.fsl"  // the sky-view uv mapping, for fogHazeTarget()
 #include "skyradiance.h.fsl" // ...and the one sample of the drawn sky it melts toward
+#include "aerial.h.fsl"      // S3.4: fogModel 1 — the air as a medium (apFogActive, apSample)
 
 // ORDER MATTERS, and getting it wrong is why v2 still read as a cutout at mid distance. Extinction
 // applied to the fog TARGET only shows up once fog is complete — by which point the surface has
@@ -294,6 +295,55 @@ float fogExtinction(float fogAir, float skyBehind)
 // keep the horizon from being a hard line.
 #define FOG_SKY_HORIZON_RAMP 38.0f
 
+// ─── S3.4: fogModel 1 — THE AIR IS A MEDIUM, NOT A CURTAIN ──────────────────────────────────────
+// `lit * T + L` out of the aerial-perspective volume (aerial.h.fsl), in the order light arrives:
+// WATER FIRST (the segment under the surface, exactly as below), THEN the air over the eye-side
+// share of the ray. MW's fog scalar, the knee, the haze target, the lift, the sun floor and the
+// extinction knob do not exist on this path: a far ridge reaches the sky's colour because the air in
+// front of it IS the sky's integral stopped at the ridge, so nothing has an edge to draw.
+//
+// The air path is the ray's length times its AIR share — MW's fog was uniform density, so the old
+// path scaled opacity by the share; here the medium is integrated, so the share scales the LENGTH.
+// With the eye under water the air segment is the far part of the ray, beyond the volume's reach,
+// and what the water fog leaves is returned as it is (the old path's `fogAir = 1`, same reason).
+// THE EDGE GUARANTEE: THE AIR SATURATES TO THE SKY THAT IS DRAWN BEHIND IT. Each column's in-scatter is
+// scaled, per channel, by (drawn sky in this direction) / (the column's own saturated value, its last
+// slice). At the far plane a surface is then covered by exactly the sky above it, up to T(D) x surface
+// (2% Clear, 0.2% Cloudy) — so the world's edge cannot draw a line at any height — and nearer air keeps
+// its physical (1 - T) growth, in the horizon's colour and level.
+//
+// Measured before it, ibokarthgad2 Cloudy, eye 4000-12000 (sky-fm1b): the edge stepped to 0.78-0.83 of
+// the sky at every height. Two sources, both the sky's and not the air's: (1) S3.5b's haze brings the
+// drawn horizon DOWN to the clouds' level ("the cloud texture is the exposure"), and the band between
+// the eye plane and the edge is drawn at that haze value; (2) the horizon ray gathers light from far
+// beyond the draw distance (the deck, higher air). A ratio to the drawn sky absorbs both and needs no
+// distance knee: the factor is constant along the column, so it cannot draw a line in depth either.
+//
+// The DRAWN sky is the one skyhw draws: the sky-view sample, through the haze; a downward ray reads the
+// horizon at its own angle to the sun (atmosHorizonDirSameAngle), exactly the sample the band below the
+// eye plane is drawn from. skyZenith.y = this view's eye offset (the water mirror's virtual eye).
+float3 apSkyMatch(float3 worldPosRel, float3 L)
+{
+    const float  scale = gFrameData.skyZenith.x;
+    const float  r     = gAtmosParams.planet.w;
+    const float3 ray   = worldPosRel - float3(0.0f, 0.0f, gFrameData.skyZenith.y);
+    float3 dir = ray * rsqrt(max(dot(ray, ray), 1.0e-12f));
+    if (dir.z < 0.0f) { dir = atmosHorizonDirSameAngle(dir); }
+    const float3 Lsky = atmosSkyHazedAt(dir, atmosSkyRadianceNative(dir, r) * scale, r, scale);
+    const float3 Lfar = apSampleFar(worldPosRel);
+    return L * clamp(Lsky / max(Lfar, f3(1.0e-6f)), f3(0.0f), f3(4.0f));
+}
+
+float3 apApplyFog(float3 lit, float3 worldPosRel)
+{
+    float2 wf = waterFogSample(worldPosRel);
+    float3 behind = waterFogComposite(lit, worldPosRel, wf);
+    if (waterCameraSubmerged()) { return behind; }
+    float3 T, L;
+    apSample(worldPosRel, length(worldPosRel) * (1.0f - wf.y), T, L);
+    return behind * T + apSkyMatch(worldPosRel, L);
+}
+
 // THE fog operation: extinguish, then melt. The fog is MW's scalar — 1 = clear, 0 = fully fogged —
 // evaluated per pixel from worldPosRel (no longer passed in from a per-vertex interpolator).
 // worldPosRel = the camera-relative world position every lit path already carries.
@@ -301,6 +351,9 @@ float fogExtinction(float fogAir, float skyBehind)
 // apart one shader at a time.
 float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy)
 {
+    // S3.4: the aerial-perspective volume replaces everything below when the host arms it.
+    if (apFogActive()) { return apApplyFog(lit, worldPosRel); }
+
     // PER PIXEL (fog.h.fsl mwFogFactorAt): the interpolated vertex fog a long wall carried was the
     // average of its far corners', not the fog at the point you are looking at.
     float fog = mwFogFactorAt(worldPosRel);

@@ -24,6 +24,7 @@
 
 #include "opaque.srt.h"
 #include "fog.h.fsl"     // mwFogAirShareAt() — the air/water ray split
+#include "aerial.h.fsl"  // S3.4: apFogActive / apTransmittanceMean
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve itself is never called here)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // mod2xStage() — the near path's twin op, in the scene's domain
@@ -78,6 +79,10 @@ float4 PS_MAIN( VSOutput In )
         const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
         if (PGI_IS_EMIS(capDbg)) { RETURN(float4(pgiCapEmisPxD(capDbg, In.Position.xy) ? t : f3(1.0f), 1.0f)); }
     }
-    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
+    // S3.4 fogModel 1: the layer's darkening survives in proportion to what the air lets through.
+    const float fk = apFogActive()
+                   ? apTransmittanceMean(In.WorldPos, length(In.WorldPos) * (1.0f - waterFogSample(In.WorldPos).y))
+                   : saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos));
+    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, fk);
     RETURN(float4(m, 1.0f));
 }

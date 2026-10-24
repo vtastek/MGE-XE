@@ -129,6 +129,19 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         {
             if (dz <= 0.0f) { continue; }
         }
+        // ...AND AIR REJECTION (S3.4, srcDims.z = the distance in MW units past which the aerial
+        // perspective keeps less than half of a surface; 0 = off). Past it the pixel is mostly the
+        // air's light, which is the drawn horizon by construction — i.e. SKY in all but depth — so it
+        // is absent for the sky's reason. Counted, the bright haze over the far sea pulled E down
+        // 3.5x (0.141 -> 0.040 at ibokarthgad2, eye 10000) and darkened the whole frame with it.
+        if (gAplParams.srcDims.z > 0.0f && dz > 0.0f)
+        {
+            float2 uvA = (float2(pd) + 0.5f) / srcSize;
+            float4 hA  = mul(gAplParams.invViewProj,
+                             float4(uvA.x * 2.0f - 1.0f, 1.0f - uvA.y * 2.0f, dz, 1.0f));
+            float3 pA  = hA.xyz * ((abs(hA.w) > 1.0e-12f) ? (1.0f / hA.w) : 0.0f);
+            if (dot(pA, pA) > gAplParams.srcDims.z * gAplParams.srcDims.z) { continue; }
+        }
         // Camera-relative world Z of whatever this pixel is showing, against the water plane in the
         // same space. `dz <= 0` is the reverse-Z far plane — nothing was drawn — and unprojecting it
         // would put the sample at infinity, so it stays LAND rather than being classified off a

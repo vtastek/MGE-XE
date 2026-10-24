@@ -1099,7 +1099,7 @@ STRUCT(ShadowMaskParams)
     // SKY HAZE (S3.5b/c, moved here from gSkyView by S3.4 so the FOG reads the same haze as the sky;
     // skyradiance.h.fsl atmosHazeTAt / atmosHazeRadianceAt). skyHaze0 = (tauZ 0 = off, H m, horizon air
     // mass, level x cloud anchor); skyHaze1 = (MW fog hue xyz luma 1, its share); skyHaze2 = (anchor
-    // diffuse, beam scale, deck radius m, 0). All zero = no haze.
+    // diffuse, beam scale, deck radius m, level floor = MW fog luma x skyHazeMwLevel). All zero = no haze.
     DATA(float4,   skyHaze0,         None);
     DATA(float4,   skyHaze1,         None);
     DATA(float4,   skyHaze2,         None);
@@ -1123,4 +1123,10 @@ STRUCT(ShadowMaskParams)
     // probe, CAMERA-RELATIVE xyz (the capture's view origin — NOT eyePos, which terrain LOD and fog key on), w = 1
     // when a probe-GI capture reflects the world cube in its PBR surfaces. Appended last.
     DATA(float4,   pgiCapEye,        None);
+    // S3.4 AERIAL PERSPECTIVE (aerial.h.fsl): apFog0 = (fogModel: 1 = every fog consumer reads the
+    // gAtmosAerial volume this frame, 0 = MW's curtain; D = the volume's far distance in MW units, 0, 0),
+    // apFog1 = (froxels across, froxels down, slices, 0). Written every frame; x is 0 in interiors and
+    // whenever the volume did not run. Appended last.
+    DATA(float4,   apFog0,           None);
+    DATA(float4,   apFog1,           None);
 };

@@ -15,6 +15,7 @@
 
 #include "opaque.srt.h"
 #include "fog.h.fsl"     // mwFogAirShareAt() — the air/water ray split
+#include "aerial.h.fsl"  // S3.4: apFogActive / apTransmittanceMean
 #include "tonemap.h.fsl"    // the curve + its inverse
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored GLOW map (step 6a)
@@ -60,5 +61,9 @@ float4 PS_MAIN( VSOutput In )
     if (PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
         RETURN(float4(pgiCapEmisPxD((uint)(gFrameData.debugParams.x + 0.5f), In.Position.xy) ? liftInPass(tex.rgb) * gShadowParams.sunny16.y : f3(0.0f), 0.0f));
     }
-    RETURN(float4(liftInPass(tex.rgb) * gShadowParams.sunny16.y * saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)), 0.0f));
+    // S3.4 fogModel 1: the air keeps T of what this layer adds; the in-scatter is the base surface's.
+    const float fk = apFogActive()
+                   ? apTransmittanceMean(In.WorldPos, length(In.WorldPos) * (1.0f - waterFogSample(In.WorldPos).y))
+                   : saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos));
+    RETURN(float4(liftInPass(tex.rgb) * gShadowParams.sunny16.y * fk, 0.0f));
 }

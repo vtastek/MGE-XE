@@ -1,0 +1,93 @@
+// mgeHost64 — AERIAL PERSPECTIVE, READ (tasks/forge-atmosphere.md S3.4).
+//
+// The air between the eye and a surface, out of atmos_aerial's froxel atlas (gAtmosAerial, layout in
+// atmosaerial.srt.h): what the surface keeps (T, per channel) and what the air adds (L, scene units).
+// `fogModel 1` (gShadowParams.apFog0.x) swaps every fog consumer onto this — applyFog, the water
+// surface's air segment, the additive and multiplicative statics layers — so MW's curtain at fogEnd
+// stops existing rather than being melted harder. The sky is the same integral to the top of the
+// atmosphere, so there is no knee, no lift, no sun floor and no extinction knob on this path.
+//
+// ⚠ THE VOLUME IS THE MAIN CAMERA'S FROXELS, AND EVERY VIEW READS IT THROUGH ITS OWN PROJECTION.
+// FrameData has no spare lane to say "I am the main view", and none is needed for the two views that
+// matter: in the main view the projection IS the one the froxels were built from (exact), and in the
+// water mirror the virtual camera lands each reflected point on the screen pixel where its reflection
+// shows, while length(worldPosRel) from the virtual eye is the whole reflected air path. The FP arms
+// are within metres, where the air is ~transparent. A probe capture's cube face gets a plausible row,
+// not its own — that is the residual this first cut carries.
+//
+// Requires opaque.srt.h (gFrameData, gShadowParams, gAtmosAerial).
+#ifndef AERIAL_H_FSL
+#define AERIAL_H_FSL
+
+// On only when the host published a live volume this frame AND this view has the physical sky's
+// native -> scene scale (skyZenith.x: 0 in interiors, with the sky off, or on an LDR target).
+bool apFogActive()
+{
+    return gShadowParams.apFog0.x > 0.5f && gFrameData.skyZenith.x > 0.0f;
+}
+
+// One slice's texel centre clamped inside its own 32-column block, so the bilinear tap never reaches
+// the neighbouring slice. `row0` is 0 for in-scatter, H for transmittance.
+float2 apAtlasUv(float2 uv, float k, float row0)
+{
+    const float W = gShadowParams.apFog1.x;
+    const float H = gShadowParams.apFog1.y;
+    const float N = gShadowParams.apFog1.z;
+    const float x = k * W + clamp(uv.x * W, 0.5f, W - 0.5f);
+    const float y = row0 + clamp(uv.y * H, 0.5f, H - 0.5f);
+    return float2(x / (W * N), y / (2.0f * H));
+}
+
+// T and L for a point `worldPosRel` (relative to THIS view's eye) whose AIR path is `airLen` units.
+// Slice k ends at D((k+1)/N)^2, so the fractional slice is sqrt(d/D) N - 1; below slice 0 the value
+// runs from the eye's (T = 1, L = 0). Past D it holds the last slice: the far plane is D, so nothing
+// drawn lies beyond it.
+void apSample(float3 worldPosRel, float airLen, out(float3) T, out(float3) L)
+{
+    const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));
+    const float2 ndc  = clip.xy / max(clip.w, 1.0e-6f);
+    const float2 uv   = saturate(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f));
+
+    const float D = gShadowParams.apFog0.y;
+    const float N = gShadowParams.apFog1.z;
+    const float H = gShadowParams.apFog1.y;
+    const float w = sqrt(saturate(airLen / max(D, 1.0f))) * N - 1.0f;
+    const float k0 = floor(w);
+    const float f  = w - k0;
+    const float k1 = min(k0 + 1.0f, N - 1.0f);
+
+    float3 L0 = f3(0.0f), T0 = f3(1.0f);
+    if (k0 >= 0.0f)
+    {
+        L0 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k0, 0.0f), 0).rgb;
+        T0 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k0, H), 0).rgb;
+    }
+    const float3 L1 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k1, 0.0f), 0).rgb;
+    const float3 T1 = SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, k1, H), 0).rgb;
+    T = lerp(T0, T1, f);
+    L = lerp(L0, L1, f) * gFrameData.skyZenith.x;   // native -> scene, the sky's own scale
+}
+
+// The column's SATURATED in-scatter: the last slice (the far plane), scene units. What a surface at the
+// draw distance in this direction is covered by — the value the sky behind it has to agree with.
+float3 apSampleFar(float3 worldPosRel)
+{
+    const float4 clip = mul(gFrameData.viewProj, float4(worldPosRel, 1.0f));
+    const float2 ndc  = clip.xy / max(clip.w, 1.0e-6f);
+    const float2 uv   = saturate(float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f));
+    const float  N    = gShadowParams.apFog1.z;
+    return SampleLvlTex2D(gAtmosAerial, gSamplerBilinearClamp, apAtlasUv(uv, N - 1.0f, 0.0f), 0).rgb
+         * gFrameData.skyZenith.x;
+}
+
+// The transmittance alone, as one number, for the BLEND layers that can only scale what they add
+// (statics_add) or how strongly they multiply (statics_multiply): the in-scatter belongs to the base
+// surface under them, which already took it.
+float apTransmittanceMean(float3 worldPosRel, float airLen)
+{
+    float3 T, L;
+    apSample(worldPosRel, airLen, T, L);
+    return dot(T, f3(1.0f / 3.0f));
+}
+
+#endif // AERIAL_H_FSL

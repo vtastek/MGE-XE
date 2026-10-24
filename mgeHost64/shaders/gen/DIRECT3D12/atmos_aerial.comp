@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 620 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
+#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosaerial.srt.h"
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosaerial.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
@@ -1024,7 +1024,10 @@ STRUCT(AtmosAerialParams)
     float4 rayDy;
 
     float4 dims;
-#line 29
+    float4 vert;
+
+
+#line 32
 };
 
 
@@ -1035,7 +1038,7 @@ STRUCT(AtmosAerialParams)
         Tex2D(float4) gAtmosTransmittance :  register(t2,space2);
         Tex2D(float4) gAtmosMultiScatter :  register(t3,space2);
         WTex2D(float4) gAtmosAerialOut :  register(u4,space2);
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
+#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 #line 85 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 float atmosCloudProfile(AtmosphereParams P, float h)
@@ -1427,7 +1430,7 @@ float2 atmosSkyViewUvFromDir(AtmosphereParams P, float r, float3 dir)
     }
     return atmosSkyViewUv(P, r, clamp(dir.z, -1.0f, 1.0f), lightViewCos);
 }
-#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
 #line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
@@ -1534,7 +1537,7 @@ void atmosSourceAt(AtmosphereParams P, float3 p, float3 rd, float3 sunDir,
     src = sunIn + msIn;
     srcC = sunInC + msInC;
 }
-#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
+#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_aerial.comp.fsl"
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(8, 8, 1)
@@ -1576,24 +1579,37 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     float3 L = f3(0.0f), Lc = f3(0.0f);
     float3 T = f3(1.0f), Tc = f3(1.0f);
-    float tPrev = 0.0f;
+
+
+
+
+
+    const float p = max(gApParams.vert.y, 1.0e-3f);
+    const float zPer = gApParams.vert.x;
+    float dPrev = 0.0f;
     for (int k = 0; k < N; ++k)
     {
         const float f = (float)(k + 1) / (float)N;
-        const float tK = D * f * f * mPerU;
-        const float dt = (tK - tPrev) / (float)M;
+        const float dK = D * f * f;
+        const float dd = (dK - dPrev) / (float)M;
         for (int j = 0; j < M; ++j)
         {
-            float3 p = origin + rd * (tPrev + dt * ((float)j + 0.5f));
+            const float d0 = dPrev + dd * (float)j;
+            const float d1 = d0 + dd;
+            const float dm = d0 + 0.5f * dd;
+            const float m0 = mPerU * D * pow(d0 / D, p);
+            const float m1 = mPerU * D * pow(d1 / D, p);
+            const float dt = m1 - m0;
+            const float tm = mPerU * D * pow(dm / D, p);
+            float3 pos = origin + float3(rd.xy * tm, rd.z * dm * zPer);
 
 
 
-
-            const float rp = length(p);
-            if (rp < Rg +  10.0f ) { p *= (Rg +  10.0f ) / max(rp, 1.0f); }
+            const float rp = length(pos);
+            if (rp < Rg +  10.0f ) { pos *= (Rg +  10.0f ) / max(rp, 1.0f); }
 
             float3 ext, extAir, src, srcC;
-            atmosSourceAt(gAtmosParams, p, rd, sunDir, phaseR, phaseM, phaseC, msGate,
+            atmosSourceAt(gAtmosParams, pos, rd, sunDir, phaseR, phaseM, phaseC, msGate,
                           ext, extAir, src, srcC);
             const float3 stepT = exp(-ext * dt);
             const float3 stepTC = exp(-extAir * dt);
@@ -1602,7 +1618,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             T *= stepT;
             Tc *= stepTC;
         }
-        tPrev = tK;
+        dPrev = dK;
 
         const int x = k * W + c.x;
         Write2D(gAtmosAerialOut, int2(x, c.y), float4(max(lerp(Lc, L, mixW), f3(0.0f)), 1.0f));

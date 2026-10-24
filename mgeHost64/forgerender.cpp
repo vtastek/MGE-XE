@@ -1044,6 +1044,22 @@ namespace {
     // MW; 0 = calibrated so Clear transmits 2% horizontally at the draw distance (apCalibrate).
     float g_apOn    = 1.0f;
     float g_apScale = 0.0f;
+    // S3.4: the ALTITUDE's scale in the aerial-perspective medium. 1 = real altitude, the sky-view LUT's
+    // own eye (so both integrals converge on one horizon); 0 = the distance scale (uniform, the first
+    // build: a 143 m hill stood 3.2 km up, above Cloudy's deck, and the far sea read 1.9x the sky).
+    float g_apAltScale = 1.0f;
+    // S3.4: the DISTANCE POWER p of the aerial-perspective medium: optical depth grows as (d/D)^p, so T at
+    // the draw distance stays the calibrated 2% (the edge stays closed) while p > 1 keeps the near field
+    // clearer. 1 = the physical medium (front-loaded: T 0.38 at D/4 — MW's linear fog had not started).
+    // 3 by the user's pick from the old / p1 / p2 / p3 contact sheet.
+    float g_apDistPow = 3.0f;   // user, 2026-10-24: "prefer clearer 3"
+    // The live weather row's sea-level green extinction (1/m), written by atmosDispatch's packing; 0 until
+    // the chain has packed once (apCalibrate then falls back to the Clear row).
+    float g_apBetaLiveG = 0.0f;
+    // S3.4 THE MASTER: 1 = every fog consumer reads the aerial-perspective volume (aerial.h.fsl),
+    // 0 = MW's curtain (knee, haze target, lift, sun floor, extinction) bit for bit — the A/B arm until
+    // the curtain's code is deleted.
+    float g_fogModel = 1.0f;    // ON since 2026-10-24 (user: "turn it on by default")
 
     // S2l: WHICH aerosol phase function the sky-view cook evaluates. 0 = single Henyey-Greenstein on
     // the row's mieG (the pre-S2l sky, bit for bit — the A/B arm); 1 = a sharp HG spike on a smooth
@@ -7506,6 +7522,8 @@ namespace {
     constexpr uint32_t kPgiSpecFloat          = kGiDebugFloat + 4;
     // H2 near probes (shadowparams.h.fsl pgiNear0, pgiNear1, pgiNearP; skyamb.h.fsl pgiNearOne).
     constexpr uint32_t kPgiNearFloat          = kPgiSpecFloat + 4;
+    // S3.4 aerial perspective (shadowparams.h.fsl apFog0, apFog1; aerial.h.fsl). After pgiNear0/1/P + pgiCapEye.
+    constexpr uint32_t kApFogFloat            = kPgiNearFloat + 16;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
@@ -7567,6 +7585,10 @@ namespace {
                   "ShadowMaskParams outgrew kShadowParamsBytes");
     static_assert(offsetof(ShadowMaskParams, pgiNear0) == kPgiNearFloat * sizeof(float),
                   "kPgiNearFloat does not land on ShadowMaskParams::pgiNear0");
+    static_assert(offsetof(ShadowMaskParams, apFog0) == kApFogFloat * sizeof(float),
+                  "kApFogFloat does not land on ShadowMaskParams::apFog0");
+    static_assert((kApFogFloat + 8) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams outgrew kShadowParamsBytes");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -22445,6 +22467,10 @@ namespace {
     // taken in (`scene` / `frame`) and prints the sky fraction beside it. Readings across the two
     // are not comparable, and every calibration target recorded from here on is a SCENE reading.
     bool   g_aplSkipSky  = true;
+    // ...AND THE AIR THAT HAS BECOME SKY (S3.4). With the aerial perspective on, a surface past the
+    // distance where the air keeps less than half of it reads as the drawn horizon; metered, the bright
+    // far haze pulled E 3.5x down and darkened the whole frame ("depressive"). Absent like sky.
+    bool   g_aplRejectAir = true;
     // SPLIT THE READING BY MEDIUM — water pixels (the view ray crossed the surface) against land.
     // Purely additive: [0..7] of the readback, and therefore the exposure servo, are untouched by
     // it. On by default because, like g_aplSkipSky, an instrument that ships switched off produces
@@ -23035,6 +23061,11 @@ namespace {
     float g_skyCloudAP     = 1.0f;     // share, 0 = off (the pre-S3.5d layer)
     float g_skyCloudApMinM = 300.0f;   // the shell never sits closer than this above the eye (m)
     float g_skyHazeMwHue = 1.0f;     // S3.5c: share of MW's authored fog HUE in the haze (0 = the medium's)
+    // S3.4: the haze's LEVEL is floored at MW's own fog brightness x this share (skyradiance.h.fsl
+    // atmosHazeRadianceAt). The cloud-anchored level sat 6.1x under MW's fog in Cloudy noon (4770 vs
+    // 28917 cd/m2) and the aerial fog inherits it; user, 2026-10-24: "MW original haze was brighter ...
+    // this is depressive for cloudy. loosen it." 0 = the S3.5b level alone.
+    float g_skyHazeMwLevel = 1.0f;
     float g_skyHazeLevel = 1.0f;     // haze radiance x the cloud anchor (texture white = 1). 1.0 put the
                                      // horizon ON the clouds at ibokarthgad2 (0.74-1.03 vs 0.73-0.83 p90,
                                      // 40 deg off the sun); 0.6 left it darker than them.
@@ -25543,6 +25574,9 @@ namespace {
             { "atmosMieMul",        &g_atmosMieMul        },
             { "apOn",               &g_apOn               },   // S3.3: aerial-perspective volume dispatch
             { "apScale",            &g_apScale            },   // S3.2: medium m per MW m, 0 = calibrated
+            { "apAltScale",         &g_apAltScale         },   // S3.4: altitude scale, 1 = real, 0 = = apScale
+            { "apDistPow",          &g_apDistPow          },   // S3.4: optical depth ~ (d/D)^p, 1 = physical
+            { "fogModel",           &g_fogModel           },   // S3.4: 1 = aerial perspective, 0 = MW curtain
             { "atmosMiePhase",      &g_atmosMiePhase      },
             { "atmosOzoneMul",      &g_atmosOzoneMul      },
             { "atmosMs",            &g_atmosMs            },
@@ -25553,6 +25587,7 @@ namespace {
             { "skyHazeM",           &g_skyHazeM           },
             { "skyHazeLevel",       &g_skyHazeLevel       },
             { "skyHazeMwHue",       &g_skyHazeMwHue       },   // S3.5c: MW fog hue share
+            { "skyHazeMwLevel",     &g_skyHazeMwLevel     },   // S3.4: haze level floored at MW fog x this
             { "skyCloudAP",         &g_skyCloudAP         },   // S3.5d: cloud aerial perspective
             { "skyCloudApMinM",     &g_skyCloudApMinM     },
             { "skyHazeClear",       &g_skyHazeW[0]        },   // per-weather share of skyHaze
@@ -26273,6 +26308,7 @@ namespace {
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
+            { "aplRejectAir",       &g_aplRejectAir       },   // S3.4: fogged-past-half samples absent
             { "arenaGpuWait",       &g_arenaGpuWait       },
             { "sunny16",            &g_sunny16            },
             { "skyAOStatics",       &g_skyAOStatics       },
@@ -50696,7 +50732,20 @@ void destroyHostWindow(Renderer* R);
                     // the render-rect pixels this would have indexed, so pd = the lattice cell.
                     p[24] = g_wddFrame ? (float)aplGrid : (float)g_live.width;
                     p[25] = g_wddFrame ? (float)aplGrid : (float)g_live.height;
-                    p[26] = 0.0f;
+                    // srcDims.z = AIR REJECTION (S3.4): the distance past which the aerial perspective
+                    // keeps less than half of a surface, from the calibration's own closed form
+                    // T(d) = exp(-3.912 (d/fogEnd)^p) -> d_half = fogEnd (ln2/3.912)^(1/p). Only while
+                    // the volume is armed this frame (apFog0.x) and the scale is calibrated; 0 = off.
+                    {
+                        float dHalf = 0.0f;
+                        if (g_aplRejectAir && sp && lf && sp[kApFogFloat + 0] > 0.5f && !(g_apScale > 0.0f)) {
+                            const float D  = sp[kApFogFloat + 1];
+                            const float fe = std::max(0.05f * D, std::min(lf[33], 4.0f * D));
+                            const float pw = std::max(0.25f, std::min(g_apDistPow, 4.0f));
+                            dHalf = fe * std::pow(0.69314718f / 3.912023f, 1.0f / pw);
+                        }
+                        p[26] = dHalf;
+                    }
                     p[27] = 0.0f;
                     // floats 28..31 = excl: this frame's probe-preview rect (uv), unmetered; then reset.
                     for (int i = 0; i < 4; ++i) { p[28 + i] = g_aplExcl[i]; g_aplExcl[i] = 0.0f; }
@@ -65587,7 +65636,12 @@ namespace ForgeRender {
                 mp[kSkyHazeFloat + 8]  = sp.cloudScene;
                 mp[kSkyHazeFloat + 9]  = hz ? sp.cloudBeamScale : 0.0f;
                 mp[kSkyHazeFloat + 10] = sp.cloudDeckRadiusM;
-                mp[kSkyHazeFloat + 11] = 0.0f;
+                // S3.4: MW's own fog LEVEL (luma of fogColNear in scene units) x the share, the floor
+                // under the haze's level. Not under water: there fogColNear is the WATER's colour.
+                const float mwY = 0.2126f * g_fogNearScene[0] + 0.7152f * g_fogNearScene[1]
+                                + 0.0722f * g_fogNearScene[2];
+                mp[kSkyHazeFloat + 11] = (hz && !g_waterFogUnder)
+                                       ? std::max(0.0f, mwY) * std::clamp(g_skyHazeMwLevel, 0.0f, 2.0f) : 0.0f;
             }
             mp[kGiDebugFloat + 0] = std::clamp(g_giTint, 0.0f, 1.0f);   // GI bounce inspection (gitint.h.fsl)
             mp[kGiDebugFloat + 1] = std::clamp(g_giTintLevel, 0.0f, 1.0f);
@@ -66410,6 +66464,9 @@ namespace ForgeRender {
                                g_atmosDeck, g_atmosMs, g_atmosDeckDown,
                                g_atmosSkySteps, 20.0f, g_atmosMsDirs,
                                g_atmosDeckSteps, lutDims, pk);
+        // S3.4 weather coupling: the LIVE row's sea-level extinction (green: Rayleigh sca + Mie ext) for
+        // apCalibrate. Not from a gate frame — that row is the reference sky, not the weather outside.
+        if (!gateFrame) { g_apBetaLiveG = pk[1] + pk[9]; }
 
         // The skip. A gate frame ALWAYS dispatches -- it exists to certify the live chain, and a
         // gate that could be served from cache would certify nothing ([[feedback_guard_fallback_is_the_bug]]).
@@ -66511,51 +66568,63 @@ namespace ForgeRender {
         }
     }
 
-    // ─── S3.2: THE WORLD SCALE THE AERIAL PERSPECTIVE MARCHES AT ────────────────────────────────────
-    // MW's draw distance is ~2 km, which real clear air barely hazes, so the medium sees MW's world
-    // stretched by one factor: Clear transmittance along the horizontal at the draw distance = 2%
-    // (Koschmieder's threshold, ln 50 = 3.912 optical depths). CALIBRATED, NOT CHOSEN: beta comes off
-    // packParams on the Clear reference row, so a change to the folded aerosol moves the scale with it
-    // and the clear-weather world still dissolves exactly where the geometry ends.
+    // ─── S3.2 + S3.4: THE WORLD SCALE THE AERIAL PERSPECTIVE MARCHES AT ─────────────────────────────
+    // MW's draw distance is ~2 km, which real clear air barely hazes, so the medium sees MW's distances
+    // stretched by one factor, chosen so the air reaches Koschmieder's 2% (ln 50 = 3.912 optical depths)
+    // at MW's OWN fog end for the weather outside — fogParams.y, FogD[weather] x AboveWaterFogEnd.
+    //
+    // ⚠ PER WEATHER, FROM MW. The first calibration used the Clear row and the draw distance once, so
+    // every weather took the medium table's own aerosol: Cloudy (mie 1.0 vs Clear 0.6) came out at ~60%
+    // of Clear's visibility, where MW authors it at 90% (fog end 117965 vs 131072 at ibokarthgad2). User:
+    // *"cloudy is clear adjacent, there should be more visibility."* Now the medium's density sets the
+    // COLOUR and the shape of the falloff, and MW's authored fog end sets HOW FAR the world reaches —
+    // Foggy closes in where MW says, Clear dissolves at the draw distance as before.
+    //
+    // With the distance power p the optical depth is beta x s x D_m x (d/D)^p, so s solves that = 3.912
+    // at d = fogEnd. beta is the live row's (atmosDispatch's packing), the Clear row's until it lands.
     struct ApScale { float s, D, betaG; };
     ApScale apCalibrate()
     {
-        static ApScale s_cal = {};
-        static float s_keyMie = -1.0f, s_keyDraw = -1.0f, s_keyPhase = -1.0f, s_keyOverride = -1.0f;
-        const float draw = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f);
-        if (s_keyMie == g_atmosMieMul && s_keyDraw == draw && s_keyPhase == g_atmosMiePhase
-            && s_keyOverride == g_apScale) {
-            return s_cal;
+        static float s_clearBeta = -1.0f, s_keyMie = -1.0f, s_keyPhase = -1.0f, s_lastLoggedS = -1.0f;
+        if (s_keyMie != g_atmosMieMul || s_keyPhase != g_atmosMiePhase) {
+            s_keyMie = g_atmosMieMul; s_keyPhase = g_atmosMiePhase;
+            // Rows 0..2 of the packed block are all this reads (Rayleigh scattering, Mie extinction); the
+            // sun, moon, deck and march arguments are inert for them, so they are passed at rest.
+            const float lutDims[6] = { (float)kAtmosSkyW, (float)kAtmosSkyH, (float)kAtmosTransW,
+                                       (float)kAtmosTransH, (float)kAtmosMsRes, (float)kAtmosMsRes };
+            const float up[3] = { 0.0f, 0.0f, 1.0f };
+            float pk[kAtmosParamFloats] = {};
+            Atmosphere::packParams(Atmosphere::referenceRow(), 0.1f, up, (float)Atmosphere::kGroundEpsM,
+                                   up, 0.0f, 0.0f, g_atmosMieMul, (g_atmosMiePhase >= 0.5f) ? 1 : 0,
+                                   g_atmosOzoneMul, 0.0f, g_atmosMs, g_atmosDeckDown,
+                                   g_atmosSkySteps, 20.0f, g_atmosMsDirs, 0.0f, lutDims, pk);
+            s_clearBeta = pk[1] + pk[9];
         }
-        s_keyMie = g_atmosMieMul; s_keyDraw = draw; s_keyPhase = g_atmosMiePhase; s_keyOverride = g_apScale;
-
-        // Rows 0..2 of the packed block are all this reads (Rayleigh scattering, Mie extinction); the
-        // sun, moon, deck and march arguments are inert for them, so they are passed at rest.
-        const float lutDims[6] = { (float)kAtmosSkyW, (float)kAtmosSkyH, (float)kAtmosTransW,
-                                   (float)kAtmosTransH, (float)kAtmosMsRes, (float)kAtmosMsRes };
-        const float up[3] = { 0.0f, 0.0f, 1.0f };
-        float pk[kAtmosParamFloats] = {};
-        Atmosphere::packParams(Atmosphere::referenceRow(), 0.1f, up, (float)Atmosphere::kGroundEpsM,
-                               up, 0.0f, 0.0f, g_atmosMieMul, (g_atmosMiePhase >= 0.5f) ? 1 : 0,
-                               g_atmosOzoneMul, 0.0f, g_atmosMs, g_atmosDeckDown,
-                               g_atmosSkySteps, 20.0f, g_atmosMsDirs, 0.0f, lutDims, pk);
-        const float betaG = pk[1] + pk[9];                          // green: Rayleigh sca + Mie ext, 1/m
+        const float draw  = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f);
         const float D     = draw * 8192.0f;                         // cells -> MW units: the far plane
         const float Dm    = D * Atmosphere::kMwUnitToMetre;
-        float s = (betaG > 0.0f && Dm > 0.0f) ? (3.912023f / (betaG * Dm)) : 1.0f;
+        const float betaG = (g_apBetaLiveG > 0.0f) ? g_apBetaLiveG : s_clearBeta;
+        // MW's fog end for this weather, off this frame's cbuffer. Clamped: under water the client swaps
+        // in the below-water range (~2458 u), and nothing reads the volume from there (both fog paths
+        // return first), but the scale must not go to infinity on the frame the eye surfaces.
+        const float* fdr = (g_live.pFrameCbv && fbr(g_live.pFrameCbv)) ? (const float*)fbr(g_live.pFrameCbv) : nullptr;
+        float fogEnd = fdr ? fdr[33] : D;
+        fogEnd = std::max(0.05f * D, std::min(fogEnd, 4.0f * D));
+        const float p    = std::max(0.25f, std::min(g_apDistPow, 4.0f));
+        const float reach = Dm * std::pow(fogEnd / D, p);           // medium metres per unit s at fogEnd
+        float s = (betaG > 0.0f && reach > 0.0f) ? (3.912023f / (betaG * reach)) : 1.0f;
         if (g_apScale > 0.0f) { s = g_apScale; }
-        s_cal = { s, D, betaG };
-        // The implied clear visual range is the sanity number: in the MEDIUM it is the aerosol's own
-        // (3.912 / beta), and in MW's world it is that over s — which is the draw distance by
-        // construction when calibrated, and says what an apScale override means when not.
-        LOG::logline(">> [forge-atmos] S3.2 aerial scale s=%.2f%s | draw %.0f cells = %.0f units = %.0f m"
-                     " | Clear sea-level beta_ext(G) %.3g /m -> visual range %.1f km of medium = %.0f m of MW",
-                     (double)s, (g_apScale > 0.0f) ? " (apScale OVERRIDE)" : " (calibrated: T=2% at draw)",
-                     (double)draw, (double)D, (double)Dm, (double)betaG,
-                     (betaG > 0.0f) ? (3.912 / betaG / 1000.0) : 0.0,
-                     (betaG > 0.0f) ? (3.912 / betaG / s) : 0.0);
-        LOG::flush();
-        return s_cal;
+        // Logged when it moves by more than 2% (weather walks it continuously).
+        if (!(s_lastLoggedS > 0.0f) || std::fabs(s / s_lastLoggedS - 1.0f) > 0.02f) {
+            s_lastLoggedS = s;
+            LOG::logline(">> [forge-atmos] aerial scale s=%.2f%s | MW fog end %.0f u (%.2f of draw %.0f u)"
+                         " | live beta_ext(G) %.3g /m (Clear %.3g) | p %.2f",
+                         (double)s, (g_apScale > 0.0f) ? " (apScale OVERRIDE)" : " (T=2% at MW's fog end)",
+                         (double)fogEnd, (double)(fogEnd / D), (double)D, (double)betaG,
+                         (double)s_clearBeta, (double)p);
+            LOG::flush();
+        }
+        return { s, D, betaG };
     }
 
     // ─── S3.3: THE AERIAL-PERSPECTIVE VOLUME, EVERY EXTERIOR FRAME ──────────────────────────────────
@@ -66565,19 +66634,38 @@ namespace ForgeRender {
     void atmosAerialDispatch(Cmd* C, const float* rzViewProj)
     {
         static bool s_logged = false;
-        if (!g_live.atmosApReady || g_apOn < 0.5f || !rzViewProj) { return; }
-        if (!g_live.atmosReady || !g_dlExterior || !g_skyHw || !g_atmosPkValid) { return; }
+        static bool s_valid  = false;   // the atlas holds a real exterior frame's volume
+        // S3.4: the fog consumers' switch, published EVERY frame (the shadow-params shadow keeps a lane
+        // that is not rewritten, so an exit that skipped this would leave a stale 1 into an interior).
+        const ApScale cal = apCalibrate();
+        auto publish = [&](bool on) {
+            float* mp = (float*)fbwRange(g_live.pShadowMaskParamsCbv, kApFogFloat * sizeof(float),
+                                         8 * sizeof(float));
+            if (!mp) { return; }
+            mp[kApFogFloat + 0] = (on && g_fogModel >= 0.5f) ? 1.0f : 0.0f;
+            mp[kApFogFloat + 1] = cal.D;
+            mp[kApFogFloat + 2] = 0.0f;
+            mp[kApFogFloat + 3] = 0.0f;
+            mp[kApFogFloat + 4] = (float)kApFroxW;
+            mp[kApFogFloat + 5] = (float)kApFroxH;
+            mp[kApFogFloat + 6] = (float)kApSlices;
+            mp[kApFogFloat + 7] = 0.0f;
+        };
+        if (!g_live.atmosApReady || g_apOn < 0.5f || !rzViewProj
+            || !g_live.atmosReady || !g_dlExterior || !g_skyHw || !g_atmosPkValid) {
+            s_valid = false;
+            publish(false);
+            return;
+        }
         // A GATE frame forces the reference sky into the params cbuffer for one dispatch; the volume
         // keeps the last real one rather than integrating a sky nobody stands under.
-        if (g_atmosGateFrame == g_renderFrame) { return; }
-
-        const ApScale cal = apCalibrate();
+        if (g_atmosGateFrame == g_renderFrame) { publish(s_valid); return; }
 
         // The froxel corner rays, camera-relative, from the frame's own raster matrix (row-vector
         // convention: clip = [x y z 1] * M). Each ray is the DIFFERENCE of two unprojected depths, so
         // it does not depend on where the matrix's origin sits (park restamps it; see eyeAbs).
         float inv[16];
-        if (!invert4x4(rzViewProj, inv)) { return; }
+        if (!invert4x4(rzViewProj, inv)) { publish(s_valid); return; }
         auto unproj = [&](float x, float y, float z, float o[3]) {
             const float v[4] = { x, y, z, 1.0f };
             float h[4];
@@ -66610,13 +66698,16 @@ namespace ForgeRender {
         };
         onPlane(c00); onPlane(c10); onPlane(c01);
 
+        const float altScale = (g_apAltScale > 0.0f) ? g_apAltScale : cal.s;
         const float altM = std::max((float)Atmosphere::kGroundEpsM,
-                                    g_eyeAbsShadow[2] * Atmosphere::kMwUnitToMetre * cal.s);
+                                    g_eyeAbsShadow[2] * Atmosphere::kMwUnitToMetre * altScale);
         float* v = (float*)fbw(g_live.pAtmosApCbv);
         v[0]  = c00[0];          v[1]  = c00[1];          v[2]  = c00[2];          v[3]  = cal.D;
         v[4]  = c10[0] - c00[0]; v[5]  = c10[1] - c00[1]; v[6]  = c10[2] - c00[2]; v[7]  = Atmosphere::kMwUnitToMetre * cal.s;
         v[8]  = c01[0] - c00[0]; v[9]  = c01[1] - c00[1]; v[10] = c01[2] - c00[2]; v[11] = Atmosphere::kGroundRadiusM + altM;
         v[12] = (float)kApFroxW; v[13] = (float)kApFroxH; v[14] = (float)kApSlices; v[15] = (float)kApSubSteps;
+        v[16] = Atmosphere::kMwUnitToMetre * altScale;                                            // vert
+        v[17] = std::max(0.25f, std::min(g_apDistPow, 4.0f)); v[18] = 0.0f; v[19] = 0.0f;
 
         TextureBarrier tb = {};
         tb.pTexture = g_live.pAtmosAerial;
@@ -66629,6 +66720,8 @@ namespace ForgeRender {
         tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
         tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
         cmdResourceBarrier(C, 0, nullptr, 1, &tb, 0, nullptr);
+        s_valid = true;
+        publish(true);
 
         if (!s_logged) {
             s_logged = true;

@@ -1090,6 +1090,19 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
+
+        if (gAplParams.srcDims.z > 0.0f && dz > 0.0f)
+        {
+            float2 uvA = (float2(pd) + 0.5f) / srcSize;
+            float4 hA = mul(gAplParams.invViewProj,
+                             float4(uvA.x * 2.0f - 1.0f, 1.0f - uvA.y * 2.0f, dz, 1.0f));
+            float3 pA = hA.xyz * ((abs(hA.w) > 1.0e-12f) ? (1.0f / hA.w) : 0.0f);
+            if (dot(pA, pA) > gAplParams.srcDims.z * gAplParams.srcDims.z) { continue; }
+        }
+
+
+
+
         bool isWater = false;
         if (gAplParams.opts.z > 0.5f && dz > 0.0f)
         {

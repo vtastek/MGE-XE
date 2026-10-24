@@ -214,7 +214,7 @@ float3 atmosCloudAerial(float3 dir, float3 Lc)
 // them from gSkyView (per view) and the fog from gAtmosParams / gFrameData.
 //   skyHaze0 = (tauZ, H m, horizon air mass M, level x the cloud anchor)
 //   skyHaze1 = (MW fog hue xyz, luma 1; w = its share)
-//   skyHaze2 = (anchor diffuse, beam scale, deck radius m, 0)
+//   skyHaze2 = (anchor diffuse, beam scale, deck radius m, the LEVEL FLOOR: MW fog luma x skyHazeMwLevel)
 float atmosHazeTAt(float3 dir, float r)
 {
     float4 h0   = gShadowParams.skyHaze0;
@@ -243,6 +243,12 @@ float3 atmosHazeRadianceAt(float3 dir, float r, float scale)
     // and uncapped the haze lifted the dusk sky 2.8x (nearfar @2700, 2026-10-14) — the wrong way, and
     // into the probes' sky, which dusk already reads too bright.
     lvl = min(lvl, hl * scale);
+    // ...and FLOORED at MW's own fog level x a share (skyHaze2.w, knob skyHazeMwLevel; 0 = off), S3.4.
+    // The cloud anchor sat 6.1x under MW's fog in Cloudy noon (4770 vs 28917 cd/m2) and the aerial
+    // fog inherits the horizon's level: *"this is depressive for cloudy. loosen it."* (user, 2026-10-24).
+    // After the cap on purpose: MW's authored fog follows the hour, so at dusk and night it is dark
+    // and the floor gives way to the cap's reason for being.
+    lvl = max(lvl, gShadowParams.skyHaze2.w);
     if (!(hl > 1.0e-20f)) { return f3(0.0f); }
     // S3.5c: MW's authored horizon hue (luma 1) in place of the medium's, by skyHaze1.w.
     float4 h1  = gShadowParams.skyHaze1;

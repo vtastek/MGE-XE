@@ -1324,7 +1324,13 @@ STRUCT(ShadowMaskParams)
 
 
     float4 pgiCapEye;
-#line 1126
+
+
+
+
+    float4 apFog0;
+    float4 apFog1;
+#line 1132
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

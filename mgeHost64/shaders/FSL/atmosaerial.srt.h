@@ -26,6 +26,9 @@ STRUCT(AtmosAerialParams)
     DATA(float4, rayDy, None);  // xyz = bottom-left minus top-left, w = the camera's radius in the
                                 //       scaled medium (m from the planet centre)
     DATA(float4, dims,  None);  // x = froxels across, y = froxels down, z = slices, w = sub-steps per slice
+    DATA(float4, vert,  None);  // x = altitude metres per MW unit of vertical travel (kMwUnitToMetre x
+                                //     apAltScale: real altitude at 1), y = the distance power p (apDistPow:
+                                //     medium distance = mPerU x D x (d/D)^p), zw = 0
 };
 
 BEGIN_SRT(AtmosAerialSrtData)
