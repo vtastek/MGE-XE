@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 1133 "FSL/shaders.list"
+#line 1140 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 3 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.srt.h"
@@ -2575,4 +2575,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     gPgiPlaceOut[s] = (lo > 1.0e8f) ? float4( -20000.0f  * 2.0f,  -20000.0f  * 2.0f, ix, iy) : float4(lo, hi, ix, iy);
     return;
 }
-#line 1134 "FSL/shaders.list"
+#line 1141 "FSL/shaders.list"

@@ -1,0 +1,173 @@
+// mgeHost64 — THE MEDIUM'S IN-SCATTERED SOURCE AT ONE POINT (tasks/forge-atmosphere.md S3.3).
+//
+// One sample of what a march along `rd` collects at `p`: the extinction of both cover arms and the
+// radiance each arm in-scatters toward the eye per unit length. atmos_skyview marches it to the top of
+// the atmosphere (the sky); atmos_aerial marches it to each froxel slice (aerial perspective). ONE
+// copy, because the fog and the sky meeting at the horizon is exactly the statement that they are the
+// same integral stopped at two distances — two copies of the source would be two media again.
+//
+// ⚠ INCLUDED ONLY BY COMPUTE PASSES THAT DECLARE gAtmosTransmittance AND gAtmosMultiScatter (and
+// gSamplerBilinearClamp). It reads them by name, which is why it is not in atmosphere.h.fsl: that file
+// is included by graphics frags whose SRT has no multiscatter LUT, and HLSL rejects an undeclared name
+// in a function body even when nothing calls it.
+//
+// `p` is relative to the PLANET CENTRE, in metres; `rd` is the unit march direction; `sunDir` the
+// unit vector toward the sun in the same frame. Outputs:
+//   ext / extAir   — the DECK arm's and the CLEAR arm's extinction (1/m)
+//   src / srcC     — the deck arm's and the clear arm's in-scattered radiance per metre (before the
+//                    step's (1 - e^-ext dt)/ext integral, which the caller applies with its own dt)
+#ifndef ATMOSSOURCE_H_FSL
+#define ATMOSSOURCE_H_FSL
+
+#include "atmosphere.h.fsl"
+
+void atmosSourceAt(AtmosphereParams P, float3 p, float3 rd, float3 sunDir,
+                   float phaseR, float phaseM, float phaseC, float msGate,
+                   out(float3) ext, out(float3) extAir, out(float3) src, out(float3) srcC)
+{
+    const float Rg = P.planet.x;
+    float  ri = length(p);
+    float  hi = ri - Rg;
+
+    // ⚠ THE MEDIUM IS SAMPLED PER STEP, NOT HOISTED. The atmosphere's parameters are a FIELD
+    // (atmosphere.h's whole discipline) and a march that evaluates the medium once at the
+    // camera is not integrating a field — it will keep working perfectly right up to the day
+    // the weather map stops being 1x1, at which point S6 becomes a rewrite of every march
+    // instead of a change to one function. Here the field is vertical (density profiles) and
+    // in S6 it becomes horizontal too; the call site is already inside the loop.
+    //
+    // The species' scattering, split so each takes its own phase function. This is the
+    // reason a Rayleigh sky is blue overhead and a Mie sky glares white around the sun: one
+    // is nearly isotropic and wavelength-selective, the other is strongly forward and grey.
+    // The cloud is the third, and it is what makes an overcast sky a flat bright lid.
+    float3 scaR, scaM, scaC, extCloud;
+    atmosMediumAt(P, hi, scaR, scaM, scaC, extAir, extCloud);
+    // (the species are summed at each USE now, not here: the air and the deck take
+    //  different multiple-scattering sources since A2 — see the note further down)
+    ext = extAir + extCloud;
+
+    // --- the SUN's contribution -------------------------------------------------------
+    float  muS  = dot(normalize(p), sunDir);
+    // Hoisted into a bool because the DECK's source below needs the same answer at a
+    // different radius; one ray-sphere test, two lookups.
+    bool   sunVis = (atmosRaySphere(p, sunDir, Rg) < 0.0f);
+    float3 sunT  = f3(0.0f);   // CLEAR arm: the air's beam
+    float  deckB = 1.0f;       // ...and the DECK's own share of it, grey (see the LUT's .a)
+    if (sunVis)
+    {
+        float2 tuv = atmosTransmittanceUv(P, ri, muS);
+        float4 tr  = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0);
+        sunT  = tr.rgb;
+        deckB = tr.a;
+    }
+    // The clear arm has no cloud to scatter off and no cloud shadowing its beam.
+    float3 sunInC = (scaR * phaseR + scaM * phaseM) * sunT * P.solar.xyz;
+    float3 sunIn  = (scaR * phaseR + scaM * phaseM + scaC * phaseC)
+                  * (sunT * deckB) * P.solar.xyz;
+
+    // --- the MOON's, on exactly the same terms (S2e) -----------------------------------
+    // ⚠ A SECOND SOURCE, NOT A SECOND MODEL. The moon enters the identical integral with its
+    // own direction and its own top-of-atmosphere irradiance, so moonlight is Rayleigh-
+    // scattered into a blue night sky by the same arithmetic that makes the day sky blue —
+    // which is what a night actually looks like and is not something a "fade to black" ramp
+    // could ever produce. w = 0 disarms it with no branch cost worth naming.
+    if (P.moonDir.w > 0.0f)
+    {
+        float3 mDir = P.moonDir.xyz;
+        float  cosM = clamp(dot(rd, mDir), -1.0f, 1.0f);
+        float  muM  = dot(normalize(p), mDir);
+        float3 moonT = f3(0.0f);
+        if (atmosRaySphere(p, mDir, Rg) < 0.0f)
+        {
+            float2 muv = atmosTransmittanceUv(P, ri, muM);
+            moonT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, muv, 0).rgb;
+        }
+        sunInC += (scaR * atmosPhaseRayleigh(cosM)
+                 + scaM * atmosPhaseAerosol(P, cosM))
+                * moonT * P.moonDir.w;
+        sunIn  += (scaR * atmosPhaseRayleigh(cosM)
+                 + scaM * atmosPhaseAerosol(P, cosM)
+                 + scaC * atmosPhaseMie(cosM, P.cloud.z))
+                * moonT * P.moonDir.w;
+    }
+
+    // --- the multiple-scattering term, isotropic by construction ------------------------
+    // ⚠⚠ SPLIT BY SPECIES SINCE S4a/A2, AND THE SPLIT IS A CONSERVATION FIX. The AIR reads
+    // the LUT, exactly as it always has. THE DECK CANNOT: its source here was `sca * ms *
+    // sInt` = `ssa * ms * (1 - stepT)`, and at a cloud's ssa of 0.9999 the deck's own optical
+    // depth CANCELS OUT OF ITS OWN SOURCE — so the term saturated at `ms` and stopped
+    // depending on tau. Measured across a 16x tau sweep, `f` was identical to five decimals
+    // and E_sky floored at 55% of the incoming flux however thick the lid got; at tau 3 the
+    // ground received 4.6x the energy arriving at the top of the atmosphere. And `ms` came
+    // off an altitude axis of 3.2 km per texel — wider than the whole deck — so the in-cloud
+    // lookup interpolated between a ground sample and one above the lid, NEITHER OF THEM
+    // INSIDE THE CLOUD. atmos_multiscatter.comp.fsl names both, and reserved exactly this
+    // fallback. The cloud is now dropped from that LUT's source too, so nothing is counted
+    // twice and `f` is an air-only quantity again.
+    float2 msUv = atmosMultiScatterUv(P, ri, muS);
+    float3 ms   = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, msUv, 0).rgb;
+    // ⚠ deckMix.y (msGate) IS AN A/B GATE ON THE AIR'S MULTIPLE SCATTERING, THE SAME KIND OF THING
+    // `atmosDeck` IS AND FOR THE SAME REASON: the clear sky reads 3.3x (red) to 8.2x (blue)
+    // above its own SINGLE-SCATTERING value, and no comparison against a published band can
+    // say which of the two additive sources in this loop is carrying that. 0 leaves exactly
+    // the first order, which is a quantity a CPU integral can reproduce to three digits —
+    // so the decomposition becomes checkable instead of arguable. 1 is the shipped medium.
+    float3 msIn = (scaR + scaM) * ms * msGate;
+
+    // THE DECK'S OWN, off the delta-Eddington two-stream slab deckSolve() solved this frame.
+    // ⚠ THE GATE IS THE CLOUD'S OWN SCATTERING, which is EXACTLY zero outside the slab and on
+    // a clear sky — so `atmosDeck 0` reaches the pre-S4a expression here term for term, and
+    // there is no second test that could disagree with the profile about where the deck is.
+    // ⚠⚠ ...AND THE SAME FIELD LIGHTS THE AIR BENEATH THE LID, WHICH HAD NO SOURCE AT ALL
+    // UNTIL S2h. Under a closed deck the beam is gone (`sun%` measured 0.003) and the air's
+    // MS LUT is shadowed BY DESIGN — atmos_multiscatter keeps the deck's extinction while
+    // dropping its scattering, and says so: *"the air under a lid really is in shadow"*.
+    // That was right about the shadow and silent about the replacement, so the ~110 km of
+    // air a HORIZON ray crosses before it climbs to the deck base in-scattered nothing, and
+    // all that reached the eye was the far deck through the whole Rayleigh column. Measured:
+    // the overcast horizon read (5435,3207,1317) — ORANGE — and its spectrum fits
+    // tau_550 = 0.7..1.1, i.e. 62-93 km of lambda^-4, against the 112 km the geometry
+    // requires. With the deck gated off the SAME horizon reads (7033,8538,9423), blue,
+    // within 3% of a clear sky's. Nothing authored is orange; this is.
+    //
+    // The fix is the term the slab already solved and nobody read below the lid. In-scatter
+    // is sigma_s * L_incident, so the only thing that changes across the cloud base is WHICH
+    // sigma_s — the droplets inside, the air beneath. The incident field is the same
+    // isotropic solution either way, continued downward at its BASE value (x = 1). That
+    // continuation is exact at the boundary, and the sub-deck column is under a kilometre so
+    // its own extinction is negligible; the horizon ray's LENGTH is carried by `throughput`,
+    // exactly as it is for every other source in the march.
+    bool inSlab   = (scaC.r > 0.0f);
+    bool underLid = (P.deckMix.w > 0.0f)
+                  && (P.cloud.x > 0.0f)
+                  && (hi < P.profGeom.z - P.profGeom.w);
+    if (inSlab || underLid)
+    {
+        // ⚠ THE BEAM AT THE LID, NOT AT THE SAMPLE. The slab was solved against the flux
+        // ARRIVING AT THE DECK, and its own attenuation with depth is already inside the
+        // table — so feeding it `sunT` from inside the cloud would apply the deck twice and
+        // black out the base, which is the only part of the field a camera under the lid can
+        // see. One extra fetch at the lid's radius; the deck is 1.2 km against a 6360 km
+        // planet, so the zenith cosine is the sample's to well past float precision.
+        float3 deckT = f3(0.0f);
+        if (sunVis)
+        {
+            float2 tuvL = atmosTransmittanceUv(P, Rg + P.profGeom.z + P.profGeom.w, muS);
+            deckT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuvL, 0).rgb;
+        }
+        // Inside the slab the scatterer is the droplets and the field is the slab's own
+        // solution at this depth; beneath it the scatterer is the AIR and the field is that
+        // solution's base value. One expression — `inSlab` is the only thing that differs.
+        float  xN    = inSlab ? atmosDeckDepth01(P, hi) : 1.0f;
+        float3 sigma = inSlab ? scaC : (scaR + scaM);
+        msIn += sigma * atmosDeckMs(P, xN) * P.solar.xyz * deckT;
+    }
+    // The clear arm takes the air's multiple scattering and nothing else — no deck source,
+    // and no deck in its extinction.
+    float3 msInC = (scaR + scaM) * ms * msGate;
+
+    src  = sunIn  + msIn;
+    srcC = sunInC + msInC;
+}
+
+#endif // ATMOSSOURCE_H_FSL

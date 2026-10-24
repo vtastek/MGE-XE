@@ -1434,6 +1434,113 @@ float2 atmosSkyViewUvFromDir(AtmosphereParams P, float r, float3 dir)
     return atmosSkyViewUv(P, r, clamp(dir.z, -1.0f, 1.0f), lightViewCos);
 }
 #line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
+#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
+
+void atmosSourceAt(AtmosphereParams P, float3 p, float3 rd, float3 sunDir,
+                   float phaseR, float phaseM, float phaseC, float msGate,
+                   out(float3) ext, out(float3) extAir, out(float3) src, out(float3) srcC)
+{
+    const float Rg = P.planet.x;
+    float ri = length(p);
+    float hi = ri - Rg;
+#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
+    float3 scaR, scaM, scaC, extCloud;
+    atmosMediumAt(P, hi, scaR, scaM, scaC, extAir, extCloud);
+
+
+    ext = extAir + extCloud;
+
+
+    float muS = dot(normalize(p), sunDir);
+
+
+    bool sunVis = (atmosRaySphere(p, sunDir, Rg) < 0.0f);
+    float3 sunT = f3(0.0f);
+    float deckB = 1.0f;
+    if (sunVis)
+    {
+        float2 tuv = atmosTransmittanceUv(P, ri, muS);
+        float4 tr = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0);
+        sunT = tr.rgb;
+        deckB = tr.a;
+    }
+
+    float3 sunInC = (scaR * phaseR + scaM * phaseM) * sunT * P.solar.xyz;
+    float3 sunIn = (scaR * phaseR + scaM * phaseM + scaC * phaseC)
+                  * (sunT * deckB) * P.solar.xyz;
+
+
+
+
+
+
+
+    if (P.moonDir.w > 0.0f)
+    {
+        float3 mDir = P.moonDir.xyz;
+        float cosM = clamp(dot(rd, mDir), -1.0f, 1.0f);
+        float muM = dot(normalize(p), mDir);
+        float3 moonT = f3(0.0f);
+        if (atmosRaySphere(p, mDir, Rg) < 0.0f)
+        {
+            float2 muv = atmosTransmittanceUv(P, ri, muM);
+            moonT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, muv, 0).rgb;
+        }
+        sunInC += (scaR * atmosPhaseRayleigh(cosM)
+                 + scaM * atmosPhaseAerosol(P, cosM))
+                * moonT * P.moonDir.w;
+        sunIn += (scaR * atmosPhaseRayleigh(cosM)
+                 + scaM * atmosPhaseAerosol(P, cosM)
+                 + scaC * atmosPhaseMie(cosM, P.cloud.z))
+                * moonT * P.moonDir.w;
+    }
+#line 107 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
+    float2 msUv = atmosMultiScatterUv(P, ri, muS);
+    float3 ms = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, msUv, 0).rgb;
+
+
+
+
+
+
+    float3 msIn = (scaR + scaM) * ms * msGate;
+#line 140 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmossource.h.fsl"
+    bool inSlab = (scaC.r > 0.0f);
+    bool underLid = (P.deckMix.w > 0.0f)
+                  && (P.cloud.x > 0.0f)
+                  && (hi < P.profGeom.z - P.profGeom.w);
+    if (inSlab || underLid)
+    {
+
+
+
+
+
+
+        float3 deckT = f3(0.0f);
+        if (sunVis)
+        {
+            float2 tuvL = atmosTransmittanceUv(P, Rg + P.profGeom.z + P.profGeom.w, muS);
+            deckT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuvL, 0).rgb;
+        }
+
+
+
+        float xN = inSlab ? atmosDeckDepth01(P, hi) : 1.0f;
+        float3 sigma = inSlab ? scaC : (scaR + scaM);
+        msIn += sigma * atmosDeckMs(P, xN) * P.solar.xyz * deckT;
+    }
+
+
+    float3 msInC = (scaR + scaM) * ms * msGate;
+
+    src = sunIn + msIn;
+    srcC = sunInC + msInC;
+}
+#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0, flags = DESCRIPTORS_VOLATILE)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(8, 8, 1)
@@ -1496,7 +1603,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         int nSteps = atmosMarchPlan(gAtmosParams, origin, rd, tMax,
                                     steps, (int)gAtmosParams.marchP.w,  1 ,
                                     planT, planN);
-#line 102 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
+#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
         float3 throughput = f3(1.0f);
         float3 throughputC = f3(1.0f);
 
@@ -1504,20 +1611,19 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         float msGate = gAtmosParams.deckMix.y;
         for (int s = 0; s < nSteps; ++s)
         {
-#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
+#line 133 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
             float t0, t1;
             atmosMarchStep(planT, planN, s, tMax,  1 , t0, t1);
             float dt = t1 - t0;
             float t = t0 + dt * 0.5f;
             float3 p = origin + rd * t;
-            float ri = length(p);
-            float hi = ri - Rg;
-#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
-            float3 scaR, scaM, scaC, extAir, extCloud;
-            atmosMediumAt(gAtmosParams, hi, scaR, scaM, scaC, extAir, extCloud);
 
 
-            float3 ext = extAir + extCloud;
+
+
+            float3 ext, extAir, src, srcC;
+            atmosSourceAt(gAtmosParams, p, rd, sunDir, phaseR, phaseM, phaseC, msGate,
+                          ext, extAir, src, srcC);
 
             float3 stepT = exp(-ext * dt);
             float3 sInt = (f3(1.0f) - stepT) / max(ext, f3(1.0e-9f));
@@ -1528,94 +1634,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float3 stepTC = exp(-extAir * dt);
             float3 sIntC = (f3(1.0f) - stepTC) / max(extAir, f3(1.0e-9f));
 
-
-            float muS = dot(normalize(p), sunDir);
-
-
-            bool sunVis = (atmosRaySphere(p, sunDir, Rg) < 0.0f);
-            float3 sunT = f3(0.0f);
-            float deckB = 1.0f;
-            if (sunVis)
-            {
-                float2 tuv = atmosTransmittanceUv(gAtmosParams, ri, muS);
-                float4 tr = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0);
-                sunT = tr.rgb;
-                deckB = tr.a;
-            }
-
-            float3 sunInC = (scaR * phaseR + scaM * phaseM) * sunT * gAtmosParams.solar.xyz;
-            float3 sunIn = (scaR * phaseR + scaM * phaseM + scaC * phaseC)
-                          * (sunT * deckB) * gAtmosParams.solar.xyz;
-
-
-
-
-
-
-
-            if (gAtmosParams.moonDir.w > 0.0f)
-            {
-                float3 mDir = gAtmosParams.moonDir.xyz;
-                float cosM = clamp(dot(rd, mDir), -1.0f, 1.0f);
-                float muM = dot(normalize(p), mDir);
-                float3 moonT = f3(0.0f);
-                if (atmosRaySphere(p, mDir, Rg) < 0.0f)
-                {
-                    float2 muv = atmosTransmittanceUv(gAtmosParams, ri, muM);
-                    moonT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, muv, 0).rgb;
-                }
-                sunInC += (scaR * atmosPhaseRayleigh(cosM)
-                         + scaM * atmosPhaseAerosol(gAtmosParams, cosM))
-                        * moonT * gAtmosParams.moonDir.w;
-                sunIn += (scaR * atmosPhaseRayleigh(cosM)
-                         + scaM * atmosPhaseAerosol(gAtmosParams, cosM)
-                         + scaC * atmosPhaseMie(cosM, gAtmosParams.cloud.z))
-                        * moonT * gAtmosParams.moonDir.w;
-            }
-#line 224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
-            float2 msUv = atmosMultiScatterUv(gAtmosParams, ri, muS);
-            float3 ms = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, msUv, 0).rgb;
-
-
-
-
-
-
-            float3 msIn = (scaR + scaM) * ms * msGate;
-#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
-            bool inSlab = (scaC.r > 0.0f);
-            bool underLid = (gAtmosParams.deckMix.w > 0.0f)
-                          && (gAtmosParams.cloud.x > 0.0f)
-                          && (hi < gAtmosParams.profGeom.z - gAtmosParams.profGeom.w);
-            if (inSlab || underLid)
-            {
-
-
-
-
-
-
-                float3 deckT = f3(0.0f);
-                if (sunVis)
-                {
-                    float2 tuvL = atmosTransmittanceUv(gAtmosParams,
-                                      Rg + gAtmosParams.profGeom.z + gAtmosParams.profGeom.w, muS);
-                    deckT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuvL, 0).rgb;
-                }
-
-
-
-                float xN = inSlab ? atmosDeckDepth01(gAtmosParams, hi) : 1.0f;
-                float3 sigma = inSlab ? scaC : (scaR + scaM);
-                msIn += sigma * atmosDeckMs(gAtmosParams, xN)
-                              * gAtmosParams.solar.xyz * deckT;
-            }
-
-
-            float3 msInC = (scaR + scaM) * ms * msGate;
-
-            L += throughput * (sunIn + msIn ) * sInt;
-            Lc += throughputC * (sunInC + msInC) * sIntC;
+            L += throughput * src * sInt;
+            Lc += throughputC * srcC * sIntC;
             throughput *= stepT;
             throughputC *= stepTC;
         }
@@ -1650,7 +1670,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             Lc += throughputC * gSky;
         }
     }
-#line 338 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
+#line 205 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmos_skyview.comp.fsl"
     Write2D(gAtmosOutB, px, float4(max(Lc + f3(gAtmosParams.nightP.x), f3(0.0f)), 1.0f));
 
     L = lerp(Lc, L, saturate(gAtmosParams.deckMix.x));

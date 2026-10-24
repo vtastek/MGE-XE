@@ -7208,7 +7208,9 @@ namespace RenderProcess {
             // here AND an entry in kDebugModeNames in the same commit, which is the whole of what
             // the paragraph above asks for and what nobody did the three times it drifted.
             // 28 (near/far producer: DL magenta, near green) lands with its host name — cycle %29.
-            g_debugMode = (g_debugMode + 1) % 29;
+            // 29/30 (sky AO, sky vis maps) drifted host-only; 31 (S3.3 aerial-perspective atlas) lands
+            // with its host name and both get names here — cycle %32.
+            g_debugMode = (g_debugMode + 1) % 32;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -7235,7 +7237,10 @@ namespace RenderProcess {
                              : (g_debugMode == 25) ? "PARALLAX UV DELTA"
                              : (g_debugMode == 26) ? "TERRAIN HEIGHT BLEND"
                              : (g_debugMode == 27) ? "PBR SPECULAR"
-                             : (g_debugMode == 28) ? "NEAR/FAR PRODUCER" : "NORMAL";
+                             : (g_debugMode == 28) ? "NEAR/FAR PRODUCER"
+                             : (g_debugMode == 29) ? "SKY AO (APPLIED)"
+                             : (g_debugMode == 30) ? "SKY VIS MAPS (RAW)"
+                             : (g_debugMode == 31) ? "ATMOS AERIAL VOLUME" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.

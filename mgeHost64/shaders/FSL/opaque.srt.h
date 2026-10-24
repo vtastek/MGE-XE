@@ -752,6 +752,12 @@ BEGIN_SRT_NO_AB(SrtData)
         // they are in no prepass, so gSkyVisScreen never holds them. Bound to the FP set only; read only
         // when gShadowParams.skyVis.w > 0, which the host publishes once it is bound and armed. Appended last.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyVisEye)
+        // S3.3 THE AERIAL-PERSPECTIVE VOLUME (atmos_aerial.comp, layout in atmosaerial.srt.h): the MAIN
+        // camera's froxels as a 1024x64 atlas — 32 slices side by side, in-scatter in rows 0..31,
+        // transmittance in rows 32..63. Read by the F12 31 view now and by applyFog from S3.4.
+        // Bound to every PerFrame instance for the reason gAtmosSkyView is; it describes the main
+        // camera only, so a consumer in another view must not read it as its own. Appended last.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gAtmosAerial)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

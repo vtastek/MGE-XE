@@ -613,6 +613,13 @@
 #include "atmos_skyview.comp.fsl"
 #end
 
+// S3.3 — the AERIAL-PERSPECTIVE volume: camera froxels marched with the sky-view's own source
+// (atmossource.h.fsl). Not part of the cached chain: it turns with the camera, so it runs every
+// exterior frame, after the chain's barriers (it reads transmittance + multiscatter).
+#comp atmos_aerial.comp
+#include "atmos_aerial.comp.fsl"
+#end
+
 // ...and THE MEASUREMENT, which is also THE GATE (S2b). Projects the LIVE sky-view LUT into SH-L1
 // over the full sphere and computes E_sky / E_sun / the zenith and horizon probes in the same pass,
 // so the LIGHT is a measurement of the DRAWN SKY rather than a parallel derivation of it. That is

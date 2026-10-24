@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 724 "FSL/shaders.list"
+#line 731 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur2d.comp.fsl"
 #line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur2d.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
@@ -1075,4 +1075,4 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     }
     return;
 }
-#line 725 "FSL/shaders.list"
+#line 732 "FSL/shaders.list"

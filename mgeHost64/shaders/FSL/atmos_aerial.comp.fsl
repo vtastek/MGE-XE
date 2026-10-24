@@ -1,0 +1,104 @@
+// mgeHost64 — THE AERIAL-PERSPECTIVE VOLUME (tasks/forge-atmosphere.md S3.3).
+//
+// What the air between the eye and a surface does to it: the radiance it in-scatters toward the eye
+// and the fraction of the surface's own light it lets through, in camera froxels — 32 x 32 over the
+// render rect, 32 slices along each ray out to the draw distance. Hillaire's camera volume, marched
+// with the SAME source the sky-view LUT is (atmossource.h.fsl), so a surface at the far end of a
+// slice and the sky just above it are one integral stopped at two distances. That is the whole of
+// what S3 is for: MW's fog was a curtain hung at fogEnd, and a curtain has an edge.
+//
+// ONE THREAD PER COLUMN, front to back: each slice's value is the running integral at its far end, so
+// a column is one march that stores as it goes rather than 32 marches of growing length.
+//
+// ⚠ THE SLICES ARE QUADRATIC IN DISTANCE, d_k = D x ((k+1)/N)^2, and Euclidean along the ray — so a
+// consumer needs only |worldPosRel| and its screen uv. Quadratic for the reason the sky-view march
+// is: the integrand changes fastest near the eye (where a few metres of fog read at all) and is
+// nearly saturated far out.
+//
+// ⚠ THE MEDIUM IS SCALED (S3.2). MW's draw distance is ~2 km, which real clear air barely hazes, so
+// distance AND the camera's altitude are stretched by one factor the host calibrates: Clear
+// transmittance along the horizontal at D = 2%. Uniform, so a climb still gains real altitude in the
+// medium and a mountain still stands out of the haze. The sky-view LUT is not scaled: the sky is an
+// infinite path either way.
+//
+// Writes the atlas described in atmosaerial.srt.h. Nothing samples it before S3.4.
+
+#include "atmosaerial.srt.h"
+#include "atmosphere.h.fsl"
+#include "atmossource.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    const int W = (int)gApParams.dims.x;
+    const int H = (int)gApParams.dims.y;
+    const int N = (int)gApParams.dims.z;
+    const int M = max((int)gApParams.dims.w, 1);
+    const int2 c = int2(DispatchThreadID.xy);
+    if (c.x >= W || c.y >= H)
+    {
+        RETURN();
+    }
+
+    // The froxel column's CENTRE ray, camera-relative world space (MW: Z up). The corner rays
+    // interpolate linearly before normalisation, which is exact for a perspective projection.
+    const float2 uv = (float2(c) + f2(0.5f)) / float2((float)W, (float)H);
+    const float3 rd = normalize(gApParams.ray00.xyz + uv.x * gApParams.rayDx.xyz + uv.y * gApParams.rayDy.xyz);
+
+    const float D     = gApParams.ray00.w;    // MW units
+    const float mPerU = gApParams.rayDx.w;    // medium metres per MW unit
+    const float Rg    = gAtmosParams.planet.x;
+    // The medium is horizontally homogeneous (until S6), so the eye stands over the planet's pole and
+    // only the ray's z matters against the vertical; the sun keeps its world direction.
+    const float3 origin = float3(0.0f, 0.0f, gApParams.rayDy.w);
+    const float3 sunDir = gAtmosParams.sunDir.xyz;
+    const float  cosTheta = clamp(dot(rd, sunDir), -1.0f, 1.0f);
+    const float  phaseR = atmosPhaseRayleigh(cosTheta);
+    const float  phaseM = atmosPhaseAerosol(gAtmosParams, cosTheta);
+    const float  phaseC = atmosPhaseMie(cosTheta, gAtmosParams.cloud.z);
+    const float  msGate = gAtmosParams.deckMix.y;
+    // The cover mixture, the LIGHT's weight (deckMix.x) — the air is lit by the mean field, exactly
+    // what gAtmosSkyView carries. Mixed per slice from two separately-marched arms, never per step:
+    // the arms are separate radiative solutions (atmos_skyview's note on THE MIX).
+    const float  mixW = saturate(gAtmosParams.deckMix.x);
+
+    float3 L  = f3(0.0f), Lc = f3(0.0f);     // in-scatter: deck arm, clear arm
+    float3 T  = f3(1.0f), Tc = f3(1.0f);     // transmittance: deck arm, clear arm
+    float  tPrev = 0.0f;                     // medium metres along the ray
+    for (int k = 0; k < N; ++k)
+    {
+        const float f  = (float)(k + 1) / (float)N;
+        const float tK = D * f * f * mPerU;
+        const float dt = (tK - tPrev) / (float)M;
+        for (int j = 0; j < M; ++j)
+        {
+            float3 p = origin + rd * (tPrev + dt * ((float)j + 0.5f));
+            // A ray aimed down meets the planet before the slice ends whenever the scene's ground is
+            // below sea level or the scale lifts the eye less than the terrain rises; the geometry
+            // is there and takes the value, so the march just stays at ground density rather than
+            // sampling a density profile below its own zero.
+            const float rp = length(p);
+            if (rp < Rg + ATMOS_GROUND_EPS_M) { p *= (Rg + ATMOS_GROUND_EPS_M) / max(rp, 1.0f); }
+
+            float3 ext, extAir, src, srcC;
+            atmosSourceAt(gAtmosParams, p, rd, sunDir, phaseR, phaseM, phaseC, msGate,
+                          ext, extAir, src, srcC);
+            const float3 stepT  = exp(-ext * dt);
+            const float3 stepTC = exp(-extAir * dt);
+            L  += T  * src  * ((f3(1.0f) - stepT)  / max(ext,    f3(1.0e-9f)));
+            Lc += Tc * srcC * ((f3(1.0f) - stepTC) / max(extAir, f3(1.0e-9f)));
+            T  *= stepT;
+            Tc *= stepTC;
+        }
+        tPrev = tK;
+
+        const int x = k * W + c.x;
+        Write2D(gAtmosAerialOut, int2(x, c.y),     float4(max(lerp(Lc, L, mixW), f3(0.0f)), 1.0f));
+        Write2D(gAtmosAerialOut, int2(x, c.y + H), float4(saturate(lerp(Tc, T, mixW)), 1.0f));
+    }
+
+    RETURN();
+}

@@ -417,6 +417,9 @@ static int forgeEcoQoSState()
 // guarded the Hosek closed form is gone with the model, because there is no longer a second
 // evaluation to guard: atmos_sh.comp measures the very texture the pixels are drawn from.
 #include "shaders/FSL/atmosphere.srt.h"
+// S3.3 THE AERIAL-PERSPECTIVE VOLUME: AtmosAerialSrtData, PerBatch, ONE instance (the LUT chain's params
+// + both LUTs read, the froxel atlas written, plus the camera's froxel-ray cbuffer).
+#include "shaders/FSL/atmosaerial.srt.h"
 // MB-1 object velocity (tasks/forge-postprocess.md — motion blur): ObjVelocitySrtData, PerDraw
 // frequency, ONE instance. A private GRAPHICS SRT, the second one in the renderer after
 // resolve.srt.h — it does not ride opaque.srt.h because it needs the PREVIOUS pose per draw, and
@@ -1035,6 +1038,12 @@ namespace {
     // at its use in atmosphere.h for why this is a calibration of a constant rather than a look knob,
     // and why the value that survives belongs folded into kMieScatterSeaLevel with this deleted.
     float g_atmosMieMul = 1.0f;
+
+    // S3.3 THE AERIAL-PERSPECTIVE VOLUME (atmos_aerial.comp). apOn = dispatch it (the cost A/B arm;
+    // nothing samples it before S3.4). apScale = the S3.2 world scale, metres of MEDIUM per metre of
+    // MW; 0 = calibrated so Clear transmits 2% horizontally at the draw distance (apCalibrate).
+    float g_apOn    = 1.0f;
+    float g_apScale = 0.0f;
 
     // S2l: WHICH aerosol phase function the sky-view cook evaluates. 0 = single Henyey-Greenstein on
     // the row's mieG (the pre-S2l sky, bit for bit — the A/B arm); 1 = a sharp HG spike on a smooth
@@ -3757,8 +3766,16 @@ namespace {
         Buffer*        pAtmosShOut         = nullptr;      // RWBuffer<uint>[kAtmosShUints], GPU only
         Buffer*        pAtmosShReadback    = nullptr;      // GPU_TO_CPU, persistent-mapped (post-fence)
         Shader*        pAtmosViewShader    = nullptr;      // shadowatlasview.vert + atmosview.frag
-        Pipeline*      pAtmosViewPipeline  = nullptr;      // F12 15 / 16
+        Pipeline*      pAtmosViewPipeline  = nullptr;      // F12 15 / 16 / 31
         bool           atmosReady          = false;
+        // S3.3: the aerial-perspective volume. The atlas is created with the LUTs (it is bound into
+        // the graphics PerFrame sets); its pass, set and per-frame cbuffer with the chain's pipelines.
+        Texture*       pAtmosAerial        = nullptr;      // (kApFroxW*kApSlices) x (2*kApFroxH) RGBA16F
+        Buffer*        pAtmosApCbv         = nullptr;      // gApParams (4 float4)
+        Shader*        pAtmosApShader      = nullptr;
+        Pipeline*      pAtmosApPipeline    = nullptr;
+        DescriptorSet* pAtmosApSet         = nullptr;      // atmosaerial.srt.h, 1 instance
+        bool           atmosApReady        = false;
 
         // --- FP1a: first-person pass (arms/weapon, after sorted-alpha, fresh depth) ---
         // The arm scene has its OWN camera (fpViewProj crossing) and MW z-clears before
@@ -7747,6 +7764,13 @@ namespace {
     constexpr uint32_t kAtmosMsRes   = 32;
     constexpr uint32_t kAtmosSkyW    = 192;
     constexpr uint32_t kAtmosSkyH    = 108;
+    // S3.3: the aerial-perspective froxels (atmosaerial.srt.h). The atlas is kApFroxW*kApSlices wide
+    // and 2*kApFroxH tall (in-scatter over transmittance). Published to the shader through dims, never
+    // hardcoded there.
+    constexpr uint32_t kApFroxW  = 32;
+    constexpr uint32_t kApFroxH  = 32;
+    constexpr uint32_t kApSlices = 32;
+    constexpr uint32_t kApSubSteps = 2;
     // MUST match ATMOS_SH_THREADS in atmos_sh.comp.fsl — the dispatch is ONE group and the shader's
     // Fibonacci direction depends on the count, so a mismatch does not fail, it silently integrates
     // a different sphere. It is also scenecal.h's kFibDirs, which is the whole point: the historical
@@ -11164,6 +11188,20 @@ namespace {
                     addLut(kAtmosMsRes,  kAtmosMsRes,  "atmosMultiScatter",  &g_live.pAtmosMultiScatter);
                     addLut(kAtmosSkyW,   kAtmosSkyH,   "atmosSkyView",       &g_live.pAtmosSkyView);
                     addLut(kAtmosSkyW,   kAtmosSkyH,   "atmosSkyViewClear",  &g_live.pAtmosSkyViewClear);
+                    // S3.3: the aerial-perspective atlas — here and not with its pipeline, for the
+                    // black-sky reason above: it is bound into the graphics PerFrame sets. 512 KB.
+                    addLut(kApFroxW * kApSlices, 2u * kApFroxH, "atmosAerial", &g_live.pAtmosAerial);
+                    {
+                        BufferLoadDesc apb = {};
+                        apb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                        apb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                        apb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                        apb.mDesc.mSize = 256;
+                        apb.mDesc.pName = "atmosApCbv";
+                        apb.pData = nullptr;
+                        apb.ppBuffer = &g_live.pAtmosApCbv;
+                        addFrameBuf(&apb);
+                    }
 
                     BufferLoadDesc apc = {};
                     apc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -12105,6 +12143,13 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pAtmosTransmittance;
+                ++np;
+            }
+            // S3.3: the aerial-perspective atlas. Every instance, type-valid, for the reason above.
+            if (g_live.pAtmosAerial) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosAerial);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pAtmosAerial;
                 ++np;
             }
             if (g_live.pAtmosParamsCbv) {
@@ -14959,6 +15004,13 @@ namespace {
                     p[rn].ppTextures = &g_live.pAtmosTransmittance;
                     ++rn;
                 }
+                // S3.3: the aerial-perspective atlas. Every instance, type-valid, for the reason above.
+                if (g_live.pAtmosAerial) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosAerial);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosAerial;
+                    ++rn;
+                }
                 if (g_live.pAtmosParamsCbv) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
                     p[rn].ppBuffers = &g_live.pAtmosParamsCbv;
@@ -15141,6 +15193,13 @@ namespace {
                     p[rn].ppTextures = &g_live.pAtmosTransmittance;
                     ++rn;
                 }
+                // S3.3: the aerial-perspective atlas. Every instance, type-valid, for the reason above.
+                if (g_live.pAtmosAerial) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosAerial);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosAerial;
+                    ++rn;
+                }
                 if (g_live.pAtmosParamsCbv) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
                     p[rn].ppBuffers = &g_live.pAtmosParamsCbv;
@@ -15254,6 +15313,13 @@ namespace {
                         p[sn].ppTextures = &g_live.pAtmosTransmittance;
                         ++sn;
                     }
+                    // S3.3: the aerial-perspective atlas. Every instance, type-valid, for the reason above.
+                    if (g_live.pAtmosAerial) {
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosAerial);
+                        p[sn].mCount = 1;
+                        p[sn].ppTextures = &g_live.pAtmosAerial;
+                        ++sn;
+                    }
                     if (g_live.pAtmosParamsCbv) {
                         p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
                         p[sn].ppBuffers = &g_live.pAtmosParamsCbv;
@@ -15355,6 +15421,13 @@ namespace {
                         p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
                         p[kn].mCount = 1;
                         p[kn].ppTextures = &g_live.pAtmosTransmittance;
+                        ++kn;
+                    }
+                    // S3.3: the aerial-perspective atlas. Every instance, type-valid, for the reason above.
+                    if (g_live.pAtmosAerial) {
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosAerial);
+                        p[kn].mCount = 1;
+                        p[kn].ppTextures = &g_live.pAtmosAerial;
                         ++kn;
                     }
                     if (g_live.pAtmosParamsCbv) {
@@ -16620,6 +16693,34 @@ namespace {
                     std::printf("[forge][atmos] LUT chain unavailable (shader/pipeline/resource) — "
                                 "the exterior sky falls back to MW's own mesh\n");
                     LOG::logline("!! [forge][atmos] LUT chain FAILED to build — no physical sky");
+                }
+
+                // S3.3: THE AERIAL-PERSPECTIVE VOLUME. Its own SRT (atmosaerial.srt.h), one instance.
+                // Reads the chain's two LUTs and params, so it is armed only with the chain.
+                if (g_live.atmosReady && g_live.pAtmosAerial && g_live.pAtmosApCbv) {
+                    ShaderLoadDesc apd = {}; apd.mComp.pFileName = "atmos_aerial.comp";
+                    addShader(R, &apd, &g_live.pAtmosApShader);
+                    mkPipe(g_live.pAtmosApShader, &g_live.pAtmosApPipeline);
+                    DescriptorSetDesc apsd = SRT_SET_DESC(AtmosAerialSrtData, PerBatch, 1, 0);
+                    addDescriptorSet(R, &apsd, &g_live.pAtmosApSet);
+                    if (g_live.pAtmosApPipeline && g_live.pAtmosApSet) {
+                        // mCount = 1 on every single-texture bind — see the chain's set above.
+                        DescriptorData d[5] = {};
+                        d[0].mIndex = SRT_RES_IDX(AtmosAerialSrtData, PerBatch, gAtmosParams);
+                        d[0].ppBuffers = &g_live.pAtmosParamsCbv;
+                        d[1].mIndex = SRT_RES_IDX(AtmosAerialSrtData, PerBatch, gApParams);
+                        d[1].ppBuffers = &g_live.pAtmosApCbv;
+                        d[2].mIndex = SRT_RES_IDX(AtmosAerialSrtData, PerBatch, gAtmosTransmittance);
+                        d[2].mCount = 1; d[2].ppTextures = &g_live.pAtmosTransmittance;
+                        d[3].mIndex = SRT_RES_IDX(AtmosAerialSrtData, PerBatch, gAtmosMultiScatter);
+                        d[3].mCount = 1; d[3].ppTextures = &g_live.pAtmosMultiScatter;
+                        d[4].mIndex = SRT_RES_IDX(AtmosAerialSrtData, PerBatch, gAtmosAerialOut);
+                        d[4].mCount = 1; d[4].ppTextures = &g_live.pAtmosAerial;
+                        updateDescriptorSet(R, 0, g_live.pAtmosApSet, 5, d);
+                        g_live.atmosApReady = true;
+                    } else {
+                        LOG::logline("!! [forge][atmos] aerial-perspective volume FAILED to build (S3.3)");
+                    }
                 }
 
                 // ─── THE ONE CONSTANT THE MEDIUM CANNOT MAKE UP, PRINTED WITH ITS CORROBORATIONS ──
@@ -18244,6 +18345,13 @@ namespace {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
                     p[fpn].mCount = 1;
                     p[fpn].ppTextures = &g_live.pAtmosTransmittance;
+                    ++fpn;
+                }
+                // S3.3: the aerial-perspective atlas. Every instance, type-valid, for the reason above.
+                if (g_live.pAtmosAerial) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosAerial);
+                    p[fpn].mCount = 1;
+                    p[fpn].ppTextures = &g_live.pAtmosAerial;
                     ++fpn;
                 }
                 if (g_live.pAtmosParamsCbv) {
@@ -25239,7 +25347,10 @@ namespace {
                                             "29 sky AO (applied)",
                                             // 30: the raw direction-map texel on terrain: R vis,
                                             // G coverage, B distance-matched.
-                                            "30 sky vis maps (raw)" };
+                                            "30 sky vis maps (raw)",
+                                            // 31: the S3.3 aerial-perspective atlas (atmosview.frag),
+                                            // with the client's `% 32` in the same commit.
+                                            "31 atmos aerial volume" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -25430,6 +25541,8 @@ namespace {
             { "atmosCacheDeg",      &g_atmosCacheDeg      },
             { "atmosCacheAltM",     &g_atmosCacheAltM     },
             { "atmosMieMul",        &g_atmosMieMul        },
+            { "apOn",               &g_apOn               },   // S3.3: aerial-perspective volume dispatch
+            { "apScale",            &g_apScale            },   // S3.2: medium m per MW m, 0 = calibrated
             { "atmosMiePhase",      &g_atmosMiePhase      },
             { "atmosOzoneMul",      &g_atmosOzoneMul      },
             { "atmosMs",            &g_atmosMs            },
@@ -36096,6 +36209,7 @@ void destroyHostWindow(Renderer* R);
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
     void atmosDispatch(Cmd* C);          // S2: the atmosphere's four-pass LUT chain, every frame
+    void atmosAerialDispatch(Cmd* C, const float* rzViewProj);   // S3.3: the camera's AP froxels
     void atmosDrain(const uint32_t* ar); // S2: decode one landed SH readback (light, or a gate arm)
     bool atmosBootstrapSync();           // the first exterior measurement, synchronously
     // S2b/S4a/S2l: the GATE, reported from settleFrameFence — one arm per forced frame.
@@ -44807,6 +44921,9 @@ void destroyHostWindow(Renderer* R);
         // frame's LUT — which would look almost right, all the time, and be wrong under a moving sun.
         gpuPhaseBegin(kGpuPhaseAtmos);
         atmosDispatch(g_live.pCmd);
+        // S3.3: the aerial-perspective froxels, after the chain (its barriers leave both LUTs readable).
+        // Inside the atmos timer, so `atmos=` on the split prices it; apOn=0 is the A/B arm.
+        atmosAerialDispatch(g_live.pCmd, rzViewProj);
         gpuPhaseEnd(kGpuPhaseAtmos);
 
         gpuPhaseBegin(kGpuPhaseCull);
@@ -50464,10 +50581,15 @@ void destroyHostWindow(Renderer* R);
         // The sky-view LUT is 16:9 by construction; the transmittance is 4:1. Drawn at the LUT's own
         // aspect so the horizon band and the (r, mu) grid are not sheared into something a reader
         // would have to mentally undo.
-        if ((g_debugMode == 15 || g_debugMode == 16) && g_live.pAtmosViewPipeline
+        // Mode 31 is the S3.3 aerial-perspective atlas, 16:1, drawn across the screen so each of its 32
+        // slices is wide enough to read.
+        if ((g_debugMode == 15 || g_debugMode == 16 || g_debugMode == 31) && g_live.pAtmosViewPipeline
             && g_live.pAtmosSkyView && g_live.pAtmosTransmittance) {
-            const float wide = (float)std::min<uint32_t>(768u, g_live.width / 2u);
+            const float wide = (g_debugMode == 31)
+                             ? (float)std::min<uint32_t>(2048u, g_live.width - 16u)
+                             : (float)std::min<uint32_t>(768u, g_live.width / 2u);
             const float tall = (g_debugMode == 15) ? (wide * (float)kAtmosSkyH / (float)kAtmosSkyW)
+                             : (g_debugMode == 31) ? (wide * (float)(2u * kApFroxH) / (float)(kApFroxW * kApSlices))
                                                    : (wide * (float)kAtmosTransH / (float)kAtmosTransW);
             BindRenderTargetsDesc avbind = {};
             avbind.mRenderTargetCount = 1;
@@ -66389,6 +66511,134 @@ namespace ForgeRender {
         }
     }
 
+    // ─── S3.2: THE WORLD SCALE THE AERIAL PERSPECTIVE MARCHES AT ────────────────────────────────────
+    // MW's draw distance is ~2 km, which real clear air barely hazes, so the medium sees MW's world
+    // stretched by one factor: Clear transmittance along the horizontal at the draw distance = 2%
+    // (Koschmieder's threshold, ln 50 = 3.912 optical depths). CALIBRATED, NOT CHOSEN: beta comes off
+    // packParams on the Clear reference row, so a change to the folded aerosol moves the scale with it
+    // and the clear-weather world still dissolves exactly where the geometry ends.
+    struct ApScale { float s, D, betaG; };
+    ApScale apCalibrate()
+    {
+        static ApScale s_cal = {};
+        static float s_keyMie = -1.0f, s_keyDraw = -1.0f, s_keyPhase = -1.0f, s_keyOverride = -1.0f;
+        const float draw = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f);
+        if (s_keyMie == g_atmosMieMul && s_keyDraw == draw && s_keyPhase == g_atmosMiePhase
+            && s_keyOverride == g_apScale) {
+            return s_cal;
+        }
+        s_keyMie = g_atmosMieMul; s_keyDraw = draw; s_keyPhase = g_atmosMiePhase; s_keyOverride = g_apScale;
+
+        // Rows 0..2 of the packed block are all this reads (Rayleigh scattering, Mie extinction); the
+        // sun, moon, deck and march arguments are inert for them, so they are passed at rest.
+        const float lutDims[6] = { (float)kAtmosSkyW, (float)kAtmosSkyH, (float)kAtmosTransW,
+                                   (float)kAtmosTransH, (float)kAtmosMsRes, (float)kAtmosMsRes };
+        const float up[3] = { 0.0f, 0.0f, 1.0f };
+        float pk[kAtmosParamFloats] = {};
+        Atmosphere::packParams(Atmosphere::referenceRow(), 0.1f, up, (float)Atmosphere::kGroundEpsM,
+                               up, 0.0f, 0.0f, g_atmosMieMul, (g_atmosMiePhase >= 0.5f) ? 1 : 0,
+                               g_atmosOzoneMul, 0.0f, g_atmosMs, g_atmosDeckDown,
+                               g_atmosSkySteps, 20.0f, g_atmosMsDirs, 0.0f, lutDims, pk);
+        const float betaG = pk[1] + pk[9];                          // green: Rayleigh sca + Mie ext, 1/m
+        const float D     = draw * 8192.0f;                         // cells -> MW units: the far plane
+        const float Dm    = D * Atmosphere::kMwUnitToMetre;
+        float s = (betaG > 0.0f && Dm > 0.0f) ? (3.912023f / (betaG * Dm)) : 1.0f;
+        if (g_apScale > 0.0f) { s = g_apScale; }
+        s_cal = { s, D, betaG };
+        // The implied clear visual range is the sanity number: in the MEDIUM it is the aerosol's own
+        // (3.912 / beta), and in MW's world it is that over s — which is the draw distance by
+        // construction when calibrated, and says what an apScale override means when not.
+        LOG::logline(">> [forge-atmos] S3.2 aerial scale s=%.2f%s | draw %.0f cells = %.0f units = %.0f m"
+                     " | Clear sea-level beta_ext(G) %.3g /m -> visual range %.1f km of medium = %.0f m of MW",
+                     (double)s, (g_apScale > 0.0f) ? " (apScale OVERRIDE)" : " (calibrated: T=2% at draw)",
+                     (double)draw, (double)D, (double)Dm, (double)betaG,
+                     (betaG > 0.0f) ? (3.912 / betaG / 1000.0) : 0.0,
+                     (betaG > 0.0f) ? (3.912 / betaG / s) : 0.0);
+        LOG::flush();
+        return s_cal;
+    }
+
+    // ─── S3.3: THE AERIAL-PERSPECTIVE VOLUME, EVERY EXTERIOR FRAME ──────────────────────────────────
+    // Recorded right after the LUT chain, whose barriers leave both LUTs readable. NOT under the
+    // chain's cache: the froxels turn with the camera. Main view only — mirror and probe views are
+    // S3.4's question. Nothing samples the atlas yet; it costs a dispatch and changes no pixel.
+    void atmosAerialDispatch(Cmd* C, const float* rzViewProj)
+    {
+        static bool s_logged = false;
+        if (!g_live.atmosApReady || g_apOn < 0.5f || !rzViewProj) { return; }
+        if (!g_live.atmosReady || !g_dlExterior || !g_skyHw || !g_atmosPkValid) { return; }
+        // A GATE frame forces the reference sky into the params cbuffer for one dispatch; the volume
+        // keeps the last real one rather than integrating a sky nobody stands under.
+        if (g_atmosGateFrame == g_renderFrame) { return; }
+
+        const ApScale cal = apCalibrate();
+
+        // The froxel corner rays, camera-relative, from the frame's own raster matrix (row-vector
+        // convention: clip = [x y z 1] * M). Each ray is the DIFFERENCE of two unprojected depths, so
+        // it does not depend on where the matrix's origin sits (park restamps it; see eyeAbs).
+        float inv[16];
+        if (!invert4x4(rzViewProj, inv)) { return; }
+        auto unproj = [&](float x, float y, float z, float o[3]) {
+            const float v[4] = { x, y, z, 1.0f };
+            float h[4];
+            for (int j = 0; j < 4; ++j) {
+                h[j] = v[0] * inv[0 * 4 + j] + v[1] * inv[1 * 4 + j] + v[2] * inv[2 * 4 + j] + v[3] * inv[3 * 4 + j];
+            }
+            const float w = (std::fabs(h[3]) > 1.0e-20f) ? h[3] : 1.0e-20f;
+            o[0] = h[0] / w; o[1] = h[1] / w; o[2] = h[2] / w;
+        };
+        auto ray = [&](float x, float y, float o[3]) {
+            float a[3], b[3];
+            unproj(x, y, 1.0f, a);     // reverse-Z: 1 = the near plane
+            unproj(x, y, 0.5f, b);
+            o[0] = b[0] - a[0]; o[1] = b[1] - a[1]; o[2] = b[2] - a[2];
+            const float l = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
+            if (l > 0.0f) { o[0] /= l; o[1] /= l; o[2] /= l; }
+        };
+        // Unit corner rays. Interpolating UNIT corner vectors is not exactly the perspective ray (the
+        // far-plane points are), so the corners are scaled onto one view plane: each divided by its
+        // own cosine to the centre ray.
+        float c00[3], c10[3], c01[3], cc[3];
+        ray(-1.0f,  1.0f, c00);    // top-left
+        ray( 1.0f,  1.0f, c10);    // top-right
+        ray(-1.0f, -1.0f, c01);    // bottom-left
+        ray( 0.0f,  0.0f, cc);
+        auto onPlane = [&](float o[3]) {
+            const float d = o[0] * cc[0] + o[1] * cc[1] + o[2] * cc[2];
+            const float k = (d > 1.0e-4f) ? 1.0f / d : 1.0f;
+            o[0] *= k; o[1] *= k; o[2] *= k;
+        };
+        onPlane(c00); onPlane(c10); onPlane(c01);
+
+        const float altM = std::max((float)Atmosphere::kGroundEpsM,
+                                    g_eyeAbsShadow[2] * Atmosphere::kMwUnitToMetre * cal.s);
+        float* v = (float*)fbw(g_live.pAtmosApCbv);
+        v[0]  = c00[0];          v[1]  = c00[1];          v[2]  = c00[2];          v[3]  = cal.D;
+        v[4]  = c10[0] - c00[0]; v[5]  = c10[1] - c00[1]; v[6]  = c10[2] - c00[2]; v[7]  = Atmosphere::kMwUnitToMetre * cal.s;
+        v[8]  = c01[0] - c00[0]; v[9]  = c01[1] - c00[1]; v[10] = c01[2] - c00[2]; v[11] = Atmosphere::kGroundRadiusM + altM;
+        v[12] = (float)kApFroxW; v[13] = (float)kApFroxH; v[14] = (float)kApSlices; v[15] = (float)kApSubSteps;
+
+        TextureBarrier tb = {};
+        tb.pTexture = g_live.pAtmosAerial;
+        tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+        tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+        cmdResourceBarrier(C, 0, nullptr, 1, &tb, 0, nullptr);
+        cmdBindPipeline(C, g_live.pAtmosApPipeline);
+        cmdBindDescriptorSet(C, 0, g_live.pAtmosApSet);
+        cmdDispatch(C, (kApFroxW + 7u) / 8u, (kApFroxH + 7u) / 8u, 1);
+        tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+        tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(C, 0, nullptr, 1, &tb, 0, nullptr);
+
+        if (!s_logged) {
+            s_logged = true;
+            LOG::logline(">> [forge-atmos] S3.3 aerial-perspective volume running: %ux%u froxels x %u slices"
+                         " to %.0f units, eye %.0f m up in the scaled medium (frame %u)",
+                         kApFroxW, kApFroxH, kApSlices, (double)cal.D, (double)altM, g_renderFrame);
+            LOG::flush();
+        }
+    }
+
     // Decode one landed SH readback. Called by settleFrameFence for a frame that dispatched, and by
     // atmosBootstrapSync for its own submit. A GATE arm's bytes go to g_atmosGateLast and are only
     // reported; every other readback is the LIGHT and goes to g_atmosShLast.
@@ -72061,6 +72311,13 @@ namespace ForgeRender {
         // S2: the ATMOSPHERE's LUT chain (this replaced the Hosek cross-check's teardown). The set
         // goes before the resources bound into it, which is the order every other block here uses.
         if (g_live.pAtmosSet)           { removeDescriptorSet(R, g_live.pAtmosSet);       g_live.pAtmosSet = nullptr; }
+        // S3.3 aerial perspective: set -> pipeline -> shader, then its cbuffer and atlas below.
+        if (g_live.pAtmosApSet)         { removeDescriptorSet(R, g_live.pAtmosApSet);     g_live.pAtmosApSet = nullptr; }
+        if (g_live.pAtmosApPipeline)    { removePipeline(R, g_live.pAtmosApPipeline);     g_live.pAtmosApPipeline = nullptr; }
+        if (g_live.pAtmosApShader)      { removeShader(R, g_live.pAtmosApShader);         g_live.pAtmosApShader = nullptr; }
+        if (g_live.pAtmosApCbv)         { removeFrameBuf(g_live.pAtmosApCbv);             g_live.pAtmosApCbv = nullptr; }
+        if (g_live.pAtmosAerial)        { removeResource(g_live.pAtmosAerial);            g_live.pAtmosAerial = nullptr; }
+        g_live.atmosApReady = false;
         if (g_live.pAtmosViewPipeline)  { removePipeline(R, g_live.pAtmosViewPipeline);   g_live.pAtmosViewPipeline = nullptr; }
         if (g_live.pMvViewPipeline)     { removePipeline(R, g_live.pMvViewPipeline);      g_live.pMvViewPipeline = nullptr; }
         if (g_live.pMvPipeline)         { removePipeline(R, g_live.pMvPipeline);          g_live.pMvPipeline = nullptr; }
