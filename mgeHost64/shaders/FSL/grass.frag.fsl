@@ -48,6 +48,7 @@
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag
 #include "skydome.h.fsl"    // applyFog() — extinguish into a silhouette, then melt into the sky
 #include "pointlights.h.fsl" // evalPointLightNearFar() — SHARED clustered froxel loop, both lists
+#include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 
 // The shaders.list variant switch (see the header). Defaulted here rather than required, so that
 // a build of this file with no define is the ORIGINAL shader, byte for byte.
@@ -125,6 +126,19 @@ PSOut PS_MAIN( VSOutput In )
     uint cov = a2cCoverageMaskFaded(tex.a, gShadowParams.grassParams2.z, In.Color.a);
     if (cov == 0u) { discard; }
 #endif
+    // PROBE CAPTURE, LEAN (opaque.frag's twin): the blade's reflectance and out — no shadow, lights, fog.
+    // Grass emits nothing. Uniform per draw (a cbuffer lane).
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (capDbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(capDbg)) {
+            PSOut C;
+#if !GRASS_EARLY_Z
+            C.Coverage = cov;
+#endif
+            C.Color = (PGI_IS_EMIS(capDbg) && pgiCapEmisPxD(capDbg, In.Position.xy)) ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(tex.rgb, 1.0f);
+            RETURN(C);
+        }
+    }
     // (GRASS_EARLY_Z: the cutout already happened, in grassdepth.frag. Every sample that reaches
     //  here passed CMP_EQUAL against the depth that pass wrote, which IS the mask — see the header.
     //  Note what this deletes besides the discard: the fwidth() and the whole coverage derivation,
@@ -218,8 +232,17 @@ PSOut PS_MAIN( VSOutput In )
     // within lodParams.x of the eye from the distant list, and the near list is the only one carrying
     // dynamic lights at all. Grass draws from the player's feet outward, so distant-only meant "no
     // point lights on grass" in every case anyone would test. Terrain hit the identical bug.
+    // The point lights' shadows: the screen mask, but only in the prepass pair (grass_eq) — there this
+    // blade's depth was in the buffer the mask was built from. Resolved at top level (derivatives).
+#if GRASS_EARLY_Z
+    const bool maskOk = gShadowParams.slotBits.x != 0u;
+    const int2 maskPx = maskOk ? shadowMaskPixel(In.Position) : int2(In.Position.xy);
+#else
+    const bool maskOk = false;
+    const int2 maskPx = int2(In.Position.xy);
+#endif
     if (gShadowParams.grassParams5.z > 0.5f) {
-        const float3 pt = evalPointLightNearFar(In.WorldPos, nFace, In.Position.xy);
+        const float3 pt = evalPointLightNearFar(In.WorldPos, nFace, In.Position.xy, maskPx, maskOk);
         result  += tex.rgb * pt;
         litTerm += pt;
     }
@@ -233,10 +256,8 @@ PSOut PS_MAIN( VSOutput In )
 #endif
 
     // F12 distance grayscale parity with statics.frag / distantland.frag / opaque.frag.
-    uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
-    if (pgiCap) { dbg = 5u; }
+    // (Probe captures never reach here: they leave after the cutout, PROBE CAPTURE, LEAN.)
+    const uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
@@ -248,7 +269,7 @@ PSOut PS_MAIN( VSOutput In )
     // ground is the surface these modes were just wired onto. With grass left out, mode 6 outdoors
     // showed pure lighting on the terrain with fully-textured blades standing all over it — which
     // reads as "grass is still on MW's path" and is the exact wrong answer this view exists to give.
-    if (dbg == 5u) { Out.Color = pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f) : float4(tex.rgb, 1.0f); RETURN(Out); }
+    if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f); RETURN(Out); }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     // Ambient here is grass.vert's In.Color, which already carries the root-AO darkening — so this
     // is also the view that shows that term on its own.

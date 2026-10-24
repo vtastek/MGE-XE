@@ -467,6 +467,7 @@ extern "C" void uiSetExternalInput(float x, float y, float wheel, bool l, bool r
 // At depth 1 nothing is ever in flight at a write, so the guard is a pair of fence reads.
 namespace ForgeRender { void descWriteGuard(int line); }
 namespace ForgeRender { void aplBindSwapchainSets(Renderer* R); }   // hostZeroCopy
+namespace ForgeRender { struct TerrainView; }                         // MirrorView names one
 #define updateDescriptorSet(R_, i_, set_, n_, d_) \
     (ForgeRender::descWriteGuard(__LINE__), ::updateDescriptorSet((R_), (i_), (set_), (n_), (d_)))
 
@@ -3143,7 +3144,7 @@ namespace {
         // Created once beside the STBN mask; bound lazily into each lit PerFrame set the first time
         // that set exists (envBrdfBound), because those sets are created across init and water setup.
         Texture*       pEnvBrdf = nullptr;
-        DescriptorSet* envBrdfBound[4] = {};
+        DescriptorSet* envBrdfBound[6] = {};
         DescriptorSet* pAOBlurSetHalf = nullptr;     // AOBlurSrtData PerFrame, all-half variant
         bool           aoHalfReady = false;          // every half-res resource/pipeline/set built
         // Which AO texture the LAST renderScene actually wrote and left in SHADER_RESOURCE. The two
@@ -3722,7 +3723,7 @@ namespace {
         // elevation, turbidity and albedo, not of the view) so the pass needs exactly one binding.
         // [0] = main, [1] = reflect; bound into pPerBatchSetSky / pPerBatchSetReflectSky, the pair
         // the sky pass already switches between.
-        Buffer*        pSkyViewCbv[2] = { nullptr, nullptr };
+        Buffer*        pSkyViewCbv[3] = { nullptr, nullptr, nullptr };   // [2] = the probe-GI capture view
 
         // --- S2: THE ATMOSPHERE's LUT chain (tasks/forge-atmosphere.md) --------------------------
         // Four compute passes over ONE SRT, four set instances. The three textures are RGBA16F and
@@ -3950,6 +3951,21 @@ namespace {
         // (overwriting pReflectFrameCbv mid-pass would corrupt the sky draws that execute later on the GPU).
         Buffer*        pReflectFrameCbvGeo = nullptr;       // gFrameData for the water-plane mirror + clip plane
         DescriptorSet* pPerFrameSetReflectGeo = nullptr;    // PerFrame set bound to pReflectFrameCbvGeo
+        // PROBE GI's OWN CAPTURE VIEW (MirrorView): the mirror's targets and per-view state again, at the
+        // peek size. Its pyramid is mip 0 alone: the gather reads that and the resolved depth, nothing else.
+        RenderTarget*  pCapColor = nullptr;
+        RenderTarget*  pCapDepth = nullptr;
+        Texture*       pCapMip0 = nullptr;                  // RGBA16F, the resolve's colour
+        Texture*       pCapDepthRes = nullptr;              // R32F, the resolve's depth
+        DescriptorSet* pCapMipSet = nullptr;                // ReflectMipSrtData, 1 instance
+        Buffer*        pCapFrameCbv = nullptr;              // the sky's gFrameData (probe face VP)
+        Buffer*        pCapFrameCbvGeo = nullptr;           // land / statics / near: + the capture lanes
+        DescriptorSet* pPerFrameSetCap = nullptr;
+        DescriptorSet* pPerFrameSetCapGeo = nullptr;
+        Buffer*        pCapSkyWorldsBuf = nullptr;
+        Buffer*        pCapSkyInstanceBuf = nullptr;
+        DescriptorSet* pPerBatchSetCapSky = nullptr;
+        bool           capReady = false;
         // SUN (directional) shadow — Phase A (forge-sun-shadows.md). MSM moments map rendered from DL
         // statics (primary caster proxy) under a sun ortho VP; F12 mode 13 blits it. Its own frame CBV
         // (gFrameData copy, viewProj := sun ortho VP), like pReflectFrameCbvGeo's second-view pattern.
@@ -4743,6 +4759,7 @@ namespace {
            kGpuPhaseSunBlur,       // inside ShadowSun: the moments blur alone (fused or two-pass)
            kGpuPhasePgi,           // inside Reflect: probe GI compute (place, relight, splat, balls)
            kGpuPhaseDof,           // depth of field (autofocus + CoC/gather), after the motion blur
+           kGpuPhasePgiCap,        // inside Reflect: probe GI's own capture pass (a face + its resolve + gather)
            kGpuPhaseCount };
 
     // MGE_GPU_MARKERS=1: every phase bracket also opens a D3D12 event named after its phase, so an
@@ -4758,7 +4775,7 @@ namespace {
         "ObjVel", "ObjVelFP", "MotionBlur", "AODown", "AOSearch", "AOBlur", "AOUp", "ResolveFilter",
         "HizMip0", "ReLinear", "Apl", "GrassDepth", "GrassColor", "SkyVis", "SkyVisScreen",
         "RippleSim", "FbCopyA", "FbCopyB", "CullCam", "CullScan", "CullSun", "CullGrass", "CullCount",
-        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur", "Pgi", "Dof"
+        "CullScatter", "SkySnap", "WaterRefr", "StaticsDepth", "SunBlur", "Pgi", "Dof", "PgiCap"
     };
     bool gpuMarkersOn() {
         static const bool on = [] { const char* e = std::getenv("MGE_GPU_MARKERS"); return e && e[0] == '1'; }();
@@ -6555,6 +6572,10 @@ namespace {
     // atlases directly, as the first-person arms do (alphaShadowParams.y on the capture's frame cbuffer).
     // 0 = the old unshadowed mirror lights (gobo only), which lit a tunnel's rock from the far side.
     float              g_capPointShadow = 1.0f;
+    // reflPointShadow (default 1): the WATER MIRROR the same — its point lights were the gobo only (the
+    // screen mask is the main view's), so a lamp lit the reflected ground behind walls and rocks
+    // ("reflections are missing some shadows", user 2026-10-23, iboseydaneenbright2).
+    float              g_reflPointShadow = 1.0f;
     std::vector<int>   g_probeSiteSlots;
     std::vector<float> g_probeData;             // per face: kProbeFaceRes² × 8 floats (see the writer)
     std::vector<float> g_probeAux;              // per face: kProbeFaceRes² × 12 {albedo3, litTerm3, ambient3, normal3}
@@ -6615,15 +6636,39 @@ namespace {
         float    dbg = 0.0f;           // debugParams.x on the mirror's FrameData copy (5 = albedo)
         bool     dbgTerrain = false;   // bind terrain_dbg (the isolation views live only there)
         uint32_t res = 0;              // viewport side (px); 0 = the whole mirror target
-        bool     steal = false;        // a WET view: keep last frame's reflection, draw only the corner
         bool     actOnly = false;      // H2-A: a near probe's near-content shot — only what is within pgiNearAct
                                        // of the camera is drawn (no sky, land, statics); the gather merges it
     };
     CapFace g_capFace;
-    // The mirror's horizon scissor top on the last NORMAL reflect frame: rows above it were cleared and
-    // never drawn, and water never samples them — where a stolen probe face may go (pgiSchedule).
-    uint32_t g_reflLastScissorTop = 0;
-    uint32_t g_reflLastScissorFrame = 0;
+    // ...and PROBE GI's capture for this frame (pgiSchedule). It is g_capFace only while its own pass is
+    // culled and recorded (CapScope): the water's mirror runs in the same frame and must not see it.
+    CapFace g_pgiCapF;
+    struct CapScope {
+        CapFace saved;
+        explicit CapScope(const CapFace& c) : saved(g_capFace) { g_capFace = c; }
+        ~CapScope() { g_capFace = saved; }
+    };
+    // THE MIRROR PASS'S VIEW: everything its cull and record write or bind per view. Two since probe GI
+    // got its own budget (tasks/forge-gi.md "GI OWN BUDGET"): the water's reflection and the probe
+    // capture both run every frame in one command list, so each owns its targets, frame cbuffers,
+    // descriptor sets, sky buffers, terrain view and statics rings. By address: most are created later.
+    struct MirrorView {
+        bool            cap;
+        RenderTarget**  color;  RenderTarget** depth;
+        Texture**       mips;   Texture**      depthRes;   DescriptorSet** mipSet;
+        Buffer**        frameCbv;  Buffer**    frameCbvGeo;
+        DescriptorSet** set;    DescriptorSet** setGeo;    DescriptorSet** skyBatch;
+        Buffer**        skyWorlds; Buffer**    skyInst;
+        int             skyView;                           // publishSkyView / g_skyViewPub index
+        ForgeRender::TerrainView* terr;
+        Buffer**        instRing;  Buffer**    argRing;    uint32_t* lastSubsets; uint32_t* lastInst;
+    };
+    const MirrorView& mirrorView(bool cap);
+    bool g_mvCap = false;   // the view being culled / recorded is the probe capture's
+    inline const MirrorView& curMirror() { return mirrorView(g_mvCap); }
+    // Probe GI's own pass this frame: its frame cbuffer is written (pgiCapCull), and its DL cull ran.
+    bool g_pgiCapFrameReady = false;
+    bool g_pgiCapGeoReady   = false;
     inline void capFaceViewProj(const float eyeAbs[3], const float pos[3], uint32_t face, float vp[16]) {
         float fwd[3], up[3], right[3];
         probeFaceBasis(face, fwd, up, right);
@@ -6646,14 +6691,17 @@ namespace {
     float g_pgiLift    = 48.0f;    // knob pgiLift: probes sit this far above their floor / the cell's top
                                    // (48 left half a steep hillside's probes in the ground, user 2026-10-12)
     float g_pgiCapRes  = 64.0f;    // knob pgiCapRes: capture viewport side (px, multiple of 8)
-    float g_pgiEvery   = 1.0f;     // knob pgiEvery: capture on every Nth dry frame (1 capture ~0.27 ms GPU)
+    float g_pgiEvery   = 1.0f;     // knob pgiEvery: capture on every Nth frame, in probe GI's own pass (~0.3 ms GPU a face)
     float g_pgiBatch   = 64.0f;    // knob pgiBatch: complete probes relit per frame
-    float g_pgiSteal   = 6.0f;     // knob pgiSteal: on a WET view, steal 1 frame in N (0 = never)
     float g_pgiLead    = 1.5f;     // knob pgiLead: capture toward where the camera will be in this many s
     float g_pgiFade    = 1.0f;     // knob pgiFade: a probe's change (a new face) blends in over ~this many s
     float g_pgiBounce  = 1.0f;     // knob pgiBounce: hits lit by the probe's own previous field (multi-bounce)
+    float g_pgiBounceGain = 1.0f;  // knob pgiBounceGain (test): that bounce's share
     float g_pgiFaceRank = 1.0f;    // knob pgiFaceRank: each face a probe already has costs it this many
                                    // columns of distance in the capture order (0 = finish near probes first)
+    float g_pgiDepthFirst = 1.0f;  // knob pgiDepthFirst: a started probe takes every capture until it is whole
+    float g_pgiTrustPair  = 1.0f;  // knob pgiTrustPair: a probe enters the field only once it has its down AND up
+                                   // faces — one face alone fills the other five from itself (user 2026-10-23)
     // GI BOUNCE INSPECTION (shaders gitint.h.fsl): a share of objects painted a pure bright colour, in
     // the main view and the probe captures alike, so their bounce shows on the neighbours. *"A debug mode
     // where seldom random objects are rendered with pure bright colors would be nice to inspect
@@ -6825,6 +6873,12 @@ namespace {
     float g_pgiWorldLift  = 384.0f;   // knob pgiWorldLift: u above max(camera, the camera column's top)
     float g_pgiWorldMove  = 1024.0f;  // knob pgiWorldMove: re-shot at the camera once this far from it (u)
     float g_pgiWorldEvery = 10.0f;    // knob pgiWorldEvery: and re-shot in place every N s (cells stream in; its sky is every probe's)
+    float g_pgiWorldSkyStops = 0.5f;  // knob pgiWorldSkyStops: and re-shot once the sky's illuminance moved this many stops (0 = off)
+    float g_pgiResetStops = 1.0f;     // knob pgiResetStops: a LIGHT EVENT = the frame's light this many stops off its lagged self (0 = off)
+    float g_pgiFog = 1.0f;            // knob pgiFog: the relight fogs each hit by the probe's distance (energy only; 0 = off)
+    float g_pgiTrace = 0.0f;          // knob pgiTrace (debug): log [pgi-trace], each probe's irradiance against its age
+    float g_pgiTraceIn[8] = {};       // TRACE: the relight's last inputs (sunCol rgb, sunDir z, ambCol rgb, fog end)
+    float g_pgiCapStop = 0.0f;        // knob pgiCapStop (test): > 0 = no probe capture after this many s of host time
     float g_pgiLiveSky    = 1.0f;     // knob pgiLiveSky: every probe's sky texels take the world probe's (0 = their own capture)
     float g_pgiBackMax    = 0.2f;     // knob pgiBackMax: a COMPLETE probe seeing more back faces than this share is inside geometry
     float g_pgiBackMaxPart = 0.5f;    // knob pgiBackMaxPartial: ... and a PARTIAL one
@@ -6853,7 +6907,7 @@ namespace {
     constexpr uint64_t kPgiBlameLane = 32ull * kPgiN;           // BLAME: 2 float4 per probe slot
     constexpr uint64_t kPgiMoveLane  = 32ull * kPgiN;           // NUDGE: 2 float4 per probe slot
     // The field's readback (probeOracleAtProbes): 16 slices of G x G RGBA16F, rows padded to 256 B.
-    constexpr uint64_t kPgiShRowPitch = 256, kPgiShSlice = kPgiShRowPitch * kPgiG, kPgiShLane = kPgiShSlice * 16ull;
+    constexpr uint64_t kPgiShRowPitch = 256, kPgiShSlice = kPgiShRowPitch * kPgiG, kPgiShLane = kPgiShSlice * 20ull;   // + 16-19 for pgiTrace
     // gPgiLit (kPgiG x 6 faces x 8 wide, kPgiL x kPgiG x 8 high, RGBA16F): 9216-byte rows, already 256-aligned.
     constexpr uint64_t kPgiLitW = 6ull * 8ull * 24ull, kPgiLitH = 2ull * 24ull * 8ull,
                        kPgiLitRowPitch = kPgiLitW * 8ull, kPgiLitLane = kPgiLitRowPitch * kPgiLitH;
@@ -6913,6 +6967,7 @@ namespace {
         // the relight), the capture's ball, and the volume.
         int            slotOwner[kPgiN];
         bool           slotClear[kPgiN] = {};
+        double         slotBorn[kPgiN] = {};  // TRACE (pgiTrace): when each slot was last cleared, s
         bool           ballMode = false;      // pgiBalls latched for this frame
         // The SPACE the pool lives in (pgiSchedule's reset): exterior or interior, and the last eye in it.
         bool           spaceSeen = false, spaceExt = true;
@@ -6951,6 +7006,17 @@ namespace {
         bool           capWorld = false;      // this frame's capture is the world probe's
         double         worldT = 0.0;          // s at the last full shot (a slow periodic refresh)
         uint32_t       worldShots = 0;        // heartbeat
+        uint32_t       worldSkyShots = 0;     // heartbeat: of those, re-shot because the sky changed
+        double         worldSkyLux = 0.0;     // the sky's illuminance at the last shot (pgiWorldSkyStops)
+        // A LIGHT EVENT (pgiResetStops): the light jumped (a wait, a weather snap). The field is rebuilt
+        // from the new light in one frame instead of easing out of the old one, which lit a night with
+        // noon for seconds (user 2026-10-23: "probes can update fast at change. they can easily reset to
+        // zero, as they are meant to add light").
+        uint32_t       resetFrames = 0;       // > 0: relight EVERY probe, write it outright, no bounce
+        bool           skyStale = false;      // captured skies predate the event: the live sky until re-shot
+        double         lightRef = 0.0;        // the light, lagged (pgiResetTau): a jump against it is an event
+        uint32_t       resets = 0;            // heartbeat
+        uint32_t       recapDup = 0;          // TRACE: pool gathers onto a face its ball already had
         // HI-RES WORLD PROBE (knob pgiHiRes): its faces at peekRes in the peek atlas (raw row 4, lit row 5),
         // the faces captured that way, and the cube built from them (opaque.srt.h gPgiWorldCube).
         uint8_t        worldHiFaces = 0;
@@ -6986,8 +7052,7 @@ namespace {
         int            ix0 = 0, iy0 = 0;
         float          spacing = 0.0f;
         bool           capThis = false;
-        uint32_t       capSlot = 0, capLayer = 0, capFace = 0, everyCount = 0, phase = 0, stealCount = 0;
-        uint32_t       steals = 0;
+        uint32_t       capSlot = 0, capLayer = 0, capFace = 0, everyCount = 0, phase = 0;
         uint32_t       captures = 0, complete = 0;
         uint32_t       zResets = 0;           // probes reset by a placement height change (heartbeat)
         float          eye[2] = {}, vel[2] = {};   // camera xy and its smoothed velocity (u/s), look-ahead
@@ -7790,7 +7855,7 @@ namespace {
     // to MW's sky mesh instead. Once true it stays true: a frame that skips a publish holds the
     // previous frame's coefficients, which is the same "prior values survive" contract the whole
     // lighting block already runs on.
-    bool g_skyViewPub[2] = { false, false };
+    bool g_skyViewPub[3] = { false, false, false };
 
     // MW's current zenith sky colour, decoded to the scene's domain (lighting[28..30]). The legacy SH
     // projection's upper pole — its only reader. It rode FrameData.skyZenith until S2j re-used those
@@ -7812,7 +7877,7 @@ namespace {
     // outlives the frame that cooked it.
     void publishSkyView(int view, const float* invVP)
     {
-        if (view < 0 || view > 1) { return; }
+        if (view < 0 || view > 2) { return; }
         Buffer* b = g_live.pSkyViewCbv[view];
         if (!b || !fbr(b)) { return; }
         float* v = (float*)fbw(b);
@@ -8943,14 +9008,22 @@ namespace {
     // a new address is a new set and gets bound again). True only when EVERY lit set that exists has
     // it — the lane that lets a shader read gEnvBRDF is published from this, so a set that missed
     // the bind can never be asked for it (an unbound read is (0,0) = no environment specular).
+    // EVERY PerFrame set the mirror's land / statics / near frags draw under: the water's reflection
+    // and probe GI's capture view. A late bind that reached only one left the other reading whatever
+    // sat at that heap offset.
+    static void updateMirrorGeoSets(Renderer* R, uint32_t n, const DescriptorData* d) {
+        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, n, d); }
+        if (g_live.pPerFrameSetCapGeo)     { updateDescriptorSet(R, 0, g_live.pPerFrameSetCapGeo, n, d); }
+    }
     static bool envBrdfEnsureBound() {
         if (!g_live.pEnvBrdf || !g_live.pRenderer || !g_live.pPerFrameSet) { return false; }
-        DescriptorSet* const sets[4] = { g_live.pPerFrameSet, g_live.pPerFrameSetReflect,
-                                         g_live.pPerFrameSetReflectGeo, g_live.pPerFrameSetFP };
+        DescriptorSet* const sets[6] = { g_live.pPerFrameSet, g_live.pPerFrameSetReflect,
+                                         g_live.pPerFrameSetReflectGeo, g_live.pPerFrameSetFP,
+                                         g_live.pPerFrameSetCap, g_live.pPerFrameSetCapGeo };
         DescriptorData d = {};
         d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gEnvBRDF);
         d.mCount = 1; d.ppTextures = &g_live.pEnvBrdf;
-        for (uint32_t k = 0; k < 4; ++k) {
+        for (uint32_t k = 0; k < 6; ++k) {
             if (sets[k] && sets[k] != g_live.envBrdfBound[k]) {
                 updateDescriptorSet(g_live.pRenderer, 0, sets[k], 1, &d);
                 g_live.envBrdfBound[k] = sets[k];
@@ -13174,13 +13247,13 @@ namespace {
             // carry invViewProj and the two views need different ones (skyview.h.fsl). 512 B each
             // (P2b's sun-disc and star lanes took the struct past 256), persistent-mapped, written
             // once per frame beside each view's matrix.
-            for (int v = 0; v < 2; ++v) {
+            for (int v = 0; v < 3; ++v) {
                 BufferLoadDesc svb = {};
                 svb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
                 svb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
                 svb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
                 svb.mDesc.mSize = 512;              // cbuffer alignment, not sizeof(SkyViewData)
-                svb.mDesc.pName = v ? "skyViewCbvReflect" : "skyViewCbvMain";
+                svb.mDesc.pName = (v == 2) ? "skyViewCbvCap" : v ? "skyViewCbvReflect" : "skyViewCbvMain";
                 svb.pData = nullptr;
                 svb.ppBuffer = &g_live.pSkyViewCbv[v];
                 addFrameBuf(&svb);
@@ -13190,7 +13263,7 @@ namespace {
             // Zeroed once, and the zero is DESIGNED: params.x = 0 reads as "not published" and
             // radiance.w = 0 as a black sky, so a frame that draws before the first publish paints
             // black rather than whatever the allocator left behind.
-            for (int v = 0; v < 2; ++v) {
+            for (int v = 0; v < 3; ++v) {
                 if (g_live.pSkyViewCbv[v] && fbr(g_live.pSkyViewCbv[v])) {
                     std::memset(fbw(g_live.pSkyViewCbv[v]), 0, 512);
                 }
@@ -14760,6 +14833,25 @@ namespace {
             rsi.ppBuffer = &g_live.pReflectSkyInstanceBuf;
             addFrameBuf(&rsi);
 
+            // PROBE GI's CAPTURE VIEW (MirrorView): the same targets at the peek size (the largest face a
+            // capture draws), the same sample count and format (one PSO set spans all three views), and its
+            // own frame cbuffers and sky buffers. Non-fatal: without them probe GI just never captures.
+            // SIX faces wide: a whole probe per pass (VS viewport-array routing, tasks/forge-gi.md) draws
+            // face f at x = f * side; one face per pass uses the first.
+            {
+                const uint32_t cs = std::max(8u, std::min(kPgiPeekRes, reflectSize()) / 8u * 8u);
+                RenderTargetDesc ccd = rcd;
+                ccd.mWidth = 6u * cs; ccd.mHeight = cs; ccd.pName = "pgiCapColor";
+                addRenderTarget(R, &ccd, &g_live.pCapColor);
+                RenderTargetDesc cdd = rdd;
+                cdd.mWidth = 6u * cs; cdd.mHeight = cs; cdd.pName = "pgiCapDepth";
+                addRenderTarget(R, &cdd, &g_live.pCapDepth);
+                BufferLoadDesc c0 = rfb; c0.mDesc.pName = "pgiCapFrameCbv";    c0.ppBuffer = &g_live.pCapFrameCbv;       addFrameBuf(&c0);
+                BufferLoadDesc c1 = rfg; c1.mDesc.pName = "pgiCapFrameCbvGeo"; c1.ppBuffer = &g_live.pCapFrameCbvGeo;    addFrameBuf(&c1);
+                BufferLoadDesc c2 = rsw; c2.mDesc.pName = "pgiCapSkyWorldsCbv"; c2.ppBuffer = &g_live.pCapSkyWorldsBuf;  addFrameBuf(&c2);
+                BufferLoadDesc c3 = rsi; c3.mDesc.pName = "instanceVBCapSky";   c3.ppBuffer = &g_live.pCapSkyInstanceBuf; addFrameBuf(&c3);
+            }
+
             waitForAllResourceLoads();
             if (!g_live.pReflectColor || !g_live.pReflectDepth || !g_live.pReflectFrameCbv
                 || !g_live.pReflectFrameCbvGeo
@@ -14777,6 +14869,10 @@ namespace {
             DescriptorSetDesc rsbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
             addDescriptorSet(R, &rsbDesc, &g_live.pPerBatchSetReflectSky);
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
+            if (g_live.pCapFrameCbv && g_live.pCapSkyWorldsBuf) {   // the capture view's twins
+                addDescriptorSet(R, &rpfDesc, &g_live.pPerFrameSetCap);
+                addDescriptorSet(R, &rsbDesc, &g_live.pPerBatchSetCapSky);
+            }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 DescriptorData p[19] = {};   // was 9; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
@@ -14867,6 +14963,11 @@ namespace {
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
                 bindCausticField(R, g_live.pPerFrameSetReflect, 0);   // W23
+                if (g_live.pPerFrameSetCap) {   // the same set, its gFrameData the capture's
+                    p[0].ppBuffers = &g_live.pCapFrameCbv;
+                    updateDescriptorSet(R, 0, g_live.pPerFrameSetCap, rn, p);
+                    bindCausticField(R, g_live.pPerFrameSetCap, 0);
+                }
             }
             {
                 // ...and the MIRROR half of the P2 pair: gSkyView bound to pSkyViewCbv[1], which is
@@ -14884,6 +14985,19 @@ namespace {
                     ++rbn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerBatchSetReflectSky, rbn, rbp);
+                if (g_live.pPerBatchSetCapSky) {   // the capture view: its own sky window and gSkyView [2]
+                    DescriptorData cbp[2] = {};
+                    uint32_t cbn = 0;
+                    cbp[cbn].mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                    cbp[cbn].ppBuffers = &g_live.pCapSkyWorldsBuf;
+                    ++cbn;
+                    if (g_live.pSkyViewCbv[2]) {
+                        cbp[cbn].mIndex = SRT_RES_IDX(SrtData, PerBatch, gSkyView);
+                        cbp[cbn].ppBuffers = &g_live.pSkyViewCbv[2];
+                        ++cbn;
+                    }
+                    updateDescriptorSet(R, 0, g_live.pPerBatchSetCapSky, cbn, cbp);
+                }
             }
 
             // WV2: pPerFrameSetReflectGeo — a THIRD PerFrame set bound to pReflectFrameCbvGeo (the
@@ -14892,6 +15006,7 @@ namespace {
             DescriptorSetDesc rpgDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
             addDescriptorSet(R, &rpgDesc, &g_live.pPerFrameSetReflectGeo);
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
+            if (g_live.pCapFrameCbvGeo) { addDescriptorSet(R, &rpgDesc, &g_live.pPerFrameSetCapGeo); }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 DescriptorData p[26] = {};   // was 13; +gSkyHeight, +gSunOcc, +the atmosphere pair, +the point atlases (and headroom)
@@ -15034,8 +15149,13 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pReflectSkyColor;
                     ++rn;
                 }
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
+                updateMirrorGeoSets(R, rn, p);   // both views' sets; then the capture's own gFrameData
                 bindCausticField(R, g_live.pPerFrameSetReflectGeo, 0);   // W23
+                if (g_live.pPerFrameSetCapGeo) {
+                    p[0].ppBuffers = &g_live.pCapFrameCbvGeo;
+                    updateDescriptorSet(R, 0, g_live.pPerFrameSetCapGeo, 1, p);
+                    bindCausticField(R, g_live.pPerFrameSetCapGeo, 0);
+                }
             }
 
             // SUN shadow: pPerFrameSetSun — a PerFrame set bound to pSunFrameCbv (gFrameData copy,
@@ -15379,6 +15499,39 @@ namespace {
                 }
                 g_live.reflectMipReady = g_live.pReflectMips && g_live.pReflectMipSet
                                       && g_live.pReflectMipPipelineFirst && g_live.pReflectMipPipeline;
+                // PROBE GI's capture view: the resolve's first pass alone, into its own mip 0 + depth (what
+                // the gather reads). Same pipelines, its own one-instance set.
+                if (g_live.reflectMipReady && g_live.pCapColor && g_live.pCapDepth) {
+                    TextureDesc cmd = rmd;
+                    cmd.mWidth = g_live.pCapColor->mWidth; cmd.mHeight = g_live.pCapColor->mHeight;
+                    cmd.mMipLevels = 1; cmd.pName = "pgiCapMip0";
+                    TextureLoadDesc cml = {}; cml.ppTexture = &g_live.pCapMip0; cml.pDesc = &cmd;
+                    addResource(&cml, nullptr);
+                    TextureDesc cdr = rdrd;
+                    cdr.mWidth = cmd.mWidth; cdr.mHeight = cmd.mHeight; cdr.pName = "pgiCapDepthRes";
+                    TextureLoadDesc cdl = {}; cdl.ppTexture = &g_live.pCapDepthRes; cdl.pDesc = &cdr;
+                    addResource(&cdl, nullptr);
+                    waitForAllResourceLoads();
+                    if (g_live.pCapMip0 && g_live.pCapDepthRes) {
+                        DescriptorSetDesc cset = SRT_SET_DESC(ReflectMipSrtData, Persistent, 1, 0);
+                        addDescriptorSet(R, &cset, &g_live.pCapMipSet);
+                    }
+                    if (g_live.pCapMipSet) {
+                        Texture* capTex  = g_live.pCapColor->pTexture;
+                        Texture* capDpth = g_live.pCapDepth->pTexture;
+                        DescriptorData d[5] = {};
+                        d[0].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrcTex);   d[0].mCount = 1; d[0].ppTextures = &capTex;
+                        d[1].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrc);      d[1].mCount = 1; d[1].ppTextures = &g_live.pCapMip0;
+                        d[2].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipDst);      d[2].mCount = 1; d[2].ppTextures = &g_live.pCapMip0;
+                        d[3].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrcDepth); d[3].mCount = 1; d[3].ppTextures = &capDpth;
+                        d[4].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflDepthDst);    d[4].mCount = 1; d[4].ppTextures = &g_live.pCapDepthRes;
+                        updateDescriptorSet(R, 0, g_live.pCapMipSet, 5, d);
+                    }
+                    g_live.capReady = g_live.pCapMipSet && g_live.pPerFrameSetCap && g_live.pPerFrameSetCapGeo
+                                   && g_live.pPerBatchSetCapSky && g_live.pCapSkyInstanceBuf;
+                }
+                std::printf("[forge][pgi] capture view ready=%d (6 x %u²)\n", (int)g_live.capReady,
+                            g_live.pCapColor ? g_live.pCapColor->mHeight : 0u);
                 // gReflectMips into the MAIN PerFrame set — the pyramid when it built, pReflectColor
                 // itself otherwise. water.frag samples this slot unconditionally, so the fallback is
                 // the un-filtered mirror (the pre-WT4d image), never a null SRV.
@@ -22183,6 +22336,7 @@ namespace {
     // against the ground beside it, in one frame, through one exposure.
     bool   g_aplSplitWater = true;
     bool   g_expEnable   = true;
+    float  g_expFixed    = 0.0f;   // knob expFixed (test): > 0 holds E there, the servo idle (a night series at one exposure)
     // WHICH STATISTIC THE METER READS — 0 = frame mean, 1 = p90, 2 = geometric mean. A LIVE knob
     // rather than a constant because the calibration table does not say, and guessing is exactly
     // what produced the 3.51x error: the first interior run read `mean=23 p10=6 p50=16 p90=50`
@@ -22310,9 +22464,21 @@ namespace {
     // 0.948, outside E 0.46), the servo setting overcast land a little brighter than mid-grey.
     float  g_expOpenStops = 9.0f;    // knob expOpenStops (0 = off)
     double g_expOpenNow   = 0.0;     // the E_open of the last servo step (heartbeat `open=`)
-    // At full night the ceiling above is also the floor (see the servo's expMinNow): a dark exterior
-    // is exposed wide open, and adaptation can no longer stop it down. Off = the old free floor.
+    // THE NIGHT FLOOR (see the servo's expMinNow): at full night adaptation may not stop a dark exterior
+    // down below its BASE — the exposure its own night light needs — so the moon, a lantern or a lit
+    // window entering the meter cannot darken the land (user: "max out should be the base"). Off = the
+    // old free floor.
+    // ⚠ THE BASE IS THE LIGHT, NOT THE CEILING (2026-10-23). It first WAS the ceiling (64 under Sunny 16),
+    // a constant 3 stops over MW's authored night: lit Balmora at 23:00 metered 109 levels, brighter
+    // than its noon (103), held there with rail=MIN for the whole night (user: "stuck high exposure
+    // after a wait/rest to night"). Now it is the exposure that puts an upward 18% card, lit by the
+    // light the frame is actually lit with (sun x sin(elevation) + ambient), at the middle of the
+    // night row's own band — times 2^g_expNightBaseStops, and never above the ceiling.
     bool   g_expNightFloor = true;
+    float  g_expNightBaseStops = 0.0f;   // knob expNightBaseStops: the base's offset in stops
+    float  g_litSunL = 0.0f;             // luma of the frame's applied sun / ambient (scene units),
+    float  g_litAmbL = 0.0f;             // after the night blend and the ambient trim
+    double g_expNightBaseNow = 0.0;      // the base of the last servo step (heartbeat `base=`)
     // The ceiling actually applied on the last servo step, for the heartbeat. `rail=MAX` is
     // meaningless without it now that the limit moves with the sun.
     float  g_expMaxNow   = 1.0e3f;
@@ -25312,6 +25478,7 @@ namespace {
             { "probeOracleAtProbes", &g_probeOracleAtProbes },
             { "probeOracleSpread",  &g_probeOracleSpread  },
             { "capPointShadow",     &g_capPointShadow     },
+            { "reflPointShadow",    &g_reflPointShadow    },
             { "svmDirs",            &g_svmDirs            },
             { "svmRes",             &g_svmRes             },
             { "svmExtent",          &g_svmExtent          },
@@ -25564,7 +25731,6 @@ namespace {
             { "pgiCapRes",           &g_pgiCapRes           },
             { "pgiEvery",            &g_pgiEvery            },
             { "pgiBatch",            &g_pgiBatch            },
-            { "pgiSteal",            &g_pgiSteal            },
             { "pgiLead",             &g_pgiLead             },
             { "pgiCapReach",         &g_pgiCapReach         },
             { "pgiCapMinR",          &g_pgiCapMinR          },
@@ -25579,6 +25745,12 @@ namespace {
             { "pgiWorldLift",        &g_pgiWorldLift        },
             { "pgiWorldMove",        &g_pgiWorldMove        },
             { "pgiWorldEvery",       &g_pgiWorldEvery       },
+            { "pgiWorldSkyStops",    &g_pgiWorldSkyStops    },
+            { "pgiResetStops",       &g_pgiResetStops       },
+            { "pgiFog",              &g_pgiFog              },
+            { "pgiTrace",            &g_pgiTrace            },
+            { "pgiBounceGain",       &g_pgiBounceGain       },
+            { "pgiCapStop",          &g_pgiCapStop          },
             { "pgiLiveSky",          &g_pgiLiveSky          },
             { "pgiFillOld",          &g_pgiFillOld          },
             { "pgiFillGain",         &g_pgiFillGain         },
@@ -25647,6 +25819,8 @@ namespace {
             { "pgiVoxel",            &g_pgiVoxel            },
             { "pgiFade",             &g_pgiFade             },
             { "pgiFaceRank",         &g_pgiFaceRank         },
+            { "pgiDepthFirst",       &g_pgiDepthFirst       },
+            { "pgiTrustPair",        &g_pgiTrustPair        },
             { "pgiBounce",           &g_pgiBounce           },
             { "pgiDebug",            &g_pgiDebug            },
             { "giTint",              &g_giTint              },   // GI bounce inspection share
@@ -25774,6 +25948,9 @@ namespace {
             { "expTauRise",          &g_expTauRise          },
             { "expTauFall",          &g_expTauFall          },
             { "expOpenStops",        &g_expOpenStops        },
+            { "expMaxNight",         &g_expMaxNight         },
+            { "expFixed",            &g_expFixed            },
+            { "expNightBaseStops",   &g_expNightBaseStops   },
     };
     const BKnob bknobs[] = {
             // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
@@ -25783,6 +25960,7 @@ namespace {
             { "sunLightFollowsDisc", &g_sunLightFollowsDisc },
             { "sunFreeze",           &g_sunFreeze           },   // TEST: aimed sun held at its first frame
             { "dumpLdrOnly",         &g_dumpLdrOnly         },   // dumps skip the EXR
+            { "expNightFloor",       &g_expNightFloor       },   // full night: the ceiling is also the floor
             // The alpha fold fix (near-opaque depth prepass), so a dense-alpha scene (the CAP candle
             // staircase: 420 flame billboards in view) can be A/B'd from a minimized harness run.
             { "alphaDepthWrite", &g_alphaDepthWrite },
@@ -28737,9 +28915,10 @@ namespace {
           t.sliderF("Probe GI balls: sun balls per frame", &g_pgiBallsSun, 0.0f, 256.0f, 16.0f, "%.0f");
           t.sliderF("Probe GI volume: temporal smoothing (s)", &g_pgiVolTau, 0.0f, 4.0f, 0.1f, "%.1f");
           t.sliderF("Probe GI volume: splat kernel (x the merge radius)", &g_pgiKernK, 0.5f, 6.0f, 0.25f, "%.2f");
-          t.sliderF("Probe GI: capture every Nth dry frame", &g_pgiEvery, 1.0f, 8.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: capture every Nth frame", &g_pgiEvery, 1.0f, 8.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI: probes relit per frame", &g_pgiBatch, 8.0f, 1152.0f, 8.0f, "%.0f");
-          t.sliderF("Probe GI: water in view -> steal 1 mirror frame in N (0 = never)", &g_pgiSteal, 0.0f, 16.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: a started probe finishes first (0/1)", &g_pgiDepthFirst, 0.0f, 1.0f, 1.0f, "%.0f");
+          t.sliderF("Probe GI: trust a probe from its down + up faces (0/1)", &g_pgiTrustPair, 0.0f, 1.0f, 1.0f, "%.0f");
           t.sliderF("Probe GI: capture look-ahead (s of camera motion)", &g_pgiLead, 0.0f, 4.0f, 0.25f, "%.2f");
           t.sliderF("Probe GI: a probe's change (new face) blends in over (s)", &g_pgiFade, 0.0f, 4.0f, 0.25f, "%.2f");
           t.sliderF("Probe GI: face rank cost (columns; 0 = finish near probes first)", &g_pgiFaceRank, 0.0f, 4.0f, 0.25f, "%.2f");
@@ -34518,7 +34697,7 @@ void destroyHostWindow(Renderer* R);
     inline bool pgiCtxOn()  { return g_dlExterior || pgiIndoor(); }
     // The relight's sun-test lane (sunDir.w): pgiSunTap outdoors; 3 indoors = unshadowed (pgi.comp.fsl
     // pgiSunVisibility) — the sun maps there are the last exterior's.
-    inline float pgiSunTapLane() { return g_dlExterior ? std::clamp(g_pgiSunTap, 0.0f, 2.0f) : 3.0f; }
+    inline float pgiSunTapLane() { return g_dlExterior ? std::clamp(g_pgiSunTap, 0.0f, 3.0f) : 3.0f; }   // 3 (test): unshadowed, the interiors' path
 
     // ─── S3a: THE CALIBRATION SETPOINT ───────────────────────────────────────────────────────────
     // The user's target mean display values, as `apl` (0..1). This table is the whole reason the
@@ -35419,6 +35598,7 @@ void destroyHostWindow(Renderer* R);
         if (!g_expEnable || !g_live.sceneReferred) {
             return;   // E is published as 1.0 in this case; leave the state where it is
         }
+        if (g_expFixed > 0.0f) { g_exposure = (double)g_expFixed; g_expLastMs = hostNowMs(); return; }
         // ⚠⚠ A DEBUG VIEW IS NOT A SCENE, AND THE SERVO CANNOT TELL. mbDebug REPLACES the frame
         // with a diagnostic — weights in [0,1], a hue wheel, a depth ramp — and the APL pass then
         // meters THAT and drives E to put it at the authored setpoint. So the diagnostic's own
@@ -35523,15 +35703,28 @@ void destroyHostWindow(Renderer* R);
                 expMaxNow = std::min(expMaxNow, std::max(expMaxNightNow, g_expOpenNow * std::exp2((double)g_expOpenStops)));
             }
         }
-        // THE NIGHT FLOOR (g_expNightFloor): at full night the ceiling is also the BASE — a camera
-        // wide open on a dark exterior, which the moon, a lantern or a lit window must not stop
+        // THE NIGHT FLOOR (g_expNightFloor): at full night the BASE — the exposure the frame's own
+        // night light needs — is the floor, which the moon, a lantern or a lit window must not stop
         // down (user: "adaptation bringing it down too much. max out should be the base"). It opens
         // toward g_expMin along the same night ramp, interpolated in STOPS so dusk is not pinned
-        // bright: half-way through the ramp the floor is half-way in log, not half the ceiling.
+        // bright: half-way through the ramp the floor is half-way in log, not half the base.
         double expMinNow = (double)g_expMin;
+        g_expNightBaseNow = 0.0;
         if (g_expNightFloor && g_skyPhys.active) {
+            // The card: an upward 18% grey under the frame's own light, lit = albedo·(amb + sun·sinEl),
+            // put at the MIDDLE of this row's band (in the gain's domain — the scene value the curve
+            // takes). NOT at mid-grey: that is day brightness, and MW's authored night row is ~0.2x
+            // day (Balmora 23:00: a mid-grey base was 48.6, barely under the 64 it replaced).
+            const double sinEl = std::sin((double)g_skyPhys.elevLight * SceneCal::kPi / 180.0);
+            const double Elit  = (double)g_litSunL * std::max(0.0, sinEl) + (double)g_litAmbL;
+            const double gMid  = calGainDomain(0.5 * ((double)ct.lo + (double)ct.hi));
+            // No light measured yet (the first frames): the ceiling, as before — never a free floor.
+            const double base = (Elit > 1.0e-9 && gMid > 0.0)
+                ? std::min(expMaxNightNow, std::exp2((double)g_expNightBaseStops) * gMid / (0.18 * Elit))
+                : expMaxNightNow;
+            g_expNightBaseNow = base;
             const double r = std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp));
-            const double Lf = std::log2(std::max(expMaxNightNow, 1.0e-12)) * (1.0 - r)
+            const double Lf = std::log2(std::max(base, 1.0e-12)) * (1.0 - r)
                             + std::log2(std::max((double)g_expMin, 1.0e-12)) * r;
             expMinNow = std::min(expMaxNow, std::max((double)g_expMin, std::exp2(Lf)));
         }
@@ -35863,6 +36056,7 @@ void destroyHostWindow(Renderer* R);
     // fcbvR = main frame cbuffer, dRel = water plane (camera-relative), eyeAbsZ = abs camera z.
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
+    void pgiCapCull(Renderer* R, const float* fcbvR);   // probe GI's own pass: its face cbuffer + cull
     // THE W-GATE. Answers "can the camera see any water surface this frame" from the per-cell terrain
     // minima of the cells the MAIN view is already drawing. Runs every frame (it is a few hundred
     // float compares); ACTING on the answer is the g_reflWaterGate knob. Defined with the terrain
@@ -36123,6 +36317,7 @@ void destroyHostWindow(Renderer* R);
             { kGpuPhaseSkySnap, "sky snapshot" }, { kGpuPhaseWaterRefr, "water refract copy" },
             { kGpuPhaseStaticsDepth, "statics depth" },
             { kGpuPhaseSunBlur, "sun blur" }, { kGpuPhasePgi, "pgi" }, { kGpuPhaseDof, "dof" },
+            { kGpuPhasePgiCap, "pgi capture" },
         };
         static_assert(sizeof(kN) / sizeof(kN[0]) == kGpuPhaseCount, "name every GPU phase");
         for (const auto& n : kN) { if (n.id == i) { return n.name; } }
@@ -36575,7 +36770,7 @@ void destroyHostWindow(Renderer* R);
     void pgiActGather(const IPC::DrawItemWire* items, uint32_t count,
                       const void* skinnedBlob, uint32_t skinnedCount, uint32_t skinnedBytes,
                       const void* multiMapBlob, uint32_t multiMapCount, uint32_t multiMapBytes);
-    void pgiSchedule(const float* fcbvR, bool dry, bool waterOk);
+    void pgiSchedule(const float* fcbvR, bool capOk);
     void pgiGatherRecord();
     void pgiFrameRecord(const float* fcbvR);
     void pgiPublish(float* mp);
@@ -40138,7 +40333,7 @@ void destroyHostWindow(Renderer* R);
             LOG::logline(">> [forge-hb] sun: blur=%.2f (%s) actorDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseSunBlur], g_live.sunBlurFused ? "fused" : "two-pass",
                          g_lastSunActorDraws);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s tiles=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) dof=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f (pgicap=%.2f pgi=%.2f) color=%.2f water=%.2f caustic=%.2f ripple=%.2f(fine=%s tiles=%s wake=%s tiles=%s) grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) dof=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -40162,7 +40357,9 @@ void destroyHostWindow(Renderer* R);
                          g_lastGpuPhaseMs[kGpuPhaseAODown],  g_lastGpuPhaseMs[kGpuPhaseAOSearch],
                          g_lastGpuPhaseMs[kGpuPhaseAOBlur],  g_lastGpuPhaseMs[kGpuPhaseAOUp],
                          g_lastGpuPhaseMs[kGpuPhaseShadowMask],
-                         g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
+                         g_lastGpuPhaseMs[kGpuPhaseReflect],
+                         g_lastGpuPhaseMs[kGpuPhasePgiCap], g_lastGpuPhaseMs[kGpuPhasePgi],
+                         g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater],
                          // caustic=<ms> — W23/W24. The whole pure-compute block: static scatter +
                          // whichever dynamic scatters were armed + both resolves. 0.00 means the
@@ -40603,7 +40800,7 @@ void destroyHostWindow(Renderer* R);
                              " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
                              " exp=%.3g(%s,%s,%s) EVapplied=%.2f s16=%s(R 2^%.2f m 2^%.2f fog x%.3g)"
-                             " rail=%s(ceil %.3g open %.3g) adapt=%s(snaps %u last %+.2f st) cal=(sun %.2f amb %.2f emis %.2f)",
+                             " rail=%s(ceil %.3g open %.3g base %.3g) adapt=%s(snaps %u last %+.2f st) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
@@ -40617,7 +40814,7 @@ void destroyHostWindow(Renderer* R);
                              evApplied,
                              g_sunny16 ? "ON" : "off", std::log2((double)sunnyR()),
                              std::log2((double)sunnyM()), (double)g_sunnyFogK,
-                             railTxt, (double)g_expMaxNow, g_expOpenNow,
+                             railTxt, (double)g_expMaxNow, g_expOpenNow, g_expNightBaseNow,
                              (g_expSnap > 0.5f) ? "cap" : "ease", g_expSnaps, (double)g_expLastSnap,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
 
@@ -41306,6 +41503,9 @@ void destroyHostWindow(Renderer* R);
                 if (ls != 1.0f) {
                     for (int c = 0; c < 3; ++c) { fd[24 + c] *= ls; }
                 }
+                // The pair as the frame is actually lit, for the servo's night floor (g_expNightBase).
+                g_litSunL = SceneCal::luma709(fd + 20);
+                g_litAmbL = SceneCal::luma709(fd + 24);
             }
             // DOOR TRACE (lighting half; the servo half is [exp-door]): the first frames after an
             // interior/exterior switch (8 frames). Reads the write-combined cbuffer — trace window only.
@@ -44417,17 +44617,10 @@ void destroyHostWindow(Renderer* R);
                 g_capFace.dbg = (m == 0u) ? 0.0f : (m == 1u) ? 64.0f : (m == 2u) ? 68.0f : (m == 3u) ? 69.0f : (m == 4u) ? 67.0f : 70.0f;   // 70 the relight's formula
                 g_capFace.dbgTerrain = g_probeModes > 1u;
             }
-            {
-                // An INTERIOR with no water (pgiInterior): the mirror pass is the capture pass and nothing
-                // else ever samples it, so every frame is a dry one.
-                const bool dryInt  = pgiIndoor() && !waterEnabled;
-                const bool waterOk = g_drawReflect && g_live.reflectReady && g_live.reflectMipReady
-                                  && (waterEnabled || dryInt) && waterParams && !underwater;
-                pgiActGather(items, count, skinnedBlob, skinnedCount, skinnedBytes,
-                             multiMapBlob, multiMapCount, multiMapBytes);   // H2-A: the near content
-                pgiSchedule(fcbvR, dryTerrain || dryScreen || dryInt, waterOk);   // may set g_capFace (pgi)
-                if (g_capFace.pgi) { g_reflWaterGateOff = false; }   // dry or stolen: the pass runs
-            }
+            // PROBE GI: its capture runs in its OWN pass (MirrorView), wet view or dry, beside the water's.
+            pgiActGather(items, count, skinnedBlob, skinnedCount, skinnedBytes,
+                         multiMapBlob, multiMapCount, multiMapBytes);   // H2-A: the near content
+            pgiSchedule(fcbvR, g_live.capReady && g_live.reflectMipReady && !underwater);   // sets g_pgiCapF
             if (waterParams) {
                 ++g_reflWaterGateTotal;
                 if (g_reflWaterGateOff) { ++g_reflWaterGateSkips; }
@@ -44462,6 +44655,7 @@ void destroyHostWindow(Renderer* R);
                 g_reflGeoReady = false;
                 g_reflFrameReady = false;
             }
+            pgiCapCull(R, fcbvR);   // ...and probe GI's capture view, after the water's
         }
         const double tCull1 = hostNowMs();   // end of the DL cull (+ lazy resource/texture load)
 
@@ -45665,11 +45859,18 @@ void destroyHostWindow(Renderer* R);
             gpuPhaseBegin(kGpuPhaseReflGeo);
             gpuPhaseEnd(kGpuPhaseReflGeo);
         }
-        if (reflectOn) {
+        // THE MIRROR PASS, per VIEW (MirrorView): the water's reflection (reflectOn), and since probe GI got
+        // its own budget, the probe capture's face in its own targets beside it (g_pgiCapFrameReady) — the
+        // same record either way; the view names every target, cbuffer, set and ring it touches.
+        auto mirrorPass = [&](const bool cap, const bool pf) {
+            g_mvCap = cap;
+            const MirrorView& MV = curMirror();
+            const bool probeFace  = pf;
+            const bool frameReady = cap ? g_pgiCapFrameReady : g_reflFrameReady;
             const float* fcbvR = (const float*)fbr(g_live.pFrameCbv);
             const float eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
-            const float waterLevelAbs = waterParams[0];
-            const bool  underwaterR = waterParams[7] > 0.5f;
+            const float waterLevelAbs = waterParams ? waterParams[0] : 0.0f;   // the capture view runs without water
+            const bool  underwaterR = waterParams && waterParams[7] > 0.5f;
             const float dRel = waterMirrorZ(waterLevelAbs) - eyeAbsZ;   // camera-relative (logged)
 
             // STAGE 1 (sky): mirror about the CAMERA's horizontal plane (z = 0 camera-relative), NOT
@@ -45726,8 +45927,8 @@ void destroyHostWindow(Renderer* R);
             // Reflect frame cbuffer = a copy of the main frame data (identical lighting/fog/skyParams/
             // skyZenith, incl. gReflWaterClip = pass-all) with ONLY the viewProj replaced by the mirror
             // matrix. 288B covers through skyZenith (float 68..71) so the reflected dome gradient matches.
-            std::memcpy(fbw(g_live.pReflectFrameCbv), fcbvR, 288);
-            std::memcpy(fbw(g_live.pReflectFrameCbv), mirrorVP, 64);
+            std::memcpy(fbw(*MV.frameCbv), fcbvR, 288);
+            std::memcpy(fbw(*MV.frameCbv), mirrorVP, 64);
             // P2 — the MIRROR's gSkyView, from the mirror matrix, at the ONE place that matrix
             // exists. Reconstructing a ray from inv(mirrorVP) returns the direction in REAL world
             // space of whatever is drawn at that pixel: mirrorVP maps p -> (p*Mirror)*VP, so its
@@ -45743,7 +45944,7 @@ void destroyHostWindow(Renderer* R);
                 if (!invert4x4(mirrorVP, reflInvVP)) {
                     for (int k = 0; k < 16; ++k) { reflInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
                 }
-                publishSkyView(1, reflInvVP);
+                publishSkyView(MV.skyView, reflInvVP);
             }
 
             // Into the pass: pReflectColor SHADER_RESOURCE -> RENDER_TARGET, and (W4c) pReflectDepth
@@ -45753,21 +45954,18 @@ void destroyHostWindow(Renderer* R);
             // leaves the next frame's depth clear writing to a read-only resource.
             {
                 RenderTargetBarrier rb[2] = {};
-                rb[0].pRenderTarget = g_live.pReflectColor;
+                rb[0].pRenderTarget = *MV.color;
                 rb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 rb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
-                rb[1].pRenderTarget = g_live.pReflectDepth;
+                rb[1].pRenderTarget = *MV.depth;
                 rb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 rb[1].mNewState = RESOURCE_STATE_DEPTH_WRITE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rb);
             }
             BindRenderTargetsDesc rbind = {};
             rbind.mRenderTargetCount = 1;
-            // A STOLEN probe-GI frame (wet view) keeps last frame's reflection: the face goes into the
-            // top-left corner, which that frame's horizon scissor left cleared and water never reads.
-            const LoadActionType reflLoad = (probeFace && g_capFace.steal) ? LOAD_ACTION_LOAD : LOAD_ACTION_CLEAR;
-            rbind.mRenderTargets[0] = { g_live.pReflectColor, reflLoad };
-            rbind.mDepthStencil = { g_live.pReflectDepth, reflLoad };
+            rbind.mRenderTargets[0] = { *MV.color, LOAD_ACTION_CLEAR };
+            rbind.mDepthStencil = { *MV.depth, LOAD_ACTION_CLEAR };
             cmdBindRenderTargets(g_live.pCmd, &rbind);
             // A probe-GI capture draws only a capRes² corner (gathered at 8x8 per face); the rest of
             // the target stays cleared and nothing samples it on such a frame (dry view).
@@ -45784,7 +45982,7 @@ void destroyHostWindow(Renderer* R);
             // uses for its screen UV) and taking the min screen-y. Underwater (whole screen can be water)
             // or horizon above the screen top → full RT (keep-all, like reflWaterCullActive=false).
             uint32_t reflScissorTop = 0;
-            if (g_reflHorizonScissor && waterParams[7] <= 0.5f && !probeFace) {
+            if (g_reflHorizonScissor && !underwaterR && !probeFace) {
                 const float* MV = fcbvR;                            // row-major D3DX; wp*M (homogeneous)
                 const float waterZrel = waterLevelAbs - eyeAbsZ;    // water plane, camera-relative
                 const float R = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f)
@@ -45810,7 +46008,6 @@ void destroyHostWindow(Renderer* R);
             }
             const uint32_t reflScissorH = (reflScissorTop < reflVp) ? (reflVp - reflScissorTop) : 1u;
             cmdSetScissor(g_live.pCmd, 0, reflScissorTop, reflVp, reflScissorH);
-            if (!probeFace) { g_reflLastScissorTop = reflScissorTop; g_reflLastScissorFrame = g_renderFrame; }
 
             // Sky draw (mirror): fill the reflect sky buffers + replay the shapes. Cull NONE in the
             // sky PSO makes the mirror's winding flip irrelevant. Same per-shape data as the main sky
@@ -45838,15 +46035,15 @@ void destroyHostWindow(Renderer* R);
             // water is always in view EVERY probe fell to the ambCol stand-in (~10x the sky at dusk).
             // H2-A: a near-content shot draws ONLY the near content — its empty texels are the static face's.
             const bool actOnly = probeFace && g_capFace.actOnly;
-            const bool drawReflSkyHw = !actOnly && g_skyPhys.active && g_skyViewPub[1] && !underwaterR
-                                    && g_live.pSkyHwPipeline && g_live.pPerBatchSetReflectSky;
+            const bool drawReflSkyHw = !actOnly && g_skyPhys.active && g_skyViewPub[MV.skyView] && !underwaterR
+                                    && g_live.pSkyHwPipeline && *MV.skyBatch;
             if (drawReflSkyHw) {
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (mirror)");
                 cmdBindPipeline(g_live.pCmd, g_live.pSkyHwPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflect);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *MV.set);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetReflectSky);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *MV.skyBatch);
                 cmdDraw(g_live.pCmd, 3, 0);
                 cmdEndDebugMarker(g_live.pCmd);
             }
@@ -45865,17 +46062,17 @@ void destroyHostWindow(Renderer* R);
             const bool skyElemPhysR = drawReflSkyHw && g_live.sceneReferred && g_live.linearScene;
             const bool drawReflSky = g_drawSky && !actOnly
                                   && skyBlob && skyCount && skyBytes && !underwaterR
-                                  && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
+                                  && g_live.pSkyPipeline && *MV.skyWorlds;
             if (drawReflSky) {
                 const uint32_t haveSkyR = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
                 nSkyR = (skyCount < haveSkyR) ? skyCount : haveSkyR;
                 if (nSkyR > kMaxSkyDraws) { nSkyR = kMaxSkyDraws; }
                 const IPC::SkyDrawWire* skyItemsR = (const IPC::SkyDrawWire*)skyBlob;
                 cmdBindPipeline(g_live.pCmd, g_live.pSkyPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflect);   // MIRROR matrix
+                cmdBindDescriptorSet(g_live.pCmd, 0, *MV.set);   // MIRROR matrix
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetReflectSky);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *MV.skyBatch);
                 Pipeline* curReflSky = g_live.pSkyPipeline;
                 for (uint32_t k = 0; k < nSkyR; ++k) {
                     const IPC::SkyDrawWire& it = skyItemsR[k];
@@ -45898,7 +46095,7 @@ void destroyHostWindow(Renderer* R);
                     }
                     if (want != curReflSky) { cmdBindPipeline(g_live.pCmd, want); curReflSky = want; }
 
-                    uint8_t* dst = (uint8_t*)fbw(g_live.pReflectSkyWorldsBuf);
+                    uint8_t* dst = (uint8_t*)fbw(*MV.skyWorlds);
                     std::memcpy(dst + (size_t)idx * 64, it.world, 64);
                     // WT2 sun-disc fix: the client faces the sun to the MAIN camera, so after the mirror
                     // (M = flip world-z) it faces the REFLECTED camera while we view from the main camera
@@ -45921,7 +46118,7 @@ void destroyHostWindow(Renderer* R);
                         w[13] += g_capFace.pos[1] - fcbvR[57];
                         w[14] += g_capFace.pos[2] - fcbvR[58];
                     }
-                    uint32_t* inst = (uint32_t*)fbw(g_live.pReflectSkyInstanceBuf);
+                    uint32_t* inst = (uint32_t*)fbw(*MV.skyInst);
                     inst[idx * kStaticInstU32 + 0] = idx;
                     inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
                     float* finst = (float*)inst;
@@ -45945,7 +46142,7 @@ void destroyHostWindow(Renderer* R);
                     uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
                     uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
                     if (!meshVb || !meshIb) continue;
-                    Buffer*  vbs[2]     = { meshVb, g_live.pReflectSkyInstanceBuf };
+                    Buffer*  vbs[2]     = { meshVb, *MV.skyInst };
                     uint32_t strides[2] = { vStride, iStride };
                     cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
@@ -45953,22 +46150,22 @@ void destroyHostWindow(Renderer* R);
                     ++reflSkyDrawn;
                 }
             }   // drawReflSky
-            g_lastReflSkyDrawn = reflSkyDrawn;   // Phase 0 panel
+            if (!cap) { g_lastReflSkyDrawn = reflSkyDrawn; }   // Phase 0 panel
 
             // "Fog samples the sky", mirror side: snapshot the reflected sky before reflected geometry
             // draws over it, exactly as the main view does after its own sky pass. The mirror needs its
             // OWN copy — the reflected mountains have to melt into the reflected sky at their position
             // in the 1024² mirror RT, and the main screen's copy is a different image at a different
             // scale. pReflectColor is never MSAA (its own fixed RT), so this is always a plain copy.
-            if (g_live.pReflectSkyColor && g_fogSkyStrength > 0.0f) {
+            if (!cap && g_live.pReflectSkyColor && g_fogSkyStrength > 0.0f) {
                 cmdBindRenderTargets(g_live.pCmd, nullptr);
                 // W5: pReflectColor is MSAA now, so this snapshot is a RESOLVE, not a plain copy.
-                snapshotColorTarget(g_live.pReflectColor, g_live.pReflectSkyColor,
+                snapshotColorTarget(*MV.color, g_live.pReflectSkyColor,
                                     g_live.sampleCount > 1);
                 BindRenderTargetsDesc rsb = {};
                 rsb.mRenderTargetCount = 1;
-                rsb.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_LOAD };
-                rsb.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_LOAD };
+                rsb.mRenderTargets[0] = { *MV.color, LOAD_ACTION_LOAD };
+                rsb.mDepthStencil = { *MV.depth, LOAD_ACTION_LOAD };
                 cmdBindRenderTargets(g_live.pCmd, &rsb);
                 cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)reflVp, (float)reflVp, 0.0f, 1.0f);
                 // Restore the horizon scissor the reflect pass set for itself — rebinding does not
@@ -45982,14 +46179,14 @@ void destroyHostWindow(Renderer* R);
             // (dlReflectGeoCull, hoisted off record). Here we only RECORD the draws into the still-bound
             // pReflectColor/Depth, AFTER the sky (depth GEQUAL+write → occludes the reflected sky). Gated by
             // g_reflGeoReady (the cull ran + rings valid this frame).
-            gpuPhaseBegin(kGpuPhaseReflGeo);
-            if (g_reflGeoReady && !actOnly) { dlReflectRecordGeo(); }
+            if (!cap) { gpuPhaseBegin(kGpuPhaseReflGeo); }
+            if ((cap ? g_pgiCapGeoReady : g_reflGeoReady) && !actOnly) { dlReflectRecordGeo(); }
             // Probe-GI near emitters (knob pgiEmitNear): after the DL statics and their layers, so
             // they overwrite any DL proxy under them. Rides the emission checkerboard (pgiEmis), so
             // pgiEmis 0 stays the pre-emission probes exactly.
             // INDOORS (pgiInterior) the same list is the client's WHOLE CELL — the only geometry an interior
             // capture has — drawn into every capture face, the probe oracle's included, emission or not.
-            if (probeFace && !actOnly && g_reflFrameReady
+            if (probeFace && !actOnly && frameReady
                 && ((g_capFace.pgi && pgiEmisOn() && g_pgiEmitNear > 0.5f) || pgiIndoor())) {
                 pgiRecordEmitters();
             }
@@ -46007,7 +46204,7 @@ void destroyHostWindow(Renderer* R);
             // else; the gather merges it over the probe's static face, for its cube only.
             const bool capPgi = probeFace && g_capFace.pgi;
             const bool capAct = capPgi && actOnly;
-            if (g_reflFrameReady && g_drawReflectNear && (!capPgi || g_pgiCapNear >= 0.5f || capAct)) {
+            if (frameReady && g_drawReflectNear && (!capPgi || g_pgiCapNear >= 0.5f || capAct)) {
                 ReflNearInput ni = {};
                 ni.itemCount    = count;
                 ni.keepR        = capAct ? g_pgiNearAct : 0.0f;
@@ -46026,11 +46223,11 @@ void destroyHostWindow(Renderer* R);
                 ni.multiMapBytes = multiMapBytes;
                 reflRecordNear(ni);
             }
-            gpuPhaseEnd(kGpuPhaseReflGeo);
+            if (!cap) { gpuPhaseEnd(kGpuPhaseReflGeo); }
             if (probeFace && !g_capFace.pgi) { g_probeJobDrawn = (int32_t)g_probeJob; }   // read back after this submit
 
             static uint32_t s_reflDrawLog = 0;
-            if ((s_reflDrawLog++ % 120) == 0) {
+            if (!cap && (s_reflDrawLog++ % 120) == 0) {
                 LOG::logline(">> [forge][reflect] PASS RAN: nSky=%u drawn=%u waterLvl=%.1f eyeZ=%.1f dRel=%.1f mVP[0,5,10]=%.3f,%.3f,%.4f",
                              nSkyR, reflSkyDrawn, waterLevelAbs, eyeAbsZ, dRel,
                              mirrorVP[0], mirrorVP[5], mirrorVP[10]);
@@ -46043,10 +46240,10 @@ void destroyHostWindow(Renderer* R);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             {
                 RenderTargetBarrier rb[2] = {};
-                rb[0].pRenderTarget = g_live.pReflectColor;
+                rb[0].pRenderTarget = *MV.color;
                 rb[0].mCurrentState = RESOURCE_STATE_RENDER_TARGET;
                 rb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                rb[1].pRenderTarget = g_live.pReflectDepth;
+                rb[1].pRenderTarget = *MV.depth;
                 rb[1].mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
                 rb[1].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rb);
@@ -46067,10 +46264,10 @@ void destroyHostWindow(Renderer* R);
                     // spans the whole build, which costs nothing and keeps the pair impossible to
                     // split by a later edit.
                     TextureBarrier tb[2] = {};
-                    tb[0].pTexture = g_live.pReflectMips;
+                    tb[0].pTexture = *MV.mips;
                     tb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                     tb[0].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    tb[1].pTexture = g_live.pReflectDepthResolved;
+                    tb[1].pTexture = *MV.depthRes;
                     tb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                     tb[1].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
@@ -46084,26 +46281,26 @@ void destroyHostWindow(Renderer* R);
                 // Its resolve keeps colour and depth on one surface (reflectmip.comp.fsl REFLMIP_PGI).
                 cmdBindPipeline(g_live.pCmd, (pgiCorner && g_live.pReflectMipPipelinePgi) ? g_live.pReflectMipPipelinePgi
                                                                                           : g_live.pReflectMipPipelineFirst);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflectMipSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *MV.mipSet);
                 cmdDispatch(g_live.pCmd, (firstN + 7u) / 8u, (firstN + 7u) / 8u, 1);
                 cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipeline);
                 uint32_t mw = reflectSize();
                 for (uint32_t m = 1; m < (pgiCorner ? 1u : kReflectMipCount); ++m) {
                     TextureBarrier tb = {};
-                    tb.pTexture = g_live.pReflectMips;
+                    tb.pTexture = *MV.mips;
                     tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                     tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
                     mw = (mw > 1u) ? (mw >> 1) : 1u;
-                    cmdBindDescriptorSet(g_live.pCmd, m, g_live.pReflectMipSet);
+                    cmdBindDescriptorSet(g_live.pCmd, m, *MV.mipSet);
                     cmdDispatch(g_live.pCmd, (mw + 7u) / 8u, (mw + 7u) / 8u, 1);
                 }
                 {
                     TextureBarrier tb[2] = {};
-                    tb[0].pTexture = g_live.pReflectMips;
+                    tb[0].pTexture = *MV.mips;
                     tb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                     tb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb[1].pTexture = g_live.pReflectDepthResolved;
+                    tb[1].pTexture = *MV.depthRes;
                     tb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                     tb[1].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
@@ -46112,6 +46309,14 @@ void destroyHostWindow(Renderer* R);
                 // PROBE GI: this frame's face is resolved (mip 0 + depth) — into its G-buffer tile.
                 if (probeFace && g_capFace.pgi) { pgiGatherRecord(); }
             }
+            g_mvCap = false;
+        };
+        if (reflectOn) { mirrorPass(false, probeFace); }
+        if (g_pgiCapFrameReady) {
+            gpuPhaseBegin(kGpuPhasePgiCap);
+            CapScope cs(g_pgiCapF);
+            mirrorPass(true, true);
+            gpuPhaseEnd(kGpuPhasePgiCap);
         }
         // PROBE GI: place the window + relight a batch, before the colour pass reads the field.
         pgiFrameRecord((const float*)fbr(g_live.pFrameCbv));
@@ -54315,6 +54520,11 @@ void destroyHostWindow(Renderer* R);
     Buffer*   g_pStaticsArgsRingRefl = nullptr;
     uint32_t  g_liveLastSubsetsRefl = 0;               // indirect-arg count for the reflect statics draw
     uint32_t  g_liveLastInstRefl    = 0;               // instance count (diagnostics)
+    // ...and probe GI's capture view's (MirrorView): culled from the probe in the same frame as the water's.
+    Buffer*   g_pStaticsInstRingCap = nullptr;
+    Buffer*   g_pStaticsArgsRingCap = nullptr;
+    uint32_t  g_liveLastSubsetsCap  = 0;
+    uint32_t  g_liveLastInstCap     = 0;
     uint32_t liveReflInstCount() { return g_liveLastInstRefl; }
     struct LiveGridCell {
         std::vector<uint32_t> inst;                    // instance indices into g_usageData ws0 records
@@ -54932,6 +55142,7 @@ void destroyHostWindow(Renderer* R);
     };
     TerrainView g_terrainMain;
     TerrainView g_terrainRefl;
+    TerrainView g_terrainCap;    // probe GI's capture view (MirrorView), its own for the same reason
     // ...and the SUN caster view. Culled against the OUTERMOST cascade's ortho box rather than the
     // camera frustum, because a caster does not have to be visible to shadow you — the ridge behind
     // the camera is exactly the one the player notices. Its own view for the same reason the
@@ -54946,7 +55157,7 @@ void destroyHostWindow(Renderer* R);
     TerrainView g_terrainSvmV[32];
     // Every view, for the alloc / reset / teardown loops.
     template <class F> void forEachTerrainView(F f) {
-        f(g_terrainMain); f(g_terrainRefl); f(g_terrainSun);
+        f(g_terrainMain); f(g_terrainRefl); f(g_terrainCap); f(g_terrainSun);
         for (TerrainView& v : g_terrainSvmV) { f(v); }
     }
 
@@ -55157,6 +55368,7 @@ void destroyHostWindow(Renderer* R);
             ir.mDesc.mSize        = (uint64_t)v->maxRows * kTerrainInstStride;
             ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing"
                                   : (v == &g_terrainRefl) ? "terrainInstRingRefl"
+                                  : (v == &g_terrainCap)  ? "terrainInstRingCap"
                                   : (v == &g_terrainSun)  ? "terrainInstRingSun"
                                                           : "terrainInstRingSvm";
             ir.pData              = nullptr;
@@ -55571,7 +55783,7 @@ void destroyHostWindow(Renderer* R);
             // actually looks like on screen.
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
             if (g_live.pPerFrameSetReflectGeo) {
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+                updateMirrorGeoSets(R, 1, &sd);
             }
             // ⚠ ...AND THE SUN CASTER SET, WHICH THIS DID NOT REACH UNTIL PHASE 4a. It did not have
             // to: these arrays had exactly one reader, terrain.FRAG, and the caster pass is PS-less.
@@ -56043,7 +56255,7 @@ void destroyHostWindow(Renderer* R);
             // here. Any resource a shared shader reads must reach EVERY set that shader draws under.
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, nTp, tp);
             if (g_live.pPerFrameSetReflectGeo) {
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, nTp, tp);
+                updateMirrorGeoSets(R, nTp, tp);
             }
             // ...and the SUN caster set, once per cascade instance. terrain.vert draws under it now
             // (P1: the landscape casts), so this is the third instance of the same lesson — and the
@@ -59297,7 +59509,7 @@ void destroyHostWindow(Renderer* R);
                 sd.ppTextures = texs.data();
                 updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
                 if (g_live.pPerFrameSetReflectGeo) {
-                    updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+                    updateMirrorGeoSets(R, 1, &sd);
                 }
             }
 
@@ -59390,7 +59602,7 @@ void destroyHostWindow(Renderer* R);
                     sd.mCount = 1; sd.ppBuffers = &g_pStaticsParamSlot;
                     updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
                     if (g_live.pPerFrameSetReflectGeo) {
-                        updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+                        updateMirrorGeoSets(R, 1, &sd);
                     }
                 }
             }
@@ -59906,10 +60118,11 @@ void destroyHostWindow(Renderer* R);
             gd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gGoboArray);
             gd.mCount = 1; gd.ppTextures = &g_gobo.pArray;
             if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &gd); }
-            if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &gd); }
+            if (g_live.pPerFrameSetReflectGeo) { updateMirrorGeoSets(R, 1, &gd); }
             // G3: the NEAR frags too — main, the near-scene mirror, and first person (the FP light
             // cbuffer is a byte copy of the near one, goboNear included).
             if (g_live.pPerFrameSetReflect)    { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, 1, &gd); }
+            if (g_live.pPerFrameSetCap)        { updateDescriptorSet(R, 0, g_live.pPerFrameSetCap, 1, &gd); }
             if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &gd); }
         }
         LOG::logline(">> [gobo] fixtures=%u baked=%u draws=%u batches=%u ms=%.1f (oct %u², face %u², carve thr %.3f)",
@@ -62024,9 +62237,15 @@ void destroyHostWindow(Renderer* R);
         addFrameBuf(&irR);
         BufferLoadDesc arR = ar; arR.mDesc.pName = "staticsArgsRingRefl"; arR.ppBuffer = &g_pStaticsArgsRingRefl;
         addFrameBuf(&arR);
+        // ...and probe GI's capture view's.
+        BufferLoadDesc irC = ir; irC.mDesc.pName = "staticsInstRingCap"; irC.ppBuffer = &g_pStaticsInstRingCap;
+        addFrameBuf(&irC);
+        BufferLoadDesc arC = ar; arC.mDesc.pName = "staticsArgsRingCap"; arC.ppBuffer = &g_pStaticsArgsRingCap;
+        addFrameBuf(&arC);
         waitForAllResourceLoads();
         return g_pStaticsInstRing && g_pStaticsArgsRing
-            && g_pStaticsInstRingRefl && g_pStaticsArgsRingRefl;
+            && g_pStaticsInstRingRefl && g_pStaticsArgsRingRefl
+            && g_pStaticsInstRingCap && g_pStaticsArgsRingCap;
     }
 
     // Follow-on 3: shadow-light occlusion-cull resources. Scene-INDEPENDENT (no statics dependency —
@@ -63101,6 +63320,10 @@ void destroyHostWindow(Renderer* R);
         bool                   rangeAtSet = false;
         float                  rangeAt[3] = {};
         float                  minR = 0.0f;
+        // A second non-primary view (probe GI's capture, MirrorView): its own terrain view, and it leaves
+        // the water mirror's published cull (g_reflCull*) alone.
+        TerrainView*           terr = nullptr;
+        bool                   cap = false;
     };
 
     // One-time distant-land resident load: land + statics library + grid + rings (+ grass field, GPU cull
@@ -63192,11 +63415,11 @@ void destroyHostWindow(Renderer* R);
         // Cleared HERE rather than by gating each consumer: the cull is the single thing that decides
         // terrain is drawable, so revoking it in one place covers the prepass, the colour pass, the sun
         // caster and the mirror at once, and the next pass to draw terrain can't forget its own gate.
-        (T.primary ? g_terrainMain : g_terrainRefl).cells = 0;
+        (T.terr ? *T.terr : T.primary ? g_terrainMain : g_terrainRefl).cells = 0;
         // ...and, for the same reason, the reflect cull's PUBLISHED rule (H0 reads it, and so does
         // the fidelity heartbeat line). This function has three early returns below; clearing here
         // means a frame that took one of them reports "no reflect cull ran" rather than last frame's.
-        if (!T.primary) { g_reflCullValid = false; }
+        if (!T.primary && !T.cap) { g_reflCullValid = false; }
         // ...and the handover plane (lodParams.z): an interior never reaches the block that writes
         // it, and a stale armed value would cut the near scene at the last exterior's reach.
         if (T.primary && g_live.pFrameCbv && fbr(g_live.pFrameCbv)) {
@@ -63270,7 +63493,7 @@ void destroyHostWindow(Renderer* R);
         // The mirror is floored at the BASE lattice: it is a half-resolution reflection of ground
         // the camera is already drawing at 8 u, and that vertex bill would be spent where
         // nobody can resolve it. The camera itself takes the floor off.
-        terrainCullAndBuild(T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
+        terrainCullAndBuild(T.terr ? *T.terr : T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
                             (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f,
                             T.lodBias, (T.primary || (g_capFace.active && !g_capFace.pgi)) ? 0u : kTerrainBaseLod);
 
@@ -63708,7 +63931,7 @@ void destroyHostWindow(Renderer* R);
         // reconstruction of it, and the fidelity heartbeat line, which has to be able to prove an arm
         // took (`waterNoReflect` is the cautionary tale — it reads like the reflection's off switch
         // and moves the frame by 0.05 ms).
-        if (!T.primary) {
+        if (!T.primary && !T.cap) {
             for (int p = 0; p < 6; ++p) { std::memcpy(g_reflCullPlanes[p], planes[p], 4 * sizeof(float)); }
             g_reflCullEye[0] = eye[0]; g_reflCullEye[1] = eye[1]; g_reflCullEye[2] = eye[2];
             g_reflCullRanges[0] = nearEnd * nearEnd;
@@ -63981,12 +64204,37 @@ void destroyHostWindow(Renderer* R);
     // are the only levers the mirror has. Both now ride the surface ROUGHNESS through reflFidelity(),
     // whose whole argument is up there beside waterBaseSlopeGain(). At the shipped defaults both
     // resolve to the identity (distScale 1.0, lodBias 0) and this call is byte-for-byte the old one.
+}   // namespace ForgeRender — mirrorView belongs to the namespace that declared MirrorView
+namespace {
+    const MirrorView& mirrorView(bool cap) {
+        static const MirrorView water = { false,
+            &g_live.pReflectColor, &g_live.pReflectDepth,
+            &g_live.pReflectMips, &g_live.pReflectDepthResolved, &g_live.pReflectMipSet,
+            &g_live.pReflectFrameCbv, &g_live.pReflectFrameCbvGeo,
+            &g_live.pPerFrameSetReflect, &g_live.pPerFrameSetReflectGeo, &g_live.pPerBatchSetReflectSky,
+            &g_live.pReflectSkyWorldsBuf, &g_live.pReflectSkyInstanceBuf, 1, &ForgeRender::g_terrainRefl,
+            &ForgeRender::g_pStaticsInstRingRefl, &ForgeRender::g_pStaticsArgsRingRefl, &ForgeRender::g_liveLastSubsetsRefl, &ForgeRender::g_liveLastInstRefl };
+        static const MirrorView probe = { true,
+            &g_live.pCapColor, &g_live.pCapDepth,
+            &g_live.pCapMip0, &g_live.pCapDepthRes, &g_live.pCapMipSet,
+            &g_live.pCapFrameCbv, &g_live.pCapFrameCbvGeo,
+            &g_live.pPerFrameSetCap, &g_live.pPerFrameSetCapGeo, &g_live.pPerBatchSetCapSky,
+            &g_live.pCapSkyWorldsBuf, &g_live.pCapSkyInstanceBuf, 2, &ForgeRender::g_terrainCap,
+            &ForgeRender::g_pStaticsInstRingCap, &ForgeRender::g_pStaticsArgsRingCap, &ForgeRender::g_liveLastSubsetsCap, &ForgeRender::g_liveLastInstCap };
+        return cap ? probe : water;
+    }
+}
+namespace ForgeRender {
+
     void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj) {
+        const MirrorView& V = curMirror();
         DlCullTargets T = {};
-        T.instRing    = &g_pStaticsInstRingRefl;
-        T.argRing     = &g_pStaticsArgsRingRefl;
-        T.lastSubsets = &g_liveLastSubsetsRefl;
-        T.lastInst    = &g_liveLastInstRefl;
+        T.instRing    = V.instRing;
+        T.argRing     = V.argRing;
+        T.lastSubsets = V.lastSubsets;
+        T.lastInst    = V.lastInst;
+        T.terr        = V.terr;
+        T.cap         = V.cap;
         T.primary     = false;
         T.suppressNearCut = true;   // draw DL statics to the eye (reflection has no near-scene path)
         // The probe oracle sits 4 u off the surface the CAMERA saw, so it needs that surface: full
@@ -65222,7 +65470,7 @@ void destroyHostWindow(Renderer* R);
                 dl.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeightLow);
                 dl.mCount = 1; dl.ppTextures = &g_live.pSkyHeightLow->pTexture;
                 if (g_live.pPerFrameSet)           { updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSet, 1, &dl); }
-                if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSetReflectGeo, 1, &dl); }
+                if (g_live.pPerFrameSetReflectGeo) { updateMirrorGeoSets(g_live.pRenderer, 1, &dl); }
                 if (g_live.pPerFrameSetFP)         { updateDescriptorSet(g_live.pRenderer, 0, g_live.pPerFrameSetFP, 1, &dl); }
                 s_lowBound = true;
             }
@@ -67135,7 +67383,7 @@ void destroyHostWindow(Renderer* R);
             dd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gGiField);
             dd.mCount = 1; dd.ppTextures = &g_live.pGiField->pTexture;
             if (g_live.pPerFrameSet)            { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &dd); }
-            if (g_live.pPerFrameSetReflectGeo)  { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &dd); }
+            if (g_live.pPerFrameSetReflectGeo)  { updateMirrorGeoSets(R, 1, &dd); }
             if (g_live.pPerFrameSetFP)          { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &dd); }
             g_live.giReady = true;
             LOG::logline(">> [forge][gi] field ready (128^2 RGBA16F over the sky-height window)");
@@ -67222,7 +67470,7 @@ void destroyHostWindow(Renderer* R);
     // probe GI is on and its inputs exist.
     bool pgiEnsure(Renderer* R) {
         if (g_pgi.ready) { return true; }
-        if (g_pgi.failed || !g_live.pSkyHeight || !g_live.pSkyHeightLow || !g_live.pReflectMips
+        if (g_pgi.failed || !g_live.capReady || !g_live.pSkyHeight || !g_live.pSkyHeightLow || !g_live.pReflectMips
             || !g_live.pReflectDepthResolved || !g_live.pShadowMaskParamsCbv || !g_live.pPerFrameSet
             || !g_pTerrainHeights || !g_pTerrainCellGrid) { return false; }
         auto fail = [&](const char* what) {
@@ -67453,8 +67701,9 @@ void destroyHostWindow(Renderer* R);
             d[3].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyTop);    d[3].ppTextures = &skyTop;
             d[4].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSkyLow);    d[4].ppTextures = &skyLow;
             d[5].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiDummy4);    d[5].ppTextures = &g_live.pReflectMips;
-            d[6].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiReflColor); d[6].ppTextures = &g_live.pReflectMips;
-            d[7].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiReflDepth); d[7].ppTextures = &g_live.pReflectDepthResolved;
+            // The capture: probe GI's own pass's resolve (MirrorView), never the water's mirror.
+            d[6].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiReflColor); d[6].ppTextures = &g_live.pCapMip0;
+            d[7].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiReflDepth); d[7].ppTextures = &g_live.pCapDepthRes;
             d[8].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiProbes);    d[8].ppBuffers  = &g_pgi.probes;
             d[9].mIndex  = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiGBuf);      d[9].ppTextures = &g_pgi.gbuf;
             d[10].mIndex = SRT_RES_IDX(PgiSrtData, PerBatch, gPgiSHOut);     d[10].ppTextures = &g_pgi.sh;
@@ -67513,23 +67762,23 @@ void destroyHostWindow(Renderer* R);
         pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiSH);
         pf.mCount = 1; pf.ppTextures = &g_pgi.sh;
         if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
-        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+        if (g_live.pPerFrameSetReflectGeo) { updateMirrorGeoSets(R, 1, &pf); }
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
         pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiVol);
         pf.ppTextures = &g_pgi.vol;
         if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
-        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+        if (g_live.pPerFrameSetReflectGeo) { updateMirrorGeoSets(R, 1, &pf); }
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
         pf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gPgiWorldCube);   // read only once pgiSpec.y > 0
         pf.ppTextures = &g_pgi.cube;
         if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
-        if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+        if (g_live.pPerFrameSetReflectGeo) { updateMirrorGeoSets(R, 1, &pf); }
         if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
         for (uint32_t j = 0; j < kPgiNear; ++j) {   // H2: read only once pgiNear0/1.w >= 0
             pf.mIndex = (j == 0u) ? SRT_RES_IDX(SrtData, PerFrame, gPgiNearCube0) : SRT_RES_IDX(SrtData, PerFrame, gPgiNearCube1);
             pf.ppTextures = &g_pgi.nearP[j].cube;
             if (g_live.pPerFrameSet)           { updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &pf); }
-            if (g_live.pPerFrameSetReflectGeo) { updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &pf); }
+            if (g_live.pPerFrameSetReflectGeo) { updateMirrorGeoSets(R, 1, &pf); }
             if (g_live.pPerFrameSetFP)         { updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 1, &pf); }
         }
         {   // "what the probe sees" reads the G-buffer atlas from the main colour pass
@@ -67642,7 +67891,7 @@ void destroyHostWindow(Renderer* R);
         }
     }
 
-    void pgiSchedule(const float* fcbvR, bool dry, bool waterOk) {
+    void pgiSchedule(const float* fcbvR, bool capOk) {
         const bool want = g_pgiOn > 0.5f && pgiCtxOn();
         if (!want) { g_pgi.active = false; return; }
         // A NEW SPACE: crossing between an exterior and an interior, or a door from one interior to the next
@@ -67739,6 +67988,123 @@ void destroyHostWindow(Renderer* R);
                 // Readbacks still in flight were measured in the old space: their balls and verdicts go.
                 for (auto& n : g_pgi.ballN) { n = 0; }
                 for (auto& n : g_pgi.moveN) { n = false; }
+            }
+        }
+        // TRACE (knob pgiTrace, debug): each probe's irradiance over its life, from the field's readback
+        // (user 2026-10-23: "slightly brighter lighting from probes, then it settles", "good bounce, then the
+        // bounce disappears"). Per slot, its DC luminance at fixed ages from its clear; one that lives to the
+        // last age reports each earlier one against it (log2), so a probe that comes in bright reads > 0.
+        if (g_pgiTrace > 0.5f && g_pgi.ballMode && g_pgi.shRb && g_pgi.shRb->pCpuMappedAddress) {
+            // Ages: kRef is the reference; the ones before it are reported by every probe that reached it,
+            // the ones after by every probe that reached them (n each) — a settled probe that drifts.
+            constexpr int kA = 12, kRef = 6;
+            static const float kAge[kA] = { 0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 20.0f, 30.0f, 40.0f, 60.0f, 80.0f, 120.0f };
+            struct Tr { double born = -1.0; float L[kA] = {}, A[kA] = {}; uint8_t F[kA] = {}; uint16_t got = 0; };
+            static Tr     s_tr[kPgiN];
+            // Per age: the summed L of the probes that reported it, and the same probes' summed L at kRef — a
+            // ratio of sums, energy-weighted (a mean of per-probe log ratios was ruled by the near-black ones).
+            static double s_sum[kA] = {}, s_abs[kA] = {}, s_logT = 0.0;
+            static uint32_t s_cnt[kA] = {};
+            static double s_aAbs[kA] = {}, s_aRef[kA] = {};   // the G-buffer witness: mean captured albedo (slice 16+l .w)
+            static uint32_t s_aChg[kA] = {};                  // ...and how many probes it moved for by more than 5%
+            const double nowS = hostNowMs() * 1.0e-3;
+            const uint8_t* lane = (const uint8_t*)g_pgi.shRb->pCpuMappedAddress + (uint64_t)g_readSlot * kPgiShLane;
+            auto texel = [&](uint32_t slice, uint32_t x, uint32_t y, float out[4]) {
+                const uint16_t* h = (const uint16_t*)(lane + slice * kPgiShSlice + y * kPgiShRowPitch + x * 8u);
+                for (int c = 0; c < 4; ++c) {
+                    const uint32_t v = h[c], e = (v >> 10) & 31u, m = v & 1023u;
+                    const float f = (e == 0) ? std::ldexp((float)m, -24) : (e == 31) ? 65504.0f : std::ldexp((float)(m | 1024u), (int)e - 25);
+                    out[c] = (v & 0x8000u) ? -f : f;
+                }
+            };
+            auto probeL = [&](uint32_t p) {   // DC luminance, the validity divided out (-1 = no validity yet)
+                const uint32_t layer = p / (kPgiG * kPgiG), s2 = p % (kPgiG * kPgiG), cx = s2 % kPgiG, cy = s2 / kPgiG;
+                float dc[4], mz[4];
+                texel(layer * 7u, cx, cy, dc);
+                texel(14u + layer, cx, cy, mz);
+                if (mz[1] < 0.05f) { return -1.0f; }
+                return std::max(0.0f, 0.2126f * dc[0] + 0.7152f * dc[1] + 0.0722f * dc[2]) / mz[1];
+            };
+            constexpr int kB = 4;   // the field now, by age: < 1 s, 1-4, 4-16, older
+            double binL[kB] = {}, binF[kB] = {}; uint32_t binN[kB] = {};
+            for (uint32_t p = 0; p < kPgiWorldSlot; ++p) {
+                const int bi = g_pgi.slotOwner[p];
+                if (bi < 0 || bi >= (int)g_pgi.pool.size()) { continue; }
+                Tr& t = s_tr[p];
+                if (t.born != g_pgi.slotBorn[p]) { t = Tr{}; t.born = g_pgi.slotBorn[p]; }
+                const double age = nowS - t.born;
+                const float L = probeL(p);
+                if (L < 0.0f) { continue; }
+                const int b = (age < 1.0) ? 0 : (age < 4.0) ? 1 : (age < 16.0) ? 2 : 3;
+                binL[b] += L; ++binN[b];
+                binF[b] += (double)__popcnt(g_pgi.pool[bi].faces);
+                for (int a = 0; a < kA; ++a) {
+                    if ((t.got & (1u << a)) || age < kAge[a]) { continue; }
+                    t.L[a] = L; t.got |= (uint16_t)(1u << a);
+                    t.F[a] = g_pgi.pool[bi].faces;
+                    {
+                        const uint32_t layer = p / (kPgiG * kPgiG), s2 = p % (kPgiG * kPgiG);
+                        float vz[4], mz[4];
+                        texel(16u + layer, s2 % kPgiG, s2 / kPgiG, vz);
+                        texel(14u + layer, s2 % kPgiG, s2 / kPgiG, mz);
+                        t.A[a] = vz[3] / std::max(mz[1], 1.0e-3f);
+                    }
+                    // A probe seen first past an age (born before the trace looked) has no early values.
+                    const uint32_t early = (1u << kRef) - 1u;
+                    if (a == kRef && (t.got & early) == early) {
+                        for (int e = 0; e <= kRef; ++e) {
+                            s_abs[e] += t.L[e]; s_sum[e] += L; ++s_cnt[e];
+                            s_aAbs[e] += t.A[e]; s_aRef[e] += t.A[kRef];
+                        }
+                    } else if (a > kRef && (t.got & (1u << kRef))) {
+                        s_abs[a] += L; s_sum[a] += t.L[kRef]; ++s_cnt[a];
+                        s_aAbs[a] += t.A[a]; s_aRef[a] += t.A[kRef];
+                        if (std::fabs(t.A[a] - t.A[kRef]) > 0.05f * std::max(t.A[kRef], 1.0e-4f)) {
+                            ++s_aChg[a];
+                            static uint32_t s_movedLogged = 0;
+                            if (s_movedLogged < 40u) {
+                                ++s_movedLogged;
+                                LOG::logline(">> [pgi-trace] moved: slot %u at %gs: albedo %.4f -> %.4f, L %.4g -> %.4g, faces %02x -> %02x",
+                                             p, (double)kAge[a], (double)t.A[kRef], (double)t.A[a], (double)t.L[kRef], (double)t.L[a],
+                                             (unsigned)t.F[kRef], (unsigned)t.F[a]);
+                            }
+                        }
+                    }
+                }
+            }
+            if (nowS - s_logT >= 2.0) {
+                s_logT = nowS;
+                char ratios[512] = {};
+                int o = 0;
+                for (int a = 0; a < kA; ++a) {
+                    if (a == kRef || !s_cnt[a]) { continue; }
+                    o += std::snprintf(ratios + o, sizeof(ratios) - (size_t)o, " %gs %+.2f", (double)kAge[a],
+                                       std::log2(std::max(s_abs[a], 1.0e-12) / std::max(s_sum[a], 1.0e-12)));
+                    if (a > kRef) { o += std::snprintf(ratios + o, sizeof(ratios) - (size_t)o, " (n %u)", s_cnt[a]); }
+                }
+                LOG::logline(">> [pgi-trace] field now (mean L, n, faces): <1s %.4g %u %.1f | 1-4s %.4g %u %.1f | 4-16s %.4g %u %.1f | old %.4g %u %.1f"
+                             " || lived %u, log2 sum L(age)/sum L(%gs):%s (mean L %gs %.4g) | light sun %.4g amb %.4g | world L %.4g sky lux %.4g"
+                             " | relight in sun %.4g %.4g %.4g dz %.3f amb %.4g %.4g %.4g fogEnd %.0f",
+                             binN[0] ? binL[0] / binN[0] : 0.0, binN[0], binN[0] ? binF[0] / binN[0] : 0.0,
+                             binN[1] ? binL[1] / binN[1] : 0.0, binN[1], binN[1] ? binF[1] / binN[1] : 0.0,
+                             binN[2] ? binL[2] / binN[2] : 0.0, binN[2], binN[2] ? binF[2] / binN[2] : 0.0,
+                             binN[3] ? binL[3] / binN[3] : 0.0, binN[3], binN[3] ? binF[3] / binN[3] : 0.0,
+                             s_cnt[kRef], (double)kAge[kRef], o ? ratios : " -", (double)kAge[kRef], s_cnt[kRef] ? s_abs[kRef] / s_cnt[kRef] : 0.0,
+                             (double)g_litSunL, (double)g_litAmbL, (double)probeL(kPgiWorldSlot), g_skyPhys.EskyLux,
+                             (double)g_pgiTraceIn[0], (double)g_pgiTraceIn[1], (double)g_pgiTraceIn[2], (double)g_pgiTraceIn[3],
+                             (double)g_pgiTraceIn[4], (double)g_pgiTraceIn[5], (double)g_pgiTraceIn[6], (double)g_pgiTraceIn[7]);
+                if (s_cnt[kRef]) {
+                    char sp[512] = {};
+                    int q = 0;
+                    for (int a = 0; a < kA; ++a) {
+                        if (a == kRef || !s_cnt[a]) { continue; }
+                        q += std::snprintf(sp + q, sizeof(sp) - (size_t)q, " %gs %+.3f", (double)kAge[a],
+                                           std::log2(std::max(s_aAbs[a], 1.0e-12) / std::max(s_aRef[a], 1.0e-12)));
+                        if (a > kRef) { q += std::snprintf(sp + q, sizeof(sp) - (size_t)q, " (moved %u/%u)", s_aChg[a], s_cnt[a]); }
+                    }
+                    LOG::logline(">> [pgi-trace] G-buffer albedo vs %gs (log2 sums; 0 = untouched):%s | dup gathers %u of %u",
+                                 (double)kAge[kRef], sp, g_pgi.recapDup, g_pgi.captures);
+                }
             }
         }
         // NUDGE: the relight's verdicts. A report names the position it judged; one about a ball that has
@@ -67966,14 +68332,54 @@ void destroyHostWindow(Renderer* R);
             if (cc.ix == cix && cc.iy == ciy && cc.zValid) { top = std::max(top, cc.z[1] - std::max(8.0f, g_pgiLift)); }
             const float tz = top + std::max(0.0f, g_pgiWorldLift);
             const double now = hostNowMs() * 1.0e-3;
+            // LIGHT EVENT: the frame's own light (the pair as applied, sun x sin(elevation) + ambient, the
+            // night floor's measure) against a 2 s lag of itself. Dusk moves a stop in about a minute and
+            // never trips it; a wait or a weather snap moves several in a frame.
+            {
+                static double s_lightT = 0.0;
+                const double sinEl = std::sin((double)g_skyPhys.elevLight * SceneCal::kPi / 180.0);
+                const double Lnow = std::max(1.0e-6, (double)g_litSunL * std::max(0.0, sinEl) + (double)g_litAmbL);
+                const double dt = (s_lightT > 0.0) ? std::clamp(now - s_lightT, 0.0, 1.0) : 0.0;
+                s_lightT = now;
+                if (g_pgi.lightRef <= 0.0) { g_pgi.lightRef = Lnow; }
+                if (g_pgiResetStops > 0.0f && std::fabs(std::log2(Lnow / g_pgi.lightRef)) > (double)g_pgiResetStops) {
+                    LOG::logline(">> [pgi] LIGHT EVENT: light %.4g -> %.4g (%+.2f stops): field rebuilt from the new light",
+                                 g_pgi.lightRef, Lnow, std::log2(Lnow / g_pgi.lightRef));
+                    g_pgi.lightRef = Lnow;
+                    g_pgi.resetFrames = 1;
+                    g_pgi.skyStale = true;
+                    g_pgi.volInit = false;          // the volume re-splats whole, no blend
+                    g_pgi.worldPend = 0;            // re-shot below, from scratch
+                    g_pgi.worldT = -1.0e9;
+                    ++g_pgi.resets;
+                } else {
+                    g_pgi.lightRef *= std::exp2(std::log2(Lnow / g_pgi.lightRef) * (1.0 - std::exp(-dt / 2.0)));
+                }
+            }
+            // The stale skies end when the re-shot after the event has landed every face.
+            if (g_pgi.skyStale && g_pgi.worldPend == 0 && g_pgi.worldFaces == 0x3Fu && g_pgi.resetFrames == 0
+                && now - g_pgi.worldT < (double)std::max(1.0f, g_pgiWorldEvery)) {
+                g_pgi.skyStale = false;
+            }
             if (g_pgi.worldPend == 0) {
                 const float dx = ex - g_pgi.worldP[0], dy = ey - g_pgi.worldP[1], dz = tz - g_pgi.worldP[2];
                 const float mv = std::max(64.0f, g_pgiWorldMove);
-                if (g_pgi.worldFaces != 0x3Fu || dx * dx + dy * dy + dz * dz > mv * mv || now - g_pgi.worldT > (double)std::max(1.0f, g_pgiWorldEvery)) {
+                // ...and the moment the SKY has changed (knob pgiWorldSkyStops). Its captured sky texels are
+                // radiance frozen at the shot and they light every probe's sky (pgiLiveSky), so a wait from
+                // noon to night lit the land with the noon sky under a black one until the 10 s re-shot
+                // (user 2026-10-23: "stuck high exposure after a wait/rest", "sky too dark"). Measured on the
+                // sky's own illuminance, so a weather snap and dusk re-shoot too, in steps of this size.
+                const double skyLux = std::max(0.01, g_skyPhys.EskyLux);
+                const bool skyMoved = g_pgiWorldSkyStops > 0.0f && g_pgi.worldSkyLux > 0.0
+                                   && std::fabs(std::log2(skyLux / g_pgi.worldSkyLux)) > (double)g_pgiWorldSkyStops;
+                if (g_pgi.worldFaces != 0x3Fu || dx * dx + dy * dy + dz * dz > mv * mv || skyMoved
+                    || now - g_pgi.worldT > (double)std::max(1.0f, g_pgiWorldEvery)) {
                     g_pgi.worldP[0] = ex; g_pgi.worldP[1] = ey; g_pgi.worldP[2] = tz;
                     g_pgi.worldPend = 0x3Fu;
                     g_pgi.worldT = now;
+                    g_pgi.worldSkyLux = skyLux;
                     ++g_pgi.worldShots;
+                    if (skyMoved) { ++g_pgi.worldSkyShots; }
                 }
             }
         }
@@ -68052,34 +68458,26 @@ void destroyHostWindow(Renderer* R);
                 std::copy(sig, sig + 6, np.actSig);
             }
         }
-        // Capture: nearest incomplete probe, next missing face. Only on a DRY view (nothing on screen
-        // samples the mirror), every pgiEvery-th such frame, and never under the probe oracle.
+        // Capture: the next face, in probe GI's OWN pass (MirrorView) — wet view or dry — every pgiEvery-th
+        // frame, and never under the probe oracle (which owns the mirror pass for its own faces).
         g_pgi.capThis = false;
         g_pgi.capBall = -1;
         g_pgi.capWorld = false;
         g_pgi.capNear = -1;
-        if (!waterOk || probeOracleActive()) { return; }
-        // A WET view (water on screen samples the mirror): steal 1 frame in pgiSteal, and only when
-        // the last normal reflect frame (the previous one) left the corner plus a margin unsampled
-        // above its horizon. That frame's water then shows a one-frame-old reflection.
-        bool steal = false;
-        if (!dry) {
-            const uint32_t capRes = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
-            if (g_pgiSteal < 1.0f || g_reflLastScissorFrame + 1u != g_renderFrame
-                || g_reflLastScissorTop < capRes + 64u) { return; }
-            if (++g_pgi.stealCount < (uint32_t)g_pgiSteal) { return; }
-            g_pgi.stealCount = 0;
-            steal = true;
-        } else {
-            if (++g_pgi.everyCount < (uint32_t)std::max(1.0f, g_pgiEvery)) { return; }
-            g_pgi.everyCount = 0;
+        g_pgiCapF = CapFace();
+        if (!capOk || probeOracleActive()) { return; }
+        if (g_pgiCapStop > 0.0f) {   // TEST: captures frozen after pgiCapStop s
+            static const double s_t0 = hostNowMs();
+            if (hostNowMs() - s_t0 > (double)g_pgiCapStop * 1000.0) { return; }
         }
+        if (++g_pgi.everyCount < (uint32_t)std::max(1.0f, g_pgiEvery)) { return; }
+        g_pgi.everyCount = 0;
         // PEEK (pgiDebug 8): on a dry view, every other capture re-shoots a face of the camera column's
         // probes at full resolution — layer 0's six faces, then layer 1's, round and round, so the peek
         // stays live. Its gather also refreshes that probe's G-buffer tile (the same capture).
         g_pgi.peekThis = false;
         // Ball mode: the two pool probes nearest the camera (rows 0 and 1), named by their slots.
-        if (g_pgi.ballMode && ((int)g_pgiDebug & 8) && dry && (++g_pgi.peekTick & 1u)) {
+        if (g_pgi.ballMode && ((int)g_pgiDebug & 8) && (++g_pgi.peekTick & 1u)) {
             int nb[2] = { -1, -1 }; float nd[2] = { 1e30f, 1e30f };
             for (int k = 0; k < (int)g_pgi.pool.size(); ++k) {
                 const PgiBall& b = g_pgi.pool[k];
@@ -68100,15 +68498,14 @@ void destroyHostWindow(Renderer* R);
                 g_pgi.capSlot = (uint32_t)b.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)b.slot / (kPgiG * kPgiG);
                 g_pgi.capFace = pf; g_pgi.capBall = b.slot; g_pgi.peekRow = pl;
                 g_pgi.capThis = true; g_pgi.peekThis = true;
-                g_capFace.active = true; g_capFace.pgi = true;
-                g_capFace.pos[0] = b.p[0]; g_capFace.pos[1] = b.p[1]; g_capFace.pos[2] = b.p[2];
-                g_capFace.face = pf; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-                g_capFace.res = g_pgi.peekRes;
-                g_capFace.steal = false;
+                g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+                g_pgiCapF.pos[0] = b.p[0]; g_pgiCapF.pos[1] = b.p[1]; g_pgiCapF.pos[2] = b.p[2];
+                g_pgiCapF.face = pf; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
+                g_pgiCapF.res = g_pgi.peekRes;
                 return;
             }
         }
-        if (!g_pgi.ballMode && ((int)g_pgiDebug & 8) && dry && (++g_pgi.peekTick & 1u)) {
+        if (!g_pgi.ballMode && ((int)g_pgiDebug & 8) && (++g_pgi.peekTick & 1u)) {
             const int cix = (int)std::floor(ex / S + 0.5f), ciy = (int)std::floor(ey / S + 0.5f);
             const int ps = wrap(ciy) * G + wrap(cix);
             const PgiColumn& pc = g_pgi.col[ps];
@@ -68120,11 +68517,10 @@ void destroyHostWindow(Renderer* R);
                 const uint32_t st = g_pgi.peekStep++ % 12u, pl = st / 6u, pf = st % 6u;
                 g_pgi.capSlot = (uint32_t)ps; g_pgi.capLayer = pl; g_pgi.capFace = pf; g_pgi.peekRow = pl;
                 g_pgi.capThis = true; g_pgi.peekThis = true;
-                g_capFace.active = true; g_capFace.pgi = true;
-                g_capFace.pos[0] = (float)pc.ix * S; g_capFace.pos[1] = (float)pc.iy * S; g_capFace.pos[2] = pc.z[pl];
-                g_capFace.face = pf; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-                g_capFace.res = g_pgi.peekRes;
-                g_capFace.steal = false;
+                g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+                g_pgiCapF.pos[0] = (float)pc.ix * S; g_pgiCapF.pos[1] = (float)pc.iy * S; g_pgiCapF.pos[2] = pc.z[pl];
+                g_pgiCapF.face = pf; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
+                g_pgiCapF.res = g_pgi.peekRes;
                 return;
             }
         }
@@ -68159,23 +68555,20 @@ void destroyHostWindow(Renderer* R);
             g_pgi.capSlot = kPgiWorldSlot % (kPgiG * kPgiG); g_pgi.capLayer = kPgiWorldSlot / (kPgiG * kPgiG);
             g_pgi.capFace = face; g_pgi.capBall = (int)kPgiWorldSlot; g_pgi.capWorld = true;
             g_pgi.capThis = true;
-            g_capFace.active = true; g_capFace.pgi = true;
-            g_capFace.pos[0] = g_pgi.worldP[0]; g_capFace.pos[1] = g_pgi.worldP[1]; g_capFace.pos[2] = g_pgi.worldP[2];
-            g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
+            g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+            g_pgiCapF.pos[0] = g_pgi.worldP[0]; g_pgiCapF.pos[1] = g_pgi.worldP[1]; g_pgiCapF.pos[2] = g_pgi.worldP[2];
+            g_pgiCapF.face = face; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
             // HI-RES (pgiHiRes): the world probe's faces at peek resolution — the gather keeps the full face
-            // in the atlas's row 4 for the cube, and still reduces it to the 8x8 tile the SH needs. Never on a
-            // STOLEN frame: the steal only checked that a pgiCapRes corner of the water's mirror was unsampled.
-            g_capFace.res = (g_pgiHiRes > 0.0f && !steal) ? g_pgi.peekRes
+            // in the atlas's row 4 for the cube, and still reduces it to the 8x8 tile the SH needs.
+            g_pgiCapF.res = (g_pgiHiRes > 0.0f) ? g_pgi.peekRes
                                                           : std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
-            g_capFace.steal = steal;
-            if (steal) { ++g_pgi.steals; }
             return;
         }
         // H2 NEAR PROBES (pgiHiNear): next, a held near probe's missing face at peek resolution — on a DRY frame
-        // only (a stolen frame reserves just a pgiCapRes corner). The capture is its own slot's, so the gather
+        // as well. The capture is its own slot's, so the gather
         // refreshes that probe's G-buffer tile too; the raw face also goes to atlas row 6 + 2j, and (H2-A) is
         // kept as the static face its near content merges over.
-        if (g_pgi.ballMode && g_pgiHiNear > 0.0f && !steal) {
+        if (g_pgi.ballMode && g_pgiHiNear > 0.0f) {
             for (uint32_t j = 0; j < kPgiNear; ++j) {
                 const auto& np = g_pgi.nearP[j];
                 if (np.slot < 0 || !np.pend) { continue; }
@@ -68186,18 +68579,17 @@ void destroyHostWindow(Renderer* R);
                 g_pgi.capSlot = (uint32_t)np.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)np.slot / (kPgiG * kPgiG);
                 g_pgi.capFace = face; g_pgi.capBall = np.slot; g_pgi.capNear = (int)j;
                 g_pgi.capThis = true;
-                g_capFace.active = true; g_capFace.pgi = true;
-                g_capFace.pos[0] = np.p[0]; g_capFace.pos[1] = np.p[1]; g_capFace.pos[2] = np.p[2];
-                g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-                g_capFace.res = g_pgi.peekRes;
-                g_capFace.steal = false;
+                g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+                g_pgiCapF.pos[0] = np.p[0]; g_pgiCapF.pos[1] = np.p[1]; g_pgiCapF.pos[2] = np.p[2];
+                g_pgiCapF.face = face; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
+                g_pgiCapF.res = g_pgi.peekRes;
                 return;
             }
         }
         // H2-A (pgiNearAct): then a held near probe's face whose near content moved — the one waiting longest.
         // It shares the capture with the pool: every frame while no pool probe is missing a face, else every
-        // other one. Peek resolution, so not on a stolen frame either.
-        if (g_pgi.ballMode && g_pgiHiNear > 0.0f && g_pgiNearAct > 0.0f && !steal) {
+        // other one. Peek resolution.
+        if (g_pgi.ballMode && g_pgiHiNear > 0.0f && g_pgiNearAct > 0.0f) {
             int bj = -1; uint32_t bf = 0, bAge = 0;
             for (uint32_t j = 0; j < kPgiNear; ++j) {
                 const auto& np = g_pgi.nearP[j];
@@ -68215,12 +68607,11 @@ void destroyHostWindow(Renderer* R);
                 g_pgi.capSlot = (uint32_t)np.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)np.slot / (kPgiG * kPgiG);
                 g_pgi.capFace = bf; g_pgi.capBall = np.slot; g_pgi.capNear = bj;
                 g_pgi.capThis = true;
-                g_capFace.active = true; g_capFace.pgi = true;
-                g_capFace.pos[0] = np.p[0]; g_capFace.pos[1] = np.p[1]; g_capFace.pos[2] = np.p[2];
-                g_capFace.face = bf; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-                g_capFace.res = g_pgi.peekRes;
-                g_capFace.steal = false;
-                g_capFace.actOnly = true;
+                g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+                g_pgiCapF.pos[0] = np.p[0]; g_pgiCapF.pos[1] = np.p[1]; g_pgiCapF.pos[2] = np.p[2];
+                g_pgiCapF.face = bf; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
+                g_pgiCapF.res = g_pgi.peekRes;
+                g_pgiCapF.actOnly = true;
                 return;
             }
         }
@@ -68233,7 +68624,11 @@ void destroyHostWindow(Renderer* R);
                 const float tier = (ox * ox + oy * oy < 512.0f * 512.0f) ? 0.0f : 1.0e12f;
                 const float dx = b.p[0] - px, dy = b.p[1] - py, dz = b.p[2] - g_pgi.eyeZ;
                 const float rank = (float)__popcnt((unsigned)b.faces);
-                const float d = tier + dx * dx + dy * dy + dz * dz + rank * rankK * rankK;
+                // B2 (pgiDepthFirst): a started probe finishes before another starts — its missing faces
+                // were filled from the ones it has, and a probe left at its down face alone read too
+                // bright for minutes at night (tasks/forge-gi.md, the drift trace).
+                const float started = (g_pgiDepthFirst > 0.5f && b.faces) ? -1.0e13f : 0.0f;
+                const float d = started + tier + dx * dx + dy * dy + dz * dz + rank * rankK * rankK;
                 if (d < bd) { bd = d; bb = k; }
             }
             if (bb < 0) { return; }
@@ -68245,12 +68640,10 @@ void destroyHostWindow(Renderer* R);
             g_pgi.capSlot = (uint32_t)b.slot % (kPgiG * kPgiG); g_pgi.capLayer = (uint32_t)b.slot / (kPgiG * kPgiG);
             g_pgi.capFace = face; g_pgi.capBall = b.slot;
             g_pgi.capThis = true;
-            g_capFace.active = true; g_capFace.pgi = true;
-            g_capFace.pos[0] = b.p[0]; g_capFace.pos[1] = b.p[1]; g_capFace.pos[2] = b.p[2];
-            g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-            g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
-            g_capFace.steal = steal;
-            if (steal) { ++g_pgi.steals; }
+            g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+            g_pgiCapF.pos[0] = b.p[0]; g_pgiCapF.pos[1] = b.p[1]; g_pgiCapF.pos[2] = b.p[2];
+            g_pgiCapF.face = face; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
+            g_pgiCapF.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
             return;
         }
         int best = -1, bestL = 0; float bestD = 1e30f;
@@ -68274,12 +68667,10 @@ void destroyHostWindow(Renderer* R);
         }
         g_pgi.capSlot = (uint32_t)best; g_pgi.capLayer = (uint32_t)bestL; g_pgi.capFace = face;
         g_pgi.capThis = true;
-        g_capFace.active = true; g_capFace.pgi = true;
-        g_capFace.pos[0] = (float)c.ix * S; g_capFace.pos[1] = (float)c.iy * S; g_capFace.pos[2] = c.z[bestL];
-        g_capFace.face = face; g_capFace.dbg = 64.0f; g_capFace.dbgTerrain = true;
-        g_capFace.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
-        g_capFace.steal = steal;
-        if (steal) { ++g_pgi.steals; }
+        g_pgiCapF.active = true; g_pgiCapF.pgi = true;
+        g_pgiCapF.pos[0] = (float)c.ix * S; g_pgiCapF.pos[1] = (float)c.iy * S; g_pgiCapF.pos[2] = c.z[bestL];
+        g_pgiCapF.face = face; g_pgiCapF.dbg = 64.0f; g_pgiCapF.dbgTerrain = true;
+        g_pgiCapF.res = std::clamp((uint32_t)g_pgiCapRes / 8u * 8u, 8u, reflectSize());
     }
 
     // The G-buffer atlas rests UAV; "what the probe sees" (pgiDebug 4) reads it in the colour pass, so it
@@ -68368,6 +68759,7 @@ void destroyHostWindow(Renderer* R);
             const int k = (g_pgi.capBall >= 0) ? g_pgi.slotOwner[g_pgi.capBall] : -1;
             if (k >= 0 && k < (int)g_pgi.pool.size()) {
                 PgiBall& b = g_pgi.pool[k];
+                if (b.faces & (1u << f)) { ++g_pgi.recapDup; }
                 b.faces |= (uint8_t)(1u << f);
                 b.faceFrame[f] = g_renderFrame;
                 if (b.faces == 0x3Fu) { b.done = true; }
@@ -68461,7 +68853,11 @@ void destroyHostWindow(Renderer* R);
         // --- relight
         {
             const uint32_t batch = (uint32_t)std::clamp(g_pgiBatch, 1.0f, (float)kPgiN);
-            const uint32_t R = (kPgiN + batch - 1u) / batch;
+            // A LIGHT EVENT (pgiResetStops): every probe this frame (one batch), written outright (alpha 1),
+            // without the multi-bounce of the old field (it rebuilds from the new light over the next relights).
+            const bool reset = g_pgi.resetFrames > 0;
+            if (reset) { --g_pgi.resetFrames; }
+            const uint32_t R = reset ? 1u : (kPgiN + batch - 1u) / batch;
             g_pgi.phase = (g_pgi.phase + 1u) % R;
             float4* pr = (float4*)fbw(g_pgi.probes);
             uint32_t complete = 0;
@@ -68474,7 +68870,7 @@ void destroyHostWindow(Renderer* R);
             const auto nowT = std::chrono::steady_clock::now();
             const float dt = std::clamp(std::chrono::duration<float>(nowT - s_fadeT).count(), 0.0f, 0.1f);
             s_fadeT = nowT;
-            const float alpha = (g_pgiFade > 0.01f) ? 1.0f - std::exp(-dt * 3.0f / g_pgiFade) : 1.0f;
+            const float alpha = (g_pgiFade > 0.01f && !reset) ? 1.0f - std::exp(-dt * 3.0f / g_pgiFade) : 1.0f;
             // BALL MODE: the slots carry the pool's probes (same states as a column layer).
             for (uint32_t p = 0; p < kPgiN && g_pgi.ballMode; ++p) {
                 const int k = g_pgi.slotOwner[p];
@@ -68483,7 +68879,9 @@ void destroyHostWindow(Renderer* R);
                 if (k >= 0 && k < (int)g_pgi.pool.size()) {
                     PgiBall& b = g_pgi.pool[k];
                     pos[0] = b.p[0]; pos[1] = b.p[1]; pos[2] = b.p[2];
-                    if (b.faces) {
+                    // pgiTrustPair: not until the down (5) and up (4) faces are both in — the probe's two
+                    // largest terms, ground bounce and sky; with depth-first that is its second capture.
+                    if (b.faces && (g_pgiTrustPair < 0.5f || (b.faces & 0x30u) == 0x30u)) {
                         const bool tr = b.trans > 0.0f;
                         b.trans = std::max(0.0f, b.trans - dt);
                         state = (tr ? 2.0f : 1.0f) + (float)b.faces / 128.0f;
@@ -68495,6 +68893,7 @@ void destroyHostWindow(Renderer* R);
                     state = 4.0f + (float)g_pgi.worldFaces / 128.0f;
                 }
                 if (state == 0.0f && (!g_pgi.cleared || g_pgi.slotClear[p])) { state = 3.0f; }
+                if (g_pgi.slotClear[p]) { g_pgi.slotBorn[p] = hostNowMs() * 1.0e-3; }
                 g_pgi.slotClear[p] = false;
                 pr[p] = float4(pos[0], pos[1], pos[2], state);
             }
@@ -68526,13 +68925,18 @@ void destroyHostWindow(Renderer* R);
             P->lodEye = float4(fcbvR[56], fcbvR[57], fcbvR[58], std::clamp(g_pgiBackMaxPart, 0.0f, 1.0f));   // w = partial probes' back-face limit
             P->sunDir = float4(fcbvR[16], fcbvR[17], fcbvR[18], pgiSunTapLane());   // w = the sun-map test (pgiSunTap)
             P->sunCol = float4(fcbvR[20], fcbvR[21], fcbvR[22], std::clamp(g_pgiBackMax, 0.0f, 1.0f));     // w = complete probes' back-face limit
+            g_pgiTraceIn[0] = fcbvR[20]; g_pgiTraceIn[1] = fcbvR[21]; g_pgiTraceIn[2] = fcbvR[22]; g_pgiTraceIn[3] = fcbvR[18];
+            g_pgiTraceIn[4] = fcbvR[24]; g_pgiTraceIn[5] = fcbvR[25]; g_pgiTraceIn[6] = fcbvR[26]; g_pgiTraceIn[7] = fcbvR[33];
             P->grid   = float4(g_pgi.spacing, (float)kPgiG, (float)g_pgi.phase, (float)R);
             // y = a transition's blend toward its new value; z = MULTI-BOUNCE on (knob pgiBounce)
-            P->capMisc = float4(g_pgiLiveSky > 0.5f ? 1.0f : 0.0f, alpha, g_pgiBounce > 0.5f ? 1.0f : 0.0f, ((int)g_pgiDebug & 64) ? 1.0f : (g_pgi.litRb ? 2.0f : 0.0f));   // x = live sky, w = lit preview (2: the oracle's split)
+            // FOG, energy only (knob pgiFog): MW's ramp over the probe's distance to each hit, toward fogColNear.
+            P->fog    = float4(fcbvR[32], fcbvR[33], g_pgiFog > 0.5f ? 1.0f : 0.0f, 0.0f);
+            P->fogCol = float4(g_fogNearScene[0], g_fogNearScene[1], g_fogNearScene[2], 0.0f);
+            P->capMisc = float4(g_pgiLiveSky > 0.5f ? 1.0f : 0.0f, alpha, (g_pgiBounce > 0.5f && !reset) ? std::max(0.0f, g_pgiBounceGain) : 0.0f, ((int)g_pgiDebug & 64) ? 1.0f : (g_pgi.litRb ? 2.0f : 0.0f));   // x = live sky, w = lit preview (2: the oracle's split)
             P->place   = float4(g_pgiFillOld > 0.5f ? 1.0f : 0.0f, std::max(0.0f, g_pgiSunGain),
                                 (g_pgiSunMarch > 0.5f || !g_live.pSunOcc) ? 1.0f : 0.0f, std::max(0.0f, g_pgiFillGain));   // z = the old sun march, w = fill share (pgiFillGain)
             // The LIVE sky: the atmosphere's sky-view field in scene units (skyhw.frag's own scale).
-            const bool skyLive = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+            const bool skyLive = (g_pgiSkyLive > 0.5f || g_pgi.skyStale) && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
             // Indoors no sky: a capture texel no geometry covers is the void past the cell's shell (a window,
             // a gap in the mesh), not light — its share is 0, not the stale exterior sky SH.
             P->skyLive = float4(skyLive ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM,
@@ -68580,7 +68984,7 @@ void destroyHostWindow(Renderer* R);
                     Q->capMisc = float4(b1.p[0], b1.p[1], b1.p[2], 0.0f);
                     Q->capTile = float4(0.0f, 0.0f, (float)g_pgi.peekRes, 0.0f);
                     Q->place   = float4((float)g_pgi.peekIx, (float)g_pgi.peekIy, (float)g_pgi.peekMask[0], (float)g_pgi.peekMask[1]);
-                    const bool skyLiveQ = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+                    const bool skyLiveQ = (g_pgiSkyLive > 0.5f || g_pgi.skyStale) && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
                     Q->skyLive = float4(skyLiveQ ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);
                     cmdBindPipeline(cmd, g_pgi.pPeekLit);
                     cmdBindDescriptorSet(cmd, 5, g_pgi.set);
@@ -68613,7 +69017,7 @@ void destroyHostWindow(Renderer* R);
                     Q->capPos  = float4(g_pgi.worldP[0], g_pgi.worldP[1], g_pgi.worldP[2], 0.0f);
                     Q->capTile = float4(0.0f, 0.0f, (float)R, 1.0f);   // w = 1: world mode
                     Q->place   = float4((float)kPgiWorldSlot, 0.0f, (float)g_pgi.worldHiFaces, 0.0f);
-                    const bool skyLiveW = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+                    const bool skyLiveW = (g_pgiSkyLive > 0.5f || g_pgi.skyStale) && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
                     Q->skyLive = float4(skyLiveW ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);
                     cmdBindPipeline(cmd, g_pgi.pPeekLit);
                     cmdBindDescriptorSet(cmd, 6, g_pgi.set);
@@ -68673,7 +69077,7 @@ void destroyHostWindow(Renderer* R);
                     Q->capPos  = float4(np.p[0], np.p[1], np.p[2], 0.0f);
                     Q->capTile = float4((float)(6u + 2u * j), 0.0f, (float)R, 1.0f);   // x = its raw row, w = 1: world mode
                     Q->place   = float4((float)np.slot, 0.0f, (float)np.hiFaces, 0.0f);
-                    const bool skyLiveN = g_pgiSkyLive > 0.5f && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
+                    const bool skyLiveN = (g_pgiSkyLive > 0.5f || g_pgi.skyStale) && g_skyPhys.active && g_live.pAtmosParamsCbv && g_live.pAtmosSkyView;
                     Q->skyLive = float4(skyLiveN ? 1.0f : 0.0f, g_skyPhys.sceneScale, g_skyPhys.cameraRadiusM, 0.0f);
                     cmdBindPipeline(cmd, g_pgi.pPeekLit);
                     cmdBindDescriptorSet(cmd, kPgiNearLitInst + j, g_pgi.set);
@@ -68813,11 +69217,11 @@ void destroyHostWindow(Renderer* R);
             cmdResourceBarrier(cmd, 0, nullptr, 1, &tb, 0, nullptr);
             g_pgi.shInSR = true;
             // probeOracleAtProbes: the field -> its readback lane, for the oracle's sidecar.
-            if (g_probeOracleAtProbes > 0.5f && g_pgi.shRb) {
+            if ((g_probeOracleAtProbes > 0.5f || g_pgiTrace > 0.5f) && g_pgi.shRb) {
                 TextureBarrier cb = {};
                 cb.pTexture = g_pgi.sh; cb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE; cb.mNewState = RESOURCE_STATE_COPY_SOURCE;
                 cmdResourceBarrier(cmd, 0, nullptr, 1, &cb, 0, nullptr);
-                for (uint32_t sl = 0; sl < 16u; ++sl) {
+                for (uint32_t sl = 0; sl < 20u; ++sl) {
                     D3D12_TEXTURE_COPY_LOCATION src = {};
                     src.pResource = g_pgi.sh->mDx.pResource;
                     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -68953,11 +69357,10 @@ void destroyHostWindow(Renderer* R);
             const PgiColumn& c0 = g_pgi.col[0];
             LOG::logline(">> [pgi] window ix0=%d iy0=%d spacing %.0f | placed %u/%u columns | complete %u/%u probes | nearDone %u/32"
                          " | %.1f s, speed %.0f u/s | zResets %u | captures %u"
-                         " (stolen %u) | slot0 col (%d,%d) z %.0f/%.0f, readback lane%u (%.1f %.1f %.1f %.1f)",
+                         " | slot0 col (%d,%d) z %.0f/%.0f, readback lane%u (%.1f %.1f %.1f %.1f)",
                          g_pgi.ix0, g_pgi.iy0, (double)g_pgi.spacing, cols, kPgiG * kPgiG, g_pgi.complete, kPgiN, nearDone,
                          secs, (double)std::sqrt(g_pgi.vel[0] * g_pgi.vel[0] + g_pgi.vel[1] * g_pgi.vel[1]), g_pgi.zResets,
                          g_pgi.captures,
-                         g_pgi.steals,
                          c0.ix, c0.iy, (double)c0.z[0], (double)c0.z[1], g_readSlot,
                          rb ? (double)rb[0] : -1.0, rb ? (double)rb[1] : -1.0, rb ? (double)rb[2] : -1.0, rb ? (double)rb[3] : -1.0);
             if (!g_dlExterior) {
@@ -68976,10 +69379,10 @@ void destroyHostWindow(Renderer* R);
                 uint32_t nRej = 0;
                 for (const PgiBall& b : g_pgi.pool) { if (b.rej) { ++nRej; } }
                 LOG::logline(">> [pgi] balls: pool %zu (camera %u, sun %u, zenith %u, light %u, bounce %u) | rejected %u, nudged %u (clearance %u) gave up %u | joined %u merged %u evicted %u (cumulative) | sun map %s | gpu pgi %.3f ms"
-                             " | world faces %02x pend %02x shots %u at (%.0f,%.0f,%.0f) | hi-res faces %02x cube builds %u %s",
+                             " | world faces %02x pend %02x shots %u (sky %u) light events %u at (%.0f,%.0f,%.0f) | hi-res faces %02x cube builds %u %s",
                              g_pgi.pool.size(), byType[1], byType[2], byType[3], byType[4], byType[5], nRej, g_pgi.nudged, g_pgi.nudgeClear, g_pgi.nudgeGaveUp, g_pgi.ballIn, g_pgi.ballMerged,
                              g_pgi.ballEvicted, g_pgiSunVPValid ? "yes" : "no", (double)g_lastGpuPhaseMs[kGpuPhasePgi],
-                             (unsigned)g_pgi.worldFaces, (unsigned)g_pgi.worldPend, g_pgi.worldShots,
+                             (unsigned)g_pgi.worldFaces, (unsigned)g_pgi.worldPend, g_pgi.worldShots, g_pgi.worldSkyShots, g_pgi.resets,
                              (double)g_pgi.worldP[0], (double)g_pgi.worldP[1], (double)g_pgi.worldP[2],
                              (unsigned)g_pgi.worldHiFaces, g_pgi.cubeBuilds,
                              (g_pgi.cubeBuilt && g_pgi.cubeInSR) ? "LIVE" : "not built");
@@ -69061,10 +69464,10 @@ void destroyHostWindow(Renderer* R);
         // pgiCapEye (shadowparams.h.fsl): this frame's capture probe, camera-relative, and whether its PBR
         // surfaces reflect the world cube (knob pgiCapRefl). Its own lane: eyePos stays the camera's,
         // because terrain picks its morph / displacement LOD from it and a capture must keep the camera's.
-        const bool capRefl = g_capFace.active && g_capFace.pgi && g_pgiCapRefl > 0.5f && cubeOn;
-        mp[kPgiNearFloat + 12] = g_capFace.pos[0] - g_pgi.eye[0];
-        mp[kPgiNearFloat + 13] = g_capFace.pos[1] - g_pgi.eye[1];
-        mp[kPgiNearFloat + 14] = g_capFace.pos[2] - g_pgi.eyeZ;
+        const bool capRefl = g_pgiCapF.active && g_pgiCapRefl > 0.5f && cubeOn;
+        mp[kPgiNearFloat + 12] = g_pgiCapF.pos[0] - g_pgi.eye[0];
+        mp[kPgiNearFloat + 13] = g_pgiCapF.pos[1] - g_pgi.eye[1];
+        mp[kPgiNearFloat + 14] = g_pgiCapF.pos[2] - g_pgi.eyeZ;
         mp[kPgiNearFloat + 15] = capRefl ? 1.0f : 0.0f;
         static_assert(kPgiNear == 2u, "shadowparams.h.fsl carries exactly pgiNear0 and pgiNear1");
     }
@@ -69507,13 +69910,14 @@ void destroyHostWindow(Renderer* R);
     // the sky into the same RT (depth GEQUAL+write, so land/statics occlude each other + the sky behind).
     void dlReflectRecordGeo() {
         if (!g_dlExterior || !g_dlLiveInit) { return; }
-        cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.6f, 0.9f, "DISTANT LAND (reflect)");
+        const MirrorView& V = curMirror();
+        cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.6f, 0.9f, V.cap ? "DISTANT LAND (probe capture)" : "DISTANT LAND (reflect)");
 
         // Host-owned terrain in the mirror, same as the main view. This is what closes the shoreline
         // gap the old bake left: the reflection now sees the SAME surface at the same resolution the
         // camera does, so a coastline reflects its actual shape instead of a 915-tri approximation
         // that had to be clipped at waterLevel-1 to hide the mismatch.
-        terrainRecord(g_live.pCmd, g_terrainRefl, g_live.pPerFrameSetReflectGeo, /*mirror*/true);
+        terrainRecord(g_live.pCmd, *V.terr, *V.setGeo, /*mirror*/true);
 
         // H2a: the draw has been cmdExecuteIndirect all along — only WHERE the args come from
         // changes. Same selector dlLiveRecord uses for the camera lane at the top of this file:
@@ -69522,25 +69926,25 @@ void destroyHostWindow(Renderer* R);
         // ⚠ THE COUNT DIFFERS IN KIND between the two arms and that is the command wall: the CPU
         // ring is COMPACTED (g_liveLastSubsetsRefl = touched subsets only), the GPU one is not
         // (cullSubsetCount, most of them zero-instance no-ops).
-        const bool reflDraw = g_reflGpuCull && !(g_capFace.active && g_capFace.pgi)   // capture: CPU cull (dlReflectCullAndBuild)
+        const bool reflDraw = g_reflGpuCull && !V.cap && !(g_capFace.active && g_capFace.pgi)   // capture: CPU cull (dlReflectCullAndBuild)
                            && g_live.reflCullReady && g_live.reflArgsInDrawState
                            && g_reflGpuCullRan;
-        if (g_drawDLStatics && g_staticsLiveOk && (reflDraw || g_liveLastSubsetsRefl > 0)) {
+        if (g_drawDLStatics && g_staticsLiveOk && (reflDraw || *V.lastSubsets > 0)) {
             // Opposite winding to the main record (the water-plane mirror flips handedness).
             cmdBindPipeline(g_live.pCmd, dlPickStaticsPipeline(/*mirror*/true));
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-            Buffer*  svbs[2]     = { g_pStaticsVB, reflDraw ? g_live.pReflInstOut : g_pStaticsInstRingRefl };
+            Buffer*  svbs[2]     = { g_pStaticsVB, reflDraw ? g_live.pReflInstOut : *V.instRing };
             uint32_t sstrides[2] = { 20, kStaticsInstStride };
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
             if (reflDraw) {
                 cullLaneExecute(g_live.pReflArgs);
             } else {
-                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
-                                   g_pStaticsArgsRingRefl, 0, nullptr, 0);
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, *V.lastSubsets,
+                                   *V.argRing, 0, nullptr, 0);
                 // PROBE GI EMISSION (pgiEmis, P2): the LAYER passes, in the main record's order. MULTIPLY first
                 // — it tints both parities (a GitD lit window is a white emissive base under an orange MOD
                 // layer; without it the probes' window light was white, user 2026-10-17) — then the GLOW
@@ -69549,13 +69953,13 @@ void destroyHostWindow(Renderer* R);
                 if (g_capFace.active && g_capFace.pgi && pgiEmisOn() && g_staticsLayerPasses) {
                     if (g_pStaticsLayerPipelineNone) {
                         cmdBindPipeline(g_live.pCmd, g_pStaticsLayerPipelineNone);
-                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
-                                           g_pStaticsArgsRingRefl, 0, nullptr, 0);
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, *V.lastSubsets,
+                                           *V.argRing, 0, nullptr, 0);
                     }
                     if (g_pStaticsAddPipelineNone) {
                         cmdBindPipeline(g_live.pCmd, g_pStaticsAddPipelineNone);
-                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
-                                           g_pStaticsArgsRingRefl, 0, nullptr, 0);
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, *V.lastSubsets,
+                                           *V.argRing, 0, nullptr, 0);
                     }
                 }
             }
@@ -69583,7 +69987,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pgiEmitItems && g_pgiEmitCount && g_live.pFPOpaquePipelineNone) {
             const uint32_t n = std::min<uint32_t>(g_pgiEmitCount, kPgiEmitMax);
             cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipelineNone);   // pipeline FIRST, then sets
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             for (uint32_t k = 0; k < n; ++k) {
@@ -69627,7 +70031,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pgiEmitMMItems && g_pgiEmitMMCount && g_live.pMultiMapReflectPipelineNone) {
             const uint32_t n = std::min<uint32_t>(g_pgiEmitMMCount, kPgiEmitMax);
             cmdBindPipeline(g_live.pCmd, g_live.pMultiMapReflectPipelineNone);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             for (uint32_t k = 0; k < n; ++k) {
@@ -69720,7 +70124,7 @@ void destroyHostWindow(Renderer* R);
         uint32_t nearDrawn = 0, skinDrawn = 0;
 
         cmdBindPipeline(g_live.pCmd, opaquePSO[0]);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+        cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
         int boundMirror = 0;
@@ -69753,7 +70157,7 @@ void destroyHostWindow(Renderer* R);
             if (!anyInMirror) { continue; }
             if ((int)mir != boundMirror) {
                 cmdBindPipeline(g_live.pCmd, opaquePSO[mir]);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = (int)mir;
@@ -69787,7 +70191,7 @@ void destroyHostWindow(Renderer* R);
             const int mirror = worldMirrored(in.items[i].world) ? 1 : 0;
             if (mirror != boundMirror) {
                 cmdBindPipeline(g_live.pCmd, opaquePSO[mirror]);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = mirror;
@@ -69822,7 +70226,7 @@ void destroyHostWindow(Renderer* R);
             const int mirror = worldMirrored(in.items[i].world) ? 1 : 0;
             if (mirror != boundMirror) {
                 cmdBindPipeline(g_live.pCmd, opaquePSO[mirror]);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = mirror;
@@ -69849,7 +70253,7 @@ void destroyHostWindow(Renderer* R);
                 g_reflNearSwapWinding ? g_live.pFPSkinnedPipeline       : g_live.pFPSkinnedPipelineMirror,
             };
             cmdBindPipeline(g_live.pCmd, skinPSO[0]);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             const uint8_t* sp   = (const uint8_t*)in.skinnedBlob;
@@ -69927,7 +70331,7 @@ void destroyHostWindow(Renderer* R);
                 std::sort(s_reflSkinAlpha.begin(), s_reflSkinAlpha.end(),
                           [](const ReflSkinAlpha& a, const ReflSkinAlpha& b) { return a.viewDepth > b.viewDepth; });
                 cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 Pipeline* curPipe = g_live.pSkinnedAlphaPipeline;
@@ -69986,7 +70390,7 @@ void destroyHostWindow(Renderer* R);
                 g_reflNearSwapWinding ? g_live.pMultiMapReflectPipeline       : g_live.pMultiMapReflectPipelineMirror,
             };
             cmdBindPipeline(g_live.pCmd, mmPSO[0]);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);   // single world window
@@ -70010,7 +70414,7 @@ void destroyHostWindow(Renderer* R);
                 const int mirror = worldMirrored(it.world) ? 1 : 0;
                 if (mirror != boundMMMirror) {
                     cmdBindPipeline(g_live.pCmd, mmPSO[mirror]);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, *curMirror().setGeo);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
@@ -70031,6 +70435,76 @@ void destroyHostWindow(Renderer* R);
         g_lastReflSkinDrawn = skinDrawn;
         g_lastReflMMDrawn   = mmDrawn;
         cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // THE CAPTURE FACE's lanes on a copy of the frame data (the probe oracle's, or probe GI's own pass):
+    // the face's matrix (g_probeFaceVP), a pass-all clip plane whose .z is NONZERO — how every colour frag
+    // recognises a non-main view (inReflect) and stops indexing the main view's screen-space buffers — and
+    // the G-buffer views. g_capFace is the face.
+    void capFaceFrameData(float* gp, const float* fcbvR) {
+        if (probeOracleActive() && !g_capFace.pgi) {
+            // The sun the FACES are lit by: a sky oracle armed on the selection frame (for the
+            // model column) swings the published sun on that frame only.
+            if (g_probeJob == 0) { std::memcpy(g_probeSun, fcbvR + 16, sizeof(g_probeSun)); }
+            else {
+                const float* sd = fcbvR + 16;
+                const float c = (sd[0]*g_probeSun[0] + sd[1]*g_probeSun[1] + sd[2]*g_probeSun[2])
+                    / std::max(1e-12f, std::sqrt((sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2])
+                                                 * (g_probeSun[0]*g_probeSun[0] + g_probeSun[1]*g_probeSun[1] + g_probeSun[2]*g_probeSun[2])));
+                g_probeSunDrift = std::max(g_probeSunDrift, std::acos(std::clamp(c, -1.0f, 1.0f)) * 57.29578f);
+            }
+            // Every job's own sun: a sky oracle armed on the selection frame can still have the
+            // published sun swung on the first job(s), so no single latch is trustworthy.
+            if ((size_t)g_probeJob * 6u + 6u <= g_probeJobSun.size()) {
+                float* js = g_probeJobSun.data() + (size_t)g_probeJob * 6u;
+                js[0] = fcbvR[16]; js[1] = fcbvR[17]; js[2] = fcbvR[18];
+                js[3] = fcbvR[20]; js[4] = fcbvR[21]; js[5] = fcbvR[22];
+            }
+        }
+        // The G-buffer views: the colour frags' own isolation ladder (debugParams.x, float 40)
+        // on THIS copy only — 5 albedo, 6 the light factor albedo multiplies, 7 its ambient.
+        gp[40] = g_capFace.dbg;
+        // ...the probe GI's checkerboard variant with emission (pgiEmis; the oracle keeps 64).
+        // pgiEmis 2 = TEST (66): every distant static emits its texture.
+        if (g_capFace.pgi && g_capFace.dbg == 64.0f && pgiEmisOn()) { gp[40] = (g_pgiEmis > 1.5f) ? 66.0f : 65.0f; }
+        // alphaShadowParams.y: the colour frags shadow the point lights from the atlases directly.
+        gp[125] = (g_capPointShadow > 0.5f) ? 1.0f : 0.0f;
+        capFaceViewProj(&fcbvR[56], g_capFace.pos, g_capFace.face, g_probeFaceVP);
+        std::memcpy(gp, g_probeFaceVP, 64);
+        gp[64] = 0.0f; gp[65] = 0.0f; gp[66] = 1.0e-6f; gp[67] = 1.0e8f;
+        gp[69] = 0.0f;
+        // No handover plane and no hero near-cut: the main view splits the near cells between
+        // MW's set (its frustum only) and distant statics, and a probe looks where that split
+        // left nothing. Distant statics to the eye; the near set overdraws the same surfaces.
+        gp[50] = 0.0f; gp[51] = 0.0f;
+    }
+
+    // PROBE GI's OWN PASS, its pre-beginCmd half (tasks/forge-gi.md "GI OWN BUDGET"): this frame's capture
+    // face's frame cbuffer, and its DL cull from the probe into the capture view's rings — after the
+    // water's, which keeps its own.
+    void pgiCapCull(Renderer* R, const float* fcbvR) {
+        g_pgiCapFrameReady = g_pgiCapGeoReady = false;
+        if (!g_pgiCapF.active || !g_live.capReady) { return; }
+        CapScope cs(g_pgiCapF);
+        g_mvCap = true;
+        float* gp = (float*)fbw(g_live.pCapFrameCbvGeo);
+        std::memcpy(gp, fcbvR, kFrameDataBytes);
+        gp[116] = 0.0f;                                   // no froxel grid here: brute-loop gLights, as the mirror
+        gp[34] = gp[35] = 1.0f / (float)reflectSize();    // the fog's sky copy bound is the mirror's (captures do not fog)
+        capFaceFrameData(gp, fcbvR);
+        g_pgiCapFrameReady = true;
+        if (g_dlExterior && g_dlLiveInit) {
+            dlReflectCullAndBuild(R, g_probeFaceVP);
+            g_pgiCapGeoReady = true;
+        }
+        g_mvCap = false;
+        static uint32_t s_n = 0, s_inst = 0, s_sub = 0, s_cells = 0;
+        s_inst += g_liveLastInstCap; s_sub += g_liveLastSubsetsCap; s_cells += g_terrainCap.cells;
+        if (++s_n >= 600) {
+            LOG::logline(">> [pgi-cap] own pass, per face over %u: %.0f statics in %.0f subsets, %.1f terrain cells (res %u)",
+                         s_n, (double)s_inst / s_n, (double)s_sub / s_n, (double)s_cells / s_n, g_pgiCapF.res);
+            s_n = s_inst = s_sub = s_cells = 0;
+        }
     }
 
     // WV2: the reflect-geo CPU CULL (mirror matrix + clip plane + pReflectFrameCbvGeo write + cull into
@@ -70114,46 +70588,15 @@ void destroyHostWindow(Renderer* R);
             // measured from the real eye, so the fog ray is `worldPosRel - (0, 0, 2*dRel)`: the
             // direction the mirror actually sees this static in, against the sky it melts into.
             gp[69] = 2.0f * dRel;
+            // alphaShadowParams.y: the mirror's frags shadow the slotted point lights from the atlases
+            // directly (reflPointShadow) — the screen mask they cannot read is the main view's.
+            gp[125] = (g_reflPointShadow > 0.5f) ? 1.0f : 0.0f;
             // THE CAPTURE FACE (probe oracle / probe GI): the same pass, aimed from a probe. Pass-all
             // clip plane, but with .z NONZERO — that is how every colour frag recognises a non-main view
             // (inReflect) and stops indexing the main view's screen-space buffers.
             if (g_capFace.active) {
-              if (probeOracleActive() && !g_capFace.pgi) {
-                // The sun the FACES are lit by: a sky oracle armed on the selection frame (for the
-                // model column) swings the published sun on that frame only.
-                if (g_probeJob == 0) { std::memcpy(g_probeSun, fcbvR + 16, sizeof(g_probeSun)); }
-                else {
-                    const float* sd = fcbvR + 16;
-                    const float c = (sd[0]*g_probeSun[0] + sd[1]*g_probeSun[1] + sd[2]*g_probeSun[2])
-                        / std::max(1e-12f, std::sqrt((sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2])
-                                                     * (g_probeSun[0]*g_probeSun[0] + g_probeSun[1]*g_probeSun[1] + g_probeSun[2]*g_probeSun[2])));
-                    g_probeSunDrift = std::max(g_probeSunDrift, std::acos(std::clamp(c, -1.0f, 1.0f)) * 57.29578f);
-                }
-                // Every job's own sun: a sky oracle armed on the selection frame can still have the
-                // published sun swung on the first job(s), so no single latch is trustworthy.
-                if ((size_t)g_probeJob * 6u + 6u <= g_probeJobSun.size()) {
-                    float* js = g_probeJobSun.data() + (size_t)g_probeJob * 6u;
-                    js[0] = fcbvR[16]; js[1] = fcbvR[17]; js[2] = fcbvR[18];
-                    js[3] = fcbvR[20]; js[4] = fcbvR[21]; js[5] = fcbvR[22];
-                }
-              }
-                // The G-buffer views: the colour frags' own isolation ladder (debugParams.x, float 40)
-                // on THIS copy only — 5 albedo, 6 the light factor albedo multiplies, 7 its ambient.
-                gp[40] = g_capFace.dbg;
-                // ...the probe GI's checkerboard variant with emission (pgiEmis; the oracle keeps 64).
-                // pgiEmis 2 = TEST (66): every distant static emits its texture.
-                if (g_capFace.pgi && g_capFace.dbg == 64.0f && pgiEmisOn()) { gp[40] = (g_pgiEmis > 1.5f) ? 66.0f : 65.0f; }
-                // alphaShadowParams.y: the colour frags shadow the point lights from the atlases directly.
-                gp[125] = (g_capPointShadow > 0.5f) ? 1.0f : 0.0f;
-                capFaceViewProj(&fcbvR[56], g_capFace.pos, g_capFace.face, g_probeFaceVP);
+                capFaceFrameData(gp, fcbvR);
                 std::memcpy(mirrorGeoVP, g_probeFaceVP, 64);
-                std::memcpy(gp, g_probeFaceVP, 64);
-                gp[64] = 0.0f; gp[65] = 0.0f; gp[66] = 1.0e-6f; gp[67] = 1.0e8f;
-                gp[69] = 0.0f;
-                // No handover plane and no hero near-cut: the main view splits the near cells between
-                // MW's set (its frustum only) and distant statics, and a probe looks where that split
-                // left nothing. Distant statics to the eye; the near set overdraws the same surfaces.
-                gp[50] = 0.0f; gp[51] = 0.0f;
             }
         }
         // The mirror matrix + clip plane are now live, which is all the NEAR reflect record needs.
@@ -71157,6 +71600,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSkyHwShader)            { removeShader(R, g_live.pSkyHwShader); }
         if (g_live.pSkyViewCbv[0])          { removeFrameBuf(g_live.pSkyViewCbv[0]); }
         if (g_live.pSkyViewCbv[1])          { removeFrameBuf(g_live.pSkyViewCbv[1]); }
+        if (g_live.pSkyViewCbv[2])          { removeFrameBuf(g_live.pSkyViewCbv[2]); }
         if (g_live.pDebugLineVB)            { removeFrameBuf(g_live.pDebugLineVB); }
         if (g_live.pPgiProbeVB)             { removeFrameBuf(g_live.pPgiProbeVB); g_live.pPgiProbeVB = nullptr; }
         if (g_live.pPgiProbePipeSolid)      { removePipeline(R, g_live.pPgiProbePipeSolid); g_live.pPgiProbePipeSolid = nullptr; }
@@ -71237,6 +71681,19 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pReflectSkyInstanceBuf)  { removeFrameBuf(g_live.pReflectSkyInstanceBuf); }
         if (g_live.pReflectColor)           { removeRenderTarget(R, g_live.pReflectColor); }
         if (g_live.pReflectDepth)           { removeRenderTarget(R, g_live.pReflectDepth); }
+        // probe GI's capture view (MirrorView)
+        if (g_live.pPerFrameSetCap)         { removeDescriptorSet(R, g_live.pPerFrameSetCap); }
+        if (g_live.pPerFrameSetCapGeo)      { removeDescriptorSet(R, g_live.pPerFrameSetCapGeo); }
+        if (g_live.pPerBatchSetCapSky)      { removeDescriptorSet(R, g_live.pPerBatchSetCapSky); }
+        if (g_live.pCapMipSet)              { removeDescriptorSet(R, g_live.pCapMipSet); }
+        if (g_live.pCapFrameCbv)            { removeFrameBuf(g_live.pCapFrameCbv); }
+        if (g_live.pCapFrameCbvGeo)         { removeFrameBuf(g_live.pCapFrameCbvGeo); }
+        if (g_live.pCapSkyWorldsBuf)        { removeFrameBuf(g_live.pCapSkyWorldsBuf); }
+        if (g_live.pCapSkyInstanceBuf)      { removeFrameBuf(g_live.pCapSkyInstanceBuf); }
+        if (g_live.pCapColor)               { removeRenderTarget(R, g_live.pCapColor); }
+        if (g_live.pCapDepth)               { removeRenderTarget(R, g_live.pCapDepth); }
+        if (g_live.pCapMip0)                { removeResource(g_live.pCapMip0); }
+        if (g_live.pCapDepthRes)            { removeResource(g_live.pCapDepthRes); }
         // Phase 1b distant-statics teardown (per-subset textures freed by the bindless loop below).
         if (g_pStaticsArgs)     { removeResource(g_pStaticsArgs);     g_pStaticsArgs = nullptr; }
         if (g_pStaticsInst)     { removeResource(g_pStaticsInst);     g_pStaticsInst = nullptr; }

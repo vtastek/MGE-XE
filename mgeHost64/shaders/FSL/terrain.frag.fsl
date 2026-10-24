@@ -568,10 +568,18 @@ float4 PS_MAIN( VSOutput In )
     // A uniform branch still reserves the registers of the path it skips (this shader sat at 128
     // regs/thread on Turing with PBR off); a constant takes the path out of the program. The host
     // binds them only while the matching knobs are off, so each is the shipped image of that state.
+    // PROBE CAPTURE, LEAN (opaque.frag's twin): a capture takes the plain land blend — no PBR, parallax
+    // or height blend — and leaves right after the VCLR paint below. Captures bind terrain_dbg only.
+#ifdef TERRAIN_DEBUG_VIEWS
+    const uint capDbgT = (uint)(gFrameData.debugParams.x + 0.5f);
+    const bool capT = (capDbgT == PGI_CAPTURE_DBG || PGI_IS_EMIS(capDbgT));
+#else
+    const bool capT = false;
+#endif
 #if defined(TERRAIN_NO_PBR)
     const bool pbrTerrainOn = false;
 #else
-    const bool pbrTerrainOn = (gShadowParams.pbrTerrain.x != 0.0f);
+    const bool pbrTerrainOn = (gShadowParams.pbrTerrain.x != 0.0f) && !capT;
 #endif
     uint ps00 = 0u, ps10 = 0u, ps01 = 0u, ps11 = 0u;
     if (pbrTerrainOn) {
@@ -745,6 +753,14 @@ float4 PS_MAIN( VSOutput In )
         float3 c11 = loadVertexColor(cslot, x1, y1);
         albedo *= lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
     }
+#ifdef TERRAIN_DEBUG_VIEWS
+    if (capT) {
+        // The ground seen from BELOW (a buried probe): the gather's back-face sentinel.
+        if (dot(cross(pbrDPdx, pbrDPdy), normal) * PGI_BACK_SIGN > 0.0f) { RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f)); }
+        if (PGI_IS_EMIS(capDbgT) && pgiCapEmisPxD(capDbgT, In.Position.xy)) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }   // emits nothing
+        RETURN(float4(albedo, 1.0f));
+    }
+#endif
 
     // ...and the MACRO VARIATION, at this site for VCLR's reason: it multiplies ALBEDO, before any
     // lighting, AO or exposure term reads it. Anywhere later and it would be fighting the servo
@@ -1394,10 +1410,8 @@ float4 PS_MAIN( VSOutput In )
 
 #ifdef TERRAIN_DEBUG_VIEWS
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
-    uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
-    if (pgiCap) { dbg = 5u; }
+    // (Probe captures never reach here: they leave after the VCLR paint, PROBE CAPTURE, LEAN.)
+    const uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
     // AO buffer views (3/4), same branches as opaque.frag / multimap.frag. Added with the AO
     // receive above: the ground is most of the screen, so without these the AO debug view was
     // mostly normally-shaded terrain — i.e. the one view you'd use to judge terrain AO couldn't
@@ -1430,13 +1444,7 @@ float4 PS_MAIN( VSOutput In )
     //
     // Raw linear values, un-tonemapped and un-fogged, exactly as opaque.frag returns them; fog on
     // an isolated component would darken it toward a colour it has no business converging on.
-    if (dbg == 5u) {                                            // blended land texture x VCLR
-        // PROBE CAPTURE back-face flag (statics.frag's): the ground seen from BELOW (a buried probe).
-        const float bs = dot(cross(pbrDPdx, pbrDPdy), normal);
-        if (pgiCap && bs * PGI_BACK_SIGN > 0.0f) { RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f)); }
-        if (pgiEmisPx) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }   // the ground emits nothing
-        RETURN(float4(albedo, 1.0f));
-    }
+    if (dbg == 5u) { RETURN(float4(albedo, 1.0f)); }            // blended land texture x VCLR
     if (dbg == 6u) { RETURN(float4(litTerm, 1.0f)); }           // sun + ambient + both point lists
     if (dbg == 7u) { RETURN(float4(amb * tAmbW, 1.0f)); }       // the ambient half of mode 6
     if (dbg == 1u || dbg == 2u) {

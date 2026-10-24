@@ -103,15 +103,15 @@ float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
 // construction: a light dropped from the distant list had its entire reach inside the ball, so it
 // cannot reach any fragment on the far side, and both lists agree AT the boundary.
 //
-// ⚠ NO PER-LIGHT SHADOW MASK ON THE NEAR ARM, and that is a hard constraint, not a saving.
-// terrain.frag reads gShadowMask here and says why it may: "only legal because terrain now writes the
-// Z-prepass — before that these pixels sat at the far plane and the mask was meaningless." Grass does
-// NOT write the prepass, so at a grass pixel that mask describes whatever stands BEHIND the grass.
-// Reading it would make blades flicker between lit and shadowed along every silhouette they cross.
-// The cost of leaving it out is real and worth stating: a lamp behind a wall will spill onto grass in
-// front of it. Fixing that properly means the prepass entry (tasks/forge-grass.md G5c), not a mask
-// read here.
-float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY)
+// THE PER-LIGHT SHADOW MASK ON THE NEAR ARM: only where the caller's own depth is in the prepass
+// (maskOk). terrain.frag reads gShadowMask and says why it may: "only legal because terrain now writes
+// the Z-prepass — before that these pixels sat at the far plane and the mask was meaningless." Grass
+// drawn WITHOUT its prepass (grass.frag) is in that position — the mask at its pixel describes whatever
+// stands behind it — so it passes maskOk false and takes the fixture gobo only. Grass WITH its prepass
+// (grass_eq.frag, G1f) wrote its depth before the mask was built, so the mask is the blade's own: a lamp
+// behind a wall or a rock no longer spills across the grass while the ground under it stays dark
+// (iboseydaneenbright2, user 2026-10-23). maskPx: shadowMaskPixel's texel (it takes derivatives).
+float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY, int2 maskPx, bool maskOk)
 {
     if (length(worldPosRel) >= gFrameData.lodParams.x)
     {
@@ -163,9 +163,23 @@ float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY)
             float d    = d2 * invD;
             float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
             att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
-            // G3: EVERY light's fixture gobo, slotted or not — this arm reads no shadow mask at all
-            // (see above), so the gobo is the only shadow grass can take from a near lamp.
-            att *= fixtureGoboNear(gLightsNear.goboNear[i >> 1u], i, toL);
+            // P1 point-light shadows through the screen mask (maskOk, above); else — slotless, or no
+            // prepass — G3's fixture gobo is the only shadow the light casts here.
+            const uint slotP1 = (uint)fo.w;
+            if (maskOk && slotP1 != 0u && gLightsNear.lightParams.z < 0.5f)
+            {
+                const uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
+                const uint  s    = slotP1 - 1u;
+                const uint  lane = s >> 3u;
+                const uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                const uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                att *= goboSlotFade(float(nib) * (1.0f / 15.0f), gLightsNear.goboNear[i >> 1u], i, toL, worldPosRel,
+                                    gLightsNear.lightParams.w);   // G4: fade to the gobo before the handover
+            }
+            else
+            {
+                att *= fixtureGoboNear(gLightsNear.goboNear[i >> 1u], i, toL);
+            }
             float lambert = saturate(dot(N, toL) * invD);
             pointDiffuse += lambert * att * lcol;
         }

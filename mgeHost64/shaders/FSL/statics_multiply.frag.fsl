@@ -70,10 +70,14 @@ float4 PS_MAIN( VSOutput In )
     // mwFogAirShareAt, matching applyFog, so this pass and the base pass cannot disagree about how
     // much air ramp a fragment owns at a waterline pixel.
     // Per pixel, matching the base pass's applyFog (fog.h.fsl mwFogFactorAt).
-    // PROBE GI capture (P2): the layer tints BOTH parities — albedo and emitted radiance alike, as it tints
-    // MW's whole composite (a GitD lit window is a white emissive base under an orange MOD layer: without
-    // it the probes took the window's light as white). No fog: the capture's base pixels carry none.
-    if (PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) { RETURN(float4(t, 1.0f)); }
+    // PROBE GI capture (P2): the layer tints the EMISSION pixels only — a GitD lit window is a white emissive
+    // base under an orange MOD layer, and without it the probes took the window's light as white. The
+    // albedo pixels keep the main map alone (lean captures, user 2026-10-23: "multimaps can use the main
+    // map"), so the layer is the identity there. No fog: the capture's base pixels carry none.
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (PGI_IS_EMIS(capDbg)) { RETURN(float4(pgiCapEmisPxD(capDbg, In.Position.xy) ? t : f3(1.0f), 1.0f)); }
+    }
     float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
     RETURN(float4(m, 1.0f));
 }

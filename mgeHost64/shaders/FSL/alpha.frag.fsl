@@ -49,6 +49,21 @@ ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
+    // PROBE CAPTURE, LEAN (tasks/forge-gi.md "Light events + lean captures"): a blended shape is captured
+    // OPAQUE — its main map, its own alpha test, no blend ("no alpha blending"), no back-face flag (cloth
+    // and glass are seen from both sides), no emission. Discarded, a probe saw through glass and window
+    // planes into the single-sided back of the wall behind: MAGENTA in the probe view (user 2026-10-23).
+    // Uniform per draw (a cbuffer lane).
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (capDbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(capDbg)) {
+            const float4 alb = sampleBase(In.TexIndex, In.ClampMode & 3u, In.Uv, useLowAF(In.AlphaRef, true));
+            if (alb.a < In.AlphaRef) { discard; }
+            if (PGI_IS_EMIS(capDbg) && pgiCapEmisPxD(capDbg, In.Position.xy)) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+            const float vkc = vcolSplitLift(In.VColSource, In.Color.rgb, In.MatAmbient.x, (uint)(gFrameData.debugParams.w + 0.5f));
+            RETURN(float4(physAlbedo(alb.rgb) * pgiCapTint(In.VColSource == 3u ? 2u : In.VColSource, In.Color.rgb + vkc, In.MatDiffuse), 1.0f));   // 3: lit as 2
+        }
+    }
     float3 N = normalize(In.Normal);
 
     // Alpha lighting toggles (gFrameData.alphaParams): .z = transmission strength (0 disables),
@@ -123,7 +138,7 @@ float4 PS_MAIN( VSOutput In )
     float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
     // SH1 sky-directional ambient — geometric normal, not the possibly-bent N (see skyamb.h.fsl).
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
+                                      : skyAmbient(In.Normal, In.WorldPos);
     // W7b — absorption on the way IN, before the point-light loop adds into `d` (waterfog.h.fsl,
     // and see opaque.frag for why point lights are excluded). Lockstep with opaque.frag.
     { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
@@ -324,9 +339,6 @@ float4 PS_MAIN( VSOutput In )
 
     // F12 debug views (opaque.frag's, alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
-    if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
         // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
@@ -336,10 +348,7 @@ float4 PS_MAIN( VSOutput In )
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
-    // P2: no blended pass is recorded into a capture (glass, flames); a skinned ghost emits nothing.
-    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f)
-                                      : float4(albedo.rgb * (pgiCap ? pgiCapTint(In.VColSource == 3u ? 2u : In.VColSource, In.Color.rgb + vk, In.MatDiffuse)
-                                                                    : f3(1.0f)), 1.0f)); }   // 3: lit as 2
+    if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }
     if (dbg == PGI_ORACLE_LIGHT) { RETURN(float4(d + a, 1.0f)); }
     if (dbg == PGI_ORACLE_AMB)   { RETURN(float4(a, 1.0f)); }
     if (dbg == PGI_ORACLE_RELIGHT) { const float3 Nv = normalize(In.Normal);   // the relight's own direct formula

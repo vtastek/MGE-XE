@@ -2818,7 +2818,11 @@ float skyAOTermEye(float3 N, float3 worldPosRel)
 
 
 
-float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+
+
+
+
+float3 skyAmbientAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
 {
     const bool fpAO = ao < 0.0f;
     if (fpAO) { ao = skyAOTermEye(N, worldPosRel); }
@@ -2862,7 +2866,7 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
 
 
 
-            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f)); }
+            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f; }
             if (rv > 0.0f) {
                 const float pv = (rv > 1.5f) ? 1.0f : pvis;
                 const float nz = normalize(N).z;
@@ -2896,20 +2900,32 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
 
         if (gShadowParams.pgiParams1.w > 0.5f) {
             const float sh = saturate(pg.a);
-            return float3(1.0f - sh, sh, 0.1f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            return float3(1.0f - sh, sh, 0.1f) * 1.5f;
         }
         if (pg.a > 0.0f) {
-            float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            float3 fp = pg.rgb * gShadowParams.pgiParams0.x;
 
 
 
 
 
             if (pg.a >= 0.999f) { return fp; }
-            return lerp(skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
+            return lerp(gFrameData.ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
         }
     }
 
+    return gFrameData.ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel);
+}
+
+
+float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+{
+
+    if (gShadowParams.pgiParams0.x > 0.0f) {
+        return skyAmbientAOpW(N, ao, worldPosRel, bw, hiRough) / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+    }
+
+    if (ao < 0.0f) { ao = skyAOTermEye(N, worldPosRel); }
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
@@ -2922,15 +2938,28 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
     return skyAmbFactorAOp(N, skyAOTerm(N, worldPosRel), worldPosRel);
 }
 
+float3 skyAmbient(float3 N, float3 worldPosRel)
+{
+    return skyAmbientAOpW(N, skyAOTerm(N, worldPosRel), worldPosRel, f3(1.0f), -1.0f);
+}
 
-float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+
+
+
+float skyAOTermPxOrArms(float3 N, float3 worldPosRel, float2 svPos)
 {
 
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return -1.0f; }
 
-
-    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
-
-    return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
+    return skyAOTermPx(N, worldPosRel, svPos);
+}
+float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbFactorAOp(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel);
+}
+float3 skyAmbientPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbientAOpW(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel, f3(1.0f), -1.0f);
 }
 
 
@@ -2941,9 +2970,16 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
 {
 
     const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
-    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
-    return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
-#line 1098 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    return skyAmbFactorAOpW(R, skyAOTermPxOrArms(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#line 1126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+}
+
+float3 skyAmbientSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
+{
+
+    const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
+    return skyAmbientAOpW(R, skyAOTermPxOrArms(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#line 1136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 }
 #line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -4721,6 +4757,38 @@ STRUCT(VSOutput)
 float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
     //INIT_MAIN;
+
+
+
+
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (capDbg ==  64u  ||  ((capDbg) == 65u || (capDbg) == 66u || (capDbg) == 67u ) ) {
+            const uint cStages = In.Packed & 0x7u;
+            const float cRef = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
+            const uint cvcs = (In.Packed >> 3u) & 0x3u;
+            const bool emPx =  ((capDbg) == 65u || (capDbg) == 66u || (capDbg) == 67u )  && pgiCapEmisPxD(capDbg, In.Position.xy);
+            const float3 em = ((cvcs == 1u) ? In.Color.rgb : In.MatEmissive) * gShadowParams.calParams.x;
+            float3 base = f3(0.0f), emC = f3(0.0f);
+            float baseA = 1.0f;
+            for (uint s = 0u; s < 4u; ++s) {
+                if (s >= cStages) { break; }
+                const uint sw = (s == 0u) ? In.Stages.x : (s == 1u) ? In.Stages.y : (s == 2u) ? In.Stages.z : In.Stages.w;
+                const uint op = (sw >> 18u) & 0x3u;
+                const uint uvSet = (sw >> 16u) & 0x3u;
+                const float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1 : (uvSet == 2u) ? In.Uv2 : In.Uv3;
+                const float4 t = sampleBase(sw & 0xFFFFu, (sw >> 20u) & 0x3u, uv, useLowAF(cRef, false));
+                if (op == 0u) { base = physAlbedo(t.rgb); baseA = t.a; emC = base * (em + expandExposedEmissiveDelta(em, base, 1.0f)); }
+                else if (op == 1u) { emC *= t.rgb; }
+                else if (op == 2u) { emC *= mod2xStage(t.rgb); }
+                else { emC += t.rgb * gShadowParams.sunny16.y; }
+            }
+            if (baseA < cRef) { discard; }
+            if (emPx) { RETURN(float4(emC, 1.0f)); }
+            const float vkc = vcolSplitLift(cvcs, In.Color.rgb, In.MatAmbient.x, (uint)(gFrameData.debugParams.w + 0.5f));
+            return (float4(base * pgiCapTint(cvcs, In.Color.rgb + vkc, In.MatDiffuse), 1.0f));
+        }
+    }
     float3 N = normalize(In.Normal);
 
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
@@ -4735,7 +4803,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 d = gFrameData.sunCol.rgb * ndl;
 
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
+                                      : skyAmbient(In.Normal, In.WorldPos);
 
 
     { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
@@ -4801,7 +4869,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                 if (!useSlot) { att *= fixtureGoboNear(gLights.goboNear[i >> 1u], i, toLight); }
                 if (useSlot)
                 {
-#line 149 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+#line 181 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
                     att *= goboSlotFade(fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u),
                                         gLights.goboNear[i >> 1u], i, toLight, In.WorldPos, gLights.lightParams.w);
                 }
@@ -4876,9 +4944,6 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg ==  64u  ||  ((dbg) == 65u || (dbg) == 66u || (dbg) == 67u ) );
-    const bool pgiEmisPx =  ((dbg) == 65u || (dbg) == 66u || (dbg) == 67u )  && pgiCapEmisPxD(dbg, In.Position.xy);
-    if (pgiCap) { dbg = 5u; }
     if (dbg == 3u || dbg == 4u) {
 
 
@@ -4888,8 +4953,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
-    if (dbg == 5u) { RETURN(pgiEmisPx ? float4(0.0f, 0.0f, 0.0f, 1.0f)
-                                      : float4(alb * (pgiCap ? pgiCapTint(vColSource, In.Color.rgb + vk, In.MatDiffuse) : f3(1.0f)), 1.0f)); }
+    if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }
     if (dbg ==  68u ) { RETURN(float4(d + a, 1.0f)); }
     if (dbg ==  69u ) { RETURN(float4(a, 1.0f)); }
     if (dbg ==  70u ) { const float3 Nv = normalize(In.Normal);
@@ -4912,7 +4976,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
         return (float4(g, g, g, 1.0f));
     }
-#line 273 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+#line 301 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
     float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }

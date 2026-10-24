@@ -74,6 +74,33 @@ float4 PS_MAIN( VSOutput In )
     const float2 pbrDUVdy = ddy(In.Uv);
     const bool   pbrOn    = (In.ParamIndex != 0u);
     const float3 pbrNg    = N;                       // geometric (interpolated) normal
+    // ─── PROBE CAPTURE, LEAN (tasks/forge-gi.md "Light events + lean captures") ─────────────────────
+    // A capture needs the surface's REFLECTANCE and its EMISSION, nothing else: the relight lights it,
+    // shadows it and fogs it itself. So it leaves here, before every term the main view pays for —
+    // parallax, PBR, shadows, AO, weather, fog (user 2026-10-23: "agressively simplify the probes").
+    // Uniform per draw (a cbuffer lane), so the branch costs no divergence. The main map (+ the terrain
+    // decal), the alpha test as a plain compare, the back-face flag, the capture tint.
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (capDbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(capDbg)) {
+            float4 alb = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
+            if (In.OverlayIndex != 0u) {
+                alb.rgb = lerp(alb.rgb, SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb, In.Color.a);
+            }
+            if (alb.a < In.AlphaRef) { discard; }
+            if (In.AlphaRef <= 0.0f && dot(cross(pbrDPdx, pbrDPdy), In.Normal) * PGI_BACK_SIGN > 0.0f) {
+                RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f));   // a BACK face: the gather's sentinel
+            }
+            alb.rgb = physAlbedo(alb.rgb);
+            if (PGI_IS_EMIS(capDbg) && pgiCapEmisPxD(capDbg, In.Position.xy)) {   // odd pixels: emitted radiance
+                const float3 em = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive) * gShadowParams.calParams.x;
+                RETURN(float4(alb.rgb * (em + expandExposedEmissiveDelta(em, alb.rgb, 1.0f)), 1.0f));
+            }
+            const float vkc = vcolSplitLift(In.VColSource, In.Color.rgb, In.MatAmbient.x,
+                                            (uint)(gFrameData.debugParams.w + 0.5f));
+            RETURN(float4(alb.rgb * pgiCapTint(In.VColSource, In.Color.rgb + vkc, In.MatDiffuse), 1.0f));
+        }
+    }
     float4 pbrParam  = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  pbrRough  = 1.0f, pbrAlpha2 = 1.0f, pbrNoV = 1.0f;
     float3 pbrV      = float3(0.0f, 0.0f, 1.0f);
@@ -303,7 +330,7 @@ float4 PS_MAIN( VSOutput In )
     // the lower hemisphere with fogColNear, which is usually brighter than the zenith. See
     // tasks/lighting.md SH1 before tuning.
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactorPx(pbrOn ? pbrNb : In.Normal, In.WorldPos, In.Position.xy);
+                                      : skyAmbientPx(pbrOn ? pbrNb : In.Normal, In.WorldPos, In.Position.xy);
     // (PBR draws take the height-derived normal here — a relief that only the sun can see flattens
     // the moment the surface is in shadow. It is the UNBENT one, so the bend's double-count argument
     // above still holds.)
@@ -659,7 +686,7 @@ float4 PS_MAIN( VSOutput In )
         // so the two cannot drift apart. L1 is blurry by nature — right for rough surfaces, soft for
         // polished ones — which is the honest limit of reflecting a probe that has no sharper term.
         const float3 R = reflect(-pbrV, pbrNb);
-        float3 env = gFrameData.ambCol.rgb * skyAmbSpecPx(R, pbrRough, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
+        float3 env = skyAmbientSpecPx(R, pbrRough, In.WorldPos, In.Position.xy) * pbrTAmb * gFrameData.dbgScales.x;
         if ((aoFlags & 64u) != 0u && aoValid) { env *= aoSpecOcc(aoSample, pbrNb, R, pbrRough); }   // GTSO: the reflected cone vs the open one
         else if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         const float3 specAdd = (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
@@ -697,10 +724,8 @@ float4 PS_MAIN( VSOutput In )
     // F12 debug views. gAO is sampled at SV_Position.xy * invAlloc (screenAlloc.zw). The isolation
     // views (5 albedo / 6 lit / 7 ambient) output one shading component so surfaces Forge does NOT
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.
-    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
-    if (pgiCap) { dbg = 5u; }
+    // (Probe captures never reach here: they leave at the top, PROBE CAPTURE, LEAN.)
+    const uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
         // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
@@ -735,28 +760,7 @@ float4 PS_MAIN( VSOutput In )
         // on a dielectric while mode 5 is the only term carrying hue.
         RETURN(float4(dbgSpec, 1.0f));
     }
-    if (dbg == 5u) {                                                         // mode 5: albedo only (texture, no lighting)
-        // PROBE CAPTURE back-face flag (statics.frag's): MW's near set is the tunnel's rock as often
-        // as the distant statics are; a probe in a hollow under it saw through it, unflagged.
-        const float bs = dot(cross(pbrDPdx, pbrDPdy), In.Normal);
-        if (pgiCap && In.AlphaRef <= 0.0f && bs * PGI_BACK_SIGN > 0.0f) { RETURN(float4(4.0f, 0.0f, 4.0f, 1.0f)); }
-        // ONE LEVEL OF RECURSION (skyamb.h pgiCapSpec): a PBR surface keeps only its diffuse share as albedo,
-        // and what it reflects — the world probe's cube from the probe (eyePos is the probe in a capture) —
-        // rides the emission pixels. A metal sphere was relit as a white ball. Seen from the PROBE
-        // (gShadowParams.pgiCapEye), not eyePos: that stays the camera's for terrain LOD and fog.
-        float3 capSpec = f3(0.0f);
-        float3 capKd   = f3(1.0f);
-        if (pgiCap && pbrOn && gShadowParams.pgiCapEye.w > 0.5f && PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
-            const float3 f0c = pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x);
-            const float3 Vc  = normalize(gShadowParams.pgiCapEye.xyz - In.WorldPos);
-            const float  nvc = max(dot(pbrNb, Vc), 1.0e-4f);
-            capKd   = f3(1.0f - pbrMetalness(pbrParam));
-            capSpec = gFrameData.ambCol.rgb * pgiCapSpec(reflect(-Vc, pbrNb), pbrRough) * pbrEnvBRDF(f0c, nvc, pbrRough);
-        }
-        // P2 EMISSION (odd pixels): the emissive addend exactly as `c` takes it above.
-        if (pgiEmisPx) { RETURN(float4(albedo.rgb * (emis + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f)) + capSpec, 1.0f)); }
-        RETURN(float4(albedo.rgb * capKd * (pgiCap ? pgiCapTint(In.VColSource, In.Color.rgb + vk, In.MatDiffuse) : f3(1.0f)), 1.0f));
-    }
+    if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }                    // mode 5: albedo only (texture, no lighting)
     if (dbg == PGI_ORACLE_LIGHT) { RETURN(float4(d + a, 1.0f)); }
     if (dbg == PGI_ORACLE_AMB)   { RETURN(float4(a, 1.0f)); }
     if (dbg == PGI_ORACLE_RELIGHT) { const float3 Nv = normalize(In.Normal);   // the relight's own direct formula

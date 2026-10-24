@@ -60,6 +60,10 @@ STRUCT(PgiParams)
     // EMISSION (knob pgiEmis, P2): x = 1 the capture is the checkerboard (PGI_CAPTURE_EMIS: even pixels
     // albedo, odd the emitted radiance) and the gather splits it; RELIGHT: x = 1 add gPgiGBufE, y = gain.
     DATA(float4, emis, None);
+    // RELIGHT FOG, energy only (knob pgiFog): x = MW fog start, y = fog end (u, the probe's distance to the
+    // hit), z = 1 on; fogCol.rgb = the frame's fog colour in scene units (the main view's fogColNear).
+    DATA(float4, fog, None);
+    DATA(float4, fogCol, None);
 };
 
 // POINT LIGHTS for the relight (knob pgiPoint): the renderer's NEAR live list (pLightCbv), read through

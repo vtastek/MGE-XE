@@ -48,6 +48,42 @@ float4 PS_MAIN( VSOutput In )
     INIT_MAIN;
     float3 N = normalize(In.Normal);
 
+    // ─── PROBE CAPTURE, LEAN (opaque.frag's twin; tasks/forge-gi.md "Light events + lean captures") ──
+    // The MAIN map is the reflectance (the base stage alone: no dark/detail/decal stages). The EMISSION
+    // keeps the stage chain the main view gives it: the base's emissive through the MOD stages — a GitD
+    // window is a white emissive base under its ORANGE MOD map — plus the glow (ADD) maps (user
+    // 2026-10-23: "multimaps can use the main map (remember to use windows glow orange map)").
+    // Every stage is sampled on every pixel: emPx is per pixel, and an implicit-LOD tap behind it would
+    // sit in divergent flow. Uniform per draw (a cbuffer lane).
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (capDbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(capDbg)) {
+            const uint  cStages = In.Packed & 0x7u;
+            const float cRef    = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
+            const uint  cvcs    = (In.Packed >> 3u) & 0x3u;
+            const bool  emPx    = PGI_IS_EMIS(capDbg) && pgiCapEmisPxD(capDbg, In.Position.xy);
+            const float3 em     = ((cvcs == 1u) ? In.Color.rgb : In.MatEmissive) * gShadowParams.calParams.x;
+            float3 base = f3(0.0f), emC = f3(0.0f);
+            float  baseA = 1.0f;
+            for (uint s = 0u; s < 4u; ++s) {
+                if (s >= cStages) { break; }
+                const uint sw = (s == 0u) ? In.Stages.x : (s == 1u) ? In.Stages.y : (s == 2u) ? In.Stages.z : In.Stages.w;
+                const uint op = (sw >> 18u) & 0x3u;
+                const uint uvSet = (sw >> 16u) & 0x3u;
+                const float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1 : (uvSet == 2u) ? In.Uv2 : In.Uv3;
+                const float4 t = sampleBase(sw & 0xFFFFu, (sw >> 20u) & 0x3u, uv, useLowAF(cRef, false));
+                if (op == 0u)      { base = physAlbedo(t.rgb); baseA = t.a; emC = base * (em + expandExposedEmissiveDelta(em, base, 1.0f)); }
+                else if (op == 1u) { emC *= t.rgb; }                                // MOD (the window's orange)
+                else if (op == 2u) { emC *= mod2xStage(t.rgb); }                    // MOD2X
+                else               { emC += t.rgb * gShadowParams.sunny16.y; }      // ADD: a glow map, MW family (SUNNY 16)
+            }
+            if (baseA < cRef) { discard; }
+            if (emPx) { RETURN(float4(emC, 1.0f)); }
+            const float vkc = vcolSplitLift(cvcs, In.Color.rgb, In.MatAmbient.x, (uint)(gFrameData.debugParams.w + 0.5f));
+            RETURN(float4(base * pgiCapTint(cvcs, In.Color.rgb + vkc, In.MatDiffuse), 1.0f));
+        }
+    }
+
     // Sample the AO buffer once (rgb = the bend term, a = visibility — aocommon.h.fsl). gAO is the
     // bilateral-blurred pAOBlur, so a single tap suffices. debugParams.w = toggle bitmask (bit0
     // AO->ambient, bit1 bent normal). Kept in lockstep with opaque.frag.
@@ -102,7 +138,7 @@ float4 PS_MAIN( VSOutput In )
     // "Ambient = white (debug)" tick (bit2): force ambient to 1.0 so AO darkening is visible.
     // SH1 sky-directional ambient — geometric normal, not the possibly-bent N (see skyamb.h.fsl).
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactorPx(In.Normal, In.WorldPos, In.Position.xy);
+                                      : skyAmbientPx(In.Normal, In.WorldPos, In.Position.xy);
     // W7b — absorption on the way IN, before the point-light loop adds into `d` (waterfog.h.fsl,
     // and see opaque.frag for why point lights are excluded). Lockstep with opaque.frag.
     { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
@@ -266,10 +302,6 @@ float4 PS_MAIN( VSOutput In )
     float albScale   = gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier (BASE stage)
     float3 c   = lit;
     float3 alb = float3(1.0f, 1.0f, 1.0f);        // texture-only product (debug mode 5 albedo view)
-    // PROBE GI capture with emission (P2): the EMITTED part of `c` on its own — the base's emissive addend
-    // through the modulating stages, plus the glow (ADD) maps, which then stay out of the albedo.
-    const bool pgiEmisMode = PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f));
-    float3 emAcc = float3(0.0f, 0.0f, 0.0f);
     float  baseA = 1.0f;
     for (uint s = 0u; s < 4u; ++s)
     {
@@ -292,12 +324,10 @@ float4 PS_MAIN( VSOutput In )
         // The emissive gain lands only on CLIPPED texels (scenecolor.h.fsl), applied HERE and not
         // after the loop: the base texel is in hand, and the later MOD/MOD2X/ADD stages then
         // modulate the corrected emissive exactly as they modulate the rest of lit.
-        if (op == 0u)      { float3 b = physAlbedo(t.rgb) * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b;
-                             if (pgiEmisMode) { emAcc = b * (emis + expandExposedEmissiveDelta(emis, b, 1.0f)); } } // BASE (MOD x DIFFUSE)
-        else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; emAcc *= t.rgb; }          // MOD
-        else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; emAcc *= m; }   // MOD2X
-        else               { c += t.rgb * gShadowParams.sunny16.y;   // ADD: a glow map, MW family (SUNNY 16)
-                             if (pgiEmisMode) { emAcc += t.rgb * gShadowParams.sunny16.y; } else { alb += t.rgb; } }
+        if (op == 0u)      { float3 b = physAlbedo(t.rgb) * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b; } // BASE (MOD x DIFFUSE)
+        else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }          // MOD
+        else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; }   // MOD2X
+        else               { c += t.rgb * gShadowParams.sunny16.y; alb += t.rgb; }   // ADD: a glow map, MW family (SUNNY 16)
     }
 
     // Alpha test on the BASE stage (other stages keep-prev alpha; irrelevant to coverage).
@@ -313,10 +343,8 @@ float4 PS_MAIN( VSOutput In )
     c = tonemapInPass(c);
     c = applyFog(c, In.WorldPos, In.Position.xy);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
-    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance (P2)
-    if (pgiCap) { dbg = 5u; }
+    // (Probe captures never reach here: they leave at the top, PROBE CAPTURE, LEAN.)
+    const uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
         // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
         // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
@@ -333,7 +361,7 @@ float4 PS_MAIN( VSOutput In )
     if (dbg == 28u) { RETURN(float4(0.0f, 1.0f, 0.0f, 1.0f)); }   // mode 28: producer — MW's near path is GREEN
     if (dbg == 5u) {                                                        // mode 5: albedo only (texture product); P2 odd: emission
         // (This line had been swallowed by the comment above: multimap fed the probes its LIT colour.)
-        RETURN(float4(pgiEmisPx ? emAcc : alb * (pgiCap ? pgiCapTint(vColSource, In.Color.rgb + vk, In.MatDiffuse) : f3(1.0f)), 1.0f));
+        RETURN(float4(alb, 1.0f));
     }
     if (dbg == PGI_ORACLE_LIGHT) { RETURN(float4(d + a, 1.0f)); }
     if (dbg == PGI_ORACLE_AMB)   { RETURN(float4(a, 1.0f)); }

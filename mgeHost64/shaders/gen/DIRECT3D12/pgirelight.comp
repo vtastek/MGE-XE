@@ -1396,7 +1396,11 @@ STRUCT(PgiParams)
 
 
     float4 emis;
-#line 63
+
+
+    float4 fog;
+    float4 fogCol;
+#line 67
 };
 
 
@@ -1412,7 +1416,7 @@ STRUCT(PgiLightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 78
+#line 82
 };
 
         CBUFFER(PgiParams) gPgiParams :  register(b0,space2);
@@ -1827,11 +1831,23 @@ float skyAOTermEye(float3 N, float3 worldPosRel)
 
 
 
-float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+
+
+
+
+float3 skyAmbientAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
 {
     const bool fpAO = ao < 0.0f;
     if (fpAO) { ao = skyAOTermEye(N, worldPosRel); }
-#line 1062 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 1066 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    return  gPgiParams .ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel);
+}
+
+
+float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+{
+#line 1077 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    if (ao < 0.0f) { ao = skyAOTermEye(N, worldPosRel); }
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
@@ -1844,11 +1860,26 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
     return skyAmbFactorAOp(N, skyAOTerm(N, worldPosRel), worldPosRel);
 }
 
+float3 skyAmbient(float3 N, float3 worldPosRel)
+{
+    return skyAmbientAOpW(N, skyAOTerm(N, worldPosRel), worldPosRel, f3(1.0f), -1.0f);
+}
 
+
+
+
+float skyAOTermPxOrArms(float3 N, float3 worldPosRel, float2 svPos)
+{
+#line 1103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    return skyAOTermPx(N, worldPosRel, svPos);
+}
 float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
 {
-#line 1082 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
-    return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
+    return skyAmbFactorAOp(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel);
+}
+float3 skyAmbientPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbientAOpW(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel, f3(1.0f), -1.0f);
 }
 
 
@@ -1861,8 +1892,17 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
 
 
 
-
     return skyAmbFactorPx(R, worldPosRel, svPos);
+
+}
+
+float3 skyAmbientSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
+{
+
+
+
+
+    return  gPgiParams .ambCol.rgb * skyAmbFactorPx(R, worldPosRel, svPos);
 
 }
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pgi.comp.fsl"
@@ -2698,7 +2738,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     float prevW = 0.0f;
     {
         const float4 pm = LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(14u + layer)));
-        prevW = (gPgiParams.capMisc.z > 0.5f && pm.y > 0.5f) ? pm.y : 0.0f;
+        prevW = (gPgiParams.capMisc.z > 0.0f && pm.y > 0.5f) ? pm.y : 0.0f;
         UNROLL for (uint k = 0u; k < 7u; ++k) {
             prevC[k] = (prevW > 0.0f) ? LoadRWTex3D(gPgiSHOut, int3((int)cx, (int)cy, (int)(layer * 7u + k))) / prevW : f4(0.0f);
         }
@@ -2711,6 +2751,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
         prevEl = s18.rgb / max(s18.w, 1.0e-3f);
     }
     float3 lanAcc = f3(0.0f);
+    float albAcc = 0.0f;
 
     const bool worldSky = !world && gPgiParams.capMisc.x > 0.5f && gPgiProbes[2u * G * G - 1u].w > 3.5f;
     if (valid) {
@@ -2752,6 +2793,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
                                                          (layer * G + cy) *  8u  + ty));
             const float4 as = pgiUnpackUnorm4(gb.x);
             const float skyF = as.w;
+            albAcc += dot(as.rgb, float3(0.2126f, 0.7152f, 0.0722f)) * (1.0f - skyF) * dom;
             const uint nGeoT = gb.w & 0xFFu, nBackT = (gb.w >> 8u) & 0xFFu;
             if (nGeoT > 0u) { backAcc += (float)nBackT / (float)nGeoT * (1.0f - skyF) * dom; }
             if (2u * nBackT > nGeoT) {
@@ -2795,7 +2837,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
                 const float sunV = pgiSunVisibility(P, N, S, gPgiParams.place.z > 0.5f);
 
 
-                float3 amb = (fillOld || gPgiParams.capMisc.z < 0.5f)
+                float3 amb = (fillOld || gPgiParams.capMisc.z <= 0.0f)
                            ? gPgiParams.ambCol.rgb * skyAmbFactorAO(N, skyAOTerm(N, Prel)) : f3(0.0f);
                 if (prevW > 0.0f) {
                     const float Yn[9] = { 0.282095f, 0.488603f * N.y, 0.488603f * N.z, 0.488603f * N.x,
@@ -2807,12 +2849,12 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
                                            prevC[6].x, prevC[6].y, prevC[6].z, prevC[6].w };
                     float3 Ep = f3(0.0f);
                     UNROLL for (uint b = 0u; b < 9u; ++b) { Ep += float3(fp[3u * b], fp[3u * b + 1u], fp[3u * b + 2u]) * Yn[b]; }
-                    amb = max(Ep, f3(0.0f));
+                    amb = max(Ep, f3(0.0f)) * gPgiParams.capMisc.z;
                 }
 
                 const float3 Elan = pgiPointLight(Prel, N);
                 const float3 E = gPgiParams.sunCol.rgb * (max(dot(N, S), 0.0f) * sunV * gPgiParams.place.y) + amb + Elan;
-                L += (1.0f - skyF) * as.rgb * E;
+                float3 Lhit = (1.0f - skyF) * as.rgb * E;
                 Ldir = (1.0f - skyF) * as.rgb * (E - amb);
                 lanAcc += (1.0f - skyF) * as.rgb * (Elan + min(amb, prevEl)) * dom;
 
@@ -2821,9 +2863,18 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
                     const float3 Le = pgiUnpackR11G11B10(LoadRWTex2D(gPgiGBufE,
                         int2(cx * 6u *  8u  + f *  8u  + tx, (layer * G + cy) *  8u  + ty)).r)
                         * ((1.0f - skyF) * gPgiParams.emis.y);
-                    L += Le;
+                    Lhit += Le;
                     lanAcc += Le * dom;
                 }
+
+
+
+
+                if (gPgiParams.fog.z > 0.5f) {
+                    const float fr = saturate((hd - gPgiParams.fog.x) / max(gPgiParams.fog.y - gPgiParams.fog.x, 1.0f));
+                    Lhit = lerp(Lhit, (1.0f - skyF) * gPgiParams.fogCol.rgb, fr);
+                }
+                L += Lhit;
             }
 
 
@@ -2859,7 +2910,7 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
     g_pgiA[tid *  12u  + 8u] = float4(missY[4], missY[5], missY[6], missY[7]);
     g_pgiA[tid *  12u  + 9u] = float4(missY[8], capL);
     g_pgiA[tid *  12u  + 10u] = float4(capD, visS, visW, skyAll);
-    g_pgiA[tid *  12u  + 11u] = float4(lanAcc, 0.0f);
+    g_pgiA[tid *  12u  + 11u] = float4(lanAcc, albAcc);
     g_pgiNear[tid] = nearB;
     g_pgiNearF[tid] = nearF;
     GroupMemoryBarrier();
@@ -2960,7 +3011,9 @@ void CS_MAIN( uint3 GroupID : SV_GROUPID, uint3 GroupThreadID : SV_GROUPTHREADID
 
         const float vp = (g_pgiA[10].z > 1.0e-6f) ? saturate(g_pgiA[10].y / g_pgiA[10].z) : 1.0f;
         const float va = (g_pgiA[10].x > 1.0e-6f) ? saturate(g_pgiA[10].w / g_pgiA[10].x) : 0.0f;
-        float4 vz = valid ? float4(vp, 1.0f, va, 0.0f) : f4(0.0f);
+
+        const float ma = (g_pgiA[10].x > 1.0e-6f) ? g_pgiA[11].w / g_pgiA[10].x : 0.0f;
+        float4 vz = valid ? float4(vp, 1.0f, va, ma) : f4(0.0f);
         const int3 at = int3((int)cx, (int)cy, (int)(16u + layer));
         if (trans) { vz = lerp(LoadRWTex3D(gPgiSHOut, at), vz, gPgiParams.capMisc.y); }
         Write3D(gPgiSHOut, at, vz);

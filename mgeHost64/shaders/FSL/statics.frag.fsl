@@ -193,6 +193,26 @@ PSOut PS_MAIN( VSOutput In )
     uint cov = a2cCoverageMask(tex.a, ((In.Flags & 0x2u) != 0u) ? (133.0f / 255.0f) : 0.0f);
     if (cov == 0u) { discard; }
 #endif
+    // ─── PROBE CAPTURE, LEAN (opaque.frag's twin; tasks/forge-gi.md "Light events + lean captures") ──
+    // Reflectance, the back-face flag and the emission pixels, and out — before weather, shadows, PBR,
+    // parallax, fog. Uniform per draw (a cbuffer lane). BLENDED subsets (0x20) are captured OPAQUE (no
+    // blend, user 2026-10-23: "no alpha blending") and without the back-face flag, like cut-outs (0x2):
+    // discarded, a probe saw through a pane into the back of the house behind it (magenta).
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if (capDbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(capDbg)) {
+            PSOut C;
+#if !STATICS_EARLY_Z
+            C.Coverage = cov;
+#endif
+            const float bs = dot(cross(ddx(In.WorldPos), ddy(In.WorldPos)), In.WorldNormal);
+            if ((In.Flags & 0x22u) == 0u && bs * PGI_BACK_SIGN > 0.0f) { C.Color = float4(4.0f, 0.0f, 4.0f, 1.0f); RETURN(C); }
+            // Emission pixels: statics.vert hands this mode the emissive ALONE in Color.
+            if (PGI_IS_EMIS(capDbg) && pgiCapEmisPxD(capDbg, In.Position.xy)) { C.Color = float4(tex.rgb * In.Color.rgb, 1.0f); RETURN(C); }
+            C.Color = float4(tex.rgb, 1.0f);
+            RETURN(C);
+        }
+    }
     weatherApply(tex.rgb, normalize(In.WorldNormal), In.WorldPos,
                  ((In.Flags & 0x2u) != 0u) ? 0.3f : 1.0f);   // wetness + snow (identity when dry); cutout = foliage
 
@@ -515,10 +535,8 @@ PSOut PS_MAIN( VSOutput In )
 #endif
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
-    uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
-    const bool pgiCap = (dbg == PGI_CAPTURE_DBG || PGI_IS_EMIS(dbg));   // the probe capture: mode 5 + the back-face flag
-    const bool pgiEmisPx = PGI_IS_EMIS(dbg) && pgiCapEmisPxD(dbg, In.Position.xy);   // odd: emitted radiance
-    if (pgiCap) { dbg = 5u; }
+    // (Probe captures never reach here: they leave at the top, PROBE CAPTURE, LEAN.)
+    const uint dbg = pgiOracleAsView((uint)(gFrameData.debugParams.x + 0.5f));   // the oracle's untinted views: no tint here
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
@@ -533,29 +551,7 @@ PSOut PS_MAIN( VSOutput In )
     // mode 28: which PRODUCER drew the pixel — DL statics MAGENTA, MW's near path GREEN (opaque /
     // multimap). Where both draw the same surface the view is a speckle of the two: the z-fight.
     if (dbg == 28u) { Out.Color = float4(1.0f, 0.0f, 1.0f, 1.0f); RETURN(Out); }
-    if (dbg == 5u) {
-        // PROBE CAPTURE back-face flag (pgi, culling off): the screen-space geometric normal against
-        // the mesh's own — the viewer is BEHIND the surface where they disagree. Written as a
-        // sentinel no albedo reaches (the target may have no alpha); pgigather counts it, and a
-        // probe that sees many is INSIDE geometry. Not for cut-outs (foliage is two-sided by intent).
-        const float bs = dot(cross(ddx(In.WorldPos), ddy(In.WorldPos)), In.WorldNormal);
-        // Nor for BLENDED ones (0x20): two-sided by intent as well — they showed magenta in the peek.
-        if (pgiCap && (In.Flags & 0x22u) == 0u && bs * PGI_BACK_SIGN > 0.0f) { Out.Color = float4(4.0f, 0.0f, 4.0f, 1.0f); RETURN(Out); }
-        // ONE LEVEL OF RECURSION (skyamb.h pgiCapSpec, opaque.frag's twin): the diffuse share as albedo, the
-        // world probe's cube as seen in the surface from the probe on the emission pixels.
-        float3 capSpec = f3(0.0f);
-        float3 capKd   = f3(1.0f);
-        if (pgiCap && pbrLive && gShadowParams.pgiCapEye.w > 0.5f && PGI_IS_EMIS((uint)(gFrameData.debugParams.x + 0.5f))) {
-            const float3 f0c = pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x);
-            const float3 Vc  = normalize(gShadowParams.pgiCapEye.xyz - In.WorldPos);
-            const float  nvc = max(dot(nShade, Vc), 1.0e-4f);
-            capKd   = pbrKd;
-            capSpec = gFrameData.lodSunAmb.rgb * pgiCapSpec(reflect(-Vc, nShade), pbrRough) * pbrEnvBRDF(f0c, nvc, pbrRough);
-        }
-        // P2 EMISSION (odd pixels): statics.vert hands this mode the emissive ALONE in Color.
-        if (pgiEmisPx) { Out.Color = float4(tex.rgb * In.Color.rgb + capSpec, 1.0f); RETURN(Out); }
-        Out.Color = float4(tex.rgb * capKd, 1.0f);      RETURN(Out);
-    }
+    if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f); RETURN(Out); }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     if (dbg == 19u) {   // mode 19: PBR material COVERAGE, same legend as opaque.frag's and terrain's

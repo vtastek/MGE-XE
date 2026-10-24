@@ -3549,7 +3549,11 @@ float skyAOTermEye(float3 N, float3 worldPosRel)
 
 
 
-float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+
+
+
+
+float3 skyAmbientAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
 {
     const bool fpAO = ao < 0.0f;
     if (fpAO) { ao = skyAOTermEye(N, worldPosRel); }
@@ -3593,7 +3597,7 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
 
 
 
-            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f)); }
+            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f; }
             if (rv > 0.0f) {
                 const float pv = (rv > 1.5f) ? 1.0f : pvis;
                 const float nz = normalize(N).z;
@@ -3627,20 +3631,32 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
 
         if (gShadowParams.pgiParams1.w > 0.5f) {
             const float sh = saturate(pg.a);
-            return float3(1.0f - sh, sh, 0.1f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            return float3(1.0f - sh, sh, 0.1f) * 1.5f;
         }
         if (pg.a > 0.0f) {
-            float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            float3 fp = pg.rgb * gShadowParams.pgiParams0.x;
 
 
 
 
 
             if (pg.a >= 0.999f) { return fp; }
-            return lerp(skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
+            return lerp(gFrameData.ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
         }
     }
 
+    return gFrameData.ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel);
+}
+
+
+float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+{
+
+    if (gShadowParams.pgiParams0.x > 0.0f) {
+        return skyAmbientAOpW(N, ao, worldPosRel, bw, hiRough) / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+    }
+
+    if (ao < 0.0f) { ao = skyAOTermEye(N, worldPosRel); }
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
@@ -3653,15 +3669,28 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
     return skyAmbFactorAOp(N, skyAOTerm(N, worldPosRel), worldPosRel);
 }
 
+float3 skyAmbient(float3 N, float3 worldPosRel)
+{
+    return skyAmbientAOpW(N, skyAOTerm(N, worldPosRel), worldPosRel, f3(1.0f), -1.0f);
+}
 
-float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+
+
+
+float skyAOTermPxOrArms(float3 N, float3 worldPosRel, float2 svPos)
 {
 
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return -1.0f; }
 
-
-    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
-
-    return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
+    return skyAOTermPx(N, worldPosRel, svPos);
+}
+float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbFactorAOp(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel);
+}
+float3 skyAmbientPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbientAOpW(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel, f3(1.0f), -1.0f);
 }
 
 
@@ -3672,9 +3701,16 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
 {
 
     const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
-    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
-    return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
-#line 1098 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    return skyAmbFactorAOpW(R, skyAOTermPxOrArms(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#line 1126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+}
+
+float3 skyAmbientSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
+{
+
+    const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
+    return skyAmbientAOpW(R, skyAOTermPxOrArms(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#line 1136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 }
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/weather.h.fsl"
@@ -5944,8 +5980,13 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     const float gradK = exp2(max(gShadowParams.terrainTex.y, 0.0f));
     const float2 gdx = duvdx * gradK;
     const float2 gdy = duvdy * gradK;
-#line 574 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
-    const bool pbrTerrainOn = (gShadowParams.pbrTerrain.x != 0.0f);
+#line 577 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+    const bool capT = false;
+
+
+
+
+    const bool pbrTerrainOn = (gShadowParams.pbrTerrain.x != 0.0f) && !capT;
 
     uint ps00 = 0u, ps10 = 0u, ps01 = 0u, ps11 = 0u;
     if (pbrTerrainOn) {
@@ -6006,7 +6047,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                 }
             }
         }
-#line 652 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 660 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
         if ((gShadowParams.parallax3.x != 0.0f) && !oneSquare)
         {
             const float4 hl = parallaxLandHeights(uint4(ps00, ps10, ps01, ps11), uvS, duvdx, duvdy);
@@ -6057,20 +6098,20 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         const float lvl = max(0.0f, log2(max(max(length(gdx * dims), length(gdy * dims)), 1e-8f)));
         if (oneSquare || (tCut & 32u) != 0u) {
             albedo =  gTerrainArrays[id00 >> 16u].SampleLevel(gSamplerBilinearWrap, float3(uvS, float(id00 & 0xFFFFu)), lvl) .
-#line 702 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 710 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 rgb;
         } else {
             albedo =  gTerrainArrays[id00 >> 16u].SampleLevel(gSamplerBilinearWrap, float3(uvS, float(id00 & 0xFFFFu)), lvl) .
-#line 705 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 713 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 rgb * w00;
             albedo +=  gTerrainArrays[id10 >> 16u].SampleLevel(gSamplerBilinearWrap, float3(uvS, float(id10 & 0xFFFFu)), lvl) .
-#line 707 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 715 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 rgb * w10;
             albedo +=  gTerrainArrays[id01 >> 16u].SampleLevel(gSamplerBilinearWrap, float3(uvS, float(id01 & 0xFFFFu)), lvl) .
-#line 709 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 717 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 rgb * w01;
             albedo +=  gTerrainArrays[id11 >> 16u].SampleLevel(gSamplerBilinearWrap, float3(uvS, float(id11 & 0xFFFFu)), lvl) .
-#line 711 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 719 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 rgb * w11;
         }
     } else if (oneSquare || (tCut & 32u) != 0u) {
@@ -6083,7 +6124,7 @@ rgb * w11;
     }
 
     albedo = physAlbedo(albedo);
-#line 739 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 747 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     if ((tCut & 64u) == 0u)
     {
         const uint cslot = In.Cell.x;
@@ -6093,7 +6134,7 @@ rgb * w11;
         float3 c11 = loadVertexColor(cslot, x1, y1);
         albedo *= lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
     }
-#line 760 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 776 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     if ((tCut & 4u) == 0u)
 
     {
@@ -6144,7 +6185,7 @@ rgb * w11;
 
 
     if (paraShOn) { sunVis *= paraSh; }
-#line 836 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 852 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     const float2 pbrDUVdx = duvdx;
     const float2 pbrDUVdy = duvdy;
 
@@ -6169,7 +6210,7 @@ rgb * w11;
     const bool pbrHAO = (gShadowParams.pbrTerrainAO.x != 0.0f);
     const float pbrHAOStr = gShadowParams.pbrTerrainAO.y;
     const float pbrHAOLvl = gShadowParams.pbrTerrainAO.z;
-#line 874 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 890 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     const float pbrGradR = gShadowParams.pbrParams.w;
 
     bool pbrLive = false;
@@ -6181,7 +6222,7 @@ rgb * w11;
         pbrLive = ((ps00 | ps10 | ps01 | ps11) != 0u);
         if (pbrLive)
         {
-#line 902 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 918 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
             float4 mat = float4(0.0f, 0.0f, 0.0f, 0.0f);
             float matW = 0.0f;
             float2 dh = float2(0.0f, 0.0f);
@@ -6258,7 +6299,7 @@ rgb * w11;
             pbrRough = sqrt(sqrt(pbrAlpha2));
         }
     }
-#line 1012 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1028 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
 
@@ -6336,7 +6377,7 @@ rgb * w11;
                   * (sunDiff
                         * tSunW
                      + amb * tAmbW);
-#line 1106 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1122 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 litTerm = sunDiff * tSunW + amb * tAmbW;
     if (pbrLive)
     {
@@ -6345,7 +6386,7 @@ rgb * w11;
         pbrSpecA += clampSceneTerm(w * st.x);
         pbrSpecB += clampSceneTerm(w * st.y);
     }
-#line 1136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
 
 
@@ -6604,7 +6645,7 @@ rgb * w11;
 
     result = tonemapInPass(result);
     if ((tCut & 16u) == 0u) { result = applyFog(result, In.WorldPos, In.Position.xy); }
-#line 1641 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1649 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     return (float4(result, 1.0f));
 }
 #line 254 "FSL/shaders.list"

@@ -3487,7 +3487,11 @@ float skyAOTermEye(float3 N, float3 worldPosRel)
 
 
 
-float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+
+
+
+
+float3 skyAmbientAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
 {
     const bool fpAO = ao < 0.0f;
     if (fpAO) { ao = skyAOTermEye(N, worldPosRel); }
@@ -3531,7 +3535,7 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
 
 
 
-            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f)); }
+            if (rv > 2.5f && rv < 3.5f) { return float3(ao, pvis, 0.0f) * 1.5f; }
             if (rv > 0.0f) {
                 const float pv = (rv > 1.5f) ? 1.0f : pvis;
                 const float nz = normalize(N).z;
@@ -3565,20 +3569,32 @@ float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float
 
         if (gShadowParams.pgiParams1.w > 0.5f) {
             const float sh = saturate(pg.a);
-            return float3(1.0f - sh, sh, 0.1f) * 1.5f / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            return float3(1.0f - sh, sh, 0.1f) * 1.5f;
         }
         if (pg.a > 0.0f) {
-            float3 fp = pg.rgb * gShadowParams.pgiParams0.x / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+            float3 fp = pg.rgb * gShadowParams.pgiParams0.x;
 
 
 
 
 
             if (pg.a >= 0.999f) { return fp; }
-            return lerp(skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
+            return lerp(gFrameData.ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel), fp, pg.a);
         }
     }
 
+    return gFrameData.ambCol.rgb * skyAmbFactorAOpOld(N, ao, worldPosRel);
+}
+
+
+float3 skyAmbFactorAOpW(float3 N, float ao, float3 worldPosRel, float3 bw, float hiRough)
+{
+
+    if (gShadowParams.pgiParams0.x > 0.0f) {
+        return skyAmbientAOpW(N, ao, worldPosRel, bw, hiRough) / max(gFrameData.ambCol.rgb, f3(1.0e-4f));
+    }
+
+    if (ao < 0.0f) { ao = skyAOTermEye(N, worldPosRel); }
     return skyAmbFactorAOpOld(N, ao, worldPosRel);
 }
 float3 skyAmbFactorAOp(float3 N, float ao, float3 worldPosRel)
@@ -3591,15 +3607,28 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
     return skyAmbFactorAOp(N, skyAOTerm(N, worldPosRel), worldPosRel);
 }
 
+float3 skyAmbient(float3 N, float3 worldPosRel)
+{
+    return skyAmbientAOpW(N, skyAOTerm(N, worldPosRel), worldPosRel, f3(1.0f), -1.0f);
+}
 
-float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+
+
+
+float skyAOTermPxOrArms(float3 N, float3 worldPosRel, float2 svPos)
 {
 
+    if (gFrameData.alphaShadowParams.z > 0.5f) { return -1.0f; }
 
-
-    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOp(N, -1.0f, worldPosRel); }
-
-    return skyAmbFactorAOp(N, skyAOTermPx(N, worldPosRel, svPos), worldPosRel);
+    return skyAOTermPx(N, worldPosRel, svPos);
+}
+float3 skyAmbFactorPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbFactorAOp(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel);
+}
+float3 skyAmbientPx(float3 N, float3 worldPosRel, float2 svPos)
+{
+    return skyAmbientAOpW(N, skyAOTermPxOrArms(N, worldPosRel, svPos), worldPosRel, f3(1.0f), -1.0f);
 }
 
 
@@ -3610,9 +3639,16 @@ float3 skyAmbSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
 {
 
     const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
-    if (gFrameData.alphaShadowParams.z > 0.5f) { return skyAmbFactorAOpW(R, -1.0f, worldPosRel, bw, rough); }
-    return skyAmbFactorAOpW(R, skyAOTermPx(R, worldPosRel, svPos), worldPosRel, bw, rough);
-#line 1098 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    return skyAmbFactorAOpW(R, skyAOTermPxOrArms(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#line 1126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+}
+
+float3 skyAmbientSpecPx(float3 R, float rough, float3 worldPosRel, float2 svPos)
+{
+
+    const float3 bw = pgiSpecBands(rough, saturate(gShadowParams.pgiSpec.x));
+    return skyAmbientAOpW(R, skyAOTermPxOrArms(R, worldPosRel, svPos), worldPosRel, bw, rough);
+#line 1136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 }
 #line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 
@@ -3648,8 +3684,11 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float3 t = (layerOp == 2u) ? mod2xStage(tex.rgb) : tex.rgb;
-#line 76 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
-    if ( (((uint)(gFrameData.debugParams.x + 0.5f)) == 65u || ((uint)(gFrameData.debugParams.x + 0.5f)) == 66u || ((uint)(gFrameData.debugParams.x + 0.5f)) == 67u ) ) { RETURN(float4(t, 1.0f)); }
+#line 77 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
+    {
+        const uint capDbg = (uint)(gFrameData.debugParams.x + 0.5f);
+        if ( ((capDbg) == 65u || (capDbg) == 66u || (capDbg) == 67u ) ) { RETURN(float4(pgiCapEmisPxD(capDbg, In.Position.xy) ? t : f3(1.0f), 1.0f)); }
+    }
     float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(mwFogFactorAt(In.WorldPos), In.WorldPos)));
     return (float4(m, 1.0f));
 }
